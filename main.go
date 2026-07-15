@@ -34,7 +34,7 @@ func main() {
 	switch cmd {
 	case "check":
 		if _, err := config.Load(*cfgPath); err != nil {
-			fmt.Fprintf(os.Stderr, "config invalid:\n%v\n", err)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("%s: config OK\n", *cfgPath)

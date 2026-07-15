@@ -16,6 +16,12 @@ func TestDurationUnmarshalYAML(t *testing.T) {
 	if err := d.UnmarshalYAML([]byte("not-a-duration")); err == nil {
 		t.Error("expected error for invalid duration")
 	}
+	if err := d.UnmarshalYAML([]byte(`"90s"`)); err != nil {
+		t.Fatalf("quoted duration must parse: %v", err)
+	}
+	if d.Std() != 90*time.Second {
+		t.Errorf("quoted: got %v, want 90s", d.Std())
+	}
 }
 
 func TestPortRangeUnmarshalYAML(t *testing.T) {
@@ -30,6 +36,12 @@ func TestPortRangeUnmarshalYAML(t *testing.T) {
 		if err := p.UnmarshalYAML([]byte(bad)); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}
+	}
+	if err := p.UnmarshalYAML([]byte(`"16384-32768"`)); err != nil {
+		t.Fatalf("quoted port range must parse: %v", err)
+	}
+	if p.Min != 16384 || p.Max != 32768 {
+		t.Errorf("quoted: got %d-%d", p.Min, p.Max)
 	}
 }
 
@@ -48,6 +60,12 @@ func TestSIPListenUnmarshalYAML(t *testing.T) {
 		if err := s.UnmarshalYAML([]byte(bad)); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}
+	}
+	if err := s.UnmarshalYAML([]byte(`"udp://0.0.0.0:5060"`)); err != nil {
+		t.Fatalf("quoted listener must parse: %v", err)
+	}
+	if s.Transport != "udp" || s.Port != 5060 {
+		t.Errorf("quoted: got %+v", s)
 	}
 }
 

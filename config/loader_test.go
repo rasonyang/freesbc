@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const minimalYAML = `
@@ -158,5 +159,37 @@ func TestLoadFromFile(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Error("expected error for missing file")
+	}
+}
+
+func TestParseQuotedScalars(t *testing.T) {
+	src := `
+listen:
+  sip: ["udp://0.0.0.0:5060"]
+  media:
+    port_range: "16384-32768"
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+shield:
+  auto_ban: { failures: 5, window: "60s", duration: 1h }
+`
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("quoted scalars must parse: %v", err)
+	}
+	if c.Listen.SIP[0].Port != 5060 {
+		t.Errorf("listener: %+v", c.Listen.SIP[0])
+	}
+	if c.Listen.Media.PortRange.Min != 16384 {
+		t.Errorf("port range: %+v", c.Listen.Media.PortRange)
+	}
+	if c.Shield.AutoBan.Window.Std() != 60*time.Second {
+		t.Errorf("window: %v", c.Shield.AutoBan.Window.Std())
 	}
 }
