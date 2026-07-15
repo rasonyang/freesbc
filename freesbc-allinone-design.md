@@ -66,7 +66,7 @@
 2. **运行时状态纯内存**：单节点定位下呼叫状态不落盘，进程重启丢在途呼叫（与 Kamailio 默认一致）。配置文件是唯一持久化。
 3. **配置热重载语义**：变更 → 校验 → 原子替换（`atomic.Pointer[Config]`）→ 新呼叫用新配置，在途呼叫不受影响。校验失败保持旧配置，进程永不因坏配置崩溃。
 4. **安全平面应用层实现**：每 IP 限速、扫描器 UA 指纹、失败阈值自动封禁，内存封禁表，可选联动 nftables（`auto/on/off`），nftables 非硬依赖（与 libresbc 相反）。
-5. **媒体面安全（latching 加固）**：首包 latching 仅在媒体流建立前生效，默认要求首包源 IP 与 SDP 信令 IP 一致（每 peer 可配 `strict/loose` 应对强 NAT），媒体建立后**不再重新 latch**，防 RTP 劫持。
+5. **媒体面安全（latching 加固）**：首包 latching 仅在媒体流建立前生效，默认要求首包源 IP 与 SDP 信令 IP 一致（每 peer 可配 `strict/loose` 应对强 NAT），媒体建立后**不再重新 latch**，防 RTP 劫持。**arming 语义（2026-07-15 已确认）**：初始媒体采用严格 per-side arming——strict 模式下某侧在信令面用 SDP 源 IP arm 之前**丢弃一切包**（防早期媒体窗口被抢注，劫持+DoS）；后续媒体地址变更（re-INVITE/hold-resume）仅能由 SIP/SDP 状态机显式调用授权 re-latch（`Relatch`），本地端口跨 re-INVITE 保持不变。
 
 ### 信令互操作基线（MVP 必备）
 
