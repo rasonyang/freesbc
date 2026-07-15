@@ -38,6 +38,26 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		b.s.dropUnidentified(req)
 		return
 	}
+
+	// In-dialog INVITE (re-INVITE: hold/resume, codec change, target
+	// refresh, ...) vs. initial INVITE is distinguished by the To-tag: an
+	// initial INVITE never carries one (RFC 3261 §8.1.1.2), an in-dialog
+	// INVITE always does (it's the tag the dialog was established with).
+	//
+	// sipgo v1.4.3's DialogServerSession.ReadInvite is single-use: calling
+	// it again for a re-INVITE on an already-established dialog corrupts
+	// that dialog's To-tag rather than answering the renegotiation. Rather
+	// than risk that corruption, reject the re-INVITE here — before ever
+	// touching dialogSrv — with 501 Not Implemented on the raw server
+	// transaction. Per RFC 3261 §14.1, a failed re-INVITE does not
+	// terminate the dialog, so the established call stays up with its
+	// existing media; the caller/target simply can't renegotiate it. Mid-
+	// dialog renegotiation support is deferred to M4.
+	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
+		b.reject(req, tx, 501, "Not Implemented")
+		return
+	}
+
 	cfg := b.s.store.Current()
 	decision, ok := Resolve(cfg, name, req.Recipient.User)
 	if !ok || decision.OutNumber == "" || len(decision.Targets) == 0 {

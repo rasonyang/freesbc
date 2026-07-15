@@ -45,6 +45,73 @@ func TestBridgeRejectsUnroutableInvite(t *testing.T) {
 	}
 }
 
+// TestBridgeRejectsReInvite proves an in-dialog INVITE (a re-INVITE — e.g.
+// a phone pressing hold, or any target-refresh/renegotiation) is rejected
+// with 501 Not Implemented rather than being handed to
+// dialogSrv.ReadInvite: sipgo v1.4.3's DialogServerSession.ReadInvite is
+// single-use and corrupts the established dialog's To-tag if called again
+// for a re-INVITE, so mid-dialog renegotiation is deferred to M4 (see
+// bridge.onInvite's in-dialog-INVITE guard). The detection signal is the
+// presence of a To-tag: an initial INVITE never carries one (RFC 3261
+// §8.1.1.2), while every in-dialog INVITE does.
+//
+// This also proves the server survives the rejection intact: a normal
+// initial INVITE sent immediately afterward on the same server still
+// routes/rejects normally, rather than the process having wedged or
+// corrupted shared state.
+func TestBridgeRejectsReInvite(t *testing.T) {
+	cfg := strings.Replace(bridgeNoRouteCfg, "45070", "45071", 1)
+	startServer(t, 45071, cfg)
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer conn.Close()
+	local := conn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45071}
+
+	// Same shape as sipRequest's INVITE, but the To header carries a tag —
+	// exactly what distinguishes an in-dialog (re-)INVITE from an initial
+	// one.
+	req := strings.Replace(
+		sipRequest("INVITE", "45071", local, "b2bua-reinvite-1"),
+		"To: <sip:sbc@127.0.0.1>",
+		"To: <sip:sbc@127.0.0.1>;tag=reinvite-tag",
+		1,
+	)
+	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write re-invite: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 501") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 501") {
+		t.Fatalf("re-INVITE (To-tag present) must get 501 Not Implemented, got:\n%s", got.String())
+	}
+
+	// The server must have survived unscathed: a fresh initial INVITE
+	// (no To-tag) still gets routed and rejected normally (bridgeNoRouteCfg
+	// only routes ^999$, so 111 gets 404) — proving ReadInvite's dialog
+	// state was never touched by the rejected re-INVITE.
+	got2 := roundTrip(t, 45071, "INVITE", "b2bua-reinvite-followup", 3*time.Second, "SIP/2.0 404")
+	if !strings.Contains(got2, "SIP/2.0 404") {
+		t.Fatalf("server did not survive re-INVITE rejection; follow-up initial INVITE got:\n%s", got2)
+	}
+}
+
 // --- Task 6: happy-path bridge, stub carrier UAS ---
 
 // stubCarrier is a minimal sipgo UAS standing in for a carrier trunk. It
