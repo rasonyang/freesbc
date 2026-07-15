@@ -9,15 +9,32 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goccy/go-yaml"
 )
+
+// yamlScalarString decodes one YAML scalar node to its string value,
+// handling quoting and escapes; UnmarshalYAML receives raw node bytes
+// which include any quote characters the user wrote.
+func yamlScalarString(b []byte) (string, error) {
+	var s string
+	if err := yaml.Unmarshal(b, &s); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(s), nil
+}
 
 // Duration parses YAML scalars like "60s" or "1h" via time.ParseDuration.
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(b []byte) error {
-	v, err := time.ParseDuration(strings.TrimSpace(string(b)))
+	s, err := yamlScalarString(b)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", string(b), err)
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
 	}
 	*d = Duration(v)
 	return nil
@@ -32,7 +49,10 @@ type PortRange struct {
 }
 
 func (p *PortRange) UnmarshalYAML(b []byte) error {
-	s := strings.TrimSpace(string(b))
+	s, err := yamlScalarString(b)
+	if err != nil {
+		return fmt.Errorf("invalid port range %q: %w", string(b), err)
+	}
 	lo, hi, ok := strings.Cut(s, "-")
 	if !ok {
 		return fmt.Errorf("invalid port range %q: want \"min-max\"", s)
@@ -60,7 +80,10 @@ type SIPListen struct {
 }
 
 func (s *SIPListen) UnmarshalYAML(b []byte) error {
-	raw := strings.TrimSpace(string(b))
+	raw, err := yamlScalarString(b)
+	if err != nil {
+		return fmt.Errorf("invalid listener %q: %w", string(b), err)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid listener %q: %w", raw, err)

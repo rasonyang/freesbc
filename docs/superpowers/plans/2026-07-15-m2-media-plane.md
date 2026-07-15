@@ -1245,3 +1245,17 @@ gofmt -l . && git add main.go README.md && git commit -m "feat: wire media pool 
 | M1 backlog — top-level `-h` exit code, watcher shutdown coordination | 6 |
 
 Deferred (documented in header): STUN for `public_ip: auto` (M3), SRTP (M5), metrics (M7), perf/batch syscalls (M3+ benchmark), `media/srtp.go` (M5).
+
+## Post-Implementation Amendments (2026-07-15, final review)
+
+- Relay panic recovery now logs the panic value and `debug.Stack()` via `slog` before killing the session (`recoverRelayPanic`, with an injection test) — silent call drops were the review's Important #1.
+
+## Carry-over for M3 (from final review)
+
+- **M3 DESIGN DECISION (Important — decide before writing SDP plumbing):** strict latching with no expectation accepts the first packet from anywhere, and the latch never re-arms. In B2BUA offer/answer timing, early media can arrive before the answer SDP supplies the expected IP, so an attacker flooding the allocated port can latch first and permanently lock out the legitimate stream (hijack becomes hijack+DoS). Also, re-INVITE/hold-resume legitimately changes the media address but there is no authorized re-latch path, and sessions must keep local ports across re-INVITEs. Options: (a) strict-without-expectation rejects until `SetExpectedRemote` (per-side arming; changes the pinned `TestLatchStrictWithoutExpectationAcceptsFirst` semantics), or (b) explicit `RelatchRemote(side)` invoked only from authorized signaling events. Decide in M3 brainstorm/plan.
+- Put the peer `media_latch` string → `LatchMode` converter in the `media` package (`ParseLatchMode`) when M3 maps peer config to sessions.
+- Concurrent `Allocate` at the exhaustion boundary can doubly fail where serial would succeed once (two-lock acquisition); fix with `allocatePairs(n)` under one lock if 503 spikes matter.
+- Relay buffer is 1500 bytes — larger datagrams are truncated, not dropped; bump or document MTU assumption (revisit for SRTP in M5).
+- RTCP traffic defers the "RTP silence" watchdog — decide intended semantics, document.
+- `Start` has no call-twice guard (M3 owns the single call site; one-line `sync.Once` insurance).
+- Test-coverage debt: panic-injection test landed; still open — RTCP-path relay test, hot-reload range pickup test, second-pair unwind regression test, `media_latch: loose` positive validate case (fold into M3's end-to-end work).

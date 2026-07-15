@@ -28,8 +28,9 @@ type ListenConfig struct {
 }
 
 type MediaConfig struct {
-	PortRange PortRange `yaml:"port_range"`
-	PublicIP  string    `yaml:"public_ip"` // "auto" (STUN-detected) or a literal IP
+	PortRange  PortRange `yaml:"port_range"`
+	PublicIP   string    `yaml:"public_ip"`   // "auto" (STUN-detected) or a literal IP
+	RTPTimeout Duration  `yaml:"rtp_timeout"` // tear down a call after this much RTP silence
 }
 
 // Peer is a SIP trunk counterpart (carrier or PBX).
@@ -39,6 +40,10 @@ type Peer struct {
 	Auth       *PeerAuth `yaml:"auth"`
 	Register   bool      `yaml:"register"` // outbound REGISTER to this peer
 	AllowedIPs []string  `yaml:"allowed_ips"`
+	// MediaLatch controls first-packet latching for this peer's media:
+	// "strict" (default) requires the first RTP packet's source IP to match
+	// the SDP-signaled address; "loose" accepts any source (hard NAT).
+	MediaLatch string `yaml:"media_latch"`
 
 	allowedNets []netip.Prefix // compiled by Validate
 }
@@ -112,9 +117,15 @@ func withDefaults(c *Config) {
 	if c.Listen.Media.PublicIP == "" {
 		c.Listen.Media.PublicIP = "auto"
 	}
+	if c.Listen.Media.RTPTimeout == 0 {
+		c.Listen.Media.RTPTimeout = Duration(5 * time.Minute)
+	}
 	for _, p := range c.Peers {
 		if p.Transport == "" {
 			p.Transport = "udp"
+		}
+		if p.MediaLatch == "" {
+			p.MediaLatch = "strict"
 		}
 	}
 	if c.Shield.RateLimit == "" {

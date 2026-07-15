@@ -31,6 +31,9 @@ func (c *Config) validate() error {
 			fail("listen.media.public_ip: %q is neither \"auto\" nor a valid IP", pub)
 		}
 	}
+	if c.Listen.Media.RTPTimeout.Std() <= 0 {
+		fail("listen.media.rtp_timeout: must be > 0, got %v", c.Listen.Media.RTPTimeout.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
@@ -49,6 +52,11 @@ func (c *Config) validate() error {
 		case "udp", "tcp", "tls":
 		default:
 			fail("peers.%s: transport must be udp, tcp, or tls, got %q", name, p.Transport)
+		}
+		switch p.MediaLatch {
+		case "strict", "loose":
+		default:
+			fail("peers.%s: media_latch must be strict or loose, got %q", name, p.MediaLatch)
 		}
 		if p.Register && p.Auth == nil {
 			fail("peers.%s: register: true requires auth credentials", name)
