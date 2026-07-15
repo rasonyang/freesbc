@@ -1,0 +1,121 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net/netip"
+	"regexp"
+	"strings"
+)
+
+// Validate checks cross-references and value constraints, collecting every
+// problem instead of stopping at the first. On success it also compiles
+// derived state (peer allowed-IP prefixes, route match regexes).
+func (c *Config) Validate() error {
+	var errs []string
+	fail := func(format string, args ...any) {
+		errs = append(errs, fmt.Sprintf(format, args...))
+	}
+
+	if len(c.Listen.SIP) == 0 {
+		fail("listen.sip: at least one listener required")
+	}
+	if pr := c.Listen.Media.PortRange; pr.Min < 1024 {
+		fail("listen.media.port_range: must start at or above 1024, got %d-%d", pr.Min, pr.Max)
+	}
+	if pub := c.Listen.Media.PublicIP; pub != "auto" {
+		if _, err := netip.ParseAddr(pub); err != nil {
+			fail("listen.media.public_ip: %q is neither \"auto\" nor a valid IP", pub)
+		}
+	}
+
+	if len(c.Peers) == 0 {
+		fail("peers: at least one peer required")
+	}
+	for name, p := range c.Peers {
+		if p.Address == "" {
+			fail("peers.%s: address required", name)
+		}
+		switch p.Transport {
+		case "udp", "tcp", "tls":
+		default:
+			fail("peers.%s: transport must be udp, tcp, or tls, got %q", name, p.Transport)
+		}
+		if p.Register && p.Auth == nil {
+			fail("peers.%s: register: true requires auth credentials", name)
+		}
+		p.allowedNets = nil
+		for _, s := range p.AllowedIPs {
+			pfx, err := parsePrefixOrAddr(s)
+			if err != nil {
+				fail("peers.%s.allowed_ips: %v", name, err)
+				continue
+			}
+			p.allowedNets = append(p.allowedNets, pfx)
+		}
+	}
+
+	for i, r := range c.Routes {
+		label := r.Name
+		if label == "" {
+			label = fmt.Sprintf("#%d", i+1)
+			fail("routes[%d]: name required", i)
+		}
+		if _, ok := c.Peers[r.From]; !ok {
+			fail("routes.%s: from: unknown peer %q", label, r.From)
+		}
+		if len(r.To) == 0 {
+			fail("routes.%s: to: at least one target peer required", label)
+		}
+		for _, t := range r.To {
+			if _, ok := c.Peers[t]; !ok {
+				fail("routes.%s: to: unknown peer %q", label, t)
+			}
+		}
+		r.matchTo = nil
+		if r.Match != nil && r.Match.To != "" {
+			re, err := regexp.Compile(r.Match.To)
+			if err != nil {
+				fail("routes.%s: match.to: %v", label, err)
+			} else {
+				r.matchTo = re
+			}
+		}
+		if r.Transform != nil && r.Transform.To != "" && r.matchTo == nil {
+			fail("routes.%s: transform.to requires match.to (capture groups come from it)", label)
+		}
+	}
+
+	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
+		fail("shield.rate_limit: %v", err)
+	}
+	switch c.Shield.NFTables {
+	case "auto", "on", "off":
+	default:
+		fail("shield.nftables: must be auto, on, or off, got %q", c.Shield.NFTables)
+	}
+
+	if c.Admin != nil {
+		if _, err := netip.ParseAddrPort(c.Admin.Listen); err != nil {
+			fail("admin.listen: %q is not host:port", c.Admin.Listen)
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "\n"))
+	}
+	return nil
+}
+
+// parsePrefixOrAddr accepts "10.0.0.0/8" or a bare "203.0.113.7"
+// (treated as a single-host prefix).
+func parsePrefixOrAddr(s string) (netip.Prefix, error) {
+	if pfx, err := netip.ParsePrefix(s); err == nil {
+		return pfx, nil
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q is neither a CIDR nor an IP", s)
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
