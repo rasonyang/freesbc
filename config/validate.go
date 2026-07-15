@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -101,6 +102,11 @@ func (c *Config) validate() error {
 		if r.Transform != nil && r.Transform.To != "" && (r.Match == nil || r.Match.To == "") {
 			fail("routes.%s: transform.to requires match.to (capture groups come from it)", label)
 		}
+		if r.Transform != nil && r.Transform.To != "" && r.matchTo != nil {
+			if g := maxGroupRef(r.Transform.To); g > r.matchTo.NumSubexp() {
+				fail("routes.%s: transform.to references capture group %d but match.to has %d group(s)", label, g, r.matchTo.NumSubexp())
+			}
+		}
 	}
 
 	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
@@ -135,6 +141,66 @@ func (c *Config) validate() error {
 		return errors.New(strings.Join(errs, "\n"))
 	}
 	return nil
+}
+
+// maxGroupRef returns the highest numeric capture-group index referenced by
+// a regexp replacement template, or -1 if it references none. It mirrors
+// regexp.Expand's parsing: $$ is a literal dollar; $name or ${name} is a
+// reference where name is a run of [A-Za-z0-9_]; a purely numeric name is a
+// group index ($0 = whole match). Named (non-numeric) refs are ignored here.
+func maxGroupRef(template string) int {
+	max := -1
+	for i := 0; i < len(template); {
+		if template[i] != '$' {
+			i++
+			continue
+		}
+		i++ // consume '$'
+		if i >= len(template) {
+			break
+		}
+		if template[i] == '$' {
+			i++ // literal "$$"
+			continue
+		}
+		braced := false
+		if template[i] == '{' {
+			braced = true
+			i++
+		}
+		start := i
+		for i < len(template) && isNameByte(template[i]) {
+			i++
+		}
+		name := template[start:i]
+		if braced && i < len(template) && template[i] == '}' {
+			i++
+		}
+		if name == "" || !allDigits(name) {
+			continue
+		}
+		n, err := strconv.Atoi(name)
+		if err != nil {
+			continue
+		}
+		if n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+func isNameByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func allDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // parsePrefixOrAddr accepts "10.0.0.0/8" or a bare "203.0.113.7"
