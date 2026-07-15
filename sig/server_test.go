@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/freesbc/freesbc/config"
+	"github.com/freesbc/freesbc/media"
 )
 
 // startServer boots a sig.Server on the given UDP port with the given
@@ -23,7 +24,8 @@ func startServer(t *testing.T, port int, cfgYAML string) {
 		t.Fatalf("parse config: %v", err)
 	}
 	store := config.NewStore(cfg)
-	srv := NewServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pool := media.NewPool(store)
+	srv := NewServer(store, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.Run(ctx) }()
@@ -111,14 +113,16 @@ func TestServerAnswersOptionsFromKnownPeer(t *testing.T) {
 	}
 }
 
-func TestServerInviteFromKnownPeerGetsStub(t *testing.T) {
+// TestServerInviteFromKnownPeerIsRoutedThenRejected supersedes the M3.1
+// stub test now that the B2BUA bridge (sig/b2bua.go) owns INVITE:
+// knownPeerCfg's route matches any number, so a known peer's INVITE is
+// identified and routed successfully, but still gets 404 because the
+// B-leg isn't implemented until Task 6.
+func TestServerInviteFromKnownPeerIsRoutedThenRejected(t *testing.T) {
 	startServer(t, 45062, strings.Replace(knownPeerCfg, "45060", "45062", 1))
-	got := roundTrip(t, 45062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 501")
-	if !strings.Contains(got, "SIP/2.0 100") {
-		t.Errorf("expected 100 Trying, got:\n%s", got)
-	}
-	if !strings.Contains(got, "SIP/2.0 501") {
-		t.Errorf("expected 501 stub, got:\n%s", got)
+	got := roundTrip(t, 45062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 404")
+	if !strings.Contains(got, "SIP/2.0 404") {
+		t.Fatalf("expected 404 (no B-leg yet), got:\n%s", got)
 	}
 }
 

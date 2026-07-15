@@ -13,20 +13,39 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/callstate"
 	"github.com/freesbc/freesbc/config"
+	"github.com/freesbc/freesbc/media"
 )
 
 // Server is the SIP signaling front door. It binds the configured
-// listeners, identifies inbound requests by transport source IP, and
-// answers OPTIONS health checks. The B2BUA bridge is wired in M3.3.
+// listeners, identifies inbound requests by transport source IP, answers
+// OPTIONS health checks, and (M3.3) hosts the B2BUA bridge for INVITE.
 type Server struct {
 	store *config.Store
+	pool  *media.Pool
 	log   *slog.Logger
+
+	registry *callstate.Registry
+
+	client    *sipgo.Client
+	dialogSrv *sipgo.DialogServerCache
+	dialogCli *sipgo.DialogClientCache
+	br        *bridge
 }
 
-func NewServer(store *config.Store, log *slog.Logger) *Server {
-	return &Server{store: store, log: log}
+func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
+	return &Server{
+		store:    store,
+		pool:     pool,
+		log:      log,
+		registry: callstate.NewRegistry(),
+	}
 }
+
+// ActiveCalls returns the number of calls currently tracked in the call
+// registry, for metrics.
+func (s *Server) ActiveCalls() int { return s.registry.Count() }
 
 // Run builds the sipgo server, binds every listen.sip entry, and blocks
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
@@ -45,12 +64,29 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sipgo server: %w", err)
 	}
-	srv.OnRequest(sip.OPTIONS, s.onOptions)
-	srv.OnInvite(s.onInvite)
-	srv.OnAck(s.onAck)
-	srv.OnNoRoute(s.onNoRoute)
+
+	client, err := sipgo.NewClient(ua)
+	if err != nil {
+		return fmt.Errorf("sipgo client: %w", err)
+	}
+	defer client.Close()
+	s.client = client
 
 	listeners := s.store.Current().Listen.SIP
+	contact := sip.ContactHeader{Address: sip.Uri{Host: "127.0.0.1", Port: 5060}}
+	if len(listeners) > 0 {
+		contact.Address = sip.Uri{Host: listeners[0].Host, Port: listeners[0].Port}
+	}
+	s.dialogSrv = sipgo.NewDialogServerCache(client, contact)
+	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
+	s.br = &bridge{s: s}
+
+	srv.OnRequest(sip.OPTIONS, s.onOptions)
+	srv.OnInvite(s.br.onInvite)
+	srv.OnAck(s.onAck)
+	srv.OnBye(s.onBye)
+	srv.OnNoRoute(s.onNoRoute)
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errs := make(chan error, len(listeners))
@@ -172,24 +208,27 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
-func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
-	name, _, ok := s.identify(req)
-	if !ok {
-		s.dropUnidentified(req)
-		return
+// onAck routes an in-dialog ACK to the dialog-server cache so sipgo's
+// dialog layer can transition the A-leg dialog to confirmed. INVITEs we
+// reject before ReadInvite (Task 5's 404s) have no dialog registered, so
+// ReadAck's "no such dialog" case is expected and merely logged.
+func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
+	if err := s.dialogSrv.ReadAck(req, tx); err != nil {
+		s.log.Debug("dialog ack", "err", err, "source", req.Source())
 	}
-	_ = tx.Respond(sip.NewResponseFromRequest(req, 100, "Trying", nil))
-	// M3.3 replaces this stub with the B2BUA bridge (routing → media
-	// allocate → SDP rewrite → B-leg INVITE).
-	if err := tx.Respond(sip.NewResponseFromRequest(req, 501, "Not Implemented", nil)); err != nil {
-		s.log.Error("respond INVITE stub", "peer", name, "err", err)
-	}
-	s.log.Info("INVITE received (bridge not yet implemented)", "peer", name)
 }
 
-// onAck absorbs ACKs (e.g. the ACK to the 501 stub's final response) so
-// sipgo does not log them as unhandled. Real in-dialog ACK handling is M3.3.
-func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {}
+// onBye routes an in-dialog BYE to whichever dialog cache owns it: the
+// A-leg (we are the UAS, dialogSrv) or the B-leg (we are the UAC,
+// dialogCli). Exactly one of the two caches will recognize the dialog.
+func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
+	if err := s.dialogSrv.ReadBye(req, tx); err == nil {
+		return
+	}
+	if err := s.dialogCli.ReadBye(req, tx); err != nil {
+		s.log.Debug("dialog bye", "err", err, "source", req.Source())
+	}
+}
 
 // onNoRoute is sipgo's catch-all for every SIP method without a dedicated
 // handler (REGISTER, BYE, SUBSCRIBE, MESSAGE, ...). Without this override,
