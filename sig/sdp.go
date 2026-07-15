@@ -34,10 +34,13 @@ func remoteMediaIP(sdpBytes []byte) (netip.Addr, error) {
 	return ip, nil
 }
 
-// rewriteSDP points the SDP at our media: session-level c= becomes ourIP,
-// and each audio m= port becomes rtpPort (a=rtcp, if present, becomes
-// rtpPort+1). It returns the re-marshalled SDP. Errors on unparseable input
-// or SDP with no audio media.
+// rewriteSDP points the SDP at our media, hiding the peer's topology from
+// the other side of the bridge: the o= origin and session-level c= become
+// ourIP, the first audio m= port becomes rtpPort (a=rtcp, if present,
+// becomes rtpPort+1), and every other media section (additional audio,
+// video, application/T.38, etc.) is declined by zeroing its port and
+// stripping any media-level c= per RFC 3264. It returns the re-marshalled
+// SDP. Errors on unparseable input or SDP with no audio media.
 func rewriteSDP(sdpBytes []byte, ourIP netip.Addr, rtpPort int) ([]byte, error) {
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(sdpBytes); err != nil {
@@ -52,18 +55,28 @@ func rewriteSDP(sdpBytes []byte, ourIP netip.Addr, rtpPort int) ([]byte, error) 
 		AddressType: sdpAddrType(ourIP),
 		Address:     addr,
 	}
+	sd.Origin.NetworkType = "IN"
+	sd.Origin.AddressType = sdpAddrType(ourIP)
+	sd.Origin.UnicastAddress = ourIP.String()
+
+	relayed := false
 	for _, md := range sd.MediaDescriptions {
-		if md.MediaName.Media != "audio" {
+		if !relayed && md.MediaName.Media == "audio" {
+			md.MediaName.Port = sdp.RangedPort{Value: rtpPort}
+			// Drop any media-level c= so the session-level one governs.
+			md.ConnectionInformation = nil
+			for i := range md.Attributes {
+				if md.Attributes[i].Key == "rtcp" {
+					md.Attributes[i].Value = strconv.Itoa(rtpPort + 1)
+				}
+			}
+			relayed = true
 			continue
 		}
-		md.MediaName.Port = sdp.RangedPort{Value: rtpPort}
-		// Drop any media-level c= so the session-level one governs.
+		// Not the relayed audio section: decline it (RFC 3264 port 0) and
+		// strip any media-level c= so it can't leak the peer's address.
+		md.MediaName.Port = sdp.RangedPort{Value: 0}
 		md.ConnectionInformation = nil
-		for i := range md.Attributes {
-			if md.Attributes[i].Key == "rtcp" {
-				md.Attributes[i].Value = strconv.Itoa(rtpPort + 1)
-			}
-		}
 	}
 	out, err := sd.Marshal()
 	if err != nil {
