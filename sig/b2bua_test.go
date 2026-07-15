@@ -332,6 +332,13 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 	if sideAPort == echoRTPPort || sideAPort == 45182 {
 		t.Errorf("answer m=audio port %d leaks carrier topology", sideAPort)
 	}
+	// c= can't differ from the carrier's here (both loopback 127.0.0.1), so
+	// the port assertions above carry the real topology-hiding proof; this
+	// additionally proves the bridge actually rewrote the SDP at all,
+	// rather than passing the carrier's answer through untouched.
+	if string(answerBody) == string(testSDPBody(echoRTPPort)) {
+		t.Errorf("answer sdp is byte-identical to carrier's original answer; bridge did not rewrite it:\n%s", answerBody)
+	}
 
 	if err := sess.Ack(context.Background()); err != nil {
 		t.Fatalf("uac ack: %v", err)

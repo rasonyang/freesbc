@@ -100,22 +100,46 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// silent, tearing down whatever is left.
 	select {
 	case <-aLeg.Context().Done():
-		_ = bLeg.Bye(context.Background())
+		byeCtx, cancel := byeContext()
+		_ = bLeg.Bye(byeCtx)
+		cancel()
 	case <-bLeg.Context().Done():
-		_ = aLeg.Bye(context.Background())
+		byeCtx, cancel := byeContext()
+		_ = aLeg.Bye(byeCtx)
+		cancel()
 	case <-sess.Done():
-		_ = aLeg.Bye(context.Background())
-		_ = bLeg.Bye(context.Background())
+		byeCtx, cancel := byeContext()
+		_ = aLeg.Bye(byeCtx)
+		_ = bLeg.Bye(byeCtx)
+		cancel()
 	}
+}
+
+// byeContext bounds a teardown BYE to 5s instead of inheriting a
+// possibly-cancelled call context or blocking up to Timer F (~32s) on
+// context.Background(): these are best-effort teardown sends to a peer
+// that may already be gone, and callers ignore the error either way.
+func byeContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
 // dialAndBridge places the B-leg to target and, on a successful answer,
 // anchors media (both SetExpectedRemote calls) and answers the A-leg with
 // RespondSDP. On success it returns the established, ACKed bLeg — the
 // caller owns it from there (Close it, hold the dialog open, tear down on
-// hangup). On failure it returns ok=false, having already sent the A-leg
-// an appropriate final response (488/503/502) and closed any bLeg it
-// opened; the caller has nothing further to send.
+// hangup). On failure it returns ok=false and closes/BYEs any bLeg it
+// opened. All failure paths up to and including the Ack failure also send
+// the A-leg an appropriate final response (488/503/502); the caller has
+// nothing further to send in those cases. The one exception is the
+// RespondSDP failure path: the A-leg answer attempt itself failed (the
+// dialog is typically already gone, e.g. the caller CANCELed), so no A-leg
+// response is sent there — only the now-established B-leg is BYE'd.
+//
+// A B-leg that reached a 2xx answer is a live, billable call at the
+// carrier: WaitAnswer succeeding is the point past which "abandon it"
+// (relying on DialogClientSession.Close, which only drops the local cache
+// entry and sends neither BYE nor CANCEL) is no longer acceptable, and
+// every path below either Acks-then-Byes it or, once Acked, Byes it.
 //
 // sess is shared across attempts (its ports don't change), so this is the
 // seam later tasks extend: Task 8's failover loop calls this once per
@@ -153,7 +177,10 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 	answer := bLeg.InviteResponse.Body()
 	remoteB, err := remoteMediaIP(answer)
 	if err != nil {
-		_ = bLeg.Close()
+		// bLeg is answered (2xx) but not yet ACKed: Bye refuses to send on
+		// an unconfirmed client dialog, so Ack first, then Bye to tear the
+		// carrier call down rather than abandoning a live/billable call.
+		b.ackThenBye(aLeg.Context(), bLeg, target)
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		return nil, false
 	}
@@ -161,25 +188,55 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 
 	aAnswer, err := rewriteSDP(answer, ourIP, sess.RTPPort(media.SideA))
 	if err != nil {
-		_ = bLeg.Close()
+		b.ackThenBye(aLeg.Context(), bLeg, target)
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		return nil, false
 	}
 
 	if err := bLeg.Ack(aLeg.Context()); err != nil {
+		// ACK could not be sent: the dialog never reaches Confirmed, so
+		// Bye would refuse it too — nothing left to do but Close (deferred
+		// by the caller would be nil here, so do it now) and tell the
+		// A-leg the call failed. This is the path that used to leave the
+		// caller hanging with no final response at all.
 		b.s.log.Error("ack b-leg", "err", err, "target", target.Name)
 		_ = bLeg.Close()
+		_ = aLeg.Respond(502, "Bad Gateway", nil)
 		return nil, false
 	}
 	// RespondSDP blocks until the A-leg ACK arrives (sipgo retransmits the
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
 	if err := aLeg.RespondSDP(aAnswer); err != nil {
+		// The B-leg is already Acked/Confirmed here, so it's a live carrier
+		// call; the A-leg answer attempt itself failed (typically the
+		// caller CANCELed), so there is no A-leg response to send — only
+		// tear the carrier call down.
 		b.s.log.Error("respond a-leg", "err", err)
-		_ = bLeg.Close()
+		byeCtx, cancel := byeContext()
+		_ = bLeg.Bye(byeCtx)
+		cancel()
 		return nil, false
 	}
 
 	return bLeg, true
+}
+
+// ackThenBye tears down a B-leg that has been answered (2xx received) but
+// not yet ACKed: DialogClientSession.Bye refuses to send on a dialog that
+// isn't Confirmed, so this Acks first (best-effort) and only then Byes
+// (also best-effort) — both errors are logged, not returned, since the
+// caller has already decided to abandon this bLeg regardless.
+func (b *bridge) ackThenBye(ctx context.Context, bLeg *sipgo.DialogClientSession, target Target) {
+	if err := bLeg.Ack(ctx); err != nil {
+		b.s.log.Error("ack b-leg for teardown", "err", err, "target", target.Name)
+		_ = bLeg.Close()
+		return
+	}
+	byeCtx, cancel := byeContext()
+	defer cancel()
+	if err := bLeg.Bye(byeCtx); err != nil {
+		b.s.log.Error("bye b-leg for teardown", "err", err, "target", target.Name)
+	}
 }
 
 // reject answers an INVITE we will not bridge, before any dialog is created.
