@@ -1,6 +1,10 @@
 package media
 
-import "time"
+import (
+	"log/slog"
+	"runtime/debug"
+	"time"
+)
 
 // Start launches the four forwarding loops (RTP and RTCP in both
 // directions) and the silence watchdog. Call at most once, after any
@@ -28,11 +32,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 		out, outLatch = s.pairs[to].RTP, s.rtp[to]
 	}
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				_ = s.Close()
-			}
-		}()
+		defer s.recoverRelayPanic()
 		buf := make([]byte, 1500)
 		for {
 			n, src, err := in.ReadFromUDP(buf)
@@ -70,5 +70,17 @@ func (s *Session) watchdog() {
 				return
 			}
 		}
+	}
+}
+
+// recoverRelayPanic is deferred by every relay goroutine: a panic kills
+// only this session, never the process (spec §7), and leaves a forensic
+// trace instead of a silent call drop.
+func (s *Session) recoverRelayPanic() {
+	if r := recover(); r != nil {
+		slog.Error("media relay panic; killing session",
+			"panic", r,
+			"stack", string(debug.Stack()))
+		_ = s.Close()
 	}
 }

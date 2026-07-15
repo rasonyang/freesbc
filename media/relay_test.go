@@ -142,3 +142,23 @@ func TestRelayActivityDefersTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayPanicRecoveryKillsSession(t *testing.T) {
+	p := NewPool(testStore(41260, 41267))
+	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		defer s.recoverRelayPanic()
+		panic("injected relay bug")
+	}()
+	<-finished
+	select {
+	case <-s.Done():
+	default:
+		t.Fatal("session must be closed after a relay panic")
+	}
+}
