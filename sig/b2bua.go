@@ -59,13 +59,12 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	// The session's side-B latch mode is fixed at allocation time, before
-	// any target has actually been dialed, so it's configured from the
-	// first candidate. If failover picks a later target with a different
-	// media_latch, that target's setting is not retroactively applied —
-	// out of scope for Task 8 (not called for by the failover spec, which
-	// only concerns which carrier gets the call, not per-carrier latch
-	// tuning); see placeCall/dialTarget for the actual failover loop.
+	// Side-B's latch mode here is only a pre-first-attempt default, seeded
+	// from Targets[0] because Allocate needs *some* mode before any target
+	// has been dialed. dialTarget calls sess.SetLatchMode(SideB, ...) with
+	// each target's own media_latch before dialing it, so the mode actually
+	// in effect always matches whichever target ends up winning failover —
+	// see placeCall/dialTarget for the loop.
 	sess, err := b.s.pool.Allocate(media.SessionConfig{
 		Latch: [2]media.LatchMode{
 			media.ParseLatchMode(fromPeer.MediaLatch),
@@ -212,6 +211,15 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 // before dialTarget's own post-answer processing does; both share the same
 // startOnce so Start runs at most once regardless of which path wins.
 func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, ok, retryable bool, code int, reason string) {
+	// Align SideB's latch policy with THIS target before dialing it — not
+	// just whichever target happened to be Targets[0] at Allocate time — so
+	// early media (relayProvisional) and the eventual answer both apply the
+	// media_latch of the carrier actually being tried on this attempt. On
+	// failover, a later attempt overwrites this before it arms/relays any
+	// SideB traffic, so the winning target's policy is always what ends up
+	// governing the session.
+	sess.SetLatchMode(media.SideB, media.ParseLatchMode(target.Peer.MediaLatch))
+
 	// peerURI builds only the trunk endpoint (host/port/transport); the
 	// dialed number (post-transform) is the Request-URI user part, so it
 	// must be set here — without it the carrier receives an INVITE with
@@ -232,7 +240,18 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	}); err != nil {
 		b.s.log.Info("b-leg not answered", "err", err, "target", target.Name)
 		failCode, failReason := 503, "Service Unavailable"
-		if bLeg.InviteResponse != nil {
+		// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
+		// it sees, including 1xx provisionals — not just the final one. If
+		// the transaction dies mid-ring (e.g. a transport error after a
+		// 100/180, or the call context is cancelled while still ringing),
+		// WaitAnswer returns an error but InviteResponse is left holding
+		// that stale provisional. A 1xx can never legally be relayed as a
+		// FINAL response (it would violate the SIP transaction model — see
+		// placeCall, which sends the last target's failure code/reason as
+		// the A-leg's final response when every target is exhausted), so
+		// only trust InviteResponse here when it is itself a final
+		// (non-provisional) response; otherwise fall back to 503.
+		if bLeg.InviteResponse != nil && !bLeg.InviteResponse.IsProvisional() {
 			failCode = bLeg.InviteResponse.StatusCode
 			failReason = bLeg.InviteResponse.Reason
 		}

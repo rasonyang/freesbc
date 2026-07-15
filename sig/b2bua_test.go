@@ -2,6 +2,7 @@ package sig
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -964,6 +965,236 @@ func TestBridgeAllTargetsFail(t *testing.T) {
 		t.Fatalf("media ports not released after teardown: %v", allocErr)
 	}
 	s2.Close()
+}
+
+// ringNoFinalCfg routes local-uac to a single carrier that floods
+// provisionals and never sends a final response — see
+// startFloodingRingCarrier and TestBridgeStaleProvisionalNotRelayedAsFinal
+// (Finding 1: a stale 1xx must never be relayed to the caller as a
+// fabricated final response).
+const ringNoFinalCfg = `
+listen:
+  sip: [udp://127.0.0.1:45250]
+  media:
+    port_range: 46250-46253
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45251
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// startFloodingRingCarrier boots a stub UAS that answers every INVITE with
+// twelve back-to-back 180 Ringing provisionals and then goes silent forever
+// — never a final response. This deterministically reproduces Finding 1's
+// "transaction dies mid-ring" precondition without depending on any
+// transport-level failure-detection behavior (sipgo's connection-close
+// termination is opt-in and not enabled by sig.Server): sipgo's own
+// DialogClientSession.WaitAnswer hard-caps itself at 10 responses
+// ("more than 10 responses received", see WaitAnswer's `if i > 10` check in
+// github.com/emiago/sipgo@v1.4.3/dialog_client.go) and returns a plain
+// error once the 11th response arrives — while
+// DialogClientSession.InviteResponse is left holding that response, a 180.
+// That is exactly the stale-provisional-on-error state Finding 1 guards
+// against, reached here via ordinary, in-spec SIP messaging rather than
+// synthetic transport failures.
+func startFloodingRingCarrier(t *testing.T, addr string) *stubCarrier {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("carrier addr: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("carrier port: %v", err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("carrier ua: %v", err)
+	}
+	t.Cleanup(func() { ua.Close() })
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		t.Fatalf("carrier server: %v", err)
+	}
+	client, err := sipgo.NewClient(ua)
+	if err != nil {
+		t.Fatalf("carrier client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
+	c := &stubCarrier{
+		dialogSrv: sipgo.NewDialogServerCache(client, contact),
+		log:       log,
+		offers:    make(chan *sip.Request, 4),
+		byeDone:   make(chan struct{}),
+	}
+
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		dlg, err := c.dialogSrv.ReadInvite(req, tx)
+		if err != nil {
+			log.Error("carrier read invite", "err", err)
+			return
+		}
+		select {
+		case c.offers <- req:
+		default:
+		}
+		// WaitAnswer's own loop receives responses for i=0..10 (11 total)
+		// before its `i > 10` cap trips on the 12th iteration — so 11
+		// provisionals is exactly enough to drive that path deterministically
+		// without leaving any additional, never-read response sitting in the
+		// client transaction's channel.
+		for i := 0; i < 11; i++ {
+			if err := dlg.Respond(180, "Ringing", nil); err != nil {
+				log.Error("carrier respond 180", "err", err, "i", i)
+				return
+			}
+		}
+		// Never send a final response: the B-leg client transaction is left
+		// ringing forever from the carrier's side.
+	})
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("carrier resolve: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("carrier listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { <-ctx.Done(); conn.Close() }()
+	tl := srv.TransportLayer()
+	go func() { _ = tl.ServeUDP(conn) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		probe, err := net.Dial("udp", addr)
+		if err == nil {
+			probe.Close()
+			time.Sleep(50 * time.Millisecond)
+			return c
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stub carrier (flooding-ring) did not start")
+	return nil
+}
+
+// TestBridgeStaleProvisionalNotRelayedAsFinal is Finding 1's regression
+// test: the sole (and therefore last) target floods 180 Ringing responses
+// and never sends a final one (see startFloodingRingCarrier), which drives
+// sipgo's WaitAnswer to return a plain error once its own >10-response cap
+// trips — with bLeg.InviteResponse left holding a 180, a provisional.
+// Before the fix, dialTarget trusted bLeg.InviteResponse whenever it was
+// non-nil regardless of whether it held a provisional; since this is the
+// last target, placeCall would then relay that 180 to the caller as though
+// it were a FINAL response — a SIP protocol violation (a 1xx cannot
+// terminate a transaction). The fix guards on !IsProvisional(), falling
+// back to 503. This proves the caller gets a proper 5xx instead of a
+// fabricated "180" final.
+//
+// The A-leg observer here deliberately does NOT use sipgo's
+// DialogClientSession.WaitAnswer: relayProvisional forwards every one of
+// the carrier's 11 provisionals to the A-leg 1:1 and in near lockstep with
+// the B-leg receiving them, so a sipgo-dialog UAC on the test side would be
+// racing its OWN identical ">10 responses" cap against the bridge's — an
+// artifact of the test client, not something the bridge does wrong. Reading
+// raw UDP datagrams sidesteps that entirely and observes exactly what the
+// bridge put on the wire.
+func TestBridgeStaleProvisionalNotRelayedAsFinal(t *testing.T) {
+	startFloodingRingCarrier(t, "127.0.0.1:45251")
+	srv := startServer(t, 45250, ringNoFinalCfg)
+
+	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer uac.Close()
+	local := uac.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45250}
+
+	req := sipInviteWithSDP("b2bua-staleprov-1", local, testSDPBody(uacRTPStubPort(t)))
+	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	// The carrier sends exactly 11 provisionals (see startFloodingRingCarrier)
+	// and relayProvisional forwards each 1:1, so the A-leg should never see
+	// more than 11 "180" lines from a correctly-behaving bridge. Any 180
+	// beyond that can only be the bug: placeCall fabricating (or
+	// retransmitting) a 180 as though it were the FINAL response.
+	var ringingCount int
+	var sawFinal bool
+	var finalLine string
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && !sawFinal {
+		_ = uac.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := uac.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		statusLine := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+		switch {
+		case strings.HasPrefix(statusLine, "SIP/2.0 180"):
+			ringingCount++
+			if ringingCount > 11 {
+				t.Fatal("bridge relayed a 180 as a FINAL response — a SIP protocol violation (Finding 1 regression)")
+			}
+		case strings.HasPrefix(statusLine, "SIP/2.0 1"):
+			// some other provisional (e.g. an auto-100); ignore.
+		case strings.HasPrefix(statusLine, "SIP/2.0 "):
+			sawFinal = true
+			finalLine = statusLine
+		}
+	}
+
+	if ringingCount == 0 {
+		t.Fatal("uac never observed a relayed 180 — test didn't exercise the stale-provisional path")
+	}
+	if !sawFinal {
+		t.Fatal("uac never received a final response (expected 503, or the bug: a 12th, fabricated 180)")
+	}
+	if !strings.Contains(finalLine, "503") {
+		t.Errorf("final response line = %q, want 503 (fallback when the captured failure code is a stale provisional)", finalLine)
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// sipInviteWithSDP builds a raw INVITE carrying an SDP offer body, for tests
+// that need to observe the bridge's raw wire responses without going
+// through sipgo's DialogClientSession (see
+// TestBridgeStaleProvisionalNotRelayedAsFinal). Mirrors sipRequest's
+// no-body form (server_test.go) but adds Content-Type/Content-Length and
+// the body.
+func sipInviteWithSDP(callID string, localAddr *net.UDPAddr, sdpBody []byte) string {
+	return strings.Join([]string{
+		"INVITE sip:5551234@127.0.0.1:45250 SIP/2.0",
+		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-%s", localAddr.String(), callID),
+		"From: <sip:tester@127.0.0.1>;tag=t1",
+		"To: <sip:sbc@127.0.0.1>",
+		"Call-ID: " + callID,
+		"CSeq: 1 INVITE",
+		"Contact: <sip:tester@" + localAddr.String() + ">",
+		"Max-Forwards: 70",
+		"Content-Type: application/sdp",
+		fmt.Sprintf("Content-Length: %d", len(sdpBody)),
+		"", string(sdpBody),
+	}, "\r\n")
 }
 
 // digestAuthCfg routes local-uac to a single carrier that requires digest

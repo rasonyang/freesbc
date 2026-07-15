@@ -88,6 +88,56 @@ func TestSessionRelatchBothKinds(t *testing.T) {
 	}
 }
 
+// TestSetLatchModeChangesAcceptBehavior proves setMode actually changes a
+// latch's runtime accept policy: a loose latch accepts a first packet from
+// anywhere, and switching it to strict (before anything has latched) makes
+// it reject again until armed — mirroring what a failover winner with a
+// different media_latch than the pre-dial default needs.
+func TestSetLatchModeChangesAcceptBehavior(t *testing.T) {
+	l := &latch{mode: LatchLoose}
+	first := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 1), Port: 5000}
+	if !l.accept(first) {
+		t.Fatal("loose mode must accept the first packet from any source")
+	}
+
+	l2 := &latch{mode: LatchLoose}
+	l2.setMode(LatchStrict)
+	src := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 5001}
+	if l2.accept(src) {
+		t.Fatal("after setMode(strict) with no expectation armed, packets must be rejected")
+	}
+	l2.setExpected(netip.MustParseAddr("198.51.100.2"))
+	if !l2.accept(src) {
+		t.Fatal("after arming with the matching IP, the first packet must latch")
+	}
+}
+
+// TestSessionSetLatchModeChangesBothKinds mirrors
+// TestSessionRelatchBothKinds: SetLatchMode on a Session must flip both the
+// RTP and RTCP latches of the given side, not just one of them.
+func TestSessionSetLatchModeChangesBothKinds(t *testing.T) {
+	p := NewPool(testStore(40510, 40517))
+	s, err := p.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Strict with no expectation set: both latches reject.
+	src := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 5), Port: 4000}
+	if s.rtp[SideB].accept(src) || s.rtcp[SideB].accept(src) {
+		t.Fatal("strict latches must reject before SetLatchMode/SetExpectedRemote")
+	}
+
+	s.SetLatchMode(SideB, LatchLoose)
+	if !s.rtp[SideB].accept(src) {
+		t.Error("rtp latch not switched to loose")
+	}
+	if !s.rtcp[SideB].accept(src) {
+		t.Error("rtcp latch not switched to loose")
+	}
+}
+
 func TestParseLatchMode(t *testing.T) {
 	if ParseLatchMode("loose") != LatchLoose {
 		t.Error("loose")
