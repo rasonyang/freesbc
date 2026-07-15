@@ -14,6 +14,7 @@ import (
 
 	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
+	"github.com/freesbc/freesbc/sig"
 )
 
 const usage = `FreeSBC — all-in-one session border controller
@@ -83,8 +84,17 @@ func run(cfgPath string) error {
 		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
 		"rtp_timeout", mediaCfg.RTPTimeout.Std())
 
-	// M3+: SIP listeners, shield, and admin API start here, each reading
-	// snapshots via store.Current().
+	sipServer := sig.NewServer(store, log)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := sipServer.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Error("sip server exited", "err", err)
+			stop() // a fatal bind error tears the whole process down
+		}
+	}()
+
+	// M3.3+: the B2BUA bridge, shield, and admin API attach here.
 
 	log.Info("freesbc started",
 		"config", cfgPath,
