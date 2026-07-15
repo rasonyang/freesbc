@@ -1,5 +1,10 @@
 # FreeSBC example configuration.
 # Copy to sbc.yaml, adjust, then:  freesbc run -c sbc.yaml
+#
+# ${ENV_VAR} references are expanded at load time (never written back to
+# disk) and work in plain string values such as passwords, addresses, and
+# IPs — but not inside compound scalars like port_range, durations, or
+# listener URLs.
 
 listen:
   sip:
