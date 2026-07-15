@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/freesbc/freesbc/config"
+	"github.com/freesbc/freesbc/media"
 )
 
 const usage = `FreeSBC — all-in-one session border controller
@@ -27,6 +29,10 @@ func main() {
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
+	if cmd == "-h" || cmd == "--help" || cmd == "help" {
+		fmt.Print(usage)
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("c", "sbc.yaml", "path to config file")
 	_ = fs.Parse(os.Args[2:])
@@ -60,21 +66,33 @@ func run(cfgPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := config.Watch(ctx, cfgPath, store, log); err != nil && ctx.Err() == nil {
 			log.Error("config watcher exited", "err", err)
 		}
 	}()
+
+	pool := media.NewPool(store)
+	_ = pool // handed to the signaling plane in M3
+
+	mediaCfg := store.Current().Listen.Media
+	log.Info("media plane ready",
+		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
+		"rtp_timeout", mediaCfg.RTPTimeout.Std())
+
+	// M3+: SIP listeners, shield, and admin API start here, each reading
+	// snapshots via store.Current().
 
 	log.Info("freesbc started",
 		"config", cfgPath,
 		"peers", len(store.Current().Peers),
 		"routes", len(store.Current().Routes))
 
-	// M2+: media port pool, SIP listeners, shield, and admin API start here,
-	// each reading snapshots via store.Current().
-
 	<-ctx.Done()
 	log.Info("shutting down")
+	wg.Wait()
 	return nil
 }

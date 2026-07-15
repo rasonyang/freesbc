@@ -71,8 +71,8 @@ routes:
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | Config foundation: schema, validation, atomic hot reload, `run`/`check` CLI | ✅ done |
-| M2 | Media plane: RTP port pool, relay engine, latching hardening | next |
-| M3 | Signaling core: SIP server, B2BUA, SDP rewrite, routing — first end-to-end call | |
+| M2 | Media plane: RTP port pool, relay engine, latching hardening | ✅ done |
+| M3 | Signaling core: SIP server, B2BUA, SDP rewrite, routing — first end-to-end call | next |
 | M4 | Trunk interop: digest auth, outbound REGISTER, session timers, PRACK, DNS SRV | |
 | M5 | SRTP (SDES) | |
 | M6 | Shield: rate limiting, scanner detection, auto-ban | |
