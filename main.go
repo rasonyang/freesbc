@@ -77,14 +77,13 @@ func run(cfgPath string) error {
 	}()
 
 	pool := media.NewPool(store)
-	_ = pool // handed to the signaling plane in M3
 
 	mediaCfg := store.Current().Listen.Media
 	log.Info("media plane ready",
 		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
 		"rtp_timeout", mediaCfg.RTPTimeout.Std())
 
-	sipServer := sig.NewServer(store, log)
+	sipServer := sig.NewServer(store, pool, log)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
