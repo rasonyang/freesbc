@@ -197,6 +197,27 @@ func (s *Server) dropUnidentified(req *sip.Request) {
 		"method", req.Method.String(), "source", req.Source())
 }
 
+// mediaIP resolves the IP the SBC advertises in rewritten SDP: the
+// configured public_ip when it isn't "auto". STUN-based discovery for
+// "auto" is a later milestone, so until then this falls back to the first
+// listen.sip host (or 127.0.0.1 if there is none — the test-only case),
+// logging a warning so the gap is visible in production.
+func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
+	if pub := cfg.Listen.Media.PublicIP; pub != "auto" {
+		if ip, err := netip.ParseAddr(pub); err == nil {
+			return ip
+		}
+	}
+	if len(cfg.Listen.SIP) > 0 {
+		if ip, err := netip.ParseAddr(cfg.Listen.SIP[0].Host); err == nil {
+			s.log.Warn("listen.media.public_ip is auto; STUN discovery isn't implemented yet, falling back to the first listen.sip host", "ip", ip)
+			return ip
+		}
+	}
+	s.log.Warn("listen.media.public_ip is auto and no usable listen.sip host; falling back to 127.0.0.1")
+	return netip.MustParseAddr("127.0.0.1")
+}
+
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 	name, _, ok := s.identify(req)
 	if !ok {

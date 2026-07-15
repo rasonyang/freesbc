@@ -16,8 +16,9 @@ import (
 
 // startServer boots a sig.Server on the given UDP port with the given
 // config YAML and returns once it is accepting packets. The server stops
-// when the test ends.
-func startServer(t *testing.T, port int, cfgYAML string) {
+// when the test ends. The returned *Server lets tests reach into
+// package-private state (registry, pool) for assertions.
+func startServer(t *testing.T, port int, cfgYAML string) *Server {
 	t.Helper()
 	cfg, err := config.Parse([]byte(cfgYAML))
 	if err != nil {
@@ -36,11 +37,12 @@ func startServer(t *testing.T, port int, cfgYAML string) {
 		if err == nil {
 			c.Close()
 			time.Sleep(100 * time.Millisecond)
-			return
+			return srv
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("server did not start")
+	return nil
 }
 
 // sipRequest builds a minimal valid SIP request whose Via advertises
@@ -113,16 +115,19 @@ func TestServerAnswersOptionsFromKnownPeer(t *testing.T) {
 	}
 }
 
-// TestServerInviteFromKnownPeerIsRoutedThenRejected supersedes the M3.1
-// stub test now that the B2BUA bridge (sig/b2bua.go) owns INVITE:
-// knownPeerCfg's route matches any number, so a known peer's INVITE is
-// identified and routed successfully, but still gets 404 because the
-// B-leg isn't implemented until Task 6.
-func TestServerInviteFromKnownPeerIsRoutedThenRejected(t *testing.T) {
+// TestServerInviteFromKnownPeerIsRoutedThenRejectedForNoSDP supersedes the
+// M3.1 stub test now that the B2BUA bridge (sig/b2bua.go) owns INVITE and
+// (Task 6) actually places the B-leg: knownPeerCfg's route matches any
+// number, so a known peer's INVITE is identified and routed successfully,
+// reaches dialogSrv.ReadInvite, and only then gets rejected — with 488 Not
+// Acceptable Here, since sipRequest builds a bare request with no SDP
+// offer to bridge. TestBridgePlacesCallAndBridges (sig/b2bua_test.go) is
+// the real happy-path coverage with an actual offer/answer.
+func TestServerInviteFromKnownPeerIsRoutedThenRejectedForNoSDP(t *testing.T) {
 	startServer(t, 45062, strings.Replace(knownPeerCfg, "45060", "45062", 1))
-	got := roundTrip(t, 45062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 404")
-	if !strings.Contains(got, "SIP/2.0 404") {
-		t.Fatalf("expected 404 (no B-leg yet), got:\n%s", got)
+	got := roundTrip(t, 45062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 488")
+	if !strings.Contains(got, "SIP/2.0 488") {
+		t.Fatalf("expected 488 (routed, but no SDP offer to bridge), got:\n%s", got)
 	}
 }
 
