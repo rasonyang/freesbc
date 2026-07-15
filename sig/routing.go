@@ -19,3 +19,17 @@ func matchRoute(cfg *config.Config, fromPeer, toNumber string) (*config.Route, b
 	}
 	return nil, false
 }
+
+// transformNumber applies a route's number transform. When the route has a
+// transform, route.Transform.To is a regexp replacement template expanded
+// against route.CompiledMatch() (which is guaranteed non-nil whenever a
+// transform is set — config validation enforces "transform requires
+// match"). Capture groups are referenced as $1 or, next to literal digits,
+// ${1}. With no transform, the number passes through unchanged.
+func transformNumber(route *config.Route, toNumber string) string {
+	if route.Transform == nil || route.Transform.To == "" {
+		return toNumber
+	}
+	re := route.CompiledMatch()
+	return re.ReplaceAllString(toNumber, route.Transform.To)
+}

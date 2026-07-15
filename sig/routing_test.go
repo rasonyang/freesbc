@@ -93,3 +93,40 @@ func TestMatchRouteNoMatch(t *testing.T) {
 		t.Fatalf("555 from internal-pbx matches no route, got %v", r)
 	}
 }
+
+func TestTransformNumberStripsPrefix(t *testing.T) {
+	cfg := routingCfg(t)
+	route, ok := matchRoute(cfg, "internal-pbx", "9123")
+	if !ok {
+		t.Fatal("setup: outbound route must match")
+	}
+	// transform "$1" over match "^9(\d+)$": strips the leading 9.
+	if got := transformNumber(route, "9123"); got != "123" {
+		t.Errorf("transformNumber = %q, want \"123\"", got)
+	}
+}
+
+func TestTransformNumberBracedGroupWithLiteral(t *testing.T) {
+	cfg := routingCfg(t)
+	route, ok := matchRoute(cfg, "internal-pbx", "00441234")
+	if !ok {
+		t.Fatal("setup: intl route must match")
+	}
+	// transform "+${1}" over match "^00(\d+)$": ${1} = "441234", so the
+	// braced group survives config parsing (Task 1) and expands correctly.
+	if got := transformNumber(route, "00441234"); got != "+441234" {
+		t.Errorf("transformNumber = %q, want \"+441234\"", got)
+	}
+}
+
+func TestTransformNumberNoTransformIsPassthrough(t *testing.T) {
+	cfg := routingCfg(t)
+	route, ok := matchRoute(cfg, "carrier-a", "5551234")
+	if !ok {
+		t.Fatal("setup: inbound route must match")
+	}
+	// inbound route has no transform → number passes through unchanged.
+	if got := transformNumber(route, "5551234"); got != "5551234" {
+		t.Errorf("transformNumber = %q, want \"5551234\"", got)
+	}
+}
