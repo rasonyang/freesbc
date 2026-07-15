@@ -1,2 +1,15 @@
+# Build artifacts
 /freesbc
+/dist/
+
+# Local runtime config (copy sbc.example.yaml to sbc.yaml)
 /sbc.yaml
+
+# Test and coverage output
+*.out
+coverage.html
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
