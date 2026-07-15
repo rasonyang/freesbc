@@ -130,3 +130,50 @@ func TestTransformNumberNoTransformIsPassthrough(t *testing.T) {
 		t.Errorf("transformNumber = %q, want \"5551234\"", got)
 	}
 }
+
+func TestResolveOutboundWithFailoverOrder(t *testing.T) {
+	cfg := routingCfg(t)
+	d, ok := Resolve(cfg, "internal-pbx", "9123")
+	if !ok {
+		t.Fatal("9123 must resolve")
+	}
+	if d.Route.Name != "outbound" {
+		t.Errorf("route = %q, want outbound", d.Route.Name)
+	}
+	if d.OutNumber != "123" {
+		t.Errorf("OutNumber = %q, want \"123\"", d.OutNumber)
+	}
+	if len(d.Targets) != 2 {
+		t.Fatalf("want 2 targets, got %d", len(d.Targets))
+	}
+	// Failover order = config order: carrier-a then carrier-b.
+	if d.Targets[0].Name != "carrier-a" || d.Targets[1].Name != "carrier-b" {
+		t.Errorf("target order = %q,%q; want carrier-a,carrier-b",
+			d.Targets[0].Name, d.Targets[1].Name)
+	}
+	// Targets carry the resolved *Peer, not just the name.
+	if d.Targets[0].Peer == nil || d.Targets[0].Peer != cfg.Peers["carrier-a"] {
+		t.Error("Targets[0].Peer must be the resolved carrier-a peer")
+	}
+}
+
+func TestResolveInboundPassthrough(t *testing.T) {
+	cfg := routingCfg(t)
+	d, ok := Resolve(cfg, "carrier-a", "5551234")
+	if !ok {
+		t.Fatal("inbound must resolve")
+	}
+	if d.Route.Name != "inbound" || d.OutNumber != "5551234" {
+		t.Errorf("route=%q out=%q; want inbound / 5551234", d.Route.Name, d.OutNumber)
+	}
+	if len(d.Targets) != 1 || d.Targets[0].Name != "internal-pbx" {
+		t.Errorf("targets = %+v; want [internal-pbx]", d.Targets)
+	}
+}
+
+func TestResolveNoRoute(t *testing.T) {
+	cfg := routingCfg(t)
+	if d, ok := Resolve(cfg, "carrier-b", "9123"); ok {
+		t.Fatalf("carrier-b has no route, got %+v", d)
+	}
+}

@@ -2,6 +2,21 @@ package sig
 
 import "github.com/freesbc/freesbc/config"
 
+// Target is one failover candidate: a peer name and its resolved config.
+type Target struct {
+	Name string
+	Peer *config.Peer
+}
+
+// Decision is the outcome of routing an inbound call: the matched route,
+// the dialed number after transform, and the ordered failover candidates
+// the B2BUA tries in turn.
+type Decision struct {
+	Route     *config.Route
+	OutNumber string
+	Targets   []Target
+}
+
 // matchRoute returns the first route whose From equals fromPeer and whose
 // match.to regex matches toNumber. A route with no match clause (nil
 // compiled regex) matches any number. Routes are tried in config order;
@@ -32,4 +47,26 @@ func transformNumber(route *config.Route, toNumber string) string {
 	}
 	re := route.CompiledMatch()
 	return re.ReplaceAllString(toNumber, route.Transform.To)
+}
+
+// Resolve routes an inbound call. It selects the first matching route for
+// fromPeer/toNumber, applies the route's number transform, and resolves
+// the route's To list (validated to reference real peers) into ordered
+// failover Targets. ok is false when no route matches. Resolve is pure and
+// stateless: peer health/cooldown skipping and failover execution are the
+// B2BUA's job (M3.3).
+func Resolve(cfg *config.Config, fromPeer, toNumber string) (*Decision, bool) {
+	route, ok := matchRoute(cfg, fromPeer, toNumber)
+	if !ok {
+		return nil, false
+	}
+	targets := make([]Target, 0, len(route.To))
+	for _, name := range route.To {
+		targets = append(targets, Target{Name: name, Peer: cfg.Peers[name]})
+	}
+	return &Decision{
+		Route:     route,
+		OutNumber: transformNumber(route, toNumber),
+		Targets:   targets,
+	}, true
 }
