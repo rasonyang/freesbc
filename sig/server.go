@@ -213,6 +213,10 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 // reject before ReadInvite (Task 5's 404s) have no dialog registered, so
 // ReadAck's "no such dialog" case is expected and merely logged.
 func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
+	if _, _, ok := s.identify(req); !ok {
+		s.dropUnidentified(req)
+		return
+	}
 	if err := s.dialogSrv.ReadAck(req, tx); err != nil {
 		s.log.Debug("dialog ack", "err", err, "source", req.Source())
 	}
@@ -222,6 +226,10 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 // A-leg (we are the UAS, dialogSrv) or the B-leg (we are the UAC,
 // dialogCli). Exactly one of the two caches will recognize the dialog.
 func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
+	if _, _, ok := s.identify(req); !ok {
+		s.dropUnidentified(req)
+		return
+	}
 	if err := s.dialogSrv.ReadBye(req, tx); err == nil {
 		return
 	}

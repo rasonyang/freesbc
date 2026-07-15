@@ -139,11 +139,13 @@ func TestServerDropsUnknownSource(t *testing.T) {
 }
 
 // TestServerDropsUnknownSourceNonOptionsMethod guards the security-plane
-// guarantee for methods beyond OPTIONS/INVITE/ACK: sipgo v1.4.3 routes any
-// method without a registered handler (REGISTER, BYE, SUBSCRIBE, ...) to its
+// guarantee for methods beyond OPTIONS/INVITE/ACK/BYE: sipgo v1.4.3 routes any
+// method without a registered handler (REGISTER, SUBSCRIBE, ...) to its
 // default no-route handler, which replies 405 without ever calling
 // identify(). An unauthorized source must get silence for every method, not
-// just the ones we happen to have explicit handlers for.
+// just the ones we happen to have explicit handlers for. (Note: BYE now has
+// a dedicated onBye handler that gates on identify(), so unidentified BYE is
+// dropped by that handler, not the no-route handler.)
 func TestServerDropsUnknownSourceNonOptionsMethod(t *testing.T) {
 	// allowed_ips excludes loopback → our REGISTER must be silently dropped.
 	cfg := strings.Replace(
@@ -166,5 +168,19 @@ func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
 	got := roundTrip(t, 45068, "REGISTER", "reg-known-1", 3*time.Second, "SIP/2.0 405")
 	if !strings.Contains(got, "SIP/2.0 405") {
 		t.Fatalf("expected 405 Method Not Allowed for known peer, got:\n%s", got)
+	}
+}
+
+func TestServerDropsUnidentifiedBye(t *testing.T) {
+	// A BYE from a source that matches no peer must be silently dropped by
+	// onBye's identify gate — not routed to the dialog cache. Reuse the
+	// unknown-source config (allowed_ips excludes loopback).
+	cfg := strings.Replace(
+		strings.Replace(knownPeerCfg, "45060", "45078", 1),
+		"127.0.0.1/32", "10.0.0.0/8", 1)
+	startServer(t, 45078, cfg)
+	got := roundTrip(t, 45078, "BYE", "bye-unknown-1", 1*time.Second, "")
+	if strings.Contains(got, "SIP/2.0") {
+		t.Fatalf("unidentified BYE must be dropped, got a response:\n%s", got)
 	}
 }
