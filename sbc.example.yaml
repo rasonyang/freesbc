@@ -30,6 +30,9 @@ peers:
     allowed_ips: [10.0.0.0/8]
 
 routes:
+  # When using transform, anchor match with ^...$ — an unanchored pattern
+  # replaces every occurrence and keeps surrounding text. Use ${1} (not $1)
+  # to place a capture group next to literal digits, e.g. "${1}000".
   - name: outbound
     from: internal-pbx
     match: { to: "^9(\\d+)$" }

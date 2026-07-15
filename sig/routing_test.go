@@ -177,3 +177,32 @@ func TestResolveNoRoute(t *testing.T) {
 		t.Fatalf("carrier-b has no route, got %+v", d)
 	}
 }
+
+func TestTransformNumberUnanchoredReplacesAll(t *testing.T) {
+	// Pins the semantics: an UNANCHORED match.to with a transform is a
+	// replace-ALL that keeps surrounding text. Operators should anchor
+	// match.to with ^...$ when transforming; this guards the behavior so
+	// it cannot change silently.
+	const src = `
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+routes:
+  - name: replaceall
+    from: pbx
+    match: { to: "0" }
+    transform: { to: "00" }
+    to: [pbx]
+`
+	cfg, err := config.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// "102030": each of the three 0s → "00", surrounding 1/2/3 kept.
+	if got := transformNumber(cfg.Routes[0], "102030"); got != "100200300" {
+		t.Errorf("transformNumber = %q, want \"100200300\"", got)
+	}
+}

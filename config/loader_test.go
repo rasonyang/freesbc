@@ -218,3 +218,15 @@ func TestParseMalformedRefStillRejected(t *testing.T) {
 		t.Errorf("expected malformed-ref error, got: %v", err)
 	}
 }
+
+func TestParseDigitLedNonNumericRefStillMalformed(t *testing.T) {
+	// The ${N} carve-out is ONLY for pure-digit spans. Digit-led spans that
+	// aren't pure digits are still malformed and must stay rejected.
+	for _, bad := range []string{"${1abc}", "${1:-x}"} {
+		src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+			"address: 10.0.0.10:5060\n    auth: { username: u, password: \""+bad+"\" }", 1)
+		if _, err := Parse([]byte(src)); err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Errorf("%q must be rejected as malformed, got: %v", bad, err)
+		}
+	}
+}
