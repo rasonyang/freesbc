@@ -245,6 +245,14 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 			return nil
 		}
 
+		// 100 Trying is hop-by-hop; each transaction emits its own (sipgo's
+		// A-leg server tx auto-generates one). Never forward the B-leg's 100 —
+		// doing so double-100s the caller. Only 18x (ringing/session progress)
+		// carry end-to-end meaning worth relaying.
+		if res.StatusCode <= 100 {
+			return nil
+		}
+
 		var (
 			body    []byte
 			headers []sip.Header
