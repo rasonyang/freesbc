@@ -1,0 +1,45 @@
+# FreeSBC example configuration.
+# Copy to sbc.yaml, adjust, then:  freesbc run -c sbc.yaml
+#
+# ${ENV_VAR} references are expanded at load time (never written back to
+# disk) and work in plain string values such as passwords, addresses, and
+# IPs — but not inside compound scalars like port_range, durations, or
+# listener URLs.
+
+listen:
+  sip:
+    - udp://0.0.0.0:5060
+    - tls://0.0.0.0:5061          # cert auto-generated (self-signed) if not configured
+  media:
+    port_range: 16384-32768
+    public_ip: auto                # auto = STUN probe, or set a literal IP
+
+peers:
+  carrier-a:
+    address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA
+    transport: udp
+    auth: { username: acct01, password: "${CARRIER_A_PASS}" }
+    register: true                 # registration-based trunk: periodic REGISTER
+    allowed_ips: [203.0.113.0/24]  # inbound calls matched to this peer by source IP
+  internal-pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+
+routes:
+  - name: outbound
+    from: internal-pbx
+    match: { to: "^9(\\d+)$" }
+    transform: { to: "$1" }
+    to: [carrier-a]                # list order = failover order
+  - name: inbound
+    from: carrier-a
+    to: [internal-pbx]
+
+shield:                            # sensible defaults; the whole section is optional
+  rate_limit: 20/s per_ip
+  auto_ban: { failures: 5, window: 60s, duration: 1h }
+  nftables: auto
+
+admin:
+  listen: 127.0.0.1:8080
+  auth: { username: admin, password_hash: "$2a$10$replace-me" }

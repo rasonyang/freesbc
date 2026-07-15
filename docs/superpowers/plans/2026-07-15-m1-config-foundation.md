@@ -1578,3 +1578,16 @@ gofmt -l . && git add main.go sbc.example.yaml .gitignore && git commit -m "feat
 | Caddy-like UX: one binary, `run`/`check` | 7 |
 
 Deferred to later milestones (intentionally, per roadmap): everything under `sig/`, `media/`, `shield/`, `admin/`, `callstate/`; STUN resolution of `public_ip: auto` (M2); TLS cert self-signing (M3); bcrypt verification of `admin.auth.password_hash` (M7).
+
+## Post-Implementation Amendments (2026-07-15, final review)
+
+The as-built code deviates from this plan in three reviewed-and-approved ways:
+1. **Env expansion is post-parse, not byte-level** (`config/expand.go`): raw YAML is strict-parsed first (errors are secret-free and reference the user's real file), then `${VAR}` is expanded via a reflection walk over decoded string fields. Malformed refs (`${VAR:-default}`) are hard errors. Trade-off: `${VAR}` does not work inside compound scalars (port_range, durations, listener URLs).
+2. **`Validate` is unexported** (`validate`); `Parse` is the only public entry point, preserving the immutable-snapshot contract.
+3. **`auto_ban` bounds are validated** (failures ≥ 1, window/duration > 0).
+
+## Carry-over Backlog for M2 (from final review)
+
+- **Important:** quoted custom scalars break parsing — `port_range: "16384-32768"`, `window: "60s"`, `sip: ["udp://..."]` all fail because `UnmarshalYAML([]byte)` receives the raw node including quotes (`config/types.go`). Fix by decoding the node to a string first; a two-phase decode would also re-enable `${VAR}` in compound scalars. First config task of M2.
+- Cosmetic: doubled error prefix `config invalid:` + `invalid config:` (main.go + Parse wrap).
+- Minor deferred items: Shield YAML round-trip assertions; `NewStore` nil-arg doc; reload negative-assertion test uses fixed 600ms sleep; top-level `-h` exits 2; watcher goroutine needs coordinated shutdown once `run()` owns listeners.
