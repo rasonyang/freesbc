@@ -6,8 +6,14 @@ import (
 	"time"
 )
 
-// Config is the root of sbc.yaml. Snapshots are immutable once published:
-// never mutate a *Config after handing it to a Store.
+// Config is the root of sbc.yaml.
+//
+// Lifecycle: Parse (the only supported entry point) unmarshals the file,
+// expands ${ENV_VAR} references, applies defaults, and validates — then the
+// resulting *Config is published via a Store. Snapshots are immutable once
+// published: never mutate a *Config after handing it to a Store. Compiled
+// fields (Peer.allowedNets, Route.matchTo) are populated by validate and are
+// only valid on a *Config that has been through Parse.
 type Config struct {
 	Listen ListenConfig     `yaml:"listen"`
 	Peers  map[string]*Peer `yaml:"peers"`

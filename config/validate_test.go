@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 )
 
 // validConfig returns a minimal config that passes Validate.
@@ -20,14 +21,14 @@ func validConfig() *Config {
 }
 
 func TestValidateOK(t *testing.T) {
-	if err := validConfig().Validate(); err != nil {
+	if err := validConfig().validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 }
 
 func TestValidateCompilesAllowedIPs(t *testing.T) {
 	c := validConfig()
-	if err := c.Validate(); err != nil {
+	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
 	p := c.Peers["pbx"]
@@ -42,7 +43,7 @@ func TestValidateCompilesAllowedIPs(t *testing.T) {
 func TestValidateBareIPBecomesHostPrefix(t *testing.T) {
 	c := validConfig()
 	c.Peers["pbx"].AllowedIPs = []string{"203.0.113.7"}
-	if err := c.Validate(); err != nil {
+	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
 	if !c.Peers["pbx"].AllowsIP(netip.MustParseAddr("203.0.113.7")) {
@@ -56,7 +57,7 @@ func TestValidateBareIPBecomesHostPrefix(t *testing.T) {
 func TestValidateCompilesMatchRegex(t *testing.T) {
 	c := validConfig()
 	c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
-	if err := c.Validate(); err != nil {
+	if err := c.validate(); err != nil {
 		t.Fatal(err)
 	}
 	re := c.Routes[0].CompiledMatch()
@@ -87,13 +88,18 @@ func TestValidateErrors(t *testing.T) {
 		{"transform without match", func(c *Config) { c.Routes[0].Transform = &RouteTransform{To: "$1"} }, "transform.to requires match.to"},
 		{"bad rate limit", func(c *Config) { c.Shield.RateLimit = "lots" }, "rate_limit"},
 		{"bad nftables", func(c *Config) { c.Shield.NFTables = "maybe" }, "nftables"},
+		{"negative auto_ban failures", func(c *Config) { c.Shield.AutoBan.Failures = -1 }, "auto_ban.failures"},
+		{"zero auto_ban window", func(c *Config) { c.Shield.AutoBan.Window = 0 }, "auto_ban.window"},
+		{"negative auto_ban window", func(c *Config) { c.Shield.AutoBan.Window = Duration(-time.Second) }, "auto_ban.window"},
+		{"zero auto_ban duration", func(c *Config) { c.Shield.AutoBan.Duration = 0 }, "auto_ban.duration"},
+		{"negative auto_ban duration", func(c *Config) { c.Shield.AutoBan.Duration = Duration(-time.Second) }, "auto_ban.duration"},
 		{"bad admin listen", func(c *Config) { c.Admin = &AdminConfig{Listen: "nope"} }, "admin.listen"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := validConfig()
 			tc.mutate(c)
-			err := c.Validate()
+			err := c.validate()
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -104,11 +110,32 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
+// TestValidateBadMatchRegexWithTransformIsOneError checks that a route with
+// both an invalid match.to regex and a transform.to reports only the regex
+// compile failure — not a spurious "transform.to requires match.to" (the
+// match clause is present, it just fails to compile).
+func TestValidateBadMatchRegexWithTransformIsOneError(t *testing.T) {
+	c := validConfig()
+	c.Routes[0].Match = &RouteMatch{To: "("}
+	c.Routes[0].Transform = &RouteTransform{To: "$1"}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "match.to:") {
+		t.Errorf("expected regex compile error, got: %q", msg)
+	}
+	if strings.Contains(msg, "transform.to requires") {
+		t.Errorf("must not also report spurious transform.to requires match.to: %q", msg)
+	}
+}
+
 func TestValidateAggregatesAllErrors(t *testing.T) {
 	c := validConfig()
 	c.Listen.SIP = nil
 	c.Routes[0].From = "ghost"
-	err := c.Validate()
+	err := c.validate()
 	if err == nil {
 		t.Fatal("expected error")
 	}

@@ -26,7 +26,7 @@ func TestPortRangeUnmarshalYAML(t *testing.T) {
 	if p.Min != 16384 || p.Max != 32768 {
 		t.Errorf("got %d-%d, want 16384-32768", p.Min, p.Max)
 	}
-	for _, bad := range []string{"16384", "32768-16384", "0-70000", "a-b"} {
+	for _, bad := range []string{"16384", "32768-16384", "0-70000", "0-100", "a-b"} {
 		if err := p.UnmarshalYAML([]byte(bad)); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}

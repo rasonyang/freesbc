@@ -69,6 +69,77 @@ func TestParseMissingEnvVarFails(t *testing.T) {
 	}
 }
 
+func TestParseEnvVarInCommentIsIgnored(t *testing.T) {
+	src := minimalYAML + "# retired peer, was using ${SOME_UNSET_VAR}\n"
+	if _, err := Parse([]byte(src)); err != nil {
+		t.Fatalf("comment referencing an unset var must not fail parsing: %v", err)
+	}
+}
+
+func TestParseEnvExpansionPreservesQuotesAndNewlines(t *testing.T) {
+	t.Setenv("TEST_SBC_QUOTED", `has "quotes" inside`)
+	t.Setenv("TEST_SBC_MULTILINE", "line one\nline two")
+
+	src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: u, password: \"${TEST_SBC_QUOTED}\" }", 1)
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := c.Peers["pbx"].Auth.Password, `has "quotes" inside`; got != want {
+		t.Errorf("password = %q, want %q", got, want)
+	}
+
+	src2 := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: u, password: \"${TEST_SBC_MULTILINE}\" }", 1)
+	c2, err := Parse([]byte(src2))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := c2.Peers["pbx"].Auth.Password, "line one\nline two"; got != want {
+		t.Errorf("password = %q, want %q", got, want)
+	}
+}
+
+func TestParseErrorDoesNotLeakSecret(t *testing.T) {
+	t.Setenv("TEST_SBC_SECRET", "SUPERSECRET_SENTINEL")
+	src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: u, password: \"${TEST_SBC_SECRET}\" }", 1)
+	// Introduce a strict-mode parse error (unknown key) alongside the secret reference.
+	src += "bogus_key: true\n"
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRET_SENTINEL") {
+		t.Errorf("parse error must not leak the secret value: %q", err.Error())
+	}
+}
+
+func TestParseMalformedEnvRefFails(t *testing.T) {
+	src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: u, password: \"${TEST_SBC_UNSET_VAR:-default}\" }", 1)
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for bash-style ${VAR:-default} reference")
+	}
+	if strings.Contains(err.Error(), "undefined environment variable") {
+		t.Errorf("malformed reference should not be reported as a missing variable: %v", err)
+	}
+}
+
+func TestParseMissingEnvVarNamedOnce(t *testing.T) {
+	src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: \"${TEST_SBC_DUP_UNSET}\", password: \"${TEST_SBC_DUP_UNSET}\" }", 1)
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatal("expected missing-env error")
+	}
+	if n := strings.Count(err.Error(), "TEST_SBC_DUP_UNSET"); n != 1 {
+		t.Errorf("expected variable named once in error, got %d times: %q", n, err.Error())
+	}
+}
+
 func TestParseInvalidConfigFails(t *testing.T) {
 	src := strings.Replace(minimalYAML, "from: pbx", "from: ghost", 1)
 	_, err := Parse([]byte(src))

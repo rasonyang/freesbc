@@ -3,12 +3,9 @@ package config
 import (
 	"fmt"
 	"os"
-	"regexp"
 
 	"github.com/goccy/go-yaml"
 )
-
-var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // Load reads and parses the config file at path.
 func Load(path string) (*Config, error) {
@@ -19,41 +16,29 @@ func Load(path string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse expands ${ENV_VAR} references, strictly unmarshals the YAML
-// (unknown keys are errors, reported with line numbers), applies defaults,
-// and validates. Secrets are expanded into memory only — callers must never
-// write the expanded form back to disk.
+// Parse strictly unmarshals the raw YAML (unknown keys are errors, reported
+// with line numbers against the user's own file), then expands ${ENV_VAR}
+// references in the decoded string fields, applies defaults, and validates.
+//
+// Expansion runs after unmarshalling — not on the raw bytes — so that: (a)
+// parse errors never echo secret values, only the literal ${VAR} text the
+// user wrote; (b) ${VAR} inside YAML comments is inert, since comments don't
+// survive unmarshalling; (c) secrets containing quotes or newlines survive
+// verbatim, since they're substituted after YAML's own escaping is resolved.
+//
+// Secrets are expanded into memory only — callers must never write the
+// expanded form back to disk.
 func Parse(data []byte) (*Config, error) {
-	expanded, err := expandEnv(data)
-	if err != nil {
-		return nil, err
-	}
 	var c Config
-	if err := yaml.UnmarshalWithOptions(expanded, &c, yaml.Strict()); err != nil {
+	if err := yaml.UnmarshalWithOptions(data, &c, yaml.Strict()); err != nil {
 		return nil, fmt.Errorf("parse config:\n%s", yaml.FormatError(err, false, true))
 	}
+	if err := expandEnv(&c); err != nil {
+		return nil, err
+	}
 	withDefaults(&c)
-	if err := c.Validate(); err != nil {
+	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config:\n%w", err)
 	}
 	return &c, nil
-}
-
-// expandEnv replaces every ${VAR} with the environment value; any reference
-// to an unset variable is an error (silent empty strings hide typos).
-func expandEnv(data []byte) ([]byte, error) {
-	var missing []string
-	out := envRef.ReplaceAllFunc(data, func(m []byte) []byte {
-		name := string(envRef.FindSubmatch(m)[1])
-		v, ok := os.LookupEnv(name)
-		if !ok {
-			missing = append(missing, name)
-			return m
-		}
-		return []byte(v)
-	})
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("undefined environment variable(s) referenced in config: %v", missing)
-	}
-	return out, nil
 }

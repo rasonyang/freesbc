@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strings"
 )
 
-// Validate checks cross-references and value constraints, collecting every
+// validate checks cross-references and value constraints, collecting every
 // problem instead of stopping at the first. On success it also compiles
-// derived state (peer allowed-IP prefixes, route match regexes).
-func (c *Config) Validate() error {
+// derived state (peer allowed-IP prefixes, route match regexes). It is
+// unexported: Parse is the only supported entry point into the lifecycle
+// described on Config.
+func (c *Config) validate() error {
 	var errs []string
 	fail := func(format string, args ...any) {
 		errs = append(errs, fmt.Sprintf(format, args...))
@@ -32,7 +35,13 @@ func (c *Config) Validate() error {
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
 	}
-	for name, p := range c.Peers {
+	peerNames := make([]string, 0, len(c.Peers))
+	for name := range c.Peers {
+		peerNames = append(peerNames, name)
+	}
+	sort.Strings(peerNames)
+	for _, name := range peerNames {
+		p := c.Peers[name]
 		if p.Address == "" {
 			fail("peers.%s: address required", name)
 		}
@@ -48,7 +57,7 @@ func (c *Config) Validate() error {
 		for _, s := range p.AllowedIPs {
 			pfx, err := parsePrefixOrAddr(s)
 			if err != nil {
-				fail("peers.%s.allowed_ips: %v", name, err)
+				fail("peers.%s: allowed_ips: %v", name, err)
 				continue
 			}
 			p.allowedNets = append(p.allowedNets, pfx)
@@ -81,7 +90,7 @@ func (c *Config) Validate() error {
 				r.matchTo = re
 			}
 		}
-		if r.Transform != nil && r.Transform.To != "" && r.matchTo == nil {
+		if r.Transform != nil && r.Transform.To != "" && (r.Match == nil || r.Match.To == "") {
 			fail("routes.%s: transform.to requires match.to (capture groups come from it)", label)
 		}
 	}
@@ -93,6 +102,19 @@ func (c *Config) Validate() error {
 	case "auto", "on", "off":
 	default:
 		fail("shield.nftables: must be auto, on, or off, got %q", c.Shield.NFTables)
+	}
+	// withDefaults fills zero values before validate normally runs, so these
+	// only trip on an explicitly negative/non-positive value reaching here
+	// (e.g. a Config built directly without withDefaults). Checked
+	// defensively regardless.
+	if c.Shield.AutoBan.Failures < 1 {
+		fail("shield.auto_ban.failures: must be >= 1, got %d", c.Shield.AutoBan.Failures)
+	}
+	if c.Shield.AutoBan.Window <= 0 {
+		fail("shield.auto_ban.window: must be > 0, got %s", c.Shield.AutoBan.Window.Std())
+	}
+	if c.Shield.AutoBan.Duration <= 0 {
+		fail("shield.auto_ban.duration: must be > 0, got %s", c.Shield.AutoBan.Duration.Std())
 	}
 
 	if c.Admin != nil {
