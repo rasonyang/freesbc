@@ -94,6 +94,8 @@ func TestValidateErrors(t *testing.T) {
 		{"zero auto_ban duration", func(c *Config) { c.Shield.AutoBan.Duration = 0 }, "auto_ban.duration"},
 		{"negative auto_ban duration", func(c *Config) { c.Shield.AutoBan.Duration = Duration(-time.Second) }, "auto_ban.duration"},
 		{"bad admin listen", func(c *Config) { c.Admin = &AdminConfig{Listen: "nope"} }, "admin.listen"},
+		{"bad media_latch", func(c *Config) { c.Peers["pbx"].MediaLatch = "sticky" }, "media_latch"},
+		{"negative rtp_timeout", func(c *Config) { c.Listen.Media.RTPTimeout = Duration(-time.Second) }, "rtp_timeout"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

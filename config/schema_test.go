@@ -77,6 +77,12 @@ func TestWithDefaults(t *testing.T) {
 	if c.Listen.Media.PublicIP != "auto" {
 		t.Errorf("public_ip default: %q", c.Listen.Media.PublicIP)
 	}
+	if c.Listen.Media.RTPTimeout.Std() != 5*time.Minute {
+		t.Errorf("rtp_timeout default: %v", c.Listen.Media.RTPTimeout.Std())
+	}
+	if c.Peers["p"].MediaLatch != "strict" {
+		t.Errorf("media_latch default: %q", c.Peers["p"].MediaLatch)
+	}
 	if c.Shield.RateLimit != "20/s per_ip" {
 		t.Errorf("rate_limit default: %q", c.Shield.RateLimit)
 	}
