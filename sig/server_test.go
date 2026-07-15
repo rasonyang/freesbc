@@ -1,6 +1,7 @@
 package sig
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -174,6 +175,90 @@ func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
 	if !strings.Contains(got, "SIP/2.0 405") {
 		t.Fatalf("expected 405 Method Not Allowed for known peer, got:\n%s", got)
 	}
+}
+
+// TestServerOurIPResolution is Fix 2's regression coverage for
+// Server.ourIP — used both for the SDP media IP (mediaIP, called per call
+// from bridge.onInvite) and for the dialog Contact host built in Run.
+// Before the fix, mediaIP's "auto" fallback used listen.sip[0]'s host
+// unconditionally, so a listener bound to 0.0.0.0 (or ::) — the normal way
+// to listen on every interface — produced c=0.0.0.0 in SDP (a media
+// blackhole) and sip:0.0.0.0:port in Contact (unroutable). The fix: prefer
+// a literal public_ip; else skip unspecified listener hosts and use the
+// first routable one; else warn once (not per call) and fall back to
+// 127.0.0.1.
+func TestServerOurIPResolution(t *testing.T) {
+	newSrv := func(t *testing.T, cfgYAML string) (*Server, *config.Config, *bytes.Buffer) {
+		t.Helper()
+		cfg, err := config.Parse([]byte(cfgYAML))
+		if err != nil {
+			t.Fatalf("parse config: %v", err)
+		}
+		var logBuf bytes.Buffer
+		srv := NewServer(config.NewStore(cfg), nil, slog.New(slog.NewTextHandler(&logBuf, nil)))
+		return srv, cfg, &logBuf
+	}
+
+	t.Run("literal public_ip wins even over a routable listener", func(t *testing.T) {
+		srv, cfg, _ := newSrv(t, `
+listen:
+  sip: [udp://198.51.100.1:5060]
+  media: { port_range: 40000-40001, public_ip: 203.0.113.10 }
+peers:
+  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
+routes:
+  - name: r
+    from: p
+    to: [p]
+`)
+		if got := srv.ourIP(cfg); got.String() != "203.0.113.10" {
+			t.Errorf("ourIP = %s, want 203.0.113.10 (literal public_ip)", got)
+		}
+	})
+
+	t.Run("auto skips an unspecified listener and picks the routable one", func(t *testing.T) {
+		srv, cfg, logBuf := newSrv(t, `
+listen:
+  sip: [udp://0.0.0.0:5060, udp://198.51.100.5:5061]
+  media: { port_range: 40002-40003, public_ip: auto }
+peers:
+  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
+routes:
+  - name: r
+    from: p
+    to: [p]
+`)
+		if got := srv.ourIP(cfg); got.String() != "198.51.100.5" {
+			t.Errorf("ourIP = %s, want 198.51.100.5 (first non-unspecified listen.sip host)", got)
+		}
+		if strings.Contains(logBuf.String(), "falling back to 127.0.0.1") {
+			t.Errorf("unexpected fallback warning when a routable listener exists:\n%s", logBuf.String())
+		}
+	})
+
+	t.Run("auto with every listener unspecified warns once and falls back to 127.0.0.1", func(t *testing.T) {
+		srv, cfg, logBuf := newSrv(t, `
+listen:
+  sip: [udp://0.0.0.0:5060, "udp://[::]:5061"]
+  media: { port_range: 40004-40005, public_ip: auto }
+peers:
+  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
+routes:
+  - name: r
+    from: p
+    to: [p]
+`)
+		// Call twice: the fallback IP must be stable, and warnAutoIPOnce must
+		// gate the warning to a single log line, not one per call.
+		for i := 0; i < 2; i++ {
+			if got := srv.ourIP(cfg); got.String() != "127.0.0.1" {
+				t.Errorf("call %d: ourIP = %s, want 127.0.0.1 fallback", i, got)
+			}
+		}
+		if n := strings.Count(logBuf.String(), "falling back to 127.0.0.1"); n != 1 {
+			t.Errorf("fallback warning logged %d times across 2 calls, want exactly 1 (warnAutoIPOnce)\nlog:\n%s", n, logBuf.String())
+		}
+	})
 }
 
 func TestServerDropsUnidentifiedBye(t *testing.T) {

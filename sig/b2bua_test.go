@@ -147,6 +147,9 @@ type stubCarrier struct {
 	digestUser      string
 	digestPass      string
 
+	// ringForever (Fix 1): see stubCarrierConfig.ringForever.
+	ringForever bool
+
 	offers  chan *sip.Request
 	byeDone chan struct{}
 }
@@ -170,6 +173,13 @@ type stubCarrierConfig struct {
 
 	digestUser string
 	digestPass string
+
+	// ringForever (Fix 1's CANCEL-stops-failover regression test): send a
+	// single 180 Ringing and then block until the dialog ends (e.g. the
+	// bridge CANCELs this leg because the A-leg went away) or the test
+	// tears the carrier down — simulates a carrier that is genuinely still
+	// ringing and never answers.
+	ringForever bool
 }
 
 // startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
@@ -221,6 +231,7 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		c.finalReason = opts[0].finalReason
 		c.digestUser = opts[0].digestUser
 		c.digestPass = opts[0].digestPass
+		c.ringForever = opts[0].ringForever
 		if c.digestUser != "" {
 			c.digestChallenge = &digest.Challenge{
 				Realm:     "freesbc-test",
@@ -239,6 +250,18 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		select {
 		case c.offers <- req:
 		default:
+		}
+
+		if c.ringForever {
+			if err := dlg.Respond(180, "Ringing", nil); err != nil {
+				log.Error("carrier respond ringing", "err", err)
+				return
+			}
+			// Never answer: block until the dialog ends (CANCEL from the
+			// bridge — see DialogUA.ReadInvite's tx.OnCancel wiring — or the
+			// test's own teardown closing the transport).
+			<-dlg.Context().Done()
+			return
 		}
 
 		if c.digestChallenge != nil && !c.digestAuthorized(req) {
@@ -1034,6 +1057,114 @@ func TestBridgeAllTargetsFail(t *testing.T) {
 	s2.Close()
 }
 
+// cancelFailoverCfg (Fix 1 regression) routes local-uac to two carriers in
+// failover order: carrier-a rings forever and never answers, carrier-b
+// would answer normally. Fresh port block (45200-45202/46220-46223),
+// disjoint from every other test's — see bridgeCallCfg's comment for why
+// allowed_ips differ per peer.
+const cancelFailoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45200]
+  media:
+    port_range: 46220-46223
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45201
+    allowed_ips: [203.0.113.16/28]
+  carrier-b:
+    address: 127.0.0.1:45202
+    allowed_ips: [198.51.100.16/28]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeCancelStopsFailover is Fix 1's regression test: the caller
+// CANCELs while the first failover target (carrier-a) is still ringing.
+//
+// Before the fix, placeCall's failover loop ignored the A-leg's state after
+// a retryable dialTarget failure and dialed the next candidate (carrier-b)
+// regardless of whether the caller was still there — sending a live INVITE
+// to a real carrier, and potentially blocking up to Timer B (~32s) waiting
+// on it, for a caller who already hung up. The fix checks
+// aLeg.Context().Err() right after each retryable failure and stops the
+// loop instead.
+//
+// carrier-a's CANCEL happens automatically: dialTarget dials via
+// aLeg.Context(), so once the A-leg's real CANCEL cancels that context,
+// sipgo's own WaitAnswer(ctx) sends the B-leg CANCEL to carrier-a itself.
+// This test only has to prove the OUTCOME — carrier-b must never see an
+// INVITE — asserted via carrier-b's offers channel staying empty across a
+// bounded wait past the CANCEL, per the task's guidance that this is more
+// reliable than trying to prove a negative directly.
+//
+// Timing-based over real UDP loopback: re-run once before treating a flake
+// as failure.
+func TestBridgeCancelStopsFailover(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45201", nil, stubCarrierConfig{ringForever: true})
+	carrierB := startStubCarrier(t, "127.0.0.1:45202", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 45200, cancelFailoverCfg)
+
+	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer uac.Close()
+	local := uac.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45200}
+
+	const callID = "b2bua-cancel-failover-1"
+	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 45200)
+	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	// Wait for carrier-a's relayed 180 Ringing: proves the bridge is
+	// mid-attempt-one (carrier-a dialed, ringing) before we cancel.
+	var sawRinging bool
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !sawRinging {
+		_ = uac.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := uac.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(string(buf[:n]), "SIP/2.0 180") {
+			sawRinging = true
+		}
+	}
+	if !sawRinging {
+		t.Fatal("uac never saw carrier-a's relayed 180 Ringing")
+	}
+
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+
+	// Cancel while carrier-a is still ringing and unanswered.
+	cancelReq := sipCancel(callID, local, 45200)
+	if _, err := uac.WriteToUDP([]byte(cancelReq), dst); err != nil {
+		t.Fatalf("write cancel: %v", err)
+	}
+
+	// Bounded wait past the CANCEL, then assert carrier-b never got an
+	// INVITE — the failover loop must have stopped rather than proceeding
+	// to the next target for a caller who already left.
+	select {
+	case <-carrierB.offers:
+		t.Fatal("carrier-b received a B-leg INVITE after the caller CANCELed — failover loop did not stop")
+	case <-time.After(2 * time.Second):
+	}
+}
+
 // ringNoFinalCfg routes local-uac to a single carrier that floods
 // provisionals and never sends a final response — see
 // startFloodingRingCarrier and TestBridgeStaleProvisionalNotRelayedAsFinal
@@ -1193,7 +1324,7 @@ func TestBridgeStaleProvisionalNotRelayedAsFinal(t *testing.T) {
 	local := uac.LocalAddr().(*net.UDPAddr)
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45250}
 
-	req := sipInviteWithSDP("b2bua-staleprov-1", local, testSDPBody(uacRTPStubPort(t)))
+	req := sipInviteWithSDP("b2bua-staleprov-1", local, testSDPBody(uacRTPStubPort(t)), 45250)
 	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
 	}
@@ -1242,15 +1373,15 @@ func TestBridgeStaleProvisionalNotRelayedAsFinal(t *testing.T) {
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }
 
-// sipInviteWithSDP builds a raw INVITE carrying an SDP offer body, for tests
-// that need to observe the bridge's raw wire responses without going
-// through sipgo's DialogClientSession (see
-// TestBridgeStaleProvisionalNotRelayedAsFinal). Mirrors sipRequest's
-// no-body form (server_test.go) but adds Content-Type/Content-Length and
-// the body.
-func sipInviteWithSDP(callID string, localAddr *net.UDPAddr, sdpBody []byte) string {
+// sipInviteWithSDP builds a raw INVITE carrying an SDP offer body targeting
+// 127.0.0.1:port, for tests that need to observe the bridge's raw wire
+// responses without going through sipgo's DialogClientSession (see
+// TestBridgeStaleProvisionalNotRelayedAsFinal, TestBridgeCancelStopsFailover).
+// Mirrors sipRequest's no-body form (server_test.go) but adds
+// Content-Type/Content-Length and the body.
+func sipInviteWithSDP(callID string, localAddr *net.UDPAddr, sdpBody []byte, port int) string {
 	return strings.Join([]string{
-		"INVITE sip:5551234@127.0.0.1:45250 SIP/2.0",
+		fmt.Sprintf("INVITE sip:5551234@127.0.0.1:%d SIP/2.0", port),
 		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-%s", localAddr.String(), callID),
 		"From: <sip:tester@127.0.0.1>;tag=t1",
 		"To: <sip:sbc@127.0.0.1>",
@@ -1261,6 +1392,27 @@ func sipInviteWithSDP(callID string, localAddr *net.UDPAddr, sdpBody []byte) str
 		"Content-Type: application/sdp",
 		fmt.Sprintf("Content-Length: %d", len(sdpBody)),
 		"", string(sdpBody),
+	}, "\r\n")
+}
+
+// sipCancel builds a CANCEL for the initial request built by sipInviteWithSDP
+// with the same callID/localAddr/port. RFC 3261 §9.1 requires the CANCEL's
+// Via (including branch), From, To, and Call-ID to match the request being
+// cancelled exactly, and its CSeq to carry the same sequence number with
+// method CANCEL — that's what lets the transaction layer match it to the
+// pending INVITE server transaction and auto-terminate it (200 to the
+// CANCEL, then 487 to the INVITE — see sipgo's TransactionLayer.handleRequest).
+func sipCancel(callID string, localAddr *net.UDPAddr, port int) string {
+	return strings.Join([]string{
+		fmt.Sprintf("CANCEL sip:5551234@127.0.0.1:%d SIP/2.0", port),
+		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-%s", localAddr.String(), callID),
+		"From: <sip:tester@127.0.0.1>;tag=t1",
+		"To: <sip:sbc@127.0.0.1>",
+		"Call-ID: " + callID,
+		"CSeq: 1 CANCEL",
+		"Max-Forwards: 70",
+		"Content-Length: 0",
+		"", "",
 	}, "\r\n")
 }
 

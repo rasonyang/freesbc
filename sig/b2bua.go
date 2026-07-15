@@ -171,6 +171,12 @@ func byeContext() (context.Context, context.CancelFunc) {
 // it's the only one not already covered by rewriteSDP's own failure (488,
 // target-independent — same offer, same failure, on every attempt) or
 // dialTarget's post-answer paths.
+//
+// After each retryable failure, placeCall also checks whether the A-leg is
+// still there (aLeg.Context().Err()) before starting the next candidate: a
+// caller CANCEL/hangup mid-setup cancels that context, and without this
+// check the loop would keep dialing (and waiting up to Timer B, ~32s, on)
+// remaining carriers for a caller who already left.
 func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (*sipgo.DialogClientSession, Target, bool) {
 	bOffer, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB))
 	if err != nil {
@@ -194,6 +200,19 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 			return nil, Target{}, false
 		}
 		lastCode, lastReason = code, reason
+
+		// The A-leg may have gone away (caller CANCEL/hangup) while this
+		// target was being dialed — dialTarget dials via aLeg.Context(), so
+		// a cancelled A-leg doesn't stop the B-leg invite from going out,
+		// only from being waited on indefinitely. Check here, before
+		// starting the next candidate: there is no caller left to bridge to,
+		// so dialing the remaining targets (each up to Timer B, ~32s) would
+		// only hammer real carriers for no reason. The eventual
+		// aLeg.Respond below (all-targets-exhausted path) is a harmless
+		// no-op against the already-gone dialog.
+		if aLeg.Context().Err() != nil {
+			return nil, Target{}, false
+		}
 	}
 
 	_ = aLeg.Respond(lastCode, lastReason, nil)

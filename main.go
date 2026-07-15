@@ -93,7 +93,9 @@ func run(cfgPath string) error {
 		}
 	}()
 
-	// M3.3+: the B2BUA bridge, shield, and admin API attach here.
+	// The B2BUA bridge (M3.3) is wired into sipServer above (sig.NewServer /
+	// sig.Server.Run). Only the shield (M6) and admin API (M7) still attach
+	// here.
 
 	log.Info("freesbc started",
 		"config", cfgPath,
