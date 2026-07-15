@@ -32,18 +32,23 @@ func NewServer(store *config.Store, log *slog.Logger) *Server {
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
 // a bind failure), or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
-	ua, err := sipgo.NewUA()
+	sipgoLog := s.log.With("caller", "sipgo")
+	ua, err := sipgo.NewUA(
+		sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerLogger(sipgoLog)),
+		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
+	)
 	if err != nil {
 		return fmt.Errorf("sipgo ua: %w", err)
 	}
 	defer ua.Close()
-	srv, err := sipgo.NewServer(ua)
+	srv, err := sipgo.NewServer(ua, sipgo.WithServerLogger(sipgoLog))
 	if err != nil {
 		return fmt.Errorf("sipgo server: %w", err)
 	}
 	srv.OnRequest(sip.OPTIONS, s.onOptions)
 	srv.OnInvite(s.onInvite)
 	srv.OnAck(s.onAck)
+	srv.OnNoRoute(s.onNoRoute)
 
 	listeners := s.store.Current().Listen.SIP
 	ctx, cancel := context.WithCancel(ctx)
@@ -147,7 +152,10 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 
 // dropUnidentified is the shield seam (M6): a request from a source that
 // matches no peer is silently dropped (spec §6 step 2). No response is
-// sent; the transaction ages out on its own.
+// sent; sipgo calls tx.TerminateGracefully() immediately after the handler
+// returns (server.go handleRequest), which terminates the unfinalized
+// transaction right away — stopping its auto-100 timer and keeping the
+// drop silent instead of merely letting the transaction age out.
 func (s *Server) dropUnidentified(req *sip.Request) {
 	s.log.Info("dropping request from unidentified source",
 		"method", req.Method.String(), "source", req.Source())
@@ -182,3 +190,23 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 // onAck absorbs ACKs (e.g. the ACK to the 501 stub's final response) so
 // sipgo does not log them as unhandled. Real in-dialog ACK handling is M3.3.
 func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {}
+
+// onNoRoute is sipgo's catch-all for every SIP method without a dedicated
+// handler (REGISTER, BYE, SUBSCRIBE, MESSAGE, ...). Without this override,
+// sipgo's default no-route handler replies "405 Method Not Allowed" before
+// ever calling identify(), which would let an unauthorized source detect
+// the SBC's existence — defeating the "silently drop unknown sources"
+// guarantee (spec §6 step 2). Every method must pass through identify()
+// first: unknown sources get silence, known peers get a normal 405 until
+// M3.3/M4 add dialog and REGISTER support for their respective methods.
+func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction) {
+	name, _, ok := s.identify(req)
+	if !ok {
+		s.dropUnidentified(req)
+		return
+	}
+	s.log.Debug("method not implemented", "peer", name, "method", req.Method.String())
+	if err := tx.Respond(sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)); err != nil {
+		s.log.Error("respond 405", "peer", name, "err", err)
+	}
+}

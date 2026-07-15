@@ -133,3 +133,34 @@ func TestServerDropsUnknownSource(t *testing.T) {
 		t.Fatalf("unknown source must be dropped, but got a response:\n%s", got)
 	}
 }
+
+// TestServerDropsUnknownSourceNonOptionsMethod guards the security-plane
+// guarantee for methods beyond OPTIONS/INVITE/ACK: sipgo v1.4.3 routes any
+// method without a registered handler (REGISTER, BYE, SUBSCRIBE, ...) to its
+// default no-route handler, which replies 405 without ever calling
+// identify(). An unauthorized source must get silence for every method, not
+// just the ones we happen to have explicit handlers for.
+func TestServerDropsUnknownSourceNonOptionsMethod(t *testing.T) {
+	// allowed_ips excludes loopback → our REGISTER must be silently dropped.
+	cfg := strings.Replace(
+		strings.Replace(knownPeerCfg, "45060", "45066", 1),
+		"127.0.0.1/32", "10.0.0.0/8", 1)
+	startServer(t, 45066, cfg)
+	got := roundTrip(t, 45066, "REGISTER", "reg-unknown-1", 1*time.Second, "")
+	if strings.Contains(got, "SIP/2.0") {
+		t.Fatalf("unknown source must be dropped for REGISTER, but got a response:\n%s", got)
+	}
+}
+
+// TestServerKnownPeerUnhandledMethodGets405 is the positive-path
+// counterpart: a known, authorized peer sending a method we don't yet
+// implement (REGISTER) still gets a normal 405 Method Not Allowed, since
+// it already passed the identify() security check.
+func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45068", 1)
+	startServer(t, 45068, cfg)
+	got := roundTrip(t, 45068, "REGISTER", "reg-known-1", 3*time.Second, "SIP/2.0 405")
+	if !strings.Contains(got, "SIP/2.0 405") {
+		t.Fatalf("expected 405 Method Not Allowed for known peer, got:\n%s", got)
+	}
+}
