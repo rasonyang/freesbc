@@ -26,14 +26,10 @@ type bridge struct {
 }
 
 // onInvite handles an inbound INVITE end to end: identify the source,
-// route it, place the B-leg, anchor media, answer the A-leg, and hold the
-// call open until either leg ends the dialog or media goes silent.
-//
-// This is the single-target happy path (Task 6), now with early media
-// (Task 7): decision.Targets[0] only, via dialAndBridge. Failover across
-// the remaining targets and auth challenges are later tasks in this
-// milestone and slot in around that seam (retry dialAndBridge over
-// decision.Targets until one succeeds, then reject).
+// route it, place the B-leg (failing over across decision.Targets and
+// applying each target's outbound digest auth as it goes — Task 8),
+// anchor media, answer the A-leg, and hold the call open until either leg
+// ends the dialog or media goes silent.
 func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	defer b.recoverCall(req)
 
@@ -63,13 +59,17 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	// --- single target (failover loop is Task 8) ---
-	target := decision.Targets[0]
-
+	// The session's side-B latch mode is fixed at allocation time, before
+	// any target has actually been dialed, so it's configured from the
+	// first candidate. If failover picks a later target with a different
+	// media_latch, that target's setting is not retroactively applied —
+	// out of scope for Task 8 (not called for by the failover spec, which
+	// only concerns which carrier gets the call, not per-carrier latch
+	// tuning); see placeCall/dialTarget for the actual failover loop.
 	sess, err := b.s.pool.Allocate(media.SessionConfig{
 		Latch: [2]media.LatchMode{
 			media.ParseLatchMode(fromPeer.MediaLatch),
-			media.ParseLatchMode(target.Peer.MediaLatch),
+			media.ParseLatchMode(decision.Targets[0].Peer.MediaLatch),
 		},
 	})
 	if err != nil {
@@ -81,9 +81,9 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	ourIP := b.s.mediaIP(cfg)
 
-	bLeg, ok := b.dialAndBridge(aLeg, target, decision.OutNumber, req.Body(), ourIP, sess)
+	bLeg, target, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), ourIP, sess)
 	if !ok {
-		return // dialAndBridge already sent the A-leg's final response.
+		return // placeCall already sent the A-leg's final response.
 	}
 	defer bLeg.Close()
 
@@ -108,10 +108,16 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		_ = aLeg.Bye(byeCtx)
 		cancel()
 	case <-sess.Done():
-		byeCtx, cancel := byeContext()
-		_ = aLeg.Bye(byeCtx)
-		_ = bLeg.Bye(byeCtx)
-		cancel()
+		// Each Bye gets its own bounded context: sharing one byeContext
+		// across both would let a slow first Bye (up to its full 5s) eat
+		// into the second leg's budget instead of each being independently
+		// bounded to 5s.
+		aByeCtx, aCancel := byeContext()
+		_ = aLeg.Bye(aByeCtx)
+		aCancel()
+		bByeCtx, bCancel := byeContext()
+		_ = bLeg.Bye(bByeCtx)
+		bCancel()
 	}
 }
 
@@ -123,41 +129,89 @@ func byeContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
-// dialAndBridge places the B-leg to target and, on a successful answer,
-// anchors media (both SetExpectedRemote calls) and answers the A-leg with
-// RespondSDP. On success it returns the established, ACKed bLeg — the
-// caller owns it from there (Close it, hold the dialog open, tear down on
-// hangup). On failure it returns ok=false and closes/BYEs any bLeg it
-// opened. All failure paths up to and including the Ack failure also send
-// the A-leg an appropriate final response (488/503/502); the caller has
-// nothing further to send in those cases. The one exception is the
-// RespondSDP failure path: the A-leg answer attempt itself failed (the
-// dialog is typically already gone, e.g. the caller CANCELed), so no A-leg
-// response is sent there — only the now-established B-leg is BYE'd.
+// placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
+// sess's stable B-side port once — that rewrite depends only on sess's own
+// ports and ourIP, neither of which changes across attempts, so it's
+// hoisted out of the per-target dialTarget below — then tries targets in
+// order via dialTarget until one is bridged.
 //
-// A B-leg that reached a 2xx answer is a live, billable call at the
-// carrier: WaitAnswer succeeding is the point past which "abandon it"
-// (relying on DialogClientSession.Close, which only drops the local cache
-// entry and sends neither BYE nor CANCEL) is no longer acceptable, and
-// every path below either Acks-then-Byes it or, once Acked, Byes it.
+// dialTarget draws a hard line at the B-leg's answer: everything before it
+// (dial failure, no/non-2xx WaitAnswer) is target-specific and safe to
+// retry on the next candidate, so placeCall just remembers the failure and
+// keeps going. Everything from the answer onward is a committed, billable
+// carrier call — dialTarget always finishes it there itself (bridge or
+// tear down + finalize the A-leg) rather than reporting a retryable
+// failure, so placeCall stops the moment dialTarget reports one of those:
+// there is nothing left to try (the A-leg has already gotten its final
+// response, or — the RespondSDP-failure case — deliberately hasn't,
+// because it's already gone).
 //
-// sess is shared across attempts (its ports don't change), so this is the
-// seam later tasks extend: Task 8's failover loop calls this once per
-// candidate in decision.Targets until one returns ok, Task 9 retries once
-// on a 401/407 with target.Peer.Auth.
-//
-// Early media (Task 7): startOnce is created here and threaded through both
-// the WaitAnswer OnResponse callback (relayProvisional, fired for every 18x
-// the B-leg sends) and the 2xx path below via processAnswerSDP, so the
-// media session Starts exactly once — whichever path (an 18x with SDP, or
-// the eventual 2xx) reaches it first.
-func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (*sipgo.DialogClientSession, bool) {
+// If every target is exhausted without an answer, placeCall responds the
+// A-leg with the last target's failure code (spec: last upstream final
+// code) — the only path here that sends a final response itself, since
+// it's the only one not already covered by rewriteSDP's own failure (488,
+// target-independent — same offer, same failure, on every attempt) or
+// dialTarget's post-answer paths.
+func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (*sipgo.DialogClientSession, Target, bool) {
 	bOffer, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB))
 	if err != nil {
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
-		return nil, false
+		return nil, Target{}, false
 	}
 
+	// startOnce is created here — not per attempt — and threaded through
+	// every dialTarget call so the media session Starts exactly once for
+	// the whole call: if an earlier, ultimately-failed target already sent
+	// early media, its 18x may have Started the session; a later target's
+	// answer still only Relatches (processAnswerSDP), never re-Starts.
+	var startOnce sync.Once
+	lastCode, lastReason := 503, "Service Unavailable"
+	for _, target := range targets {
+		bLeg, ok, retryable, code, reason := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
+		if ok {
+			return bLeg, target, true
+		}
+		if !retryable {
+			return nil, Target{}, false
+		}
+		lastCode, lastReason = code, reason
+	}
+
+	_ = aLeg.Respond(lastCode, lastReason, nil)
+	return nil, Target{}, false
+}
+
+// dialTarget places one B-leg to target and waits for its answer via
+// WaitAnswer, passing target's digest credentials (empty strings for an
+// IP-auth trunk — WaitAnswer only attempts digest when Password is
+// non-empty) so a 401/407 challenge is retried transparently inside
+// WaitAnswer itself; the caller never sees the intermediate challenge.
+//
+// Two regimes, split at the B-leg's answer:
+//
+//   - Before it (dial error, or WaitAnswer returning any error — including
+//     a non-2xx final): the B-leg never reached Established, so there is
+//     nothing to ACK or BYE, just Close (drops the local dialog-cache
+//     entry only) — and nothing target-specific has committed, so this is
+//     exactly what placeCall retries the next candidate on. No A-leg
+//     response is sent here; retryable=true and code/reason (the upstream
+//     status, or 503/"Service Unavailable" when none was received — dial
+//     error, timeout, CANCEL race) are placeCall's to use if every
+//     candidate is exhausted.
+//
+//   - From it onward (2xx received): the B-leg is now a live, billable
+//     carrier call, so dialTarget always finishes the call itself from
+//     here — anchoring media and RespondSDP-ing the A-leg on success, or
+//     tearing the B-leg down and finalizing the A-leg on failure — rather
+//     than reporting a retryable failure. retryable=false in every path
+//     past this point: a carrier that already answered is not something
+//     you abandon to try a different one.
+//
+// Early media: for every 18x the B-leg sends, relayProvisional (via
+// WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
+// before dialTarget's own post-answer processing does; both share the same
+// startOnce so Start runs at most once regardless of which path wins.
+func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, ok, retryable bool, code int, reason string) {
 	// peerURI builds only the trunk endpoint (host/port/transport); the
 	// dialed number (post-transform) is the Request-URI user part, so it
 	// must be set here — without it the carrier receives an INVITE with
@@ -168,47 +222,51 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer)
 	if err != nil {
 		b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
-		_ = aLeg.Respond(503, "Service Unavailable", nil)
-		return nil, false
+		return nil, false, true, 503, "Service Unavailable"
 	}
 
-	var startOnce sync.Once
 	if err := bLeg.WaitAnswer(aLeg.Context(), sipgo.AnswerOptions{
-		OnResponse: b.relayProvisional(aLeg, sess, ourIP, &startOnce),
+		OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce),
+		Username:   authUser(target),
+		Password:   authPass(target),
 	}); err != nil {
 		b.s.log.Info("b-leg not answered", "err", err, "target", target.Name)
+		failCode, failReason := 503, "Service Unavailable"
+		if bLeg.InviteResponse != nil {
+			failCode = bLeg.InviteResponse.StatusCode
+			failReason = bLeg.InviteResponse.Reason
+		}
 		_ = bLeg.Close()
-		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		return nil, false
+		return nil, false, true, failCode, failReason
 	}
 
+	// Past this point the B-leg is answered (2xx): a live, billable carrier
+	// call. Every remaining path is terminal (retryable=false).
 	answer := bLeg.InviteResponse.Body()
-	if err := processAnswerSDP(sess, answer, media.SideB, &startOnce); err != nil {
-		// bLeg is answered (2xx) but not yet ACKed: Bye refuses to send on
-		// an unconfirmed client dialog, so Ack first, then Bye to tear the
-		// carrier call down rather than abandoning a live/billable call.
-		b.ackThenBye(aLeg.Context(), bLeg, target)
+	if err := processAnswerSDP(sess, answer, media.SideB, startOnce); err != nil {
+		// Respond the A-leg before tearing the B-leg down: ackThenBye is a
+		// network round trip bounded by byeContext's 5s, and there's no
+		// reason to hold the caller's final response hostage behind it.
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
-		return nil, false
+		b.ackThenBye(aLeg.Context(), bLeg, target)
+		return nil, false, false, 488, "Not Acceptable Here"
 	}
 
 	aAnswer, err := rewriteSDP(answer, ourIP, sess.RTPPort(media.SideA))
 	if err != nil {
-		b.ackThenBye(aLeg.Context(), bLeg, target)
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
-		return nil, false
+		b.ackThenBye(aLeg.Context(), bLeg, target)
+		return nil, false, false, 488, "Not Acceptable Here"
 	}
 
 	if err := bLeg.Ack(aLeg.Context()); err != nil {
 		// ACK could not be sent: the dialog never reaches Confirmed, so
-		// Bye would refuse it too — nothing left to do but Close (deferred
-		// by the caller would be nil here, so do it now) and tell the
-		// A-leg the call failed. This is the path that used to leave the
-		// caller hanging with no final response at all.
+		// Bye would refuse it too — nothing left to do but Close and tell
+		// the A-leg the call failed.
 		b.s.log.Error("ack b-leg", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		return nil, false
+		return nil, false, false, 502, "Bad Gateway"
 	}
 	// RespondSDP blocks until the A-leg ACK arrives (sipgo retransmits the
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
@@ -221,16 +279,34 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 		byeCtx, cancel := byeContext()
 		_ = bLeg.Bye(byeCtx)
 		cancel()
-		return nil, false
+		return nil, false, false, 0, ""
 	}
 
-	return bLeg, true
+	return bLeg, true, false, 200, "OK"
 }
 
-// relayProvisional builds dialAndBridge's WaitAnswer OnResponse callback: it
+// authUser and authPass return target's outbound digest credentials, or
+// empty strings when Peer.Auth is nil (an IP-auth trunk) — WaitAnswer only
+// attempts a 401/407 digest retry when Password is non-empty, so an empty
+// pair is exactly "don't authenticate," not a credential to send.
+func authUser(target Target) string {
+	if target.Peer.Auth == nil {
+		return ""
+	}
+	return target.Peer.Auth.Username
+}
+
+func authPass(target Target) string {
+	if target.Peer.Auth == nil {
+		return ""
+	}
+	return target.Peer.Auth.Password
+}
+
+// relayProvisional builds dialTarget's WaitAnswer OnResponse callback: it
 // fires for every response the B-leg sends, including the eventual final
 // one, but only acts on provisionals (18x) — the final response is handled
-// by dialAndBridge itself once WaitAnswer returns. For a provisional
+// by dialTarget itself once WaitAnswer returns. For a provisional
 // carrying an SDP body (early media) it arms the B-side and rewrites the
 // SDP to the A-side port, sharing processAnswerSDP with the 2xx path so
 // Start runs exactly once regardless of which path reaches it first; for a

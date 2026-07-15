@@ -12,6 +12,7 @@ import (
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/icholy/digest"
 	"github.com/pion/sdp/v3"
 
 	"github.com/freesbc/freesbc/media"
@@ -60,28 +61,56 @@ type stubCarrier struct {
 	earlySDP  []byte
 	proceed   <-chan struct{}
 
+	// finalStatus/finalReason (Task 8): when finalStatus is set and is not
+	// a 2xx, the handler declines every INVITE with this status instead of
+	// answering — simulates an unavailable carrier for the failover tests.
+	finalStatus int
+	finalReason string
+
+	// digestChallenge/digestUser/digestPass (Task 8): when set, the handler
+	// challenges any INVITE that doesn't carry a matching Authorization
+	// header with a 401 + WWW-Authenticate built from digestChallenge, and
+	// only proceeds to the normal answer path once the retried INVITE's
+	// digest response verifies — the outbound-auth test's stub carrier.
+	// The challenge is fixed (not rotated per attempt) so verifying a
+	// retry's Authorization header doesn't require correlating it back to
+	// a per-request nonce.
+	digestChallenge *digest.Challenge
+	digestUser      string
+	digestPass      string
+
 	offers  chan *sip.Request
 	byeDone chan struct{}
 }
 
-// stubCarrierConfig carries the Task 7 early-media options for
-// startStubCarrier; the zero value reproduces Task 6's immediate-200
-// behavior (no options passed at all). When earlySDP is set, the handler
-// sends a 183 Session Progress with that body before the final answer; if
-// proceed is also set, it then blocks on that channel so the test can
-// synchronize RTP/assertion checks before allowing the final 200 to go
-// out — proving the early media flowed strictly before the answer.
+// stubCarrierConfig carries the Task 7 early-media and Task 8
+// failover/auth options for startStubCarrier; the zero value reproduces
+// Task 6's immediate-200 behavior (no options passed at all). When
+// earlySDP is set, the handler sends a 183 Session Progress with that body
+// before the final answer; if proceed is also set, it then blocks on that
+// channel so the test can synchronize RTP/assertion checks before allowing
+// the final 200 to go out — proving the early media flowed strictly before
+// the answer. When finalStatus is a non-2xx code, every INVITE is declined
+// with it instead of answered. When digestUser is set, every INVITE
+// lacking a valid Authorization header is first challenged with a 401.
 type stubCarrierConfig struct {
 	earlySDP []byte
 	proceed  <-chan struct{}
+
+	finalStatus int
+	finalReason string
+
+	digestUser string
+	digestPass string
 }
 
 // startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
 // returns once it is accepting packets. It follows the same bind-our-own-
 // socket-and-close-from-a-watcher-goroutine pattern as Server.bindListener
 // (see sig/server.go) to avoid sipgo's known shutdown-race in
-// ListenAndServe. opts is optional (Task 7 early-media config); omit it for
-// Task 6's plain immediate-200 stub.
+// ListenAndServe. opts is optional (Task 7 early-media, Task 8
+// failover/digest-auth config); omit it for Task 6's plain immediate-200
+// stub.
 func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubCarrierConfig) *stubCarrier {
 	t.Helper()
 	host, portStr, err := net.SplitHostPort(addr)
@@ -120,6 +149,17 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 	if len(opts) > 0 {
 		c.earlySDP = opts[0].earlySDP
 		c.proceed = opts[0].proceed
+		c.finalStatus = opts[0].finalStatus
+		c.finalReason = opts[0].finalReason
+		c.digestUser = opts[0].digestUser
+		c.digestPass = opts[0].digestPass
+		if c.digestUser != "" {
+			c.digestChallenge = &digest.Challenge{
+				Realm:     "freesbc-test",
+				Nonce:     "test-nonce-fixed",
+				Algorithm: "MD5",
+			}
+		}
 	}
 
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -132,6 +172,22 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		case c.offers <- req:
 		default:
 		}
+
+		if c.digestChallenge != nil && !c.digestAuthorized(req) {
+			if err := dlg.Respond(401, "Unauthorized", nil,
+				sip.NewHeader("WWW-Authenticate", c.digestChallenge.String())); err != nil {
+				log.Error("carrier respond 401", "err", err)
+			}
+			return
+		}
+
+		if c.finalStatus != 0 && c.finalStatus/100 != 2 {
+			if err := dlg.Respond(c.finalStatus, c.finalReason, nil); err != nil {
+				log.Error("carrier respond final", "err", err)
+			}
+			return
+		}
+
 		if len(c.earlySDP) > 0 {
 			if err := dlg.Respond(183, "Session Progress", c.earlySDP,
 				sip.NewHeader("Content-Type", "application/sdp")); err != nil {
@@ -186,6 +242,31 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 	}
 	t.Fatal("stub carrier did not start")
 	return nil
+}
+
+// digestAuthorized reports whether req carries an Authorization header
+// whose digest response matches c.digestChallenge for c.digestUser/Pass —
+// mirrors sipgo's own (unexported) DialogServerSession.authDigest, which
+// isn't reachable from this package.
+func (c *stubCarrier) digestAuthorized(req *sip.Request) bool {
+	h := req.GetHeader("Authorization")
+	if h == nil {
+		return false
+	}
+	creds, err := digest.ParseCredentials(h.Value())
+	if err != nil {
+		return false
+	}
+	want, err := digest.Digest(c.digestChallenge, digest.Options{
+		Method:   sip.INVITE.String(),
+		URI:      req.Recipient.Addr(),
+		Username: c.digestUser,
+		Password: c.digestPass,
+	})
+	if err != nil {
+		return false
+	}
+	return creds.Response == want.Response
 }
 
 // testSDPBody builds a minimal offer/answer SDP whose audio media points
@@ -599,6 +680,406 @@ func TestBridgeEarlyMedia(t *testing.T) {
 		t.Fatalf("uac bye: %v", err)
 	}
 
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+
+	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatalf("media ports not released after teardown: %v", err)
+	}
+	s2.Close()
+}
+
+// --- Task 8: B-leg failover across targets + outbound digest auth ---
+
+// failoverCfg routes local-uac to two carriers, in failover order:
+// carrier-a (always declines with 503) then carrier-b (answers normally).
+// allowed_ips deliberately differ across all three peers and from
+// 127.0.0.1 — see bridgeCallCfg's comment on why (IdentifyPeer's
+// lexicographic tie-break on 127.0.0.1 would otherwise pick the wrong
+// peer). Ports are a disjoint slice of the 45180-45199/46xxx blocks from
+// Tasks 6/7's bridgeCallCfg (45180/45182/45185, 46180-46183) and
+// earlyMediaCfg (45190/45192/45195, 46190-46193).
+const failoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45181]
+  media:
+    port_range: 46200-46203
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45183
+    allowed_ips: [203.0.113.0/24]
+  carrier-b:
+    address: 127.0.0.1:45184
+    allowed_ips: [198.51.100.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeFailoverToSecondTarget proves the B2BUA walks decision.Targets
+// in order: carrier-a always declines with 503, so the bridge must retry
+// carrier-b, which answers — the UAC sees a 200 (not carrier-a's 503) and
+// media bridges to carrier-b's echo socket, never carrier-a's. Timing-based
+// over real UDP loopback: re-run once before treating a flake as failure.
+func TestBridgeFailoverToSecondTarget(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45186})
+	if err != nil {
+		t.Fatalf("carrier-b echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrierA := startStubCarrier(t, "127.0.0.1:45183", nil, stubCarrierConfig{
+		finalStatus: 503,
+		finalReason: "Service Unavailable",
+	})
+	carrierB := startStubCarrier(t, "127.0.0.1:45184", testSDPBody(echoRTPPort))
+	srv := startServer(t, 45181, failoverCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45181}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200 (carrier-b should have answered after carrier-a's 503)", sess.InviteResponse.StatusCode)
+	}
+
+	// Both carriers must have been tried, in order.
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+	var carrierBOffer *sip.Request
+	select {
+	case carrierBOffer = <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+
+	answerBody := sess.InviteResponse.Body()
+	sideAPort := sdpAudioPort(t, answerBody)
+	if sideAPort < 46200 || sideAPort > 46203 {
+		t.Errorf("answer m=audio port %d not in media pool range 46200-46203", sideAPort)
+	}
+	sideBPort := sdpAudioPort(t, carrierBOffer.Body())
+	if sideBPort < 46200 || sideBPort > 46203 || sideBPort == sideAPort {
+		t.Errorf("b-leg offer m=audio port %d invalid (side A port %d)", sideBPort, sideAPort)
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- RTP round trip against carrier-b's echo socket ---
+	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
+	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+	if _, err := echoRTP.WriteToUDP([]byte("arm-b"), sideBAddr); err != nil {
+		t.Fatalf("arm side b: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	sendUntilReceived(t, uacRTP, sideAAddr, echoRTP, "ping-a-to-b")
+	sendUntilReceived(t, echoRTP, sideBAddr, uacRTP, "pong-b-to-a")
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrierB.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b dialog never ended after BYE")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+
+	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatalf("media ports not released after teardown: %v", err)
+	}
+	s2.Close()
+}
+
+// allFailCfg routes local-uac to two carriers that both always decline —
+// proves the failover loop exhausts every target and gives up, rather than
+// looping forever or leaving the A-leg unanswered.
+const allFailCfg = `
+listen:
+  sip: [udp://127.0.0.1:45187]
+  media:
+    port_range: 46210-46213
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45188
+    allowed_ips: [203.0.113.4/30]
+  carrier-b:
+    address: 127.0.0.1:45189
+    allowed_ips: [203.0.113.8/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// uacRTPStubPort binds a throwaway UDP socket, closes it immediately, and
+// returns its port — TestBridgeAllTargetsFail and TestBridgeDigestAuth's
+// A-leg offer just need a syntactically valid port for the m= line, not a
+// live socket (no A-side media flows in the all-fail case; the digest-auth
+// case doesn't assert on A-side RTP).
+func uacRTPStubPort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp stub socket: %v", err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
+// TestBridgeAllTargetsFail proves that when every target in decision.
+// Targets fails, the B2BUA gives the caller the last upstream final code
+// (both carriers answer 503 here) rather than hanging or answering
+// success, and that it still releases the media session it allocated even
+// though the call never bridged.
+func TestBridgeAllTargetsFail(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45188", nil, stubCarrierConfig{
+		finalStatus: 503,
+		finalReason: "Service Unavailable",
+	})
+	carrierB := startStubCarrier(t, "127.0.0.1:45189", nil, stubCarrierConfig{
+		finalStatus: 503,
+		finalReason: "Service Unavailable",
+	})
+	srv := startServer(t, 45187, allFailCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45187}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 503 {
+		t.Errorf("got status %d, want 503 (last upstream final code)", sess.InviteResponse.StatusCode)
+	}
+
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+	select {
+	case <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+
+	// The call never bridged, so it was never added to the registry.
+	if got := srv.ActiveCalls(); got != 0 {
+		t.Errorf("active calls = %d, want 0 (call never bridged)", got)
+	}
+
+	// The media session allocated in onInvite before the loop must still be
+	// released on total failure; onInvite's own goroutine unwinds its
+	// defers asynchronously to this test, so retry briefly.
+	var (
+		s2       *media.Session
+		allocErr error
+	)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s2, allocErr = srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+		if allocErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if allocErr != nil {
+		t.Fatalf("media ports not released after teardown: %v", allocErr)
+	}
+	s2.Close()
+}
+
+// digestAuthCfg routes local-uac to a single carrier that requires digest
+// auth (peer Auth is set); the stub challenges the first attempt and only
+// answers once WaitAnswer's built-in retry supplies a valid Authorization.
+const digestAuthCfg = `
+listen:
+  sip: [udp://127.0.0.1:45191]
+  media:
+    port_range: 46220-46223
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45193
+    allowed_ips: [203.0.113.12/30]
+    media_latch: loose
+    auth:
+      username: carrieruser
+      password: carrierpass
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeDigestAuth proves the B2BUA passes the target peer's Auth
+// creds into WaitAnswer's AnswerOptions: the stub carrier challenges the
+// first (unauthenticated) attempt with a 401 + WWW-Authenticate, and only
+// answers once the authenticated retry's Authorization header verifies —
+// entirely inside WaitAnswer's own internal retry (the bridge calls
+// WaitAnswer exactly once per target). The UAC must see a single clean
+// 200, never the intermediate 401.
+func TestBridgeDigestAuth(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45194})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45193", testSDPBody(echoRTPPort), stubCarrierConfig{
+		digestUser: "carrieruser",
+		digestPass: "carrierpass",
+	})
+	srv := startServer(t, 45191, digestAuthCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	var sawProvisional bool
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{
+		OnResponse: func(res *sip.Response) error {
+			if res.IsProvisional() {
+				sawProvisional = true
+			}
+			return nil
+		},
+	}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sawProvisional {
+		t.Error("UAC observed a provisional/interim response; the 401 challenge-retry must stay entirely inside the B2BUA's WaitAnswer call")
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200 (digest retry should have completed the call)", sess.InviteResponse.StatusCode)
+	}
+
+	// The carrier must have seen exactly two INVITEs: the unauthenticated
+	// first attempt, then the authenticated retry.
+	var firstOffer, secondOffer *sip.Request
+	select {
+	case firstOffer = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the initial B-leg INVITE")
+	}
+	select {
+	case secondOffer = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the authenticated retry INVITE")
+	}
+	if firstOffer.GetHeader("Authorization") != nil {
+		t.Error("first B-leg INVITE already carried Authorization; nothing to challenge")
+	}
+	if secondOffer.GetHeader("Authorization") == nil {
+		t.Error("retried B-leg INVITE carried no Authorization header")
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
 	select {
 	case <-carrier.byeDone:
 	case <-time.After(3 * time.Second):
