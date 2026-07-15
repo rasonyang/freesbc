@@ -175,3 +175,17 @@ func TestValidateTransformGroupInRange(t *testing.T) {
 		t.Fatalf("$$ escape must pass: %v", err)
 	}
 }
+
+func TestValidateTransformEdgeCasesNotFalseRejected(t *testing.T) {
+	// These templates never reference a real out-of-range group at runtime
+	// (they mirror regexp.Expand: unterminated ${ is literal; leading-zero
+	// names are named refs, not group indices), so validation must ACCEPT them.
+	for _, tmpl := range []string{"${5", "$012", "$01", "$00"} {
+		c := validConfig()
+		c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`} // 1 group
+		c.Routes[0].Transform = &RouteTransform{To: tmpl}
+		if err := c.validate(); err != nil {
+			t.Errorf("template %q must not be rejected as out-of-range: %v", tmpl, err)
+		}
+	}
+}

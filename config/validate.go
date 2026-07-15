@@ -173,10 +173,20 @@ func maxGroupRef(template string) int {
 			i++
 		}
 		name := template[start:i]
+		closedBrace := false
 		if braced && i < len(template) && template[i] == '}' {
+			closedBrace = true
 			i++
 		}
+		// Unterminated brace: treat as literal text, not a reference
+		if braced && !closedBrace {
+			continue
+		}
 		if name == "" || !allDigits(name) {
+			continue
+		}
+		// Leading zeros: $01, $012, $00 etc. are named refs in Go regexp, not group indices
+		if len(name) > 1 && name[0] == '0' {
 			continue
 		}
 		n, err := strconv.Atoi(name)
