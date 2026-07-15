@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -28,11 +29,11 @@ type bridge struct {
 // route it, place the B-leg, anchor media, answer the A-leg, and hold the
 // call open until either leg ends the dialog or media goes silent.
 //
-// This is the single-target happy path (Task 6): decision.Targets[0] only,
-// via dialAndBridge. Failover across the remaining targets, early media,
-// and auth challenges are later tasks in this milestone and slot in
-// around that seam (retry dialAndBridge over decision.Targets until one
-// succeeds, then reject).
+// This is the single-target happy path (Task 6), now with early media
+// (Task 7): decision.Targets[0] only, via dialAndBridge. Failover across
+// the remaining targets and auth challenges are later tasks in this
+// milestone and slot in around that seam (retry dialAndBridge over
+// decision.Targets until one succeeds, then reject).
 func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	defer b.recoverCall(req)
 
@@ -86,7 +87,6 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer bLeg.Close()
 
-	sess.Start()
 	call := callstate.Call{
 		ID:            callID(req),
 		FromPeer:      name,
@@ -143,9 +143,14 @@ func byeContext() (context.Context, context.CancelFunc) {
 //
 // sess is shared across attempts (its ports don't change), so this is the
 // seam later tasks extend: Task 8's failover loop calls this once per
-// candidate in decision.Targets until one returns ok, Task 7 adds early
-// media before the final answer, Task 9 retries once on a 401/407 with
-// target.Peer.Auth.
+// candidate in decision.Targets until one returns ok, Task 9 retries once
+// on a 401/407 with target.Peer.Auth.
+//
+// Early media (Task 7): startOnce is created here and threaded through both
+// the WaitAnswer OnResponse callback (relayProvisional, fired for every 18x
+// the B-leg sends) and the 2xx path below via processAnswerSDP, so the
+// media session Starts exactly once — whichever path (an 18x with SDP, or
+// the eventual 2xx) reaches it first.
 func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (*sipgo.DialogClientSession, bool) {
 	bOffer, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB))
 	if err != nil {
@@ -167,7 +172,10 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 		return nil, false
 	}
 
-	if err := bLeg.WaitAnswer(aLeg.Context(), sipgo.AnswerOptions{}); err != nil {
+	var startOnce sync.Once
+	if err := bLeg.WaitAnswer(aLeg.Context(), sipgo.AnswerOptions{
+		OnResponse: b.relayProvisional(aLeg, sess, ourIP, &startOnce),
+	}); err != nil {
 		b.s.log.Info("b-leg not answered", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
@@ -175,8 +183,7 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 	}
 
 	answer := bLeg.InviteResponse.Body()
-	remoteB, err := remoteMediaIP(answer)
-	if err != nil {
+	if err := processAnswerSDP(sess, answer, media.SideB, &startOnce); err != nil {
 		// bLeg is answered (2xx) but not yet ACKed: Bye refuses to send on
 		// an unconfirmed client dialog, so Ack first, then Bye to tear the
 		// carrier call down rather than abandoning a live/billable call.
@@ -184,7 +191,6 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		return nil, false
 	}
-	sess.SetExpectedRemote(media.SideB, remoteB)
 
 	aAnswer, err := rewriteSDP(answer, ourIP, sess.RTPPort(media.SideA))
 	if err != nil {
@@ -219,6 +225,62 @@ func (b *bridge) dialAndBridge(aLeg *sipgo.DialogServerSession, target Target, o
 	}
 
 	return bLeg, true
+}
+
+// relayProvisional builds dialAndBridge's WaitAnswer OnResponse callback: it
+// fires for every response the B-leg sends, including the eventual final
+// one, but only acts on provisionals (18x) — the final response is handled
+// by dialAndBridge itself once WaitAnswer returns. For a provisional
+// carrying an SDP body (early media) it arms the B-side and rewrites the
+// SDP to the A-side port, sharing processAnswerSDP with the 2xx path so
+// Start runs exactly once regardless of which path reaches it first; for a
+// provisional with no body it relays status only. Errors processing the
+// SDP fall back to a status-only relay rather than failing the call — early
+// media is a courtesy, not something worth tearing down the dialog over.
+// The returned callback always returns nil: WaitAnswer aborts on a non-nil
+// error, which must never happen here.
+func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) func(res *sip.Response) error {
+	return func(res *sip.Response) error {
+		if !res.IsProvisional() {
+			return nil
+		}
+
+		var (
+			body    []byte
+			headers []sip.Header
+		)
+		if raw := res.Body(); len(raw) > 0 {
+			if err := processAnswerSDP(sess, raw, media.SideB, startOnce); err != nil {
+				b.s.log.Error("early media sdp", "err", err, "code", res.StatusCode)
+			} else if rewritten, err := rewriteSDP(raw, ourIP, sess.RTPPort(media.SideA)); err != nil {
+				b.s.log.Error("early media rewrite", "err", err, "code", res.StatusCode)
+			} else {
+				body = rewritten
+				headers = []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
+			}
+		}
+		if err := aLeg.Respond(res.StatusCode, res.Reason, body, headers...); err != nil {
+			b.s.log.Error("relay provisional", "err", err, "code", res.StatusCode)
+		}
+		return nil
+	}
+}
+
+// processAnswerSDP arms sess's side latch to the media address carried in
+// answer and, the first time it's called across either the early-media
+// (18x) or final (2xx) path — whichever reaches it first — Starts the
+// relay loops, guarded by startOnce so Start runs exactly once per session
+// even though both paths call this. Returns the remoteMediaIP parse error
+// unchanged so callers can decide how to fail (early media falls back to a
+// status-only relay; the final path rejects the call).
+func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, startOnce *sync.Once) error {
+	remote, err := remoteMediaIP(answer)
+	if err != nil {
+		return err
+	}
+	sess.Relatch(side, remote)
+	startOnce.Do(sess.Start)
+	return nil
 }
 
 // ackThenBye tears down a B-leg that has been answered (2xx received) but

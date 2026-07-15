@@ -57,17 +57,32 @@ type stubCarrier struct {
 	dialogSrv *sipgo.DialogServerCache
 	log       *slog.Logger
 	answerSDP []byte
+	earlySDP  []byte
+	proceed   <-chan struct{}
 
 	offers  chan *sip.Request
 	byeDone chan struct{}
+}
+
+// stubCarrierConfig carries the Task 7 early-media options for
+// startStubCarrier; the zero value reproduces Task 6's immediate-200
+// behavior (no options passed at all). When earlySDP is set, the handler
+// sends a 183 Session Progress with that body before the final answer; if
+// proceed is also set, it then blocks on that channel so the test can
+// synchronize RTP/assertion checks before allowing the final 200 to go
+// out — proving the early media flowed strictly before the answer.
+type stubCarrierConfig struct {
+	earlySDP []byte
+	proceed  <-chan struct{}
 }
 
 // startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
 // returns once it is accepting packets. It follows the same bind-our-own-
 // socket-and-close-from-a-watcher-goroutine pattern as Server.bindListener
 // (see sig/server.go) to avoid sipgo's known shutdown-race in
-// ListenAndServe.
-func startStubCarrier(t *testing.T, addr string, answerSDP []byte) *stubCarrier {
+// ListenAndServe. opts is optional (Task 7 early-media config); omit it for
+// Task 6's plain immediate-200 stub.
+func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubCarrierConfig) *stubCarrier {
 	t.Helper()
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -102,6 +117,10 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte) *stubCarrier 
 		offers:    make(chan *sip.Request, 4),
 		byeDone:   make(chan struct{}),
 	}
+	if len(opts) > 0 {
+		c.earlySDP = opts[0].earlySDP
+		c.proceed = opts[0].proceed
+	}
 
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
 		dlg, err := c.dialogSrv.ReadInvite(req, tx)
@@ -112,6 +131,16 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte) *stubCarrier 
 		select {
 		case c.offers <- req:
 		default:
+		}
+		if len(c.earlySDP) > 0 {
+			if err := dlg.Respond(183, "Session Progress", c.earlySDP,
+				sip.NewHeader("Content-Type", "application/sdp")); err != nil {
+				log.Error("carrier respond early media", "err", err)
+				return
+			}
+			if c.proceed != nil {
+				<-c.proceed
+			}
 		}
 		if err := dlg.RespondSDP(c.answerSDP); err != nil {
 			log.Error("carrier respond sdp", "err", err)
@@ -392,6 +421,192 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 	// The pool holds exactly one session's worth of ports
 	// (46180-46183): a fresh Allocate only succeeds if the bridge
 	// actually released them on teardown.
+	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatalf("media ports not released after teardown: %v", err)
+	}
+	s2.Close()
+}
+
+// --- Task 7: early media (18x with SDP) ---
+
+// earlyMediaCfg mirrors bridgeCallCfg on a disjoint port set (Task 7 gets
+// its own SIP/media ports rather than sharing bridgeCallCfg's, since Go
+// tests in this package run sequentially but each starts/stops its own
+// listeners and media pool).
+const earlyMediaCfg = `
+listen:
+  sip: [udp://127.0.0.1:45190]
+  media:
+    port_range: 46190-46193
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45192
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeEarlyMedia proves 18x-with-SDP early media flows before the
+// final answer: the stub carrier sends 183 Session Progress + SDP (pointing
+// at its echo socket), the test verifies the 183's SDP was rewritten to the
+// bridge's own A-side port and that RTP actually flows end to end on that
+// port, and only then lets the carrier send 200 OK — so the RTP check
+// necessarily happens strictly before the final answer, not just before the
+// test's own assertions on it. Timing-based over real UDP loopback for the
+// RTP hop itself: re-run once before treating a flake as failure.
+func TestBridgeEarlyMedia(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45195})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	// The carrier keeps the same media address across 183 and 200 (typical
+	// early-media behavior), and is held after the 183 until the test
+	// signals proceed — so its 200 provably cannot reach the UAC before
+	// the RTP checks below run.
+	echoSDP := testSDPBody(echoRTPPort)
+	proceed := make(chan struct{})
+	carrier := startStubCarrier(t, "127.0.0.1:45192", echoSDP, stubCarrierConfig{
+		earlySDP: echoSDP,
+		proceed:  proceed,
+	})
+	srv := startServer(t, 45190, earlyMediaCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45190}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	var (
+		early        *sip.Response
+		earlySideA   int
+		gotEarlyRTP  bool
+		carrierOffer *sip.Request
+	)
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{
+		OnResponse: func(res *sip.Response) error {
+			if !res.IsProvisional() {
+				return nil // final response: handled after WaitAnswer returns.
+			}
+			if res.StatusCode != 183 {
+				return nil
+			}
+			early = res
+
+			// The B-leg offer (captured by the carrier when the bridge
+			// placed the outbound INVITE) is already available by the time
+			// any response — even a 183 — comes back.
+			select {
+			case carrierOffer = <-carrier.offers:
+			case <-time.After(3 * time.Second):
+				t.Fatal("carrier never received the B-leg INVITE")
+			}
+
+			earlyBody := res.Body()
+			if len(earlyBody) == 0 {
+				t.Fatal("183 carried no SDP body")
+			}
+			if string(earlyBody) == string(echoSDP) {
+				t.Fatal("183 sdp is byte-identical to carrier's original; bridge did not rewrite it")
+			}
+			earlySideA = sdpAudioPort(t, earlyBody)
+			if earlySideA < 46190 || earlySideA > 46193 {
+				t.Fatalf("183 m=audio port %d not in media pool range 46190-46193", earlySideA)
+			}
+			sideBPort := sdpAudioPort(t, carrierOffer.Body())
+			if sideBPort < 46190 || sideBPort > 46193 || sideBPort == earlySideA {
+				t.Fatalf("b-leg offer m=audio port %d invalid (early side A port %d)", sideBPort, earlySideA)
+			}
+
+			// --- RTP round trip, strictly before the carrier is allowed
+			// to send 200 (gated below by proceed). ---
+			sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: earlySideA}
+			sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+			if _, err := echoRTP.WriteToUDP([]byte("arm-b"), sideBAddr); err != nil {
+				t.Fatalf("arm side b: %v", err)
+			}
+			time.Sleep(150 * time.Millisecond)
+			sendUntilReceived(t, uacRTP, sideAAddr, echoRTP, "early-ping-a-to-b")
+			sendUntilReceived(t, echoRTP, sideBAddr, uacRTP, "early-pong-b-to-a")
+			gotEarlyRTP = true
+
+			close(proceed) // let the carrier send its 200 now.
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if early == nil {
+		t.Fatal("never received a 183 provisional")
+	}
+	if !gotEarlyRTP {
+		t.Fatal("early media RTP round trip never completed")
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+
+	// The final answer must reuse the same session (and so the same A-side
+	// port) that early media already armed and started — Start runs at
+	// most once whichever path (18x or 2xx) reaches it first.
+	finalBody := sess.InviteResponse.Body()
+	finalSideA := sdpAudioPort(t, finalBody)
+	if finalSideA != earlySideA {
+		t.Errorf("final answer m=audio port %d != early media port %d; session was re-armed on a different pair", finalSideA, earlySideA)
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+
 	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("media ports not released after teardown: %v", err)
