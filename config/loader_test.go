@@ -193,3 +193,40 @@ shield:
 		t.Errorf("window: %v", c.Shield.AutoBan.Window.Std())
 	}
 }
+
+func TestParseNumericBraceRefIsLiteral(t *testing.T) {
+	// ${1} is a regexp capture-group reference, not an env var (a digit-led
+	// name is never a valid env variable), so it must survive parsing
+	// verbatim — routing transforms depend on this.
+	src := strings.Replace(minimalYAML, "from: pbx",
+		"from: pbx\n    match: { to: \"^9(\\\\d+)$\" }\n    transform: { to: \"00${1}\" }", 1)
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("${1} in a transform must parse, got: %v", err)
+	}
+	if got := c.Routes[0].Transform.To; got != "00${1}" {
+		t.Errorf("transform.to = %q, want literal \"00${1}\"", got)
+	}
+}
+
+func TestParseMalformedRefStillRejected(t *testing.T) {
+	// A bash-style default is still malformed and must still be rejected —
+	// the numeric-group carve-out must not weaken this.
+	src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+		"address: 10.0.0.10:5060\n    auth: { username: u, password: \"${PASS:-x}\" }", 1)
+	if _, err := Parse([]byte(src)); err == nil || !strings.Contains(err.Error(), "malformed") {
+		t.Errorf("expected malformed-ref error, got: %v", err)
+	}
+}
+
+func TestParseDigitLedNonNumericRefStillMalformed(t *testing.T) {
+	// The ${N} carve-out is ONLY for pure-digit spans. Digit-led spans that
+	// aren't pure digits are still malformed and must stay rejected.
+	for _, bad := range []string{"${1abc}", "${1:-x}"} {
+		src := strings.Replace(minimalYAML, "address: 10.0.0.10:5060",
+			"address: 10.0.0.10:5060\n    auth: { username: u, password: \""+bad+"\" }", 1)
+		if _, err := Parse([]byte(src)); err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Errorf("%q must be rejected as malformed, got: %v", bad, err)
+		}
+	}
+}

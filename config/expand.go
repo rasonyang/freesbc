@@ -14,6 +14,12 @@ import (
 // literal.
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
+// numericGroupRef matches ${123} — a regexp replacement group reference,
+// not an env variable (a digit-led name can never be a valid env var). Such
+// spans are left verbatim so route transforms can use ${N} next to literal
+// digits (e.g. "${1}000"); they are neither expanded nor flagged malformed.
+var numericGroupRef = regexp.MustCompile(`\$\{[0-9]+\}`)
+
 // expandEnv walks a freshly unmarshalled Config and expands ${VAR}
 // references in every exported string field — including slices, maps, and
 // nested structs/pointers — so fields added in later milestones are covered
@@ -143,6 +149,7 @@ func fieldLabel(sf reflect.StructField) string {
 // "malformed".
 func malformedRef(s string) (string, bool) {
 	stripped := envRef.ReplaceAllString(s, "")
+	stripped = numericGroupRef.ReplaceAllString(stripped, "")
 	if !strings.Contains(stripped, "${") {
 		return "", false
 	}

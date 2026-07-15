@@ -525,3 +525,13 @@ gofmt -l . && git add sig/routing.go sig/routing_test.go README.md && git commit
 | M1 backlog — `${N}` regexp group refs vs env-syntax collision | 1 |
 
 Deferred (documented in header): failover *execution* + peer health/cooldown skipping (M3.3 B2BUA loop); DNS SRV peer-address resolution (M4); per-peer SDP codec filtering (M3.3). No runtime wiring in this slice — `Resolve` is a library consumed first by the M3.3 bridge.
+
+## Post-Implementation Amendments (2026-07-15, final review)
+
+Pre-merge fix wave (doc + tests only, no engine code change): documented that `match.to` should be anchored with `^…$` when a `transform` is present (an unanchored pattern is a replace-ALL that keeps surrounding text) with a characterization test pinning that semantics; added a boundary test for the `${N}` carve-out (`${1abc}`, `${1:-x}` still rejected as malformed).
+
+## Carry-over for M3.3 (from final review)
+
+- **M3.3 Task 1 (Important — fail-fast validation):** `config/validate.go` accepts transform templates that reference nonexistent capture groups (`transform.to: "$2"` against `^9(\d+)$`, or `$1000` parsed as group 1000), which Go's `Expand` silently expands to an empty/mangled dialed number — the worst failure mode for a telecom box. Add a check in the `routes` loop (next to "transform.to requires match.to"): scan `Transform.To` for numeric group refs (`$N` / `${N}`, honoring `$$` escaping; `$0` = whole match is valid) and fail if any exceeds `matchTo.NumSubexp()`. ~40 lines with a careful template scanner. Land before the bridge exercises real configs.
+- **M3.3 bridge seam notes:** (a) `Resolve` can legally return an empty `OutNumber` (e.g. `^9(\d*)$` on input `"9"`); the B2BUA must decide explicitly whether an empty Request-URI user part is a reject or a passthrough, not discover it at call time. (b) Key peer health/cooldown state by `Target.Name` (stable across hot reloads), NOT the `*config.Peer` pointer (changes every config snapshot).
+- Minor deferred: `Targets[1].Peer` identity assertion (opportunistic); `numericGroupRef` carve-out is config-global not transform-scoped (harmless, one-sentence comment could note the trade-off).

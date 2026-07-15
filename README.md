@@ -74,8 +74,8 @@ routes:
 | M2 | Media plane: RTP port pool, relay engine, latching hardening | ✅ done |
 | M3 | Signaling core: SIP server, B2BUA, SDP rewrite, routing — first end-to-end call | in progress |
 | ├ M3.1 | SIP front door: listeners, OPTIONS, source-IP identification | ✅ done |
-| ├ M3.2 | Routing engine: match / transform / failover | next |
-| └ M3.3 | B2BUA bridge: leg pairing, SDP rewrite, media wiring, Relatch | |
+| ├ M3.2 | Routing engine: match / transform / failover | ✅ done |
+| └ M3.3 | B2BUA bridge: leg pairing, SDP rewrite, media wiring, Relatch | next |
 | M4 | Trunk interop: digest auth, outbound REGISTER, session timers, PRACK, DNS SRV | |
 | M5 | SRTP (SDES) | |
 | M6 | Shield: rate limiting, scanner detection, auto-ban | |
