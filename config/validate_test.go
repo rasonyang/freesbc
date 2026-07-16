@@ -96,6 +96,7 @@ func TestValidateErrors(t *testing.T) {
 		{"bad admin listen", func(c *Config) { c.Admin = &AdminConfig{Listen: "nope"} }, "admin.listen"},
 		{"bad media_latch", func(c *Config) { c.Peers["pbx"].MediaLatch = "sticky" }, "media_latch"},
 		{"negative rtp_timeout", func(c *Config) { c.Listen.Media.RTPTimeout = Duration(-time.Second) }, "rtp_timeout"},
+		{"negative ring_timeout", func(c *Config) { c.RingTimeout = Duration(-time.Second) }, "ring_timeout"},
 		{"transform group out of range", func(c *Config) {
 			c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
 			c.Routes[0].Transform = &RouteTransform{To: "$2"}
