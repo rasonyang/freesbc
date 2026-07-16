@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+
+	"github.com/freesbc/freesbc/config"
 )
 
 // regParams is the immutable identity of one peer's registration: what
@@ -177,4 +181,177 @@ func (rg *registration) unregister() {
 	if _, err := registerOnce(ctx, rg.client, rg.params, 0); err != nil {
 		rg.log.Debug("un-register failed", "peer", rg.params.Name, "err", err)
 	}
+}
+
+// Registrar manages outbound REGISTER for all register:true peers: one
+// registration goroutine per peer, reconciled against config on hot reload.
+type Registrar struct {
+	store  *config.Store
+	client *sipgo.Client
+	srv    *Server
+	log    *slog.Logger
+
+	mu      sync.RWMutex
+	state   map[string]bool        // peer name → registered
+	running map[string]*runningReg // peer name → active goroutine handle
+}
+
+// runningReg is the manager's handle on one peer's live registration
+// goroutine: the params it was started with (for change-detection in
+// reconcile), the cancel that tells registration.run to un-REGISTER and
+// return, and a channel closed once it has.
+type runningReg struct {
+	params regParams
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// NewRegistrar builds a Registrar over store's config, using client to send
+// REGISTERs and srv to resolve our own Contact address (ourIP/ourSigPort).
+// Callers must call Run to start reconciling.
+func NewRegistrar(store *config.Store, client *sipgo.Client, srv *Server, log *slog.Logger) *Registrar {
+	return &Registrar{
+		store: store, client: client, srv: srv, log: log,
+		state: map[string]bool{}, running: map[string]*runningReg{},
+	}
+}
+
+// IsRegistered reports whether the bridge may route to this peer now. A peer
+// without register:true is always available; a register:true peer is
+// available only while its registration is live. An unknown peer name (not
+// in the current config) also reports available — routing itself is
+// responsible for rejecting calls to unknown peers; IsRegistered only gates
+// on registration state.
+func (r *Registrar) IsRegistered(name string) bool {
+	cfg := r.store.Current()
+	p := cfg.Peers[name]
+	if p == nil || !p.Register {
+		return true
+	}
+	r.mu.RLock()
+	ok := r.state[name]
+	r.mu.RUnlock()
+	return ok
+}
+
+// setRegistered records name's current registration state, for
+// registration.run to report through and IsRegistered to read.
+func (r *Registrar) setRegistered(name string, ok bool) {
+	r.mu.Lock()
+	r.state[name] = ok
+	r.mu.Unlock()
+}
+
+// Run reconciles registrations against config until ctx is cancelled, then
+// stops every peer goroutine (each un-REGISTERs) and returns once they exit.
+// It always returns nil: there is no fatal-error case here, only ctx
+// cancellation (individual peer register failures are handled inside
+// registration.run's own retry/backoff loop and never propagate here).
+func (r *Registrar) Run(ctx context.Context) error {
+	sub := r.store.Subscribe()
+	r.reconcile(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			r.stopAll()
+			return nil
+		case <-sub:
+			r.reconcile(ctx)
+		}
+	}
+}
+
+// reconcile diffs the desired register:true (with auth) peer set against the
+// running set: peers removed from config, or whose regParams changed, are
+// stopped (their goroutine un-REGISTERs on cancel); peers newly added, or
+// re-added after a change-triggered stop, are started.
+func (r *Registrar) reconcile(ctx context.Context) {
+	cfg := r.store.Current()
+	desired := map[string]regParams{}
+	for name, p := range cfg.Peers {
+		if p.Register && p.Auth != nil {
+			desired[name] = r.paramsFor(cfg, name, p)
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Stop removed or changed.
+	for name, rr := range r.running {
+		if d, ok := desired[name]; !ok || d != rr.params {
+			rr.cancel()
+			delete(r.running, name)
+		}
+	}
+	// Start added or changed (re-added after the stop above).
+	for name, d := range desired {
+		if _, ok := r.running[name]; ok {
+			continue
+		}
+		cctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		rg := &registration{client: r.client, params: d, setRegistered: r.setRegistered, log: r.log}
+		requested := r.requestedExpires(cfg, name)
+		go func() { rg.run(cctx, requested); close(done) }()
+		r.running[name] = &runningReg{params: d, cancel: cancel, done: done}
+	}
+}
+
+// stopAll cancels every running peer goroutine and waits for each to finish
+// un-REGISTERing (bounded by registration.unregister's own 2s timeout), so
+// Run does not return until every outstanding REGISTER has been retracted.
+func (r *Registrar) stopAll() {
+	r.mu.Lock()
+	handles := make([]*runningReg, 0, len(r.running))
+	for name, rr := range r.running {
+		rr.cancel()
+		handles = append(handles, rr)
+		delete(r.running, name)
+	}
+	r.mu.Unlock()
+	for _, rr := range handles {
+		<-rr.done
+	}
+}
+
+// paramsFor builds the immutable regParams for a register:true peer: the
+// registrar host/port parsed from its configured address, and our own
+// Contact IP/port resolved fresh from cfg (so a hot-reloaded public_ip or
+// listener takes effect on the next reconcile without a restart).
+func (r *Registrar) paramsFor(cfg *config.Config, name string, p *config.Peer) regParams {
+	host, port := splitHostPortDefault(p.Address, 5060)
+	ourIP := r.srv.ourIP(cfg)
+	return regParams{
+		Name: name, RegistrarHost: host, RegistrarPort: port,
+		Transport: p.Transport, Username: p.Auth.Username, Password: p.Auth.Password,
+		ContactIP: ourIP, ContactPort: r.srv.ourSigPort(cfg, p.Transport),
+	}
+}
+
+// requestedExpires returns the peer's register_expires override, or the
+// config-global default when the peer doesn't set one.
+func (r *Registrar) requestedExpires(cfg *config.Config, name string) time.Duration {
+	if p := cfg.Peers[name]; p != nil && p.RegisterExpires != 0 {
+		return p.RegisterExpires.Std()
+	}
+	return cfg.RegisterExpires.Std()
+}
+
+// splitHostPortDefault parses "host:port" into its parts, defaulting the
+// port to defPort when addr carries none (net.SplitHostPort errors on a
+// bare host). Mirrors peerURI's inline address parsing in b2bua.go — kept
+// separate since peerURI returns a sip.Uri (with transport params for the
+// B2BUA's outbound leg) rather than the (host, port) pair reconcile needs to
+// build a regParams.
+func splitHostPortDefault(addr string, defPort int) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, defPort
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return host, defPort
+	}
+	return host, port
 }

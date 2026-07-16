@@ -14,6 +14,8 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
+
+	"github.com/freesbc/freesbc/config"
 )
 
 // --- Task 3: registerOnce + stub-registrar UAS test harness ---
@@ -337,5 +339,129 @@ func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 	case <-done: // returns when ctx expires — must not spin-exit early
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not return after ctx cancel")
+	}
+}
+
+// --- Task 5: Registrar manager (reconcile, IsRegistered, startup, shutdown) ---
+//
+// Ports for this section's tests: 45330-45349.
+
+// registrarConfigYAML renders a config with a "carrier" peer at
+// 127.0.0.1:port (credentials user/pass, register: registerCarrier) and a
+// non-register "internal-pbx" peer, plus a literal public_ip and a listen.sip
+// entry so ourIP/ourSigPort resolve predictably and the config validates
+// (at least one listener, at least one peer). The listen.sip port here is
+// never actually bound — serverForRegistrar never calls Server.Run, and
+// Registrar itself never binds a socket — so it doesn't need to be distinct
+// from any port a stub registrar is using.
+func registrarConfigYAML(port int, user, pass string, registerCarrier bool) string {
+	return fmt.Sprintf(`
+listen:
+  sip: [udp://127.0.0.1:45999]
+  media: { port_range: 45900-45901, public_ip: 127.0.0.1 }
+peers:
+  carrier:
+    address: 127.0.0.1:%d
+    transport: udp
+    auth: { username: %s, password: %s }
+    register: %v
+  internal-pbx:
+    address: 10.0.0.10:5060
+`, port, user, pass, registerCarrier)
+}
+
+// registrarTestStore builds a *config.Store with a register:true "carrier"
+// peer pointing at 127.0.0.1:port (the stub registrar started by
+// startStubRegistrar) plus a non-register "internal-pbx" peer, for
+// Registrar.reconcile to pick up.
+func registrarTestStore(t *testing.T, port int, user, pass string) *config.Store {
+	t.Helper()
+	cfg, err := config.Parse([]byte(registrarConfigYAML(port, user, pass, true)))
+	if err != nil {
+		t.Fatalf("parse registrar test config: %v", err)
+	}
+	return config.NewStore(cfg)
+}
+
+// withCarrierRegisterFalse returns a validated config shaped like
+// registrarTestStore's, except carrier has register: false — for
+// store.Replace in the hot-reload test. The registrar port/credentials here
+// don't need to match the original store: a peer dropped from reconcile's
+// desired set is never read for its address again — the un-REGISTER the
+// test observes comes from cancelling the goroutine already running against
+// the original (register:true) params.
+func withCarrierRegisterFalse(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.Parse([]byte(registrarConfigYAML(45332, "u", "p", false)))
+	if err != nil {
+		t.Fatalf("parse withCarrierRegisterFalse config: %v", err)
+	}
+	return cfg
+}
+
+// serverForRegistrar builds the minimal *Server the Registrar needs: just
+// enough for ourIP/ourSigPort to resolve from store's config. It never
+// calls Run, so no media pool or bound socket is needed — Registrar only
+// reads the Server's config-derived Contact address, it never routes or
+// bridges through it (mirrors TestServerOurIPResolution's newSrv helper in
+// server_test.go, which also passes a nil pool).
+func serverForRegistrar(t *testing.T, store *config.Store) *Server {
+	t.Helper()
+	return NewServer(store, nil, discardLogger())
+}
+
+// TestRegistrarReconcilesAndReportsRegistered proves the manager's startup
+// path: reconcile (called once at the top of Run) starts a registration
+// goroutine for the register:true "carrier" peer, which reports registered
+// once it completes its REGISTER against the stub registrar; a non-register
+// peer ("internal-pbx") reports available immediately regardless. On ctx
+// cancel, Run stops the goroutine, which un-REGISTERs before Run returns.
+func TestRegistrarReconcilesAndReportsRegistered(t *testing.T) {
+	reg := startStubRegistrar(t, 45330, "u", "p", 120)
+	// Config with one register:true peer pointing at the stub registrar.
+	store := registrarTestStore(t, 45330, "u", "p") // helper builds the config
+	client := reg.client(t)
+	srv := serverForRegistrar(t, store) // minimal Server exposing ourIP/ourSigPort
+	r := NewRegistrar(store, client, srv, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = r.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+	// A non-register peer is always available.
+	if !r.IsRegistered("internal-pbx") {
+		t.Error("a non-register:true peer must report available")
+	}
+	cancel()
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+}
+
+// TestRegistrarHotReloadStopsRemovedPeer proves reconcile reacts to a
+// Subscribe fire: flipping carrier to register:false drops it from the
+// desired set, so reconcile cancels its goroutine, which un-REGISTERs
+// before exiting — proving the goroutine actually stopped rather than
+// being left running against a config that no longer wants it registered.
+//
+// This does NOT assert IsRegistered("carrier") turns false: by spec (and
+// the reference implementation) a peer without register:true is always
+// available, so once the peer is register:false, IsRegistered reports it
+// available immediately — including in the split second right after
+// store.Replace, before reconcile has even run. That's the correct
+// behavior (a non-register:true peer is never gated), so the assertion
+// below checks it explicitly instead of waiting on a state transition that
+// IsRegistered's contract says can't happen.
+func TestRegistrarHotReloadStopsRemovedPeer(t *testing.T) {
+	reg := startStubRegistrar(t, 45332, "u", "p", 120)
+	store := registrarTestStore(t, 45332, "u", "p")
+	client := reg.client(t)
+	srv := serverForRegistrar(t, store)
+	r := NewRegistrar(store, client, srv, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+	// Hot-reload: flip carrier to register:false → un-REGISTER + stop.
+	store.Replace(withCarrierRegisterFalse(t)) // helper returns a modified config
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+	if !r.IsRegistered("carrier") {
+		t.Error("carrier is no longer register:true; IsRegistered must report it available")
 	}
 }
