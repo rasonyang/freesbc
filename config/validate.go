@@ -38,6 +38,9 @@ func (c *Config) validate() error {
 	if c.RingTimeout.Std() <= 0 {
 		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())
 	}
+	if c.RegisterExpires.Std() <= 0 {
+		fail("register_expires: must be > 0, got %v", c.RegisterExpires.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
@@ -61,6 +64,9 @@ func (c *Config) validate() error {
 		case "strict", "loose":
 		default:
 			fail("peers.%s: media_latch must be strict or loose, got %q", name, p.MediaLatch)
+		}
+		if p.RegisterExpires != 0 && p.RegisterExpires.Std() <= 0 {
+			fail("peers.%s: register_expires must be > 0 when set", name)
 		}
 		if p.Register && p.Auth == nil {
 			fail("peers.%s: register: true requires auth credentials", name)

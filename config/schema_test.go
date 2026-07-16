@@ -95,6 +95,9 @@ func TestWithDefaults(t *testing.T) {
 	if c.RingTimeout.Std() != 60*time.Second {
 		t.Errorf("ring_timeout default: %v", c.RingTimeout.Std())
 	}
+	if c.RegisterExpires.Std() != 3600*time.Second {
+		t.Errorf("register_expires default: %v", c.RegisterExpires.Std())
+	}
 }
 
 func TestParseRingTimeout(t *testing.T) {
@@ -118,5 +121,16 @@ ring_timeout: 30s
 	}
 	if c.RingTimeout.Std() != 30*time.Second {
 		t.Errorf("ring_timeout = %v, want 30s", c.RingTimeout.Std())
+	}
+}
+
+func TestParseRegisterExpires(t *testing.T) {
+	src := minimalYAML + "register_expires: 1200s\n"
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.RegisterExpires.Std() != 1200*time.Second {
+		t.Errorf("register_expires = %v, want 1200s", c.RegisterExpires.Std())
 	}
 }
