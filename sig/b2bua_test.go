@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,6 +153,38 @@ type stubCarrier struct {
 
 	offers  chan *sip.Request
 	byeDone chan struct{}
+
+	// mu guards lastInvite (Task 2/M4.1): OnInvite's handler runs in a
+	// separate goroutine per request from the test's own goroutine, so
+	// reading the captured From/Contact needs the same synchronization the
+	// send does for offers — a plain field write/read here would otherwise
+	// race under -race.
+	mu         sync.Mutex
+	lastInvite *sip.Request
+}
+
+// lastFrom returns the From header of the most recent INVITE this carrier
+// received (nil if none yet) — captures what the bridge actually placed on
+// the wire for the B-leg, in particular the caller identity (CLI)
+// pass-through and topology-hiding host rewrite under test in
+// TestBridgeOutboundFromAndContact.
+func (c *stubCarrier) lastFrom() *sip.FromHeader {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastInvite == nil {
+		return nil
+	}
+	return c.lastInvite.From()
+}
+
+// lastContact mirrors lastFrom for the Contact header.
+func (c *stubCarrier) lastContact() *sip.ContactHeader {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastInvite == nil {
+		return nil
+	}
+	return c.lastInvite.Contact()
 }
 
 // stubCarrierConfig carries the Task 7 early-media and Task 8
@@ -251,6 +284,9 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		case c.offers <- req:
 		default:
 		}
+		c.mu.Lock()
+		c.lastInvite = req
+		c.mu.Unlock()
 
 		if c.ringForever {
 			if err := dlg.Respond(180, "Ringing", nil); err != nil {
@@ -1730,4 +1766,145 @@ func TestBridgeDigestAuth(t *testing.T) {
 		t.Fatalf("media ports not released after teardown: %v", err)
 	}
 	s2.Close()
+}
+
+// --- M4.1 Task 2: From/CLI propagation + per-transport B-leg Contact ---
+
+// outboundFromCfg mirrors bridgeCallCfg's shape on a disjoint port set
+// (45180-45198 are already claimed by the Task 6/7/8/9 tests above — see
+// bridgeCallCfg's comment for why allowed_ips differ per peer).
+const outboundFromCfg = `
+listen:
+  sip: [udp://127.0.0.1:45203]
+  media:
+    port_range: 46230-46233
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45204
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeOutboundFromAndContact is M4.1 Task 2's crux: it closes the
+// M3.3 blocker where the B-leg INVITE went out with sipgo's synthesized
+// "From: sipgo@localhost" instead of the caller's own identity. The UAC's
+// INVITE carries From user "1001" (CLI pass-through under test); the
+// assertions below read the carrier's *received* INVITE (not the UAC's own
+// request) to prove the bridge rebuilt From/Contact rather than merely
+// forwarding the A-leg's headers: From user must still be "1001" (CLI
+// preserved) but From/Contact host must be ourIP (127.0.0.1, this config's
+// public_ip) — never the UAC's own loopback source port — and the Contact
+// must carry our SIP listen port with no transport= param (carrier's
+// transport defaults to udp, SIP's own default per RFC 3261 §19.1.2).
+// No RTP is exercised here (Task 6/7/8 already cover the media path); this
+// test only needs the call to reach a bridged, ACKed state so the carrier's
+// captured B-leg INVITE reflects a real end-to-end placement.
+func TestBridgeOutboundFromAndContact(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45204", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 45203, outboundFromCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	// Empty Contact, same as the other UAC harnesses above (see
+	// TestBridgePlacesCallAndBridges): this UAC never receives requests.
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45203}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	// Build the A-leg INVITE by hand (via WriteInvite, not the plain Invite
+	// convenience method) so it carries an explicit From identifying the
+	// caller as "1001" with a display name — DialogClientCache.Invite would
+	// otherwise let sipgo synthesize a default From from the UA's own
+	// name/hostname, which wouldn't exercise CLI pass-through at all.
+	inviteReq := sip.NewRequest(sip.INVITE, bridgeURI)
+	inviteReq.SetBody(testSDPBody(uacRTPStubPort(t)))
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", sip.GenerateTagN(16))
+	inviteReq.AppendHeader(&sip.FromHeader{
+		DisplayName: "Caller 1001",
+		Address:     sip.Uri{Scheme: "sip", User: "1001", Host: "127.0.0.1", Port: 5070},
+		Params:      fromParams,
+	})
+
+	sess, err := dialogCli.WriteInvite(inviteCtx, inviteReq)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	from := carrier.lastFrom()
+	if from == nil {
+		t.Fatal("carrier never captured a From header on the B-leg INVITE")
+	}
+	if from.Address.User != "1001" {
+		t.Errorf("From user = %q, want caller number 1001 (CLI pass-through)", from.Address.User)
+	}
+	if from.Address.Host != "127.0.0.1" { // ourIP (public_ip) in outboundFromCfg
+		t.Errorf("From host = %q, want ourIP 127.0.0.1 (topology hiding; must not be the caller's own address)", from.Address.Host)
+	}
+	if from.DisplayName != "Caller 1001" {
+		t.Errorf("From display name = %q, want caller's display name preserved", from.DisplayName)
+	}
+	if tag, ok := from.Params.Get("tag"); !ok || tag == "" {
+		t.Error("From must carry a tag")
+	} else if uacTag, _ := inviteReq.From().Params.Get("tag"); tag == uacTag {
+		t.Error("From tag must be freshly generated for the B-leg dialog, not the A-leg's own tag")
+	}
+
+	contact := carrier.lastContact()
+	if contact == nil {
+		t.Fatal("carrier never captured a Contact header on the B-leg INVITE")
+	}
+	if contact.Address.Host != "127.0.0.1" {
+		t.Errorf("Contact host = %q, want ourIP 127.0.0.1", contact.Address.Host)
+	}
+	if contact.Address.Port != 45203 {
+		t.Errorf("Contact port = %d, want our SIP listen port 45203", contact.Address.Port)
+	}
+	if tp, ok := contact.Address.UriParams.Get("transport"); ok && tp != "" && tp != "udp" {
+		t.Errorf("Contact transport param = %q, want no param or udp (carrier's transport defaults to udp)", tp)
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
 }

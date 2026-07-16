@@ -246,6 +246,23 @@ func (s *Server) ourIP(cfg *config.Config) netip.Addr {
 	return netip.MustParseAddr("127.0.0.1")
 }
 
+// ourSigPort returns our listening port for the given transport (the first
+// matching listen.sip entry), or the first listener's port as a fallback —
+// mirrors the Contact-port resolution Run does once at startup (see the
+// contactPort comment above), but re-resolved per call/per-target so it
+// tracks whichever transport the B-leg is actually being placed on.
+func (s *Server) ourSigPort(cfg *config.Config, transport string) int {
+	for _, l := range cfg.Listen.SIP {
+		if l.Transport == transport {
+			return l.Port
+		}
+	}
+	if len(cfg.Listen.SIP) > 0 {
+		return cfg.Listen.SIP[0].Port
+	}
+	return 5060
+}
+
 // mediaIP is ourIP's per-call entry point for the SDP media address: called
 // once per bridged INVITE (see bridge.onInvite), it re-resolves from cfg
 // each time so a hot-reloaded public_ip takes effect on the next call

@@ -2,6 +2,8 @@ package sig
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -266,7 +268,12 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	bTarget := peerURI(target.Peer)
 	bTarget.User = outNumber
 
-	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer)
+	cfg := b.s.store.Current()
+	sigPort := b.s.ourSigPort(cfg, target.Peer.Transport)
+	from := b.buildFrom(aLeg.InviteRequest, ourIP, sigPort)
+	contact := b.buildContact(ourIP, sigPort, target.Peer.Transport)
+
+	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, from, contact)
 	if err != nil {
 		b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
 		return nil, false, true, 503, "Service Unavailable"
@@ -341,6 +348,61 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	}
 
 	return bLeg, true, false, 200, "OK"
+}
+
+// buildFrom clones the caller's identity onto a B-leg From: the caller's
+// user and display name (CLI pass-through, closing the M3.3 blocker where
+// the B-leg went out as sipgo's synthesized "From: sipgo@localhost") with
+// our own host (topology hiding — the caller's address is never exposed to
+// the target) and a fresh local tag, since this From establishes a brand
+// new dialog to the target rather than reusing the A-leg's.
+func (b *bridge) buildFrom(req *sip.Request, ourIP netip.Addr, port int) *sip.FromHeader {
+	caller := req.From()
+	params := sip.NewParams()
+	params.Add("tag", freshTag())
+	return &sip.FromHeader{
+		DisplayName: caller.DisplayName,
+		Address: sip.Uri{
+			Scheme: "sip",
+			User:   caller.Address.User,
+			Host:   ourIP.String(),
+			Port:   port,
+		},
+		Params: params,
+	}
+}
+
+// buildContact advertises our address for the given transport so in-dialog
+// requests (re-INVITE, BYE, ...) from the target reach us on the right leg.
+// The transport param is only needed for a non-default transport (udp is
+// SIP's own default, RFC 3261 §19.1.2); tcp/tls carry an explicit
+// transport= so the target dials us back the same way.
+func (b *bridge) buildContact(ourIP netip.Addr, port int, transport string) *sip.ContactHeader {
+	c := &sip.ContactHeader{
+		Address: sip.Uri{Scheme: "sip", Host: ourIP.String(), Port: port},
+	}
+	if transport != "" && transport != "udp" {
+		params := sip.NewParams()
+		params.Add("transport", transport)
+		c.Address.UriParams = params
+	}
+	return c
+}
+
+// freshTag returns a random 24-hex-char (12-byte) dialog tag, generated with
+// crypto/rand rather than sipgo's own sip.GenerateTagN (which the client's
+// clientRequestBuildReq path uses internally when it synthesizes a From) —
+// this bridge always supplies its own From/tag explicitly, so it needs its
+// own generator rather than depending on that unexported-path behavior.
+func freshTag() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read failing is effectively unrecoverable (the OS CSPRNG
+		// is unavailable); a fixed fallback keeps call setup from panicking,
+		// at the cost of a non-unique tag in that vanishingly rare case.
+		return "freesbc-tag-fallback"
+	}
+	return hex.EncodeToString(b)
 }
 
 // authUser and authPass return target's outbound digest credentials, or
