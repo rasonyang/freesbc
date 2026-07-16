@@ -204,6 +204,9 @@ type stubCarrier struct {
 	// ringForever (Fix 1): see stubCarrierConfig.ringForever.
 	ringForever bool
 
+	// brokenAnswer (Fix 3 regression test): see stubCarrierConfig.brokenAnswer.
+	brokenAnswer bool
+
 	offers  chan *sip.Request
 	byeDone chan struct{}
 
@@ -276,6 +279,14 @@ type stubCarrierConfig struct {
 	// tears the carrier down — simulates a carrier that is genuinely still
 	// ringing and never answers.
 	ringForever bool
+
+	// brokenAnswer (whole-branch-review Fix 3 regression test): answer 200
+	// OK, but with an unparseable body instead of the caller's answerSDP —
+	// simulates a carrier that answered for real but whose SDP is
+	// missing/broken. Proves dialTarget's post-answer failure path responds
+	// the A-leg 502 Bad Gateway (not 488, which would wrongly blame the
+	// caller's own offer for a problem in the carrier's answer).
+	brokenAnswer bool
 }
 
 // startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
@@ -329,6 +340,7 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		c.digestUser = opts[0].digestUser
 		c.digestPass = opts[0].digestPass
 		c.ringForever = opts[0].ringForever
+		c.brokenAnswer = opts[0].brokenAnswer
 		if c.digestUser != "" {
 			c.digestChallenge = &digest.Challenge{
 				Realm:     "freesbc-test",
@@ -392,7 +404,13 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 				<-c.proceed
 			}
 		}
-		if err := dlg.RespondSDP(c.answerSDP); err != nil {
+		if c.brokenAnswer {
+			if err := dlg.Respond(200, "OK", []byte("not-valid-sdp"),
+				sip.NewHeader("Content-Type", "application/sdp")); err != nil {
+				log.Error("carrier respond broken sdp", "err", err)
+				return
+			}
+		} else if err := dlg.RespondSDP(c.answerSDP); err != nil {
 			log.Error("carrier respond sdp", "err", err)
 			return
 		}
@@ -2572,5 +2590,181 @@ func TestBridgeRingTimeoutNoTargetsReturns408(t *testing.T) {
 	case <-carrier.cancelled:
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier never received a CANCEL after its ring timeout expired")
+	}
+}
+
+// --- Whole-branch-review Fix wave: raced 2xx teardown, failReal restricted
+// to real finals (401/407 -> 503), 502 for bad answer SDP ---
+
+// authChallengeCfg routes local-uac to a single carrier peer with NO
+// configured auth (an IP-auth trunk) that nonetheless challenges every
+// INVITE with 401 Unauthorized — WaitAnswer only attempts its own digest
+// retry when Password is non-empty (see authUser/authPass), so with no
+// configured auth this 401 reaches dialTarget as a genuine final response
+// it can't do anything about. Fresh ports (45270-45271, 46300-46303),
+// disjoint from every other test's.
+const authChallengeCfg = `
+listen:
+  sip: [udp://127.0.0.1:45270]
+  media:
+    port_range: 46300-46303
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45271
+    allowed_ips: [203.0.113.60/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeAuthChallengeMapsTo503 is the whole-branch-review Fix 2's
+// deterministic new coverage: a target's final response is 401
+// Unauthorized (e.g. a carrier that unexpectedly challenges an IP-auth
+// trunk, or whose challenge our credentials can't satisfy) and the peer
+// has no configured auth, so WaitAnswer's own digest retry never engages
+// (it only retries when opts.Password is non-empty — see
+// AnswerOptions/authUser/authPass) — bLeg.InviteResponse ends up holding
+// the bare 401 as its final response. Before the fix, dialTarget's
+// classification trusted any non-provisional final (!IsProvisional()) as
+// failReal and would have relayed this 401 to the caller verbatim — a
+// hop-by-hop credential negotiation with the target that the caller can't
+// act on. The fix excludes 401/407 from failReal, so this must reach the
+// caller as 503 instead. (TestBridgePassesRealFinalCode/
+// TestBridgeFailoverThenRealCode already cover the companion claim — a
+// genuine >=300 final, e.g. 486, still reaches the caller verbatim.)
+func TestBridgeAuthChallengeMapsTo503(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45271", nil, stubCarrierConfig{
+		finalStatus: 401,
+		finalReason: "Unauthorized",
+	})
+	startServer(t, 45270, authChallengeCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45270}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if finalCode := sess.InviteResponse.StatusCode; finalCode != 503 {
+		t.Fatalf("caller got %d, want 503 (the target's 401 must not be relayed as-is)", finalCode)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+}
+
+// brokenAnswerCfg routes local-uac to a single carrier that answers 200 OK
+// but with an unparseable SDP body — see stubCarrierConfig.brokenAnswer.
+// Fresh ports (45272-45273, 46310-46313), disjoint from every other
+// test's.
+const brokenAnswerCfg = `
+listen:
+  sip: [udp://127.0.0.1:45272]
+  media:
+    port_range: 46310-46313
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45273
+    allowed_ips: [203.0.113.64/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeBrokenAnswerSDPGets502 is the whole-branch-review Fix 3's
+// regression test: the carrier answers 200 OK for real — a live, billable
+// carrier call — but its SDP body is unparseable, so processAnswerSDP
+// fails. Before the fix, dialTarget responded the A-leg 488 Not Acceptable
+// Here, which wrongly tells the caller ITS OWN offer was the problem; the
+// fix responds 502 Bad Gateway, correctly attributing the failure to the
+// upstream leg's answer. This also proves the B-leg is still torn down
+// with a real ACK+BYE (ackThenBye) rather than abandoned: the carrier's
+// dialog only ends, closing byeDone, once it has actually received that
+// BYE.
+func TestBridgeBrokenAnswerSDPGets502(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45273", nil, stubCarrierConfig{
+		brokenAnswer: true,
+	})
+	startServer(t, 45272, brokenAnswerCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45272}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if finalCode := sess.InviteResponse.StatusCode; finalCode != 502 {
+		t.Fatalf("caller got %d, want 502 (broken carrier answer SDP, not 488 which would blame the caller's own offer)", finalCode)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended; B-leg was not ACKed+BYEed after the broken answer")
 	}
 }

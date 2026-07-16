@@ -20,10 +20,10 @@ ring_timeout: 60s   # cancel a target that rings this long without answering, th
 
 peers:
   carrier-a:
-    address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA
+    address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA (M4.4, not yet implemented)
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
-    register: true                 # registration-based trunk: periodic REGISTER
+    register: true                 # registration-based trunk: periodic REGISTER (M4.2, not yet implemented)
     allowed_ips: [203.0.113.0/24]  # inbound calls matched to this peer by source IP
     # media_latch: strict          # strict (default): first RTP packet must
     #                              # come from the SDP-signaled IP; use loose
