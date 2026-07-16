@@ -33,6 +33,7 @@ type Server struct {
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
 	br        *bridge
+	registrar *Registrar
 
 	// warnAutoIPOnce gates ourIP's "can't resolve a routable address"
 	// warning to a single log line for the life of the process: ourIP is
@@ -107,6 +108,20 @@ func (s *Server) Run(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// The Registrar shares this same ctx: a fatal listener bind failure
+	// (which also cancels ctx, above) stops it just like a normal shutdown
+	// would, rather than leaving outbound REGISTERs running against a
+	// server that never came up. Run blocks on <-ctx.Done() below before
+	// ever reaching this function's defers, so by the time the deferred
+	// wait on regDone executes, ctx is already cancelled and the registrar
+	// goroutine is already unwinding (or done) — the un-REGISTER on every
+	// registered peer completes before Run returns.
+	s.registrar = NewRegistrar(s.store, client, s, s.log)
+	regDone := make(chan struct{})
+	go func() { _ = s.registrar.Run(ctx); close(regDone) }()
+	defer func() { <-regDone }()
+
 	errs := make(chan error, len(listeners))
 	var wg sync.WaitGroup
 	for _, l := range listeners {

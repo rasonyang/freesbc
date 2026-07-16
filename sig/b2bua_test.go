@@ -2768,3 +2768,106 @@ func TestBridgeBrokenAnswerSDPGets502(t *testing.T) {
 		t.Fatal("carrier dialog never ended; B-leg was not ACKed+BYEed after the broken answer")
 	}
 }
+
+// --- Task 6: routing gate skips unregistered register:true targets ---
+
+// skipUnregisteredCfg routes local-uac to "carrier", a register:true peer.
+// Its Address doubles as both the REGISTER target and the outbound call
+// address (Registrar.paramsFor and peerURI both derive from the same
+// config.Peer.Address — see sig/register.go), so pointing it at the stub
+// carrier below both makes registration fail forever (the stub only
+// installs OnInvite/OnAck/OnBye — no REGISTER handler — so sipgo's default
+// no-route handler answers every REGISTER 405 Method Not Allowed, never
+// 200) and lets the test observe whether an INVITE ever reaches it. Fresh
+// port block (45290 sip / 45291 carrier / 46290-46293 media), disjoint from
+// every other test's.
+const skipUnregisteredCfg = `
+listen:
+  sip: [udp://127.0.0.1:45290]
+  media:
+    port_range: 46290-46293
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45291
+    auth: { username: reguser, password: regpass }
+    register: true
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeSkipsUnregisteredTarget proves Task 6's routing gate:
+// placeCall must never dial a register:true target whose REGISTER has not
+// succeeded. carrier is the ONLY target on the route, and its "registrar"
+// (itself, per skipUnregisteredCfg's comment) never grants a 200, so
+// Registrar.IsRegistered("carrier") stays false for the life of the test —
+// the gate must skip it every time, leaving placeCall's failover loop with
+// nothing dialed at all. With no target ever attempted, neither a real
+// carrier failure (failReal) nor a ring timeout (failRing) is ever
+// recorded, so placeCall's exhaustion default applies: 503 Service
+// Unavailable to the caller. The stub carrier's offers channel staying
+// empty proves the skip happened at the routing-gate level (before
+// dialTarget ever ran), not that the carrier merely rejected an INVITE it
+// received.
+//
+// Timing-based over real UDP loopback (waiting for the Registrar's Run
+// goroutine to reconcile before placing the call): re-run once before
+// treating a flake as failure.
+func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45291", nil)
+	// startServer's own probe (dial the UDP port, then a short settle
+	// sleep) already only returns once bindListener's accept/read loop is
+	// live; b.s.registrar is assigned earlier in Run, in the same
+	// goroutine, before any listener goroutine is even spawned, so the
+	// INVITE this test sends below is guaranteed to be dispatched (via
+	// sipgo's own request-handling goroutine, itself transitively spawned
+	// from Run's goroutine — a real happens-before chain) after the
+	// Registrar exists. No direct read of srv.registrar from this test
+	// goroutine is needed (or safe: Run assigns it from its own goroutine
+	// with no lock, so reading it straight from the test would race).
+	startServer(t, 45290, skipUnregisteredCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45290}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if got := sess.InviteResponse.StatusCode; got != 503 {
+		t.Fatalf("caller got %d, want 503 (only target skipped: unregistered)", got)
+	}
+
+	select {
+	case <-carrier.offers:
+		t.Fatal("carrier received an INVITE — unregistered target was not skipped")
+	case <-time.After(1 * time.Second):
+	}
+}
