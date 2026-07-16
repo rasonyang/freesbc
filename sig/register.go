@@ -194,6 +194,7 @@ type Registrar struct {
 	mu      sync.RWMutex
 	state   map[string]bool        // peer name → registered
 	running map[string]*runningReg // peer name → active goroutine handle
+	epoch   map[string]int         // peer name → current generation counter
 }
 
 // runningReg is the manager's handle on one peer's live registration
@@ -213,6 +214,7 @@ func NewRegistrar(store *config.Store, client *sipgo.Client, srv *Server, log *s
 	return &Registrar{
 		store: store, client: client, srv: srv, log: log,
 		state: map[string]bool{}, running: map[string]*runningReg{},
+		epoch: map[string]int{},
 	}
 }
 
@@ -239,6 +241,19 @@ func (r *Registrar) IsRegistered(name string) bool {
 func (r *Registrar) setRegistered(name string, ok bool) {
 	r.mu.Lock()
 	r.state[name] = ok
+	r.mu.Unlock()
+}
+
+// setRegisteredGen records a peer's registration state only if the calling
+// goroutine is still the current generation for that peer. A goroutine
+// superseded by a reconcile (peer params changed) has an older gen, so its
+// late writes are ignored — preventing a stale un-register from clobbering
+// the new goroutine's live state.
+func (r *Registrar) setRegisteredGen(name string, gen int, ok bool) {
+	r.mu.Lock()
+	if r.epoch[name] == gen {
+		r.state[name] = ok
+	}
 	r.mu.Unlock()
 }
 
@@ -291,7 +306,10 @@ func (r *Registrar) reconcile(ctx context.Context) {
 		}
 		cctx, cancel := context.WithCancel(ctx)
 		done := make(chan struct{})
-		rg := &registration{client: r.client, params: d, setRegistered: r.setRegistered, log: r.log}
+		r.epoch[name]++
+		gen := r.epoch[name]
+		setRegistered := func(name string, ok bool) { r.setRegisteredGen(name, gen, ok) }
+		rg := &registration{client: r.client, params: d, setRegistered: setRegistered, log: r.log}
 		requested := r.requestedExpires(cfg, name)
 		go func() { rg.run(cctx, requested); close(done) }()
 		r.running[name] = &runningReg{params: d, cancel: cancel, done: done}

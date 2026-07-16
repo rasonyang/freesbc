@@ -434,6 +434,118 @@ func TestRegistrarReconcilesAndReportsRegistered(t *testing.T) {
 	waitFor(t, 3*time.Second, reg.sawUnregister)
 }
 
+// --- Changed-peer stale-write race fix: generation-guarded state writes ---
+
+// TestSetRegisteredGenIgnoresStaleGeneration is a fully deterministic,
+// non-concurrent unit test of the guard mechanism itself: setRegisteredGen
+// must apply a write only when the caller's gen still matches r.epoch[name],
+// and must silently drop it otherwise. This is exactly what stands between a
+// superseded (changed-peer) goroutine's late setRegistered(name, false) and
+// clobbering the current goroutine's live state — see the package doc on
+// setRegisteredGen. No goroutines or timing are involved, so this test can
+// never flake.
+func TestSetRegisteredGenIgnoresStaleGeneration(t *testing.T) {
+	r := NewRegistrar(nil, nil, nil, discardLogger())
+	r.epoch["carrier"] = 2
+	r.state["carrier"] = true
+
+	// A stale generation (an old goroutine's leftover reference) must not
+	// modify state, even though it's a live call with a valid name.
+	r.setRegisteredGen("carrier", 1, false)
+	if !r.state["carrier"] {
+		t.Fatal("setRegisteredGen with a stale generation must not modify state")
+	}
+
+	// The current generation's write must land normally.
+	r.setRegisteredGen("carrier", 2, false)
+	if r.state["carrier"] {
+		t.Fatal("setRegisteredGen with the current generation must update state")
+	}
+
+	// After a further bump (simulating a second reconcile), the
+	// now-previous-current generation (2) becomes stale in turn, and only
+	// the new current generation (3) may write.
+	r.epoch["carrier"] = 3
+	r.setRegisteredGen("carrier", 2, true)
+	if r.state["carrier"] {
+		t.Fatal("setRegisteredGen from a generation superseded again must not modify state")
+	}
+	r.setRegisteredGen("carrier", 3, true)
+	if !r.state["carrier"] {
+		t.Fatal("setRegisteredGen with the new current generation must update state")
+	}
+}
+
+// registrarConfigYAMLPublicIP is registrarConfigYAML with an overridable
+// public_ip, for TestRegistrarChangedPeerParamsDoNotFlapRegistered: bumping
+// public_ip alone changes the resolved ContactIP (via Server.ourIP →
+// Registrar.paramsFor) without touching the registrar host/port or
+// credentials, so reconcile takes the changed-peer stop+start path while the
+// new goroutine still registers against the very same stub registrar.
+func registrarConfigYAMLPublicIP(port int, user, pass, publicIP string, registerCarrier bool) string {
+	return fmt.Sprintf(`
+listen:
+  sip: [udp://127.0.0.1:45999]
+  media: { port_range: 45900-45901, public_ip: %s }
+peers:
+  carrier:
+    address: 127.0.0.1:%d
+    transport: udp
+    auth: { username: %s, password: %s }
+    register: %v
+  internal-pbx:
+    address: 10.0.0.10:5060
+`, publicIP, port, user, pass, registerCarrier)
+}
+
+// TestRegistrarChangedPeerParamsDoNotFlapRegistered drives the actual
+// changed-peer reconcile path (regParams differ, not removed) end to end:
+// carrier first registers normally, then a hot reload changes only
+// public_ip, so reconcile cancels the old goroutine and starts a new one
+// against the same stub registrar. Before the generation guard, the old
+// goroutine's fast synchronous setRegistered(name, false) (from its
+// cancel→unregister path) could race the new goroutine's slower
+// network-bound setRegistered(name, true) with no happens-before; with the
+// guard, reconcile bumps r.epoch[name] and starts the new goroutine under
+// the same mu.Lock() critical section that stops the old one, so any write
+// the old goroutine attempts afterward blocks on r.mu until the bump has
+// already happened and is then dropped as stale — the ordering is
+// structural, not timing-dependent, so asserting IsRegistered never
+// observes false here is a reliable (not merely low-probability) check, on
+// top of the fully deterministic unit test above.
+func TestRegistrarChangedPeerParamsDoNotFlapRegistered(t *testing.T) {
+	reg := startStubRegistrar(t, 45334, "u", "p", 120)
+	store := registrarTestStore(t, 45334, "u", "p")
+	client := reg.client(t)
+	srv := serverForRegistrar(t, store)
+	r := NewRegistrar(store, client, srv, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+
+	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(45334, "u", "p", "127.0.0.2", true)))
+	if err != nil {
+		t.Fatalf("parse changed-public-ip config: %v", err)
+	}
+	store.Replace(cfg2)
+
+	// The old goroutine's un-REGISTER landing proves reconcile really took
+	// the changed-peer stop+start path (not a no-op).
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+
+	// The new goroutine re-registers against the same stub; wait for it,
+	// then poll for a further stretch to catch any late flap to false.
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !r.IsRegistered("carrier") {
+			t.Fatal("carrier flapped to unregistered after a changed-peer (not removed) hot reload")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestRegistrarHotReloadStopsRemovedPeer proves reconcile reacts to a
 // Subscribe fire: flipping carrier to register:false drops it from the
 // desired set, so reconcile cancels its goroutine, which un-REGISTERs
