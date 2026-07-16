@@ -76,7 +76,7 @@ routes:
 | ├ M3.1 | SIP front door: listeners, OPTIONS, source-IP identification | ✅ done |
 | ├ M3.2 | Routing engine: match / transform / failover | ✅ done |
 | └ M3.3 | B2BUA bridge: leg pairing, SDP rewrite, media wiring, Relatch | ✅ done |
-| M4 | Trunk interop: digest auth, outbound REGISTER, session timers, PRACK, DNS SRV | in progress |
+| M4 | Trunk interop: From/CLI, outbound REGISTER, session timers, PRACK, DNS SRV | in progress |
 | ├ M4.1 | Outbound-INVITE realism: From/CLI, ring cap, response codes | ✅ done |
 | ├ M4.2 | Outbound REGISTER | next |
 | ├ M4.3 | Session timers (RFC 4028) + 100rel/PRACK | |
