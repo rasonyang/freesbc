@@ -227,3 +227,115 @@ func TestRegisterOnceBadCredentialsFails(t *testing.T) {
 		t.Fatal("expected error for wrong password")
 	}
 }
+
+// --- Task 4: per-peer registration lifecycle ---
+
+// waitFor polls cond until it returns true or timeout elapses, failing the
+// test if the deadline is reached first. Mirrors config/reload_test.go's
+// helper of the same name (different package, so not shareable directly).
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
+}
+
+// discardLogger returns a *slog.Logger that writes nowhere, for tests that
+// need a non-nil logger but don't care about its output.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// loopbackClient returns a sipgo Client bound to an ephemeral loopback port
+// with no registrar (or anything else) listening on the other end — for
+// tests that need every register attempt to fail (connection refused /
+// timeout) without standing up a stub server.
+func loopbackClient(t *testing.T) *sipgo.Client {
+	t.Helper()
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("loopback client ua: %v", err)
+	}
+	t.Cleanup(func() { ua.Close() })
+	client, err := sipgo.NewClient(ua, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("loopback client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return client
+}
+
+// TestRegistrationRunRefreshesAndUnregisters proves the happy path of the
+// lifecycle loop: run() registers against the stub registrar, marks the
+// peer registered via setRegistered, and on ctx cancellation sends a
+// best-effort Expires:0 un-REGISTER before returning — leaving the peer
+// marked unregistered.
+func TestRegistrationRunRefreshesAndUnregisters(t *testing.T) {
+	reg := startStubRegistrar(t, 45324, "u", "p", 60)
+	client := reg.client(t)
+	var mu sync.Mutex
+	states := map[string]bool{}
+	set := func(name string, ok bool) { mu.Lock(); states[name] = ok; mu.Unlock() }
+	rg := &registration{
+		client: client,
+		params: regParams{
+			Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45324,
+			Transport: "udp", Username: "u", Password: "p",
+			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45997,
+		},
+		setRegistered: set,
+		log:           discardLogger(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { rg.run(ctx, time.Hour); close(done) }()
+	// Wait until registered.
+	waitFor(t, 3*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return states["carrier"] })
+	if !reg.sawAuthorizedRegister() {
+		t.Fatal("registrar saw no authorized REGISTER")
+	}
+	// Cancel → un-REGISTER (Expires 0).
+	cancel()
+	<-done
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+	mu.Lock()
+	if states["carrier"] {
+		t.Error("registration should be marked unregistered after cancel")
+	}
+	mu.Unlock()
+}
+
+// TestRegistrationRunBacksOffOnFailure proves the loop doesn't spin or exit
+// early when every register attempt fails: with no registrar listening on
+// the target port, run() must keep retrying with backoff until ctx expires,
+// then return.
+func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
+	// No registrar listening on this port → every register fails; the loop
+	// must mark unregistered and keep retrying (not spin, not exit).
+	client := loopbackClient(t) // a client with nothing to talk to at 45326
+	set := func(string, bool) {}
+	rg := &registration{
+		client: client,
+		params: regParams{
+			Name: "dead", RegistrarHost: "127.0.0.1", RegistrarPort: 45326,
+			Transport: "udp", Username: "u", Password: "p",
+			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45996,
+		},
+		setRegistered: set,
+		log:           discardLogger(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { rg.run(ctx, time.Hour); close(done) }()
+	select {
+	case <-done: // returns when ctx expires — must not spin-exit early
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after ctx cancel")
+	}
+}

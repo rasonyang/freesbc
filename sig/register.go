@@ -3,6 +3,7 @@ package sig
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"strconv"
 	"time"
@@ -102,4 +103,78 @@ func newTagParams() sip.HeaderParams {
 	pr := sip.NewParams()
 	pr.Add("tag", freshTag())
 	return pr
+}
+
+const (
+	// regBackoffMin is the initial retry delay after a failed register.
+	regBackoffMin = 5 * time.Second
+	// regBackoffMax is the ceiling the exponential backoff saturates at.
+	regBackoffMax = 60 * time.Second
+	// regRefreshFloor is the minimum delay before a refresh REGISTER, even
+	// if 0.9x the granted lifetime would be shorter (guards against a
+	// registrar granting a very short lifetime causing a refresh storm).
+	regRefreshFloor = 10 * time.Second
+)
+
+// registration runs one peer's register→refresh→backoff loop. It is built
+// by the manager (Task 5), one per configured outbound-register peer.
+type registration struct {
+	client        *sipgo.Client
+	params        regParams
+	setRegistered func(name string, ok bool)
+	log           *slog.Logger
+}
+
+// run blocks until ctx is cancelled, keeping the peer registered: it
+// registers, marks the peer registered, refreshes at ~0.9×granted (floor
+// regRefreshFloor), and on any failure marks it unregistered and retries
+// with exponential backoff (regBackoffMin doubling to regBackoffMax, reset
+// to regBackoffMin on the next success). On ctx cancellation it best-effort
+// un-REGISTERs before returning.
+func (rg *registration) run(ctx context.Context, requested time.Duration) {
+	backoff := regBackoffMin
+	for {
+		granted, err := registerOnce(ctx, rg.client, rg.params, requested)
+		if ctx.Err() != nil {
+			break
+		}
+		var wait time.Duration
+		if err != nil {
+			rg.setRegistered(rg.params.Name, false)
+			rg.log.Warn("register failed", "peer", rg.params.Name, "err", err, "retry_in", backoff)
+			wait = backoff
+			if backoff *= 2; backoff > regBackoffMax {
+				backoff = regBackoffMax
+			}
+		} else {
+			rg.setRegistered(rg.params.Name, true)
+			backoff = regBackoffMin
+			wait = time.Duration(float64(granted) * 0.9)
+			if wait < regRefreshFloor {
+				wait = regRefreshFloor
+			}
+			rg.log.Info("registered", "peer", rg.params.Name, "granted", granted, "refresh_in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			rg.unregister()
+			return
+		case <-time.After(wait):
+		}
+	}
+	rg.unregister()
+}
+
+// unregister sends a best-effort Expires:0 REGISTER, bounded to a fixed
+// timeout independent of the (already-cancelled) run loop's ctx, and marks
+// the peer unregistered regardless of whether the registrar could be
+// reached — the peer should not be treated as registered once we've
+// stopped refreshing it.
+func (rg *registration) unregister() {
+	rg.setRegistered(rg.params.Name, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := registerOnce(ctx, rg.client, rg.params, 0); err != nil {
+		rg.log.Debug("un-register failed", "peer", rg.params.Name, "err", err)
+	}
 }
