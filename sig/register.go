@@ -284,10 +284,16 @@ func (r *Registrar) reconcile(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Stop removed or changed.
+	// Stop removed or changed. For a changed (not removed) peer, record the
+	// stopped handle's done channel by name: the start loop below uses it so
+	// the replacement goroutine can wait for the old one's un-REGISTER to
+	// actually land before it sends anything of its own (see the start loop
+	// for why that ordering matters).
+	stoppedDone := map[string]chan struct{}{}
 	for name, rr := range r.running {
 		if d, ok := desired[name]; !ok || d != rr.params {
 			rr.cancel()
+			stoppedDone[name] = rr.done
 			delete(r.running, name)
 		}
 	}
@@ -303,7 +309,30 @@ func (r *Registrar) reconcile(ctx context.Context) {
 		setRegistered := func(name string, ok bool) { r.setRegisteredGen(name, gen, ok) }
 		rg := &registration{client: r.client, params: d, setRegistered: setRegistered, log: r.log}
 		requested := r.requestedExpires(cfg, name)
-		go func() { rg.run(cctx, requested); close(done) }()
+		// oldDone is nil for a fresh add; for a restart (changed peer) it is
+		// the just-stopped goroutine's done channel. Without waiting on it,
+		// the old goroutine's Expires:0 un-REGISTER and this new goroutine's
+		// real REGISTER race on the wire — if the carrier applies the
+		// un-REGISTER second, it deletes the binding the new goroutine just
+		// created, while our own epoch-guarded state still says
+		// "registered" (that guard only protects our bookkeeping, not what
+		// the carrier actually has on file). Waiting serializes the two: the
+		// old REGISTER exchange (send + receive, or its own bounded 2s
+		// timeout) fully completes before the new one is even sent.
+		oldDone := stoppedDone[name]
+		go func() {
+			// This wait MUST happen here, inside the goroutine — never
+			// synchronously in reconcile while r.mu is held. The old
+			// goroutine's unregister() path ends by calling
+			// setRegisteredGen, which itself takes r.mu; blocking on oldDone
+			// under r.mu would deadlock reconcile against the very
+			// goroutine it just cancelled.
+			if oldDone != nil {
+				<-oldDone
+			}
+			rg.run(cctx, requested)
+			close(done)
+		}()
 		r.running[name] = &runningReg{params: d, cancel: cancel, done: done}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/icholy/digest"
 
 	"github.com/freesbc/freesbc/config"
+	"github.com/freesbc/freesbc/media"
 )
 
 // --- Task 3: registerOnce + stub-registrar UAS test harness ---
@@ -37,6 +39,14 @@ type stubRegistrar struct {
 	mu              sync.Mutex
 	authorizedCount int
 	unregisterCount int
+	events          []bool // one entry per authorized REGISTER, in processed order; true = un-REGISTER (Expires:0)
+
+	// conn is the stub's own bound UDP socket (the same one REGISTER
+	// traffic arrives on). Exposed so tests can send a raw packet FROM this
+	// exact socket — mirroring a real carrier's OPTIONS keepalive landing on
+	// the same address the SBC will later send an un-REGISTER back to (Fix
+	// 1's shutdown-ordering regression test).
+	conn *net.UDPConn
 }
 
 // startStubRegistrar boots the stub UAS on 127.0.0.1:port and returns once
@@ -81,9 +91,12 @@ func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires 
 
 		r.mu.Lock()
 		r.authorizedCount++
+		isUnregister := false
 		if eh := req.GetHeader("Expires"); eh != nil && eh.Value() == "0" {
 			r.unregisterCount++
+			isUnregister = true
 		}
+		r.events = append(r.events, isUnregister)
 		r.mu.Unlock()
 
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
@@ -102,6 +115,7 @@ func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires 
 	if err != nil {
 		t.Fatalf("registrar listen: %v", err)
 	}
+	r.conn = conn
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { <-ctx.Done(); conn.Close() }()
@@ -162,6 +176,46 @@ func (r *stubRegistrar) sawUnregister() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.unregisterCount > 0
+}
+
+// eventLog returns a snapshot of every authorized REGISTER the registrar has
+// processed, in order, as true=un-REGISTER (Expires:0) / false=real
+// register — for the Fix 2 changed-peer-restart ordering test.
+func (r *stubRegistrar) eventLog() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]bool, len(r.events))
+	copy(out, r.events)
+	return out
+}
+
+// sendRawOptions sends a bare OPTIONS request FROM the stub's own bound
+// socket (the same one all REGISTER traffic arrives on) TO targetAddr. Used
+// by the Fix 1 shutdown-ordering test to mimic a real carrier's OPTIONS
+// keepalive landing on the SBC's listener, attempting to seed the SBC
+// transport's pooled connection for that remote address before the SBC's
+// own un-REGISTER later goes out to the same address.
+func (r *stubRegistrar) sendRawOptions(t *testing.T, targetAddr string) {
+	t.Helper()
+	dst, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	local := r.conn.LocalAddr().String()
+	msg := strings.Join([]string{
+		"OPTIONS sip:sbc@" + targetAddr + " SIP/2.0",
+		"Via: SIP/2.0/UDP " + local + ";branch=z9hG4bK-optsprobe",
+		"From: <sip:" + r.user + "@" + local + ">;tag=probe1",
+		"To: <sip:sbc@" + targetAddr + ">",
+		"Call-ID: probe-options-1",
+		"CSeq: 1 OPTIONS",
+		"Max-Forwards: 70",
+		"Content-Length: 0",
+		"", "",
+	}, "\r\n")
+	if _, err := r.conn.WriteToUDP([]byte(msg), dst); err != nil {
+		t.Fatalf("send raw options: %v", err)
+	}
 }
 
 // client returns a sipgo Client bound to an ephemeral loopback port, for
@@ -575,5 +629,157 @@ func TestRegistrarHotReloadStopsRemovedPeer(t *testing.T) {
 	waitFor(t, 3*time.Second, reg.sawUnregister)
 	if !r.IsRegistered("carrier") {
 		t.Error("carrier is no longer register:true; IsRegistered must report it available")
+	}
+}
+
+// --- Fix 2 (whole-branch review): changed-peer restart must not race the
+// old goroutine's un-REGISTER against the new goroutine's REGISTER ---
+
+// TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister is Fix 2's
+// regression coverage: before the fix, a changed-peer restart (regParams
+// differ — e.g. a password/public_ip rotation) started the new goroutine
+// immediately, without waiting for the old goroutine's Expires:0
+// un-REGISTER to finish. The two REGISTERs then raced on the wire; if the
+// carrier processed the old's un-REGISTER AFTER the new's real REGISTER, it
+// deleted the binding the new goroutine had just (re)created — even though
+// our own epoch-guarded state still said "registered" (TestSetRegisteredGen
+// IgnoresStaleGeneration / TestRegistrarChangedPeerParamsDoNotFlapRegistered
+// above cover that OUR bookkeeping doesn't flap; neither proves what the
+// carrier actually has on file, which is what this test checks).
+//
+// reconcile now makes the new goroutine wait on the old goroutine's done
+// channel before sending anything at all, so the old's un-REGISTER
+// round-trip (its own request/response, or its bounded 2s timeout)
+// structurally completes before the new REGISTER is even transmitted — this
+// is an ordering guarantee, not a timing race, so asserting on it is
+// reliable rather than merely low-probability (same reasoning as the
+// existing changed-peer test above).
+func TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister(t *testing.T) {
+	reg := startStubRegistrar(t, 45336, "u", "p", 120)
+	store := registrarTestStore(t, 45336, "u", "p")
+	client := reg.client(t)
+	srv := serverForRegistrar(t, store)
+	r := NewRegistrar(store, client, srv, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+
+	// Change only public_ip: same registrar/credentials, but regParams
+	// differ, so reconcile takes the changed-peer stop+start path against
+	// the very same stub registrar.
+	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(45336, "u", "p", "127.0.0.2", true)))
+	if err != nil {
+		t.Fatalf("parse changed-public-ip config: %v", err)
+	}
+	store.Replace(cfg2)
+
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
+	// Let any further refresh/backoff traffic settle before inspecting what
+	// the stub actually saw, on the wire, in what order.
+	time.Sleep(200 * time.Millisecond)
+
+	events := reg.eventLog()
+	if len(events) == 0 {
+		t.Fatal("stub saw no authorized REGISTER at all")
+	}
+	if events[len(events)-1] {
+		t.Fatalf("last REGISTER the stub processed was an un-REGISTER (Expires:0) — "+
+			"the new registration was wiped by a raced old un-register; events=%v", events)
+	}
+}
+
+// --- Fix 1 (whole-branch review): shutdown sequencing — the registrar must
+// un-REGISTER before listener sockets close ---
+//
+// Ports for this test: 45340 (stub registrar, doubling as "the carrier"
+// that probes the SBC's listener) and 45341 (the SBC's own listen.sip UDP
+// port).
+
+// TestServerShutdownDeliversUnregisterBeforeListenerCloses is Fix 1's
+// regression coverage. Server.Run used to share one ctx between the
+// registrar and the listener-socket watchers, so on shutdown a listener
+// socket could close CONCURRENTLY with the registrar's Expires:0
+// un-REGISTER. In sipgo, a UDP listener's connection is pooled per remote
+// addr it has received a packet from, and an outbound request from the same
+// UA/transport REUSES that pooled conn (connectionReuse default true) — so
+// once a real carrier has sent inbound traffic (e.g. an OPTIONS keepalive)
+// on our listener, the un-REGISTER we send back to that same carrier
+// address can route onto the just-closed listener socket and fail with
+// net.ErrClosed, defeating spec Decision #3 (clean shutdown un-register).
+//
+// This drives a real Server.Run — an actual bound UDP listener, not a mock
+// — with a register:true peer pointing at a live stub registrar. Before
+// triggering shutdown, the stub sends a raw OPTIONS packet to the SBC's
+// listener FROM the exact socket it also receives REGISTER traffic on (the
+// same shape a real carrier's keepalive takes), attempting to seed the
+// SBC's transport-layer connection pool for that remote address before the
+// SBC's own un-REGISTER goes out to it.
+//
+// sipgo's internal connection-pool selection isn't part of its public API,
+// so reproducing that exact pooled-conn code path deterministically from a
+// black-box test can't be fully guaranteed. What this test DOES guarantee,
+// unconditionally, is the externally observable behavior Fix 1 promises:
+// Server.Run's shutdown sequencing (regCancel + wait <-regDone BEFORE
+// listenCancel) means the un-REGISTER attempt always completes before Run
+// returns, whether or not this particular run happened to exercise the
+// pooled-conn path. The sequencing itself is also verified directly by
+// inspection of Run's shutdown tail (see the comment there).
+func TestServerShutdownDeliversUnregisterBeforeListenerCloses(t *testing.T) {
+	reg := startStubRegistrar(t, 45340, "u", "p", 120)
+
+	cfgYAML := `
+listen:
+  sip: [udp://127.0.0.1:45341]
+  media: { port_range: 45902-45903, public_ip: 127.0.0.1 }
+peers:
+  carrier:
+    address: 127.0.0.1:45340
+    transport: udp
+    auth: { username: u, password: p }
+    register: true
+    allowed_ips: [127.0.0.1/32]
+`
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	store := config.NewStore(cfg)
+	pool := media.NewPool(store)
+	srv := NewServer(store, pool, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = srv.Run(ctx); close(runDone) }()
+
+	// Wait until the SBC's listener answers (bind completed).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, derr := net.Dial("udp", "127.0.0.1:45341")
+		if derr == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Wait for the SBC to have actually registered — via the stub's own
+	// (mutex-guarded) observation, not Server's internal registrar field,
+	// which races with Run's own goroutine assigning it.
+	waitFor(t, 3*time.Second, reg.sawAuthorizedRegister)
+
+	// Force an inbound packet on the SBC's listener from the registrar's own
+	// bound socket, attempting to seed the pooled-conn path.
+	reg.sendRawOptions(t, "127.0.0.1:45341")
+	time.Sleep(100 * time.Millisecond) // let the SBC's transport process it
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Server.Run did not return after ctx cancel")
+	}
+
+	if !reg.sawUnregister() {
+		t.Fatal("stub registrar never saw the Expires:0 un-REGISTER — shutdown must deliver it before Run returns")
 	}
 }

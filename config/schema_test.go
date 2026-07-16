@@ -134,3 +134,33 @@ func TestParseRegisterExpires(t *testing.T) {
 		t.Errorf("register_expires = %v, want 1200s", c.RegisterExpires.Std())
 	}
 }
+
+// TestParsePeerRegisterExpiresOverride proves a per-peer register_expires
+// parses distinctly from the config-global default (Fix 5, whole-branch
+// review): "pbx" overrides to 600s while the global stays 1200s.
+func TestParsePeerRegisterExpiresOverride(t *testing.T) {
+	src := `
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+    register_expires: 600s
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+register_expires: 1200s
+`
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.RegisterExpires.Std() != 1200*time.Second {
+		t.Errorf("global register_expires = %v, want 1200s", c.RegisterExpires.Std())
+	}
+	if got := c.Peers["pbx"].RegisterExpires.Std(); got != 600*time.Second {
+		t.Errorf("peer register_expires override = %v, want 600s", got)
+	}
+}

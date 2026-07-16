@@ -24,7 +24,7 @@ peers:
     address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA (M4.4, not yet implemented)
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
-    register: true                 # registration-based trunk: periodic REGISTER (M4.2, not yet implemented)
+    register: true                 # registration-based trunk: SBC periodically sends REGISTER, un-registers on shutdown
     allowed_ips: [203.0.113.0/24]  # inbound calls matched to this peer by source IP
     # media_latch: strict          # strict (default): first RTP packet must
     #                              # come from the SDP-signaled IP; use loose
