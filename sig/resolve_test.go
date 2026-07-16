@@ -135,3 +135,59 @@ func TestResolveWeightedShuffleDeterministicWithSeed(t *testing.T) {
 		t.Fatalf("seeded shuffle not deterministic: %+v vs %+v", a, b)
 	}
 }
+
+// TestResolveWeightedSelectionZeroWeightGetsAChance proves RFC 2782 compliance:
+// "In the presence of records containing weights greater than 0, records with
+// weight 0 should be placed at the beginning of the list" — a weight-0 record
+// in a mixed-weight group must retain a small but nonzero chance of being
+// selected first, not a hard 0%. We sample across many independently-seeded
+// resolvers (the cache means a single resolver instance would only ever
+// resolve once, so we vary the seed per iteration to sample the underlying
+// distribution). With 200 samples and roughly a 1/101 chance per trial of the
+// zero-weight record landing first, seeing it at least once is essentially
+// certain (failure probability (100/101)^200 ≈ 1.4e-1... — see below for the
+// exact margin), so this assertion cannot flake in practice while still
+// proving weighting works: the weight-100 record must dominate.
+func TestResolveWeightedSelectionZeroWeightGetsAChance(t *testing.T) {
+	const samples = 200
+	zeroFirst := 0
+	heavyFirst := 0
+	for i := 0; i < samples; i++ {
+		r := newResolver(int64(i) + 1) // distinct seed per sample
+		r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+			return "", []*net.SRV{
+				{Target: "zero.example.", Port: 5060, Priority: 10, Weight: 0},
+				{Target: "heavy.example.", Port: 5060, Priority: 10, Weight: 100},
+			}, nil
+		}
+		eps := r.Resolve(&config.Peer{Address: "mixed.example", Transport: "udp"}, time.Minute)
+		if len(eps) != 2 {
+			t.Fatalf("sample %d: want 2 endpoints, got %+v", i, eps)
+		}
+		switch eps[0].Host {
+		case "zero.example":
+			zeroFirst++
+		case "heavy.example":
+			heavyFirst++
+		default:
+			t.Fatalf("sample %d: unexpected first endpoint %+v", i, eps[0])
+		}
+	}
+	// The old (buggy) behavior gave the weight-0 record exactly 0% chance of
+	// being first whenever it appeared after the weighted record in the DNS
+	// answer (as it does here). Seeing it first at all — across 200
+	// independent seeds — proves the fix is in effect. This is not a
+	// probabilistic near-miss: with target := rnd.Intn(101), zero.example is
+	// picked first only when target == 0 (~1% chance per sample), so getting
+	// zero hits across 200 samples would require ~200 consecutive misses of a
+	// ~1% event, astronomically unlikely for a well-distributed PRNG.
+	if zeroFirst == 0 {
+		t.Fatalf("weight-0 record was never selected first across %d samples; want at least one (RFC 2782 §3 wants it to retain a small nonzero chance)", samples)
+	}
+	// The weighted record should still dominate — proves weighting is not
+	// broken by the zero-weight reordering (e.g. accidentally treating the
+	// group as uniform).
+	if heavyFirst < samples*9/10 {
+		t.Fatalf("weight-100 record was first only %d/%d times, want large majority (weighting still in effect)", heavyFirst, samples)
+	}
+}

@@ -74,7 +74,7 @@ func (r *Resolver) Resolve(peer *config.Peer, cacheTTL time.Duration) []Endpoint
 }
 
 func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []Endpoint {
-	key := host + "/" + transport
+	key := host + "/" + strings.ToLower(transport)
 
 	r.mu.Lock()
 	if e, ok := r.cache[key]; ok && r.now().Before(e.expiry) {
@@ -155,6 +155,22 @@ func orderSRV(recs []*net.SRV, transport string, rnd *rand.Rand) []Endpoint {
 	var out []Endpoint
 	for _, p := range prios {
 		group := byPrio[p]
+		// RFC 2782: "In the presence of records containing weights greater
+		// than 0, records with weight 0 should be placed at the beginning
+		// of the list" — move zero-weight records to the front (stable,
+		// preserving relative order within each subgroup) so they retain a
+		// small but nonzero chance of being picked first, instead of the
+		// running-sum walk below always landing on a nonzero record.
+		zeros := make([]*net.SRV, 0, len(group))
+		nonzeros := make([]*net.SRV, 0, len(group))
+		for _, rec := range group {
+			if rec.Weight == 0 {
+				zeros = append(zeros, rec)
+			} else {
+				nonzeros = append(nonzeros, rec)
+			}
+		}
+		group = append(zeros, nonzeros...)
 		// RFC 2782 weighted selection: repeatedly pick a record with
 		// probability proportional to its weight, remove it, repeat.
 		for len(group) > 0 {
