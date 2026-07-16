@@ -154,6 +154,16 @@ type stubCarrier struct {
 	offers  chan *sip.Request
 	byeDone chan struct{}
 
+	// cancelled (Task 4) closes exactly once, the first time this carrier's
+	// dialog ends because it actually received a CANCEL request — as
+	// opposed to ending for any other reason (the test tearing the
+	// transport down, etc.). Only meaningful with ringForever: sipgo's
+	// DialogUA.ReadInvite wires tx.OnCancel to end the dialog with cause
+	// sip.ErrTransactionCanceled specifically on a real CANCEL (see
+	// dialog_ua.go), which is what distinguishes it here from an ordinary
+	// transaction/transport teardown.
+	cancelled chan struct{}
+
 	// mu guards lastInvite (Task 2/M4.1): OnInvite's handler runs in a
 	// separate goroutine per request from the test's own goroutine, so
 	// reading the captured From/Contact needs the same synchronization the
@@ -256,6 +266,7 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		answerSDP: answerSDP,
 		offers:    make(chan *sip.Request, 4),
 		byeDone:   make(chan struct{}),
+		cancelled: make(chan struct{}),
 	}
 	if len(opts) > 0 {
 		c.earlySDP = opts[0].earlySDP
@@ -297,6 +308,9 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 			// bridge — see DialogUA.ReadInvite's tx.OnCancel wiring — or the
 			// test's own teardown closing the transport).
 			<-dlg.Context().Done()
+			if context.Cause(dlg.Context()) == sip.ErrTransactionCanceled {
+				close(c.cancelled)
+			}
 			return
 		}
 
@@ -2189,5 +2203,201 @@ func TestBridgeFailoverRealCodeSurvivesTrailingDialFailure(t *testing.T) {
 	case <-carrierB.offers:
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+}
+
+// --- Task 4: ring timeout with failover ---
+
+// ringTimeoutFailoverCfg sets ring_timeout to 300ms so a single ringing
+// target (carrier-a, which never answers) is capped and failed over well
+// within the test's own timeouts. Fresh ports (45260-45262, 46260-46263),
+// disjoint from every other test's — see bridgeCallCfg's comment for why
+// allowed_ips differ per peer.
+const ringTimeoutFailoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45260]
+  media:
+    port_range: 46260-46263
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45261
+    allowed_ips: [203.0.113.40/30]
+  carrier-b:
+    address: 127.0.0.1:45262
+    allowed_ips: [203.0.113.44/30]
+ring_timeout: 300ms
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeRingTimeoutFailsOver is Task 4's core case: carrier-a (the
+// first target) sends 180 Ringing and then never answers. With
+// ring_timeout set to 300ms, the bridge must give up on carrier-a well
+// before the caller's own patience (Timer B, ~32s) runs out, send it a
+// real CANCEL (not just abandon the transaction), and fail over to
+// carrier-b, which answers immediately.
+//
+// This is the mirror image of TestBridgeCancelStopsFailover (Fix 1): there
+// the CANCEL comes from the CALLER (aLeg.Context() itself is cancelled) and
+// the failover loop must STOP; here the CANCEL is the BRIDGE's own, sent to
+// a single hung target because only the per-attempt ring timer expired
+// (aLeg.Context() is still live), and failover must PROCEED. Swapping that
+// distinction in dialTarget's WaitAnswer-error classification would either
+// wrongly halt failover here or wrongly continue it in the Fix-1 case.
+//
+// Timing-based over real UDP loopback: re-run once before treating a flake
+// as failure.
+func TestBridgeRingTimeoutFailsOver(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45261", nil, stubCarrierConfig{ringForever: true})
+	carrierB := startStubCarrier(t, "127.0.0.1:45262", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 45260, ringTimeoutFailoverCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45260}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200 (carrier-b should have answered after carrier-a's ring timeout)", sess.InviteResponse.StatusCode)
+	}
+
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+	select {
+	case <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+
+	// carrier-a must have received an actual CANCEL — not just been
+	// abandoned — once its ring timer expired.
+	select {
+	case <-carrierA.cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received a CANCEL after its ring timeout expired")
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrierB.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b dialog never ended after BYE")
+	}
+}
+
+// ringTimeoutNoFailoverCfg routes to a single carrier that rings forever,
+// with the same 300ms ring_timeout — proves the exhaustion fallback (408,
+// not 503) when a ring timeout is the ONLY kind of failure seen across
+// every target. Fresh ports (45265-45266, 46270-46273).
+const ringTimeoutNoFailoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45265]
+  media:
+    port_range: 46270-46273
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45266
+    allowed_ips: [203.0.113.48/30]
+ring_timeout: 300ms
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeRingTimeoutNoTargetsReturns408 proves placeCall's exhaustion
+// fallback: when every target's only failure is a ring timeout (no target
+// ever produces a genuine failReal code), the caller gets 408 Request
+// Timeout rather than the generic 503 — the same precedence slot failReal
+// occupies, but one level below it (see placeCall's haveReal/haveRing
+// switch).
+//
+// Timing-based over real UDP loopback: re-run once before treating a flake
+// as failure.
+func TestBridgeRingTimeoutNoTargetsReturns408(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45266", nil, stubCarrierConfig{ringForever: true})
+	startServer(t, 45265, ringTimeoutNoFailoverCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45265}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	finalCode := sess.InviteResponse.StatusCode
+	if finalCode != 408 {
+		t.Fatalf("caller got %d, want 408 Request Timeout", finalCode)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+	select {
+	case <-carrier.cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received a CANCEL after its ring timeout expired")
 	}
 }

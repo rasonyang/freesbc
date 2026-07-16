@@ -165,6 +165,7 @@ const (
 	failDial     failKind = iota // couldn't reach the target / no usable final response → 503
 	failReal                     // a genuine SIP final failure from the target → its own code
 	failUnusable                 // 2xx received but unusable on our side (bad/missing SDP, ACK failure, ...) → 488/502
+	failRing                     // this attempt's ring timer expired before the target answered → 408
 )
 
 // attemptResult is dialTarget's outcome for one target. ok is the only
@@ -207,10 +208,15 @@ type attemptResult struct {
 // falling back to 503 only if no target ever produced one — a trailing
 // dial failure (no response, or a stale provisional; see dialTarget) must
 // never clobber an earlier target's real code just because it happened
-// last. This is the only path here that sends a final response itself,
-// since it's the only one not already covered by rewriteSDP's own failure
-// (488, target-independent — same offer, same failure, on every attempt)
-// or dialTarget's post-answer paths.
+// last. Task 4 slots a ring timeout into this same precedence: if no target
+// ever produced a real code but at least one attempt was cut short by its
+// own ring timer (failRing), the caller gets 408 Request Timeout rather
+// than a bare 503 — still only as a fallback behind any genuine carrier
+// code, since a real (if late) carrier response is always more informative
+// than our own synthesized timeout. This is the only path here that sends
+// a final response itself, since it's the only one not already covered by
+// rewriteSDP's own failure (488, target-independent — same offer, same
+// failure, on every attempt) or dialTarget's post-answer paths.
 //
 // After each retryable failure, placeCall also checks whether the A-leg is
 // still there (aLeg.Context().Err()) before starting the next candidate: a
@@ -231,6 +237,7 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	// answer still only Relatches (processAnswerSDP), never re-Starts.
 	var startOnce sync.Once
 	haveReal := false
+	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
 	for _, target := range targets {
 		bLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
@@ -243,6 +250,9 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		if res.kind == failReal {
 			haveReal = true
 			lastRealCode, lastRealReason = res.code, res.reason
+		}
+		if res.kind == failRing {
+			haveRing = true
 		}
 
 		// The A-leg may have gone away (caller CANCEL/hangup) while this
@@ -259,9 +269,12 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		}
 	}
 
-	if haveReal {
+	switch {
+	case haveReal:
 		_ = aLeg.Respond(lastRealCode, lastRealReason, nil)
-	} else {
+	case haveRing:
+		_ = aLeg.Respond(408, "Request Timeout", nil)
+	default:
 		_ = aLeg.Respond(503, "Service Unavailable", nil)
 	}
 	return nil, Target{}, false
@@ -331,7 +344,24 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
 	}
 
-	if err := bLeg.WaitAnswer(aLeg.Context(), sipgo.AnswerOptions{
+	// attemptCtx caps how long THIS target is allowed to ring before we give
+	// up on it and fail over — cfg.RingTimeout, not the whole-call budget.
+	// It's a child of aLeg.Context(), not context.Background(): a caller
+	// CANCEL/hangup must still abort the attempt immediately rather than
+	// waiting out the ring timer. Deriving from aLeg.Context() also means a
+	// parent cancellation (caller gone) propagates into attemptCtx as
+	// context.Canceled, while an attemptCtx-only expiry propagates as
+	// context.DeadlineExceeded — that distinction is exactly how the
+	// WaitAnswer-error classification below tells a caller CANCEL apart
+	// from a ring timeout (see the comment there). WaitAnswer's own
+	// ctx.Done() path (github.com/emiago/sipgo@v1.4.3 dialog_client.go)
+	// sends the target a real CANCEL and returns ctx.Err() from
+	// inviteCancel — so attemptCtx expiring both cancels the hung target on
+	// the wire and gives us a reliable signal to classify on.
+	attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
+	defer cancel()
+
+	if err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
 		OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce),
 		Username:   authUser(target),
 		Password:   authPass(target),
@@ -351,7 +381,24 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// own synthesized ones (failDial, 503: dial error, timeout, CANCEL
 		// race, or a stale provisional).
 		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
-		if bLeg.InviteResponse != nil && !bLeg.InviteResponse.IsProvisional() {
+		switch {
+		case aLeg.Context().Err() != nil:
+			// The A-leg itself is gone (caller CANCEL/hangup): placeCall's
+			// own aLeg.Context().Err() check, right after this return, stops
+			// the failover loop before trying another target. The exact
+			// kind/code here never reaches the caller (there is no caller
+			// left to respond to), so failDial's zero-value default is fine
+			// — the important thing is NOT to misclassify this as failRing,
+			// which would be a lie (nothing "timed out"; the caller left).
+		case attemptCtx.Err() == context.DeadlineExceeded:
+			// aLeg.Context() is still live (checked above) but the
+			// PER-ATTEMPT deadline fired: this target simply rang too long.
+			// WaitAnswer already sent it a CANCEL (see attemptCtx's comment
+			// above) — placeCall fails over to the next target.
+			res.kind = failRing
+			res.code = 408
+			res.reason = "Request Timeout"
+		case bLeg.InviteResponse != nil && !bLeg.InviteResponse.IsProvisional():
 			res.kind = failReal
 			res.code = bLeg.InviteResponse.StatusCode
 			res.reason = bLeg.InviteResponse.Reason
