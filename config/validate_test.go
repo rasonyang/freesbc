@@ -97,6 +97,16 @@ func TestValidateErrors(t *testing.T) {
 		{"bad media_latch", func(c *Config) { c.Peers["pbx"].MediaLatch = "sticky" }, "media_latch"},
 		{"negative rtp_timeout", func(c *Config) { c.Listen.Media.RTPTimeout = Duration(-time.Second) }, "rtp_timeout"},
 		{"negative ring_timeout", func(c *Config) { c.RingTimeout = Duration(-time.Second) }, "ring_timeout"},
+		{"negative register_expires", func(c *Config) { c.RegisterExpires = Duration(-time.Second) }, "register_expires"},
+		{"peer register_expires negative", func(c *Config) {
+			c.Peers["pbx"].RegisterExpires = Duration(-time.Second)
+		}, "register_expires"},
+		{"sub-second register_expires truncates to Expires:0", func(c *Config) {
+			c.RegisterExpires = Duration(500 * time.Millisecond)
+		}, "at least 1s"},
+		{"peer sub-second register_expires truncates to Expires:0", func(c *Config) {
+			c.Peers["pbx"].RegisterExpires = Duration(500 * time.Millisecond)
+		}, "at least 1s"},
 		{"transform group out of range", func(c *Config) {
 			c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
 			c.Routes[0].Transform = &RouteTransform{To: "$2"}

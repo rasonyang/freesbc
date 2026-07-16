@@ -245,6 +245,17 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
 	for _, target := range targets {
+		// A register:true target we have not (yet, or no longer) actually
+		// registered with must never be dialed — the far end has no idea
+		// who we are and would reject or misroute the call. b.s.registrar
+		// is nil only in tests that build a bridge without going through
+		// Server.Run (e.g. directly constructing &bridge{s: s}); treat that
+		// the same as "no gating" rather than skipping every target.
+		if target.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(target.Name) {
+			b.s.log.Debug("skipping unregistered target", "peer", target.Name)
+			continue
+		}
+
 		bLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
 		if res.ok {
 			return bLeg, target, true

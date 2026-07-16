@@ -33,6 +33,7 @@ type Server struct {
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
 	br        *bridge
+	registrar *Registrar
 
 	// warnAutoIPOnce gates ourIP's "can't resolve a routable address"
 	// warning to a single log line for the life of the process: ourIP is
@@ -105,8 +106,53 @@ func (s *Server) Run(ctx context.Context) error {
 	srv.OnBye(s.onBye)
 	srv.OnNoRoute(s.onNoRoute)
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Shutdown sequencing (deliberately NOT one shared ctx for the registrar
+	// and the listeners): in sipgo, a UDP listener's connection is pooled
+	// under every remote addr it has received a packet from, and an
+	// outbound request from the same UA/transport REUSES that pooled conn
+	// (connectionReuse default true). So once a real carrier has sent us
+	// inbound traffic (e.g. an OPTIONS keepalive) on a listener, the
+	// registrar's shutdown Expires:0 un-REGISTER to that same carrier is
+	// exactly the kind of outbound request that can land on the pooled
+	// listener conn. If the listener socket closes CONCURRENTLY with that
+	// un-REGISTER (as it did when both watched one shared ctx), the
+	// un-REGISTER can route onto the just-closed socket and fail with
+	// net.ErrClosed — defeating spec Decision #3 (clean shutdown
+	// un-register) against exactly the carriers it matters most for.
+	//
+	// The fix: give the registrar and the listeners independent contexts,
+	// rooted below (not derived from one another, and NOT children of the
+	// same WithCancel — a child automatically cancels when its parent does,
+	// which would reintroduce the same race the instant the caller's ctx is
+	// cancelled). stopCh is the single "begin shutdown" trigger — fired by
+	// either the caller cancelling ctx or a fatal listener bind failure —
+	// and its only job is to kick off a strictly ordered tail: cancel the
+	// registrar and wait for it to finish (un-REGISTERing while every
+	// listener socket is still open), THEN cancel the listeners (closing
+	// their sockets), THEN wait for their goroutines to actually exit.
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(stopCh) }) }
+	// Watch the caller's ctx, but also exit when shutdown was triggered some
+	// other way (e.g. a fatal bind failure closing stopCh) so this goroutine
+	// can't park forever if the caller never cancels ctx.
+	go func() {
+		select {
+		case <-ctx.Done():
+			stop()
+		case <-stopCh:
+		}
+	}()
+
+	regCtx, regCancel := context.WithCancel(context.Background())
+	defer regCancel()
+	listenCtx, listenCancel := context.WithCancel(context.Background())
+	defer listenCancel()
+
+	s.registrar = NewRegistrar(s.store, client, s, s.log)
+	regDone := make(chan struct{})
+	go func() { _ = s.registrar.Run(regCtx); close(regDone) }()
+
 	errs := make(chan error, len(listeners))
 	var wg sync.WaitGroup
 	for _, l := range listeners {
@@ -115,16 +161,22 @@ func (s *Server) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lerr := s.bindListener(ctx, srv, l, addr)
-			if lerr != nil && ctx.Err() == nil {
+			lerr := s.bindListener(listenCtx, srv, l, addr)
+			if lerr != nil && listenCtx.Err() == nil {
 				errs <- fmt.Errorf("listen %s://%s: %w", l.Transport, addr, lerr)
-				cancel()
+				stop()
 			}
 		}()
 	}
 	s.log.Info("sip server listening", "listeners", len(listeners))
 
-	<-ctx.Done()
+	<-stopCh
+	// Registrar first: every un-REGISTER attempt completes (success or its
+	// own bounded 2s timeout) while listener sockets are still open.
+	regCancel()
+	<-regDone
+	// Only now is it safe to close the listener sockets.
+	listenCancel()
 	wg.Wait()
 	select {
 	case err := <-errs:

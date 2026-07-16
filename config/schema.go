@@ -15,12 +15,13 @@ import (
 // fields (Peer.allowedNets, Route.matchTo) are populated by validate and are
 // only valid on a *Config that has been through Parse.
 type Config struct {
-	Listen      ListenConfig     `yaml:"listen"`
-	Peers       map[string]*Peer `yaml:"peers"`
-	Routes      []*Route         `yaml:"routes"`
-	Shield      ShieldConfig     `yaml:"shield"`
-	Admin       *AdminConfig     `yaml:"admin"`
-	RingTimeout Duration         `yaml:"ring_timeout"` // cancel a ringing target after this long, then failover
+	Listen          ListenConfig     `yaml:"listen"`
+	Peers           map[string]*Peer `yaml:"peers"`
+	Routes          []*Route         `yaml:"routes"`
+	Shield          ShieldConfig     `yaml:"shield"`
+	Admin           *AdminConfig     `yaml:"admin"`
+	RingTimeout     Duration         `yaml:"ring_timeout"`     // cancel a ringing target after this long, then failover
+	RegisterExpires Duration         `yaml:"register_expires"` // requested REGISTER lifetime (carrier may grant less)
 }
 
 type ListenConfig struct {
@@ -45,6 +46,9 @@ type Peer struct {
 	// "strict" (default) requires the first RTP packet's source IP to match
 	// the SDP-signaled address; "loose" accepts any source (hard NAT).
 	MediaLatch string `yaml:"media_latch"`
+	// RegisterExpires overrides the global register_expires for this peer
+	// (0 = use the global default). Only meaningful with register: true.
+	RegisterExpires Duration `yaml:"register_expires"`
 
 	allowedNets []netip.Prefix // compiled by Validate
 }
@@ -146,5 +150,8 @@ func withDefaults(c *Config) {
 	}
 	if c.RingTimeout == 0 {
 		c.RingTimeout = Duration(60 * time.Second)
+	}
+	if c.RegisterExpires == 0 {
+		c.RegisterExpires = Duration(3600 * time.Second)
 	}
 }

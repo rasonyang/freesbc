@@ -983,3 +983,17 @@ gofmt -l . && git add README.md && git commit -m "docs: mark M4.2 done in roadma
 | §8 stub-registrar testing | 3, 4, 5, 6 |
 
 Deferred (spec §9): session timers + PRACK (M4.3); DNS SRV + cross-call health/cooldown + configurable failover code (M4.4); REGISTER forwarding (non-goal); separate registrar host distinct from call address; per-peer CLI/PAI.
+
+## Post-Implementation Amendments (2026-07-16, whole-branch review)
+
+- **Shutdown sequencing** (Fix 1): the registrar now stops and un-REGISTERs *before* listener sockets close. sipgo pools the UDP listener connection under remotes it has heard from and reuses it for outbound requests, so a concurrent listener close was making the shutdown un-REGISTER fail (`net.ErrClosed`) against any carrier that had sent us traffic. Registrar and listeners now use separate contexts, cancelled in order.
+- **Changed-peer restart serialized** (Fix 2): on a param change (e.g. credential rotation) the new registration goroutine waits for the old one's un-REGISTER (`Expires:0`) to finish before it registers, so the old goroutine can't wipe the carrier's fresh binding. The wait is inside the new goroutine (not under `reconcile`'s mutex — that would deadlock the old goroutine's state write).
+- **`register_expires` floor** (Fix 3): validated `>= 1s` (global + per-peer) — a sub-second value truncated to `Expires: 0` (an un-register masquerading as a registration).
+
+## Carry-over for M4.3/M4.4 (from whole-branch review)
+
+- **423 Interval Too Brief** (M4.3/M4.4): a carrier's 423 is currently a generic backoff-retry with the same Expires, so a `register_expires` below the carrier's Min-Expires never registers. RFC 3261 §10.2.8 wants a retry with the Min-Expires from the 423. Handle when trunk-interop hardening lands.
+- **Call-ID / CSeq continuity** (spec §3 deviation): each refresh is a fresh REGISTER (new Call-ID, random CSeq), not "same Call-ID, CSeq++" as the design's state machine describes. RFC 3261 §10.2.4 is a SHOULD and registrars tolerate it, but it deviates from spec §3 — either implement per-peer Call-ID/CSeq continuity or amend the spec text in a later pass.
+- **`grantedExpires` first-Contact** (M4.4): reads the first Contact of the 200; a shared trunk account with multiple registered devices could read the wrong binding's expires. Correct fix: match our own Contact URI. Mitigated today by the Expires-header-first precedence.
+- **Grace-until-expiry on transient refresh failure** (M4.4 health): one failed refresh gates the peer out of routing immediately even though the carrier-side binding is valid until its granted expiry; fold into M4.4's generalized peer health.
+- **`stopAll` draining** (Minor): a peer stopped by an earlier reconcile just before shutdown isn't waited on by `stopAll`; its in-flight un-REGISTER can race `client.Close`. Best-effort; fold stopped-but-draining handles into the wait list if it matters.

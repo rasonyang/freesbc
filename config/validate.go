@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // validate checks cross-references and value constraints, collecting every
@@ -38,6 +39,9 @@ func (c *Config) validate() error {
 	if c.RingTimeout.Std() <= 0 {
 		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())
 	}
+	if c.RegisterExpires.Std() < time.Second {
+		fail("register_expires: must be at least 1s, got %v", c.RegisterExpires.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
@@ -61,6 +65,13 @@ func (c *Config) validate() error {
 		case "strict", "loose":
 		default:
 			fail("peers.%s: media_latch must be strict or loose, got %q", name, p.MediaLatch)
+		}
+		// Sub-second is rejected (not just <= 0): registerOnce's Expires
+		// header is uint32(expires.Seconds()), which truncates e.g. 500ms to
+		// 0 — silently turning a "register" into an un-register that then
+		// leaves the peer falsely marked registered.
+		if p.RegisterExpires != 0 && p.RegisterExpires.Std() < time.Second {
+			fail("peers.%s: register_expires must be at least 1s when set, got %v", name, p.RegisterExpires.Std())
 		}
 		if p.Register && p.Auth == nil {
 			fail("peers.%s: register: true requires auth credentials", name)
