@@ -133,7 +133,16 @@ func (s *Server) Run(ctx context.Context) error {
 	stopCh := make(chan struct{})
 	var stopOnce sync.Once
 	stop := func() { stopOnce.Do(func() { close(stopCh) }) }
-	go func() { <-ctx.Done(); stop() }()
+	// Watch the caller's ctx, but also exit when shutdown was triggered some
+	// other way (e.g. a fatal bind failure closing stopCh) so this goroutine
+	// can't park forever if the caller never cancels ctx.
+	go func() {
+		select {
+		case <-ctx.Done():
+			stop()
+		case <-stopCh:
+		}
+	}()
 
 	regCtx, regCancel := context.WithCancel(context.Background())
 	defer regCancel()
