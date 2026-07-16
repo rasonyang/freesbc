@@ -236,14 +236,6 @@ func (r *Registrar) IsRegistered(name string) bool {
 	return ok
 }
 
-// setRegistered records name's current registration state, for
-// registration.run to report through and IsRegistered to read.
-func (r *Registrar) setRegistered(name string, ok bool) {
-	r.mu.Lock()
-	r.state[name] = ok
-	r.mu.Unlock()
-}
-
 // setRegisteredGen records a peer's registration state only if the calling
 // goroutine is still the current generation for that peer. A goroutine
 // superseded by a reconcile (peer params changed) has an older gen, so its
