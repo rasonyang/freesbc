@@ -35,6 +35,9 @@ func (c *Config) validate() error {
 	if c.Listen.Media.RTPTimeout.Std() <= 0 {
 		fail("listen.media.rtp_timeout: must be > 0, got %v", c.Listen.Media.RTPTimeout.Std())
 	}
+	if c.RingTimeout.Std() <= 0 {
+		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")

@@ -92,4 +92,31 @@ func TestWithDefaults(t *testing.T) {
 	if c.Shield.NFTables != "auto" {
 		t.Errorf("nftables default: %q", c.Shield.NFTables)
 	}
+	if c.RingTimeout.Std() != 60*time.Second {
+		t.Errorf("ring_timeout default: %v", c.RingTimeout.Std())
+	}
+}
+
+func TestParseRingTimeout(t *testing.T) {
+	// minimalYAML defined in loader_test.go, but we'll use a simpler approach here
+	src := `
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+ring_timeout: 30s
+`
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.RingTimeout.Std() != 30*time.Second {
+		t.Errorf("ring_timeout = %v, want 30s", c.RingTimeout.Std())
+	}
 }

@@ -15,11 +15,12 @@ import (
 // fields (Peer.allowedNets, Route.matchTo) are populated by validate and are
 // only valid on a *Config that has been through Parse.
 type Config struct {
-	Listen ListenConfig     `yaml:"listen"`
-	Peers  map[string]*Peer `yaml:"peers"`
-	Routes []*Route         `yaml:"routes"`
-	Shield ShieldConfig     `yaml:"shield"`
-	Admin  *AdminConfig     `yaml:"admin"`
+	Listen      ListenConfig     `yaml:"listen"`
+	Peers       map[string]*Peer `yaml:"peers"`
+	Routes      []*Route         `yaml:"routes"`
+	Shield      ShieldConfig     `yaml:"shield"`
+	Admin       *AdminConfig     `yaml:"admin"`
+	RingTimeout Duration         `yaml:"ring_timeout"` // cancel a ringing target after this long, then failover
 }
 
 type ListenConfig struct {
@@ -142,5 +143,8 @@ func withDefaults(c *Config) {
 	}
 	if c.Shield.NFTables == "" {
 		c.Shield.NFTables = "auto"
+	}
+	if c.RingTimeout == 0 {
+		c.RingTimeout = Duration(60 * time.Second)
 	}
 }
