@@ -21,6 +21,15 @@ import (
 // package-private state (registry, pool) for assertions.
 func startServer(t *testing.T, port int, cfgYAML string) *Server {
 	t.Helper()
+	return startServerConfigured(t, port, cfgYAML, nil)
+}
+
+// startServerConfigured is startServer with a hook to mutate the *Server
+// before Run starts — e.g. to install a resolver lookupSRV stub. The hook
+// runs before the Run goroutine is spawned, so its writes happen-before any
+// call-handling goroutine reads them (no data race under -race).
+func startServerConfigured(t *testing.T, port int, cfgYAML string, configure func(*Server)) *Server {
+	t.Helper()
 	cfg, err := config.Parse([]byte(cfgYAML))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
@@ -28,6 +37,9 @@ func startServer(t *testing.T, port int, cfgYAML string) *Server {
 	store := config.NewStore(cfg)
 	pool := media.NewPool(store)
 	srv := NewServer(store, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if configure != nil {
+		configure(srv)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.Run(ctx) }()

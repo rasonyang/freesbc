@@ -3704,3 +3704,162 @@ func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
 		t.Errorf("dialEndpoint lost its Target: %+v", des[0].Target)
 	}
 }
+
+// TestExpandTargetsSkipsCooledEndpoints is Task 5's filter coverage: a
+// cooled-down endpoint is skipped as long as some alternative is healthy,
+// but cooldown is never a hard block — if every candidate is cooled,
+// expandTargets dials them all anyway.
+func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
+	cfg, err := config.Parse([]byte(bridgeCallCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s := NewServer(config.NewStore(cfg), nil, discardLogger())
+	b := &bridge{s: s}
+
+	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{
+			{Target: "ep1.example.", Port: 5060, Priority: 10, Weight: 0},
+			{Target: "ep2.example.", Port: 5061, Priority: 20, Weight: 0},
+		}, nil
+	}
+	targets := []Target{{Name: "a", Peer: &config.Peer{Address: "multi.example", Transport: "udp"}}}
+
+	// Cool down ep1: expandTargets returns only ep2.
+	s.health.Penalize(Endpoint{Host: "ep1.example", Port: 5060, Transport: "udp"}, time.Hour)
+	des := b.expandTargets(targets)
+	if len(des) != 1 || des[0].Endpoint.Host != "ep2.example" {
+		t.Fatalf("with ep1 cooled, want [ep2.example], got %+v", des)
+	}
+
+	// Cool down ep2 as well: everything is cooled → dial them ALL anyway.
+	s.health.Penalize(Endpoint{Host: "ep2.example", Port: 5061, Transport: "udp"}, time.Hour)
+	des = b.expandTargets(targets)
+	if len(des) != 2 {
+		t.Fatalf("all cooled → dial-anyway must return both, got %+v", des)
+	}
+}
+
+// healthCfg routes local-uac → carrier, where carrier is addressed by a bare
+// hostname (srvhost.test) so resolution goes through SRV (the resolver's
+// lookupSRV is stubbed per-test — see
+// TestBridgePenalizesDeadEndpointThenBridges). media_latch: loose matches
+// the stub carrier's answer coming from a different address than the offer
+// implied. ring_timeout is kept short as a general safety net for any
+// attempt that DOES ring without answering (the dead-endpoint case in
+// TestBridgePenalizesDeadEndpointThenBridges fails synchronously — see its
+// comment — and so does not itself depend on this value).
+const healthCfg = `
+listen:
+  sip: [udp://127.0.0.1:45191]
+  media:
+    port_range: 46210-46213
+    public_ip: 127.0.0.1
+ring_timeout: 3s
+peer_cooldown: 60s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: srvhost.test
+    transport: udp
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgePenalizesDeadEndpointThenBridges proves the M4.4 health path
+// end to end: a peer resolving to [dead, live] fails over from the dead
+// endpoint to the live one, and the dead endpoint is left in cooldown.
+func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	// Live stub carrier on a real port. The "dead" endpoint is 0.0.0.0, not
+	// an unlistened 127.0.0.1 port: sipgo v1.4.3's UDP transport sends via an
+	// unconnected socket (net.ListenPacket + WriteTo), so on this platform a
+	// write to an unlistened loopback port never surfaces a synchronous
+	// error — the OS's ICMP port-unreachable does not reach an unconnected
+	// socket's send path, and DialogClientSession.WaitAnswer's ctx.Done()
+	// handling (inviteCancel, github.com/emiago/sipgo@v1.4.3
+	// dialog_client.go) only cancels promptly once at least one response
+	// (even a stray provisional) has been seen; with none ever arriving it
+	// instead blocks on the underlying INVITE transaction's own Timer B
+	// (RFC 3261, hardcoded 32s) — our short ring_timeout never gets a
+	// chance to matter. 0.0.0.0 sidesteps this: WriteTo it is invalid at the
+	// OS level ("sendto: no route to host"), so tx.Init() fails and
+	// dialTarget's own `err != nil` branch fires immediately — a fast,
+	// deterministic failDial with no dependency on OS-level ICMP behavior or
+	// sipgo's ring-timeout-vs-CANCEL interaction.
+	const livePort = 45194
+	const deadPort = 45195
+	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
+
+	// A peer addressed by hostname so resolution goes through SRV; the SBC's
+	// "carrier" peer in healthCfg uses address: srvhost.test (no port). The
+	// resolver stub MUST be installed before Run starts handling calls —
+	// startServerConfigured sets it inside NewServer→Run's happens-before
+	// window (goroutine start), so -race sees no data race on lookupSRV.
+	srv := startServerConfigured(t, 45191, healthCfg, func(s *Server) {
+		s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+			return "", []*net.SRV{
+				{Target: "0.0.0.0.", Port: deadPort, Priority: 10, Weight: 0},   // tried first — fails to connect
+				{Target: "127.0.0.1.", Port: livePort, Priority: 20, Weight: 0}, // fallback
+			}, nil
+		}
+	})
+
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	uacUA, _ := sipgo.NewUA()
+	defer uacUA.Close()
+	uacClient, _ := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (should bridge on the live endpoint)", sess.InviteResponse.StatusCode)
+	}
+	select {
+	case <-live.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live carrier never received the B-leg INVITE")
+	}
+	_ = sess.Ack(context.Background())
+
+	// The dead endpoint must now be in cooldown; the live one must not.
+	if srv.health.Available(Endpoint{Host: "0.0.0.0", Port: deadPort, Transport: "udp"}) {
+		t.Error("dead endpoint should be cooled down after failDial")
+	}
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}) {
+		t.Error("live endpoint should be Recovered after a successful bridge")
+	}
+
+	_ = sess.Bye(context.Background())
+	waitForActiveCalls(t, srv, 0, 5*time.Second)
+}

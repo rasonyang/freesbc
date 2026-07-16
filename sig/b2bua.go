@@ -297,10 +297,13 @@ type dialEndpoint struct {
 // endpoints to dial, in order: each peer is resolved (DNS SRV → priority/
 // weight-ordered endpoints, or a single endpoint for an IP/host:port), and a
 // register:true peer we have not registered with is skipped entirely (the
-// far end has no idea who we are). Health filtering is layered on in Task 5.
+// far end has no idea who we are). Task 5: endpoints currently in cooldown
+// (b.s.health, populated by placeCall's Penalize on a failDial) are skipped
+// in favor of healthy ones — but only when at least one healthy endpoint
+// exists; see the dial-anyway fallback below.
 func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 	cfg := b.s.store.Current()
-	var out []dialEndpoint
+	var available, cooled []dialEndpoint
 	for _, t := range targets {
 		// b.s.registrar is nil only in tests that build a bridge without
 		// Server.Run; treat that as "no gating" rather than skipping every
@@ -310,10 +313,20 @@ func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 			continue
 		}
 		for _, ep := range b.s.resolver.Resolve(t.Peer, cfg.SRVCacheTTL.Std()) {
-			out = append(out, dialEndpoint{Target: t, Endpoint: ep})
+			de := dialEndpoint{Target: t, Endpoint: ep}
+			if b.s.health.Available(ep) {
+				available = append(available, de)
+			} else {
+				cooled = append(cooled, de)
+			}
 		}
 	}
-	return out
+	// Cooldown is a skip-if-alternatives, never a hard block: if every
+	// endpoint is cooled down, dial them all anyway rather than fail the call.
+	if len(available) > 0 {
+		return available
+	}
+	return cooled
 }
 
 // placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
@@ -364,6 +377,8 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		return nil, Target{}, nil, nil, false
 	}
 
+	cfg := b.s.store.Current()
+
 	// startOnce is created here — not per attempt — and threaded through
 	// every dialTarget call so the media session Starts exactly once for
 	// the whole call: if an earlier, ultimately-failed target already sent
@@ -376,10 +391,19 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	for _, de := range b.expandTargets(targets) {
 		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, bOffer, sess, ourIP, &startOnce)
 		if res.ok {
+			// A bridged call proves this endpoint is reachable — clear any
+			// prior cooldown so it is usable immediately on the next call.
+			b.s.health.Recover(de.Endpoint)
 			return dialedLeg, de.Target, res.aAnswer, bOffer, true
 		}
 		if !res.retryable {
 			return nil, Target{}, nil, nil, false
+		}
+		// Only a genuine connect failure (no usable response at all) cools an
+		// endpoint down; a real carrier final / ring-timeout / our-side
+		// unusable answer all mean the endpoint itself is reachable.
+		if res.kind == failDial {
+			b.s.health.Penalize(de.Endpoint, cfg.PeerCooldown.Std())
 		}
 		if res.kind == failReal {
 			haveReal = true
