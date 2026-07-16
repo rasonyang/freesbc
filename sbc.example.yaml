@@ -12,7 +12,8 @@ listen:
     - tls://0.0.0.0:5061          # cert auto-generated (self-signed) if not configured
   media:
     port_range: 16384-32768
-    public_ip: auto                # auto = STUN probe, or set a literal IP
+    public_ip: 203.0.113.10        # your SBC's public IP (advertised in SDP/Contact).
+                                    # "auto" (STUN) is a future milestone.
     # rtp_timeout: 5m              # tear down calls after this much RTP silence
 
 peers:

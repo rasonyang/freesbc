@@ -13,20 +13,45 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/callstate"
 	"github.com/freesbc/freesbc/config"
+	"github.com/freesbc/freesbc/media"
 )
 
 // Server is the SIP signaling front door. It binds the configured
-// listeners, identifies inbound requests by transport source IP, and
-// answers OPTIONS health checks. The B2BUA bridge is wired in M3.3.
+// listeners, identifies inbound requests by transport source IP, answers
+// OPTIONS health checks, and (M3.3) hosts the B2BUA bridge for INVITE.
 type Server struct {
 	store *config.Store
+	pool  *media.Pool
 	log   *slog.Logger
+
+	registry *callstate.Registry
+
+	client    *sipgo.Client
+	dialogSrv *sipgo.DialogServerCache
+	dialogCli *sipgo.DialogClientCache
+	br        *bridge
+
+	// warnAutoIPOnce gates ourIP's "can't resolve a routable address"
+	// warning to a single log line for the life of the process: ourIP is
+	// called on every INVITE (mediaIP's per-call SDP rewrite), and without
+	// this the same warning would otherwise spam the log once per call.
+	warnAutoIPOnce sync.Once
 }
 
-func NewServer(store *config.Store, log *slog.Logger) *Server {
-	return &Server{store: store, log: log}
+func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
+	return &Server{
+		store:    store,
+		pool:     pool,
+		log:      log,
+		registry: callstate.NewRegistry(),
+	}
 }
+
+// ActiveCalls returns the number of calls currently tracked in the call
+// registry, for metrics.
+func (s *Server) ActiveCalls() int { return s.registry.Count() }
 
 // Run builds the sipgo server, binds every listen.sip entry, and blocks
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
@@ -45,12 +70,40 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("sipgo server: %w", err)
 	}
+
+	client, err := sipgo.NewClient(ua)
+	if err != nil {
+		return fmt.Errorf("sipgo client: %w", err)
+	}
+	defer client.Close()
+	s.client = client
+
+	cfg := s.store.Current()
+	listeners := cfg.Listen.SIP
+	contactPort := 5060
+	if len(listeners) > 0 {
+		contactPort = listeners[0].Port
+	}
+	// The Contact host must be an address the far side can actually reach —
+	// see ourIP: same resolution (public_ip literal, else a non-unspecified
+	// listen.sip host) as the SDP media IP, so a Contact built from
+	// listeners[0]'s raw host (which may be 0.0.0.0 when listening on all
+	// interfaces) doesn't advertise an unroutable sip:0.0.0.0:port. Resolved
+	// once here from the config Run started with; hot-reloaded changes to
+	// public_ip/listeners don't retroactively update this cached Contact
+	// (mediaIP/ourIP's SDP-facing use, by contrast, is resolved fresh per
+	// call from the current config).
+	contact := sip.ContactHeader{Address: sip.Uri{Host: s.ourIP(cfg).String(), Port: contactPort}}
+	s.dialogSrv = sipgo.NewDialogServerCache(client, contact)
+	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
+	s.br = &bridge{s: s}
+
 	srv.OnRequest(sip.OPTIONS, s.onOptions)
-	srv.OnInvite(s.onInvite)
+	srv.OnInvite(s.br.onInvite)
 	srv.OnAck(s.onAck)
+	srv.OnBye(s.onBye)
 	srv.OnNoRoute(s.onNoRoute)
 
-	listeners := s.store.Current().Listen.SIP
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errs := make(chan error, len(listeners))
@@ -161,6 +214,46 @@ func (s *Server) dropUnidentified(req *sip.Request) {
 		"method", req.Method.String(), "source", req.Source())
 }
 
+// ourIP resolves the IP the SBC advertises as its own to the outside world:
+// the media IP rewritten into SDP (mediaIP's per-call use, below) and the
+// dialog Contact host built in Run. Resolution order:
+//
+//  1. The configured public_ip, when it is a literal address (not "auto" —
+//     STUN-based discovery for "auto" is a later milestone).
+//  2. Otherwise, the first listen.sip host that is NOT unspecified (0.0.0.0
+//     / ::): a listener commonly binds every interface (0.0.0.0) while the
+//     SBC still has one real, routable address to advertise, so an
+//     unspecified listener host is skipped rather than handed to the far
+//     side — advertising 0.0.0.0 in SDP is a media blackhole, and in a
+//     Contact header is unroutable.
+//  3. If every listen.sip host is itself unspecified (or there are none),
+//     fall back to 127.0.0.1 and log a warning — once per process
+//     (warnAutoIPOnce), not per call, since this is called on every INVITE.
+func (s *Server) ourIP(cfg *config.Config) netip.Addr {
+	if pub := cfg.Listen.Media.PublicIP; pub != "auto" {
+		if ip, err := netip.ParseAddr(pub); err == nil {
+			return ip
+		}
+	}
+	for _, l := range cfg.Listen.SIP {
+		if ip, err := netip.ParseAddr(l.Host); err == nil && !ip.IsUnspecified() {
+			return ip
+		}
+	}
+	s.warnAutoIPOnce.Do(func() {
+		s.log.Warn("listen.media.public_ip is auto (STUN discovery isn't implemented yet) and no listen.sip host is a specific, routable address; falling back to 127.0.0.1 — SDP media and the Contact header will be unroutable from any other host")
+	})
+	return netip.MustParseAddr("127.0.0.1")
+}
+
+// mediaIP is ourIP's per-call entry point for the SDP media address: called
+// once per bridged INVITE (see bridge.onInvite), it re-resolves from cfg
+// each time so a hot-reloaded public_ip takes effect on the next call
+// without restarting the process.
+func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
+	return s.ourIP(cfg)
+}
+
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 	name, _, ok := s.identify(req)
 	if !ok {
@@ -172,24 +265,35 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
-func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
-	name, _, ok := s.identify(req)
-	if !ok {
+// onAck routes an in-dialog ACK to the dialog-server cache so sipgo's
+// dialog layer can transition the A-leg dialog to confirmed. INVITEs we
+// reject before ReadInvite (Task 5's 404s) have no dialog registered, so
+// ReadAck's "no such dialog" case is expected and merely logged.
+func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
+	if _, _, ok := s.identify(req); !ok {
 		s.dropUnidentified(req)
 		return
 	}
-	_ = tx.Respond(sip.NewResponseFromRequest(req, 100, "Trying", nil))
-	// M3.3 replaces this stub with the B2BUA bridge (routing → media
-	// allocate → SDP rewrite → B-leg INVITE).
-	if err := tx.Respond(sip.NewResponseFromRequest(req, 501, "Not Implemented", nil)); err != nil {
-		s.log.Error("respond INVITE stub", "peer", name, "err", err)
+	if err := s.dialogSrv.ReadAck(req, tx); err != nil {
+		s.log.Debug("dialog ack", "err", err, "source", req.Source())
 	}
-	s.log.Info("INVITE received (bridge not yet implemented)", "peer", name)
 }
 
-// onAck absorbs ACKs (e.g. the ACK to the 501 stub's final response) so
-// sipgo does not log them as unhandled. Real in-dialog ACK handling is M3.3.
-func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {}
+// onBye routes an in-dialog BYE to whichever dialog cache owns it: the
+// A-leg (we are the UAS, dialogSrv) or the B-leg (we are the UAC,
+// dialogCli). Exactly one of the two caches will recognize the dialog.
+func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
+	if _, _, ok := s.identify(req); !ok {
+		s.dropUnidentified(req)
+		return
+	}
+	if err := s.dialogSrv.ReadBye(req, tx); err == nil {
+		return
+	}
+	if err := s.dialogCli.ReadBye(req, tx); err != nil {
+		s.log.Debug("dialog bye", "err", err, "source", req.Source())
+	}
+}
 
 // onNoRoute is sipgo's catch-all for every SIP method without a dedicated
 // handler (REGISTER, BYE, SUBSCRIBE, MESSAGE, ...). Without this override,

@@ -45,6 +45,27 @@ func (l *latch) setExpected(ip netip.Addr) {
 	l.mu.Unlock()
 }
 
+// setMode changes the latch's strict/loose policy at runtime. Used when the
+// peer actually selected for a call (e.g. the winning failover target)
+// carries a different media_latch setting than whatever the session was
+// allocated with.
+func (l *latch) setMode(m LatchMode) {
+	l.mu.Lock()
+	l.mode = m
+	l.mu.Unlock()
+}
+
+// relatch re-arms the latch to a new expected IP and forgets the current
+// remote, so the next packet from the new expected address re-latches. Used
+// only for authorized media-address changes (re-INVITE); unsolicited packets
+// still cannot move a latch.
+func (l *latch) relatch(ip netip.Addr) {
+	l.mu.Lock()
+	l.expected = ip
+	l.remote = nil
+	l.mu.Unlock()
+}
+
 // accept reports whether a packet from src may be processed, latching the
 // stream to src on the first acceptance.
 func (l *latch) accept(src *net.UDPAddr) bool {
@@ -53,7 +74,10 @@ func (l *latch) accept(src *net.UDPAddr) bool {
 	if l.remote != nil {
 		return l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port
 	}
-	if l.mode == LatchStrict && l.expected.IsValid() {
+	if l.mode == LatchStrict {
+		if !l.expected.IsValid() {
+			return false // strict: reject until SetExpectedRemote arms the latch
+		}
 		ip, ok := netip.AddrFromSlice(src.IP)
 		if !ok || ip.Unmap() != l.expected.Unmap() {
 			return false
@@ -138,6 +162,34 @@ func (s *Session) RTPPort(side Side) int { return s.pairs[side].RTPPort() }
 func (s *Session) SetExpectedRemote(side Side, ip netip.Addr) {
 	s.rtp[side].setExpected(ip)
 	s.rtcp[side].setExpected(ip)
+}
+
+// Relatch re-arms both the RTP and RTCP latches of one side to ip, for an
+// authorized media-address change signalled by a re-INVITE.
+func (s *Session) Relatch(side Side, ip netip.Addr) {
+	s.rtp[side].relatch(ip)
+	s.rtcp[side].relatch(ip)
+}
+
+// SetLatchMode changes both the RTP and RTCP latch policy of one side at
+// runtime, to align it with the peer actually selected for the call — e.g.
+// a failover winner whose media_latch differs from the target the session
+// was originally Allocated against. Safe to call at any point in the
+// session's lifecycle, including after packets have already latched (it
+// only changes how a not-yet-latched or future latch decides acceptance;
+// see latch.accept).
+func (s *Session) SetLatchMode(side Side, mode LatchMode) {
+	s.rtp[side].setMode(mode)
+	s.rtcp[side].setMode(mode)
+}
+
+// ParseLatchMode maps a peer's media_latch config string to a LatchMode.
+// Anything other than "loose" is strict (the safe default).
+func ParseLatchMode(s string) LatchMode {
+	if s == "loose" {
+		return LatchLoose
+	}
+	return LatchStrict
 }
 
 // Done is closed when the session ends (Close or silence timeout).

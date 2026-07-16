@@ -77,14 +77,13 @@ func run(cfgPath string) error {
 	}()
 
 	pool := media.NewPool(store)
-	_ = pool // handed to the signaling plane in M3
 
 	mediaCfg := store.Current().Listen.Media
 	log.Info("media plane ready",
 		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
 		"rtp_timeout", mediaCfg.RTPTimeout.Std())
 
-	sipServer := sig.NewServer(store, log)
+	sipServer := sig.NewServer(store, pool, log)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -94,7 +93,9 @@ func run(cfgPath string) error {
 		}
 	}()
 
-	// M3.3+: the B2BUA bridge, shield, and admin API attach here.
+	// The B2BUA bridge (M3.3) is wired into sipServer above (sig.NewServer /
+	// sig.Server.Run). Only the shield (M6) and admin API (M7) still attach
+	// here.
 
 	log.Info("freesbc started",
 		"config", cfgPath,

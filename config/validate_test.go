@@ -96,6 +96,14 @@ func TestValidateErrors(t *testing.T) {
 		{"bad admin listen", func(c *Config) { c.Admin = &AdminConfig{Listen: "nope"} }, "admin.listen"},
 		{"bad media_latch", func(c *Config) { c.Peers["pbx"].MediaLatch = "sticky" }, "media_latch"},
 		{"negative rtp_timeout", func(c *Config) { c.Listen.Media.RTPTimeout = Duration(-time.Second) }, "rtp_timeout"},
+		{"transform group out of range", func(c *Config) {
+			c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
+			c.Routes[0].Transform = &RouteTransform{To: "$2"}
+		}, "capture group"},
+		{"transform braced group out of range", func(c *Config) {
+			c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
+			c.Routes[0].Transform = &RouteTransform{To: "${5}"}
+		}, "capture group"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,5 +152,40 @@ func TestValidateAggregatesAllErrors(t *testing.T) {
 	msg := err.Error()
 	if !strings.Contains(msg, "listen.sip") || !strings.Contains(msg, "ghost") {
 		t.Errorf("expected both errors reported, got: %q", msg)
+	}
+}
+
+func TestValidateTransformGroupInRange(t *testing.T) {
+	c := validConfig()
+	c.Routes[0].Match = &RouteMatch{To: `^9(\d+)(\d)$`}
+	c.Routes[0].Transform = &RouteTransform{To: "$1$2"} // both groups exist
+	if err := c.validate(); err != nil {
+		t.Fatalf("in-range group refs must pass: %v", err)
+	}
+	c2 := validConfig()
+	c2.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
+	c2.Routes[0].Transform = &RouteTransform{To: "+$0"} // $0 = whole match, always valid
+	if err := c2.validate(); err != nil {
+		t.Fatalf("$0 (whole match) must pass: %v", err)
+	}
+	c3 := validConfig()
+	c3.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
+	c3.Routes[0].Transform = &RouteTransform{To: `$$1`} // $$ is an escaped literal $, not a ref
+	if err := c3.validate(); err != nil {
+		t.Fatalf("$$ escape must pass: %v", err)
+	}
+}
+
+func TestValidateTransformEdgeCasesNotFalseRejected(t *testing.T) {
+	// These templates never reference a real out-of-range group at runtime
+	// (they mirror regexp.Expand: unterminated ${ is literal; leading-zero
+	// names are named refs, not group indices), so validation must ACCEPT them.
+	for _, tmpl := range []string{"${5", "$012", "$01", "$00"} {
+		c := validConfig()
+		c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`} // 1 group
+		c.Routes[0].Transform = &RouteTransform{To: tmpl}
+		if err := c.validate(); err != nil {
+			t.Errorf("template %q must not be rejected as out-of-range: %v", tmpl, err)
+		}
 	}
 }
