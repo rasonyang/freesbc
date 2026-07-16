@@ -67,6 +67,16 @@ func sipRequest(method, targetPort string, localAddr *net.UDPAddr, callID string
 // sees wantSubstr or the timeout elapses. Returns all received text.
 func roundTrip(t *testing.T, targetPort int, method, callID string, timeout time.Duration, wantSubstr string) string {
 	t.Helper()
+	return roundTripWithHeaders(t, targetPort, method, callID, timeout, wantSubstr)
+}
+
+// roundTripWithHeaders is roundTrip plus the ability to inject extra raw
+// header lines (e.g. "Require: 100rel", "Session-Expires: 30") into the
+// request built by sipRequest, for tests that need to exercise header-driven
+// gating without hand-rolling the whole request. roundTrip is a thin
+// zero-extra-headers wrapper around this.
+func roundTripWithHeaders(t *testing.T, targetPort int, method, callID string, timeout time.Duration, wantSubstr string, extraHeaders ...string) string {
+	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +85,16 @@ func roundTrip(t *testing.T, targetPort int, method, callID string, timeout time
 	local := conn.LocalAddr().(*net.UDPAddr)
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: targetPort}
 	req := sipRequest(method, fmt.Sprintf("%d", targetPort), local, callID)
+	if len(extraHeaders) > 0 {
+		// sipRequest terminates with "\r\n\r\n" (blank line ends the
+		// header block, no body). Splice the extra header lines in just
+		// before that blank line so they land in the header section.
+		const terminator = "\r\n\r\n"
+		if !strings.HasSuffix(req, terminator) {
+			t.Fatalf("sipRequest output missing expected terminator, got:\n%s", req)
+		}
+		req = strings.TrimSuffix(req, terminator) + "\r\n" + strings.Join(extraHeaders, "\r\n") + terminator
+	}
 	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatal(err)
 	}

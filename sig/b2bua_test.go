@@ -113,6 +113,42 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	}
 }
 
+// TestBridgeRejects100relRequire proves an initial INVITE that mandates
+// reliable provisional responses (Require: 100rel, RFC 3262) — a feature we
+// do not implement — is rejected at the front door with 420 Bad Extension
+// and an Unsupported: 100rel header (RFC 3261 §21.4.20's required pairing),
+// before ever reaching Resolve/ReadInvite.
+func TestBridgeRejects100relRequire(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45410", 1)
+	startServer(t, 45410, cfg)
+	got := roundTripWithHeaders(t, 45410, "INVITE", "req100rel-1", 3*time.Second, "SIP/2.0 420",
+		"Require: 100rel")
+	if !strings.Contains(got, "SIP/2.0 420") {
+		t.Fatalf("Require:100rel must get 420, got:\n%s", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "unsupported: 100rel") {
+		t.Errorf("420 should carry Unsupported: 100rel, got:\n%s", got)
+	}
+}
+
+// TestBridgeRejectsLowSessionExpires proves an initial INVITE offering a
+// Session-Expires below the configured min_se (knownPeerCfg leaves min_se at
+// its 90s default) is rejected with 422 Session Interval Too Small and a
+// Min-SE header advertising the floor (RFC 4028 §5), before ever reaching
+// Resolve/ReadInvite.
+func TestBridgeRejectsLowSessionExpires(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45412", 1)
+	startServer(t, 45412, cfg)
+	got := roundTripWithHeaders(t, 45412, "INVITE", "lowse-1", 3*time.Second, "SIP/2.0 422",
+		"Session-Expires: 30")
+	if !strings.Contains(got, "SIP/2.0 422") {
+		t.Fatalf("low Session-Expires must get 422, got:\n%s", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "min-se:") {
+		t.Errorf("422 should carry Min-SE, got:\n%s", got)
+	}
+}
+
 // TestBridgeMalformedInviteGets400 proves a request-shape problem — here,
 // an INVITE with no Contact header, which sipgo's DialogUA.ReadInvite
 // refuses outright (sip.ErrDialogInviteNoContact) before any dialog is

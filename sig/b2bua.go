@@ -61,6 +61,38 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	cfg := b.s.store.Current()
+
+	// M4.3 front-door gating for INITIAL INVITEs only (the in-dialog
+	// re-INVITE branch above already returned): reject anything we cannot
+	// honor before Resolve/ReadInvite ever run, so neither routing nor a
+	// dialog is spent on a request that's going nowhere.
+	if requires100rel(req) {
+		// We do not implement RFC 3262 reliable provisionals. Require:
+		// 100rel mandates them, so the only correct response is 420 Bad
+		// Extension with the offending option tag echoed back in
+		// Unsupported (RFC 3261 §21.4.20) — responding via the raw tx,
+		// same as the reject helper, since no dialog exists yet.
+		res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
+		res.AppendHeader(sip.NewHeader("Unsupported", "100rel"))
+		_ = tx.Respond(res)
+		b.s.log.Info("declined Require: 100rel", "source", req.Source())
+		return
+	}
+	if se := headerSeconds(req, "Session-Expires"); se > 0 {
+		if minSE := cfg.MinSE.Std(); se < minSE {
+			// sip.NewResponseFromRequest has no named constant for 422
+			// (sipgo only defines the common codes) — RFC 4028 §5 defines
+			// it as "422 Session Interval Too Small" with a mandatory
+			// Min-SE header advertising our floor, so the caller can retry
+			// with an acceptable value.
+			res := sip.NewResponseFromRequest(req, 422, "Session Interval Too Small", nil)
+			res.AppendHeader(sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds()))))
+			_ = tx.Respond(res)
+			b.s.log.Info("rejected low Session-Expires", "requested", se, "min_se", minSE)
+			return
+		}
+	}
+
 	decision, ok := Resolve(cfg, name, req.Recipient.User)
 	if !ok || decision.OutNumber == "" || len(decision.Targets) == 0 {
 		b.reject(req, tx, 404, "Not Found")
