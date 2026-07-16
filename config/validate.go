@@ -48,6 +48,12 @@ func (c *Config) validate() error {
 	if c.SessionExpires.Std() < c.MinSE.Std() {
 		fail("session_expires: must be >= min_se (%v), got %v", c.MinSE.Std(), c.SessionExpires.Std())
 	}
+	if c.PeerCooldown.Std() <= 0 {
+		fail("peer_cooldown: must be > 0, got %v", c.PeerCooldown.Std())
+	}
+	if c.SRVCacheTTL.Std() < time.Second {
+		fail("srv_cache_ttl: must be at least 1s, got %v", c.SRVCacheTTL.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")

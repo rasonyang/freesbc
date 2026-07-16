@@ -20,6 +20,8 @@ ring_timeout: 60s   # cancel a target that rings this long without answering, th
 register_expires: 3600s   # requested REGISTER lifetime for register:true peers (carrier may grant less)
 session_expires: 1800s   # RFC 4028 session timer we advertise/accept (carrier may lower it)
 min_se: 90s              # smallest session interval accepted; a lower request gets 422 + Min-SE
+peer_cooldown: 30s   # after a connect failure (no response) to a peer endpoint, skip it this long before retrying
+srv_cache_ttl: 300s  # cache DNS SRV/A resolutions this long (Go's resolver exposes no record TTL, so this is a fixed window)
 
 peers:
   carrier-a:

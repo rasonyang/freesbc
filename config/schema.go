@@ -24,6 +24,8 @@ type Config struct {
 	RegisterExpires Duration         `yaml:"register_expires"` // requested REGISTER lifetime (carrier may grant less)
 	SessionExpires  Duration         `yaml:"session_expires"`  // RFC 4028 Session-Expires we advertise/accept
 	MinSE           Duration         `yaml:"min_se"`           // minimum session interval accepted (else 422)
+	PeerCooldown    Duration         `yaml:"peer_cooldown"`    // skip a peer endpoint this long after a connect failure
+	SRVCacheTTL     Duration         `yaml:"srv_cache_ttl"`    // cache DNS SRV/endpoint resolutions this long (stdlib exposes no record TTL)
 }
 
 type ListenConfig struct {
@@ -161,5 +163,11 @@ func withDefaults(c *Config) {
 	}
 	if c.MinSE == 0 {
 		c.MinSE = Duration(90 * time.Second)
+	}
+	if c.PeerCooldown == 0 {
+		c.PeerCooldown = Duration(30 * time.Second)
+	}
+	if c.SRVCacheTTL == 0 {
+		c.SRVCacheTTL = Duration(300 * time.Second)
 	}
 }
