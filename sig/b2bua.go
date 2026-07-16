@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"net"
 	"net/netip"
 	"runtime/debug"
 	"strconv"
@@ -15,7 +14,6 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/callstate"
-	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
 )
 
@@ -278,6 +276,12 @@ const (
 // kind/code/reason are only meaningful when retryable is true; placeCall
 // uses them solely to remember the last failReal code, for the case where
 // every target is exhausted.
+//
+// penalize marks a result as a genuine connect failure (no response from a
+// reachable endpoint / caller still present) that should cool the endpoint
+// down. Only set true at true connect-failure sites; everything relying on
+// the zero-value default (caller CANCEL, auth challenge, raced/stale
+// response) stays false.
 type attemptResult struct {
 	ok        bool
 	aAnswer   []byte
@@ -285,6 +289,51 @@ type attemptResult struct {
 	kind      failKind
 	code      int
 	reason    string
+	penalize  bool
+}
+
+// dialEndpoint pairs a resolved dial destination with the Target (peer) it
+// came from — dialing needs the endpoint's host/port, but auth credentials,
+// From/Contact, and session-timer headers still come from the peer.
+type dialEndpoint struct {
+	Target   Target
+	Endpoint Endpoint
+}
+
+// expandTargets flattens the ordered failover Targets into the concrete
+// endpoints to dial, in order: each peer is resolved (DNS SRV → priority/
+// weight-ordered endpoints, or a single endpoint for an IP/host:port), and a
+// register:true peer we have not registered with is skipped entirely (the
+// far end has no idea who we are). Task 5: endpoints currently in cooldown
+// (b.s.health, populated by placeCall's Penalize on a failDial) are skipped
+// in favor of healthy ones — but only when at least one healthy endpoint
+// exists; see the dial-anyway fallback below.
+func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
+	cfg := b.s.store.Current()
+	var available, cooled []dialEndpoint
+	for _, t := range targets {
+		// b.s.registrar is nil only in tests that build a bridge without
+		// Server.Run; treat that as "no gating" rather than skipping every
+		// target (mirrors the pre-M4.4 inline gate this replaces).
+		if t.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(t.Name) {
+			b.s.log.Debug("skipping unregistered target", "peer", t.Name)
+			continue
+		}
+		for _, ep := range b.s.resolver.Resolve(t.Peer, cfg.SRVCacheTTL.Std()) {
+			de := dialEndpoint{Target: t, Endpoint: ep}
+			if b.s.health.Available(ep) {
+				available = append(available, de)
+			} else {
+				cooled = append(cooled, de)
+			}
+		}
+	}
+	// Cooldown is a skip-if-alternatives, never a hard block: if every
+	// endpoint is cooled down, dial them all anyway rather than fail the call.
+	if len(available) > 0 {
+		return available
+	}
+	return cooled
 }
 
 // placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
@@ -335,6 +384,8 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		return nil, Target{}, nil, nil, false
 	}
 
+	cfg := b.s.store.Current()
+
 	// startOnce is created here — not per attempt — and threaded through
 	// every dialTarget call so the media session Starts exactly once for
 	// the whole call: if an earlier, ultimately-failed target already sent
@@ -344,24 +395,24 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	haveReal := false
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
-	for _, target := range targets {
-		// A register:true target we have not (yet, or no longer) actually
-		// registered with must never be dialed — the far end has no idea
-		// who we are and would reject or misroute the call. b.s.registrar
-		// is nil only in tests that build a bridge without going through
-		// Server.Run (e.g. directly constructing &bridge{s: s}); treat that
-		// the same as "no gating" rather than skipping every target.
-		if target.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(target.Name) {
-			b.s.log.Debug("skipping unregistered target", "peer", target.Name)
-			continue
-		}
-
-		dialedLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
+	for _, de := range b.expandTargets(targets) {
+		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, bOffer, sess, ourIP, &startOnce)
 		if res.ok {
-			return dialedLeg, target, res.aAnswer, bOffer, true
+			// A bridged call proves this endpoint is reachable — clear any
+			// prior cooldown so it is usable immediately on the next call.
+			b.s.health.Recover(de.Endpoint)
+			return dialedLeg, de.Target, res.aAnswer, bOffer, true
 		}
 		if !res.retryable {
 			return nil, Target{}, nil, nil, false
+		}
+		// Only a genuine connect failure (attemptResult.penalize) cools an
+		// endpoint down; failDial is a catch-all that also covers caller
+		// CANCEL, an unsatisfied auth challenge, and a raced/stale response —
+		// all cases where the endpoint was demonstrably reachable, so kind
+		// alone is not a safe signal here (see attemptResult's doc).
+		if res.penalize {
+			b.s.health.Penalize(de.Endpoint, cfg.PeerCooldown.Std())
 		}
 		if res.kind == failReal {
 			haveReal = true
@@ -444,7 +495,7 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 // WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
 // before dialTarget's own post-answer processing does; both share the same
 // startOnce so Start runs at most once regardless of which path wins.
-func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
+func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep Endpoint, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
 	// Align SideB's latch policy with THIS target before dialing it — not
 	// just whichever target happened to be Targets[0] at Allocate time — so
 	// early media (relayProvisional) and the eventual answer both apply the
@@ -458,7 +509,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	// dialed number (post-transform) is the Request-URI user part, so it
 	// must be set here — without it the carrier receives an INVITE with
 	// no destination number.
-	bTarget := peerURI(target.Peer)
+	bTarget := peerURI(ep)
 	bTarget.User = outNumber
 
 	cfg := b.s.store.Current()
@@ -491,7 +542,20 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		bLeg, err = b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
 		if err != nil {
 			b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			// Invite() itself failed (dial/DNS/transport error before any
+			// request even went out, or went out and was synchronously
+			// rejected): the endpoint never had a chance to respond — normally
+			// a genuine connect failure worth cooling down. But sipgo resolves
+			// a hostname/SRV endpoint using aLeg.Context() (the request is
+			// dialed via that context), so a caller CANCEL/hangup can itself
+			// make Invite() fail instantly here (a cancelled-context resolve
+			// error) for a perfectly healthy target — e.g. a 422 retry's
+			// Invite() racing a caller hangup. Gate on the same
+			// aLeg.Context().Err() signal the WaitAnswer-error classification
+			// below already uses, so only a genuine unreachable-host dial
+			// error (caller still present) cools the endpoint down; a
+			// caller-cancellation-induced Invite failure does not.
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable", penalize: aLeg.Context().Err() == nil}
 		}
 
 		// attemptCtx caps how long THIS target is allowed to ring before we give
@@ -562,6 +626,20 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// real ACK+BYE rather than silently abandoned to ring up ~32s of
 		// carrier billing for a call nobody is using.
 		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		// The endpoint sent NOTHING at all (no provisional, no final — not
+		// even a stale one left over from a dead transaction) and the caller
+		// is still present: this is our own ring-timeout or a transport
+		// failure with no signal that the endpoint is reachable, which is
+		// exactly the genuine-connect-failure case that should cool the
+		// endpoint down. This condition is deliberately narrower than
+		// "kind == failDial": it excludes the caller-CANCEL case
+		// (aLeg.Context().Err() != nil, handled below) and every case where
+		// InviteResponse is non-nil — a raced/stale 2xx or provisional, or an
+		// unsatisfied 401/407 challenge — all of which prove the endpoint
+		// DID respond and so must not be penalized.
+		if bLeg.InviteResponse == nil && aLeg.Context().Err() == nil {
+			res.penalize = true
+		}
 
 		// A target can answer 200 in the window between our CANCEL and its
 		// arrival (caller hangup, ring timeout, or a malformed 2xx). This
@@ -911,19 +989,11 @@ func callID(req *sip.Request) string {
 // startNano is wall-clock time for callstate.Call.StartUnixNano.
 func startNano() int64 { return time.Now().UnixNano() }
 
-// peerURI builds the sip.Uri sipgo needs to dial a peer, from its Address
-// (host:port) and Transport. This lives in sig, not on config.Peer,
-// because config must not import sipgo.
-func peerURI(p *config.Peer) sip.Uri {
-	host := p.Address
-	port := 5060
-	if h, portStr, err := net.SplitHostPort(p.Address); err == nil {
-		host = h
-		if n, perr := strconv.Atoi(portStr); perr == nil {
-			port = n
-		}
-	}
-	transport := p.Transport
+// peerURI builds the sip.Uri sipgo needs to dial a resolved endpoint
+// (host/port/transport). The dialed number is set separately as the
+// Request-URI user part by the caller.
+func peerURI(ep Endpoint) sip.Uri {
+	transport := ep.Transport
 	if transport == "" {
 		transport = "udp"
 	}
@@ -931,8 +1001,8 @@ func peerURI(p *config.Peer) sip.Uri {
 	params.Add("transport", transport)
 	return sip.Uri{
 		Scheme:    "sip",
-		Host:      host,
-		Port:      port,
+		Host:      ep.Host,
+		Port:      ep.Port,
 		UriParams: params,
 	}
 }

@@ -181,3 +181,60 @@ func TestParseSessionTimers(t *testing.T) {
 		t.Errorf("got session_expires=%v min_se=%v", c.SessionExpires.Std(), c.MinSE.Std())
 	}
 }
+
+func TestPeerCooldownAndSRVCacheTTLDefaults(t *testing.T) {
+	// Minimal config omitting both fields → defaults applied.
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.PeerCooldown.Std(); got != 30*time.Second {
+		t.Errorf("peer_cooldown default = %v, want 30s", got)
+	}
+	if got := cfg.SRVCacheTTL.Std(); got != 300*time.Second {
+		t.Errorf("srv_cache_ttl default = %v, want 300s", got)
+	}
+}
+
+func TestPeerCooldownAndSRVCacheTTLParsed(t *testing.T) {
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peer_cooldown: 45s
+srv_cache_ttl: 120s
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.PeerCooldown.Std(); got != 45*time.Second {
+		t.Errorf("peer_cooldown = %v, want 45s", got)
+	}
+	if got := cfg.SRVCacheTTL.Std(); got != 120*time.Second {
+		t.Errorf("srv_cache_ttl = %v, want 120s", got)
+	}
+}

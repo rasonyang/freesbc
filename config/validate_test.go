@@ -192,6 +192,50 @@ func TestValidateTransformGroupInRange(t *testing.T) {
 	}
 }
 
+func TestValidatePeerCooldownMustBePositive(t *testing.T) {
+	_, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peer_cooldown: -1s
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err == nil || !strings.Contains(err.Error(), "peer_cooldown") {
+		t.Fatalf("want peer_cooldown error, got %v", err)
+	}
+}
+
+func TestValidateSRVCacheTTLMinimum(t *testing.T) {
+	_, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+srv_cache_ttl: 500ms
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err == nil || !strings.Contains(err.Error(), "srv_cache_ttl") {
+		t.Fatalf("want srv_cache_ttl error, got %v", err)
+	}
+}
+
 func TestValidateTransformEdgeCasesNotFalseRejected(t *testing.T) {
 	// These templates never reference a real out-of-range group at runtime
 	// (they mirror regexp.Expand: unterminated ${ is literal; leading-zero

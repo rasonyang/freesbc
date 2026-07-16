@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -41,6 +42,13 @@ type Server struct {
 	br        *bridge
 	registrar *Registrar
 
+	// resolver turns a peer into ordered dialable endpoints (DNS SRV with
+	// A/AAAA fallback, priority/weight); health tracks per-endpoint cooldowns
+	// after connect failures. Both are internally synchronized and shared
+	// across concurrent calls. (M4.4)
+	resolver *Resolver
+	health   *endpointHealth
+
 	// warnAutoIPOnce gates ourIP's "can't resolve a routable address"
 	// warning to a single log line for the life of the process: ourIP is
 	// called on every INVITE (mediaIP's per-call SDP rewrite), and without
@@ -55,6 +63,8 @@ func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server 
 		log:      log,
 		registry: callstate.NewRegistry(),
 		sdps:     newCallSDPStore(),
+		resolver: newResolver(time.Now().UnixNano()),
+		health:   newEndpointHealth(),
 	}
 }
 

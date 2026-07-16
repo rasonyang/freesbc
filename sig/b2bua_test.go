@@ -17,6 +17,7 @@ import (
 	"github.com/icholy/digest"
 	"github.com/pion/sdp/v3"
 
+	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
 )
 
@@ -1469,12 +1470,19 @@ routes:
 // bounded wait past the CANCEL, per the task's guidance that this is more
 // reliable than trying to prove a negative directly.
 //
+// It also covers the Task 5 fix-wave finding that a caller CANCEL must
+// NOT cool carrier-a down (it was reachable/ringing, not unreachable):
+// dialTarget's WaitAnswer-error classification hits the
+// aLeg.Context().Err() != nil case here, which leaves attemptResult.penalize
+// at its zero-value default (false) — see attemptResult's doc and the
+// classification switch in dialTarget.
+//
 // Timing-based over real UDP loopback: re-run once before treating a flake
 // as failure.
 func TestBridgeCancelStopsFailover(t *testing.T) {
 	carrierA := startStubCarrier(t, "127.0.0.1:45201", nil, stubCarrierConfig{ringForever: true})
 	carrierB := startStubCarrier(t, "127.0.0.1:45202", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45200, cancelFailoverCfg)
+	srv := startServer(t, 45200, cancelFailoverCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1528,6 +1536,12 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 	case <-carrierB.offers:
 		t.Fatal("carrier-b received a B-leg INVITE after the caller CANCELed — failover loop did not stop")
 	case <-time.After(2 * time.Second):
+	}
+
+	// carrier-a was reachable (it was ringing when the caller CANCELed) —
+	// the CANCEL must not have cooled it down.
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45201, Transport: "udp"}) {
+		t.Error("carrier-a should not be cooled down after a caller CANCEL, only after a genuine connect failure")
 	}
 }
 
@@ -3667,4 +3681,360 @@ func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier dialog never ended after BYE")
 	}
+}
+
+// TestExpandTargetsResolvesEndpointsInOrder verifies expandTargets (M4.4
+// Task 4) resolves a single Target's peer into its ordered endpoints and
+// preserves the originating Target on each dialEndpoint, using a stubbed
+// SRV lookup so the test doesn't depend on real DNS.
+func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
+	cfg, err := config.Parse([]byte(bridgeCallCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s := NewServer(config.NewStore(cfg), nil, discardLogger())
+	// expandTargets doesn't use the cfg's carrier peer here — we stub the
+	// resolver and pass our own multi-endpoint peer.
+	b := &bridge{s: s}
+
+	peerA := &config.Peer{Address: "multi.example", Transport: "udp"}
+	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{
+			{Target: "ep1.example.", Port: 5060, Priority: 10, Weight: 0},
+			{Target: "ep2.example.", Port: 5061, Priority: 20, Weight: 0},
+		}, nil
+	}
+	targets := []Target{{Name: "a", Peer: peerA}}
+	des := b.expandTargets(targets)
+	if len(des) != 2 {
+		t.Fatalf("want 2 dialEndpoints, got %d: %+v", len(des), des)
+	}
+	if des[0].Endpoint.Host != "ep1.example" || des[1].Endpoint.Host != "ep2.example" {
+		t.Errorf("endpoint order = [%s, %s], want [ep1.example, ep2.example]",
+			des[0].Endpoint.Host, des[1].Endpoint.Host)
+	}
+	if des[0].Target.Name != "a" {
+		t.Errorf("dialEndpoint lost its Target: %+v", des[0].Target)
+	}
+}
+
+// TestExpandTargetsSkipsCooledEndpoints is Task 5's filter coverage: a
+// cooled-down endpoint is skipped as long as some alternative is healthy,
+// but cooldown is never a hard block — if every candidate is cooled,
+// expandTargets dials them all anyway.
+func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
+	cfg, err := config.Parse([]byte(bridgeCallCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s := NewServer(config.NewStore(cfg), nil, discardLogger())
+	b := &bridge{s: s}
+
+	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{
+			{Target: "ep1.example.", Port: 5060, Priority: 10, Weight: 0},
+			{Target: "ep2.example.", Port: 5061, Priority: 20, Weight: 0},
+		}, nil
+	}
+	targets := []Target{{Name: "a", Peer: &config.Peer{Address: "multi.example", Transport: "udp"}}}
+
+	// Cool down ep1: expandTargets returns only ep2.
+	s.health.Penalize(Endpoint{Host: "ep1.example", Port: 5060, Transport: "udp"}, time.Hour)
+	des := b.expandTargets(targets)
+	if len(des) != 1 || des[0].Endpoint.Host != "ep2.example" {
+		t.Fatalf("with ep1 cooled, want [ep2.example], got %+v", des)
+	}
+
+	// Cool down ep2 as well: everything is cooled → dial them ALL anyway.
+	s.health.Penalize(Endpoint{Host: "ep2.example", Port: 5061, Transport: "udp"}, time.Hour)
+	des = b.expandTargets(targets)
+	if len(des) != 2 {
+		t.Fatalf("all cooled → dial-anyway must return both, got %+v", des)
+	}
+}
+
+// healthCfg routes local-uac → carrier, where carrier is addressed by a bare
+// hostname (srvhost.test) so resolution goes through SRV (the resolver's
+// lookupSRV is stubbed per-test — see
+// TestBridgePenalizesDeadEndpointThenBridges). media_latch: loose matches
+// the stub carrier's answer coming from a different address than the offer
+// implied. ring_timeout is kept short as a general safety net for any
+// attempt that DOES ring without answering (the dead-endpoint case in
+// TestBridgePenalizesDeadEndpointThenBridges fails synchronously — see its
+// comment — and so does not itself depend on this value).
+const healthCfg = `
+listen:
+  sip: [udp://127.0.0.1:45191]
+  media:
+    port_range: 46210-46213
+    public_ip: 127.0.0.1
+ring_timeout: 3s
+peer_cooldown: 60s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: srvhost.test
+    transport: udp
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// healthRecoverCfg is TestBridgeRecoversEndpointOnSuccess's config: it routes
+// local-uac to a carrier addressed by a literal host:port (127.0.0.1:45301,
+// an explicit port — see classifyAddress), which Resolve returns as exactly
+// ONE endpoint, no SRV lookup involved. A single-endpoint peer is the point:
+// with only one candidate, expandTargets' cooldown-is-skip-if-alternatives
+// filter (Task 5) has no healthy alternative to prefer, so its dial-anyway
+// fallback dials the sole endpoint regardless of its health state, and a
+// successful bridge through it can only be explained by placeCall's
+// post-answer Recover call actually firing (see the test).
+const healthRecoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45300]
+  media:
+    port_range: 46300-46303
+    public_ip: 127.0.0.1
+ring_timeout: 3s
+peer_cooldown: 60s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45301
+    transport: udp
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgePenalizesDeadEndpointThenBridges proves the M4.4 health path's
+// Penalize direction end to end: a peer resolving to [dead, live] fails over
+// from the dead endpoint to the live one, and the dead endpoint is left in
+// cooldown.
+//
+// Whole-branch-review Finding 2: earlier this test ALSO pre-penalized both
+// endpoints before the call (to make the companion Recover assertion
+// genuine — see TestBridgeRecoversEndpointOnSuccess, which now owns that
+// assertion instead). That made the dead-endpoint-cooled assertion below
+// vacuous: Available(dead) == false held from the pre-penalize alone,
+// regardless of whether placeCall's own post-dial Penalize call ever ran —
+// deleting that call from placeCall left the whole suite green. Neither
+// endpoint is pre-penalized here anymore, so the dead endpoint starts (and
+// is dialed) fully healthy; the ONLY thing that can cool it down by the time
+// the call bridges is placeCall's genuine Penalize call on the dead
+// attempt's failDial result. This test does not assert anything about the
+// live endpoint's health — that direction is TestBridgeRecoversEndpointOnSuccess's.
+func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	// Live stub carrier on a real port. The "dead" endpoint's SRV target,
+	// "deadhost..invalid." (note the DOUBLE dot — an empty DNS label), is
+	// syntactically invalid per RFC 1035 (a label may not be empty): Go's
+	// net package rejects it in-process ("no such host") before issuing any
+	// query, under both the pure-Go and cgo resolvers alike (verified on
+	// this machine: sub-millisecond, no network round trip). sipgo's client
+	// therefore fails to resolve it and dialogCli.Invite() returns an error
+	// immediately, so dialTarget's own `err != nil` branch fires — a fast,
+	// deterministic, platform-portable failDial that depends on nothing but
+	// DNS name syntax.
+	//
+	// Two alternatives were tried and rejected:
+	//   - An unlistened 127.0.0.1 port (or 0.0.0.0, which on some platforms
+	//     fails synchronously via the OS's "no route to host" but on Linux
+	//     routes to loopback) is not portable: sipgo v1.4.3's UDP transport
+	//     sends via an unconnected socket (net.ListenPacket + WriteTo), so a
+	//     write to an unlistened loopback port never surfaces a synchronous
+	//     error on every platform.
+	//   - A name in the reserved .invalid TLD (RFC 6761, e.g.
+	//     "deadhost.invalid") is NOT reliably unresolvable in every
+	//     environment: this sandbox's resolver answers every hostname,
+	//     including .invalid ones, with a synthetic address in the
+	//     IANA-reserved benchmarking range (198.18.0.0/15) rather than
+	//     NXDOMAIN. That address then never responds — but the ring-timeout
+	//     fallback does NOT bound this the way it looks like it should:
+	//     sipgo v1.4.3's WaitAnswer only cancels promptly on ctx expiry once
+	//     at least one response (even a stray provisional) has been seen
+	//     from the target; with none ever arriving, WaitAnswer instead blocks
+	//     on the underlying INVITE transaction's own Timer B (RFC 3261,
+	//     hardcoded 32s) or the caller's own context, whichever is shorter —
+	//     confirmed experimentally: this test hung for its full 15s ctx
+	//     budget and failed outright with .invalid. Only a failure at
+	//     Invite() itself (before WaitAnswer is ever entered) sidesteps that
+	//     quirk, which is why this must be a synchronous resolve failure,
+	//     not a silent/unreachable one.
+	const livePort = 45194
+	const deadPort = 45195
+	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
+
+	// A peer addressed by hostname so resolution goes through SRV; the SBC's
+	// "carrier" peer in healthCfg uses address: srvhost.test (no port). The
+	// resolver stub MUST be installed before Run starts handling calls —
+	// startServerConfigured sets it inside NewServer→Run's happens-before
+	// window (goroutine start), so -race sees no data race on lookupSRV.
+	srv := startServerConfigured(t, 45191, healthCfg, func(s *Server) {
+		s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+			return "", []*net.SRV{
+				{Target: "deadhost..invalid.", Port: deadPort, Priority: 10, Weight: 0}, // tried first — invalid DNS syntax, never resolves
+				{Target: "127.0.0.1.", Port: livePort, Priority: 20, Weight: 0},         // fallback
+			}, nil
+		}
+	})
+
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	uacUA, _ := sipgo.NewUA()
+	defer uacUA.Close()
+	uacClient, _ := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	// Neither endpoint is pre-penalized (Finding 2's fix — see the doc
+	// comment above): both start healthy, so expandTargets' one-time
+	// snapshot at the top of placeCall's failover loop returns them in
+	// priority order [dead, live] via its normal "available" branch, no
+	// dial-anyway fallback involved. dead is tried first and fails to
+	// connect (invalid DNS syntax — see the comment above on
+	// "deadhost..invalid."); live is tried second and bridges.
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (should bridge on the live endpoint)", sess.InviteResponse.StatusCode)
+	}
+	select {
+	case <-live.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live carrier never received the B-leg INVITE")
+	}
+	_ = sess.Ack(context.Background())
+
+	// The dead endpoint must now be in cooldown. Unlike the live/Recover
+	// check this replaced (moved to TestBridgeRecoversEndpointOnSuccess),
+	// this needs no poll: placeCall's Penalize call on the dead attempt runs
+	// synchronously, inside the SAME goroutine, well before the live attempt
+	// is even dialed — let alone before the A-leg's 200 OK reaches this
+	// client — so by the time WaitAnswer above returned, Penalize has
+	// already run (or, under the deleted-Penalize regression, provably has
+	// not: nothing else in this test ever touches the dead endpoint's health,
+	// so Available(dead) staying true is exactly the signal that guard is
+	// gone).
+	dead := Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}
+	if srv.health.Available(dead) {
+		t.Error("dead endpoint should be cooled down after failDial")
+	}
+
+	_ = sess.Bye(context.Background())
+	waitForActiveCalls(t, srv, 0, 5*time.Second)
+}
+
+// TestBridgeRecoversEndpointOnSuccess proves the M4.4 health path's Recover
+// direction end to end, split out of TestBridgePenalizesDeadEndpointThenBridges
+// (Finding 2): a peer resolving to exactly ONE endpoint (see healthRecoverCfg)
+// — the live stub carrier — is pre-penalized before the call. Because it is
+// the only candidate, expandTargets' dial-anyway fallback (Task 5: cooldown
+// is skip-if-alternatives, never a hard block) dials it anyway despite the
+// cooldown; the call bridges, and placeCall's post-answer Recover call is the
+// ONLY thing that can explain Available(live) == true afterward — nothing
+// else in this test ever touches its health. Deleting placeCall's Recover
+// call makes this test fail.
+func TestBridgeRecoversEndpointOnSuccess(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	const livePort = 45301
+	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
+
+	srv := startServer(t, 45300, healthRecoverCfg)
+
+	liveEndpoint := Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}
+	// Pre-penalize the only endpoint this peer resolves to, BEFORE the
+	// INVITE: this is what makes the post-call Available(live) == true
+	// assertion below genuine rather than trivially true (see the doc
+	// comment above).
+	srv.health.Penalize(liveEndpoint, time.Hour)
+
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	uacUA, _ := sipgo.NewUA()
+	defer uacUA.Close()
+	uacClient, _ := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45300}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (should dial-anyway the sole, pre-penalized endpoint and bridge)", sess.InviteResponse.StatusCode)
+	}
+	select {
+	case <-live.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live carrier never received the B-leg INVITE")
+	}
+	_ = sess.Ack(context.Background())
+
+	// dialTarget's aLeg.Respond (the 200 OK above) blocks server-side until
+	// OUR ACK is processed, and only then does dialTarget return so placeCall
+	// can call Recover — but sess.Ack just fires the ACK packet and returns,
+	// without waiting for the server to finish processing it, so there is a
+	// short unavoidable race between "ACK sent" and "Recover has run"; poll
+	// briefly, but the final assertion is unconditional.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !srv.health.Available(liveEndpoint) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !srv.health.Available(liveEndpoint) {
+		t.Fatal("live endpoint should be Recovered after a successful bridge, despite being pre-penalized")
+	}
+
+	_ = sess.Bye(context.Background())
+	waitForActiveCalls(t, srv, 0, 5*time.Second)
 }
