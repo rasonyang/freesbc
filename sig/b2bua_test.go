@@ -1470,12 +1470,19 @@ routes:
 // bounded wait past the CANCEL, per the task's guidance that this is more
 // reliable than trying to prove a negative directly.
 //
+// It also covers the Task 5 fix-wave finding that a caller CANCEL must
+// NOT cool carrier-a down (it was reachable/ringing, not unreachable):
+// dialTarget's WaitAnswer-error classification hits the
+// aLeg.Context().Err() != nil case here, which leaves attemptResult.penalize
+// at its zero-value default (false) — see attemptResult's doc and the
+// classification switch in dialTarget.
+//
 // Timing-based over real UDP loopback: re-run once before treating a flake
 // as failure.
 func TestBridgeCancelStopsFailover(t *testing.T) {
 	carrierA := startStubCarrier(t, "127.0.0.1:45201", nil, stubCarrierConfig{ringForever: true})
 	carrierB := startStubCarrier(t, "127.0.0.1:45202", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45200, cancelFailoverCfg)
+	srv := startServer(t, 45200, cancelFailoverCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1529,6 +1536,12 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 	case <-carrierB.offers:
 		t.Fatal("carrier-b received a B-leg INVITE after the caller CANCELed — failover loop did not stop")
 	case <-time.After(2 * time.Second):
+	}
+
+	// carrier-a was reachable (it was ringing when the caller CANCELed) —
+	// the CANCEL must not have cooled it down.
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45201, Transport: "udp"}) {
+		t.Error("carrier-a should not be cooled down after a caller CANCEL, only after a genuine connect failure")
 	}
 }
 
@@ -3783,22 +3796,41 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	// Live stub carrier on a real port. The "dead" endpoint is 0.0.0.0, not
-	// an unlistened 127.0.0.1 port: sipgo v1.4.3's UDP transport sends via an
-	// unconnected socket (net.ListenPacket + WriteTo), so on this platform a
-	// write to an unlistened loopback port never surfaces a synchronous
-	// error — the OS's ICMP port-unreachable does not reach an unconnected
-	// socket's send path, and DialogClientSession.WaitAnswer's ctx.Done()
-	// handling (inviteCancel, github.com/emiago/sipgo@v1.4.3
-	// dialog_client.go) only cancels promptly once at least one response
-	// (even a stray provisional) has been seen; with none ever arriving it
-	// instead blocks on the underlying INVITE transaction's own Timer B
-	// (RFC 3261, hardcoded 32s) — our short ring_timeout never gets a
-	// chance to matter. 0.0.0.0 sidesteps this: WriteTo it is invalid at the
-	// OS level ("sendto: no route to host"), so tx.Init() fails and
-	// dialTarget's own `err != nil` branch fires immediately — a fast,
-	// deterministic failDial with no dependency on OS-level ICMP behavior or
-	// sipgo's ring-timeout-vs-CANCEL interaction.
+	// Live stub carrier on a real port. The "dead" endpoint's SRV target,
+	// "deadhost..invalid." (note the DOUBLE dot — an empty DNS label), is
+	// syntactically invalid per RFC 1035 (a label may not be empty): Go's
+	// net package rejects it in-process ("no such host") before issuing any
+	// query, under both the pure-Go and cgo resolvers alike (verified on
+	// this machine: sub-millisecond, no network round trip). sipgo's client
+	// therefore fails to resolve it and dialogCli.Invite() returns an error
+	// immediately, so dialTarget's own `err != nil` branch fires — a fast,
+	// deterministic, platform-portable failDial that depends on nothing but
+	// DNS name syntax.
+	//
+	// Two alternatives were tried and rejected:
+	//   - An unlistened 127.0.0.1 port (or 0.0.0.0, which on some platforms
+	//     fails synchronously via the OS's "no route to host" but on Linux
+	//     routes to loopback) is not portable: sipgo v1.4.3's UDP transport
+	//     sends via an unconnected socket (net.ListenPacket + WriteTo), so a
+	//     write to an unlistened loopback port never surfaces a synchronous
+	//     error on every platform.
+	//   - A name in the reserved .invalid TLD (RFC 6761, e.g.
+	//     "deadhost.invalid") is NOT reliably unresolvable in every
+	//     environment: this sandbox's resolver answers every hostname,
+	//     including .invalid ones, with a synthetic address in the
+	//     IANA-reserved benchmarking range (198.18.0.0/15) rather than
+	//     NXDOMAIN. That address then never responds — but the ring-timeout
+	//     fallback does NOT bound this the way it looks like it should:
+	//     sipgo v1.4.3's WaitAnswer only cancels promptly on ctx expiry once
+	//     at least one response (even a stray provisional) has been seen
+	//     from the target; with none ever arriving, WaitAnswer instead blocks
+	//     on the underlying INVITE transaction's own Timer B (RFC 3261,
+	//     hardcoded 32s) or the caller's own context, whichever is shorter —
+	//     confirmed experimentally: this test hung for its full 15s ctx
+	//     budget and failed outright with .invalid. Only a failure at
+	//     Invite() itself (before WaitAnswer is ever entered) sidesteps that
+	//     quirk, which is why this must be a synchronous resolve failure,
+	//     not a silent/unreachable one.
 	const livePort = 45194
 	const deadPort = 45195
 	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
@@ -3811,8 +3843,8 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	srv := startServerConfigured(t, 45191, healthCfg, func(s *Server) {
 		s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
 			return "", []*net.SRV{
-				{Target: "0.0.0.0.", Port: deadPort, Priority: 10, Weight: 0},   // tried first — fails to connect
-				{Target: "127.0.0.1.", Port: livePort, Priority: 20, Weight: 0}, // fallback
+				{Target: "deadhost..invalid.", Port: deadPort, Priority: 10, Weight: 0}, // tried first — invalid DNS syntax, never resolves
+				{Target: "127.0.0.1.", Port: livePort, Priority: 20, Weight: 0},         // fallback
 			}, nil
 		}
 	})
@@ -3829,6 +3861,30 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	uacClient, _ := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	// Pre-penalize the live endpoint so a successful bridge through it can
+	// only be explained by Recover actually firing (Finding 3): without
+	// this, Available(live)==true after the call would hold trivially (the
+	// live endpoint is never otherwise penalized in this test), so deleting
+	// the Recover call in placeCall would still pass. With it, Available
+	// (live) being true afterward proves Recover ran.
+	//
+	// The dead endpoint is pre-penalized too — not just live: expandTargets
+	// computes availability ONCE per call, before any target is dialed
+	// (Task 5's "skip-if-alternatives" design — see its doc comment), so if
+	// only live were cooled here, the dead endpoint would still look
+	// available at that snapshot and expandTargets would return ONLY the
+	// dead endpoint (available beats cooled whenever available is
+	// non-empty) — live would never even be attempted, and the call would
+	// fail with 503 rather than bridging. Pre-penalizing both makes every
+	// resolved endpoint cooled at that snapshot, which is exactly what
+	// drives expandTargets' dial-anyway fallback (see its doc): it dials
+	// them ALL, in the same priority order (dead first, then live), so dead
+	// still fails first (its cooldown gets extended, redundantly with what
+	// it would get anyway) and the loop then falls over to live, which
+	// bridges and Recovers.
+	srv.health.Penalize(Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}, time.Hour)
+	srv.health.Penalize(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}, time.Hour)
 
 	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -3852,8 +3908,19 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	}
 	_ = sess.Ack(context.Background())
 
-	// The dead endpoint must now be in cooldown; the live one must not.
-	if srv.health.Available(Endpoint{Host: "0.0.0.0", Port: deadPort, Transport: "udp"}) {
+	// The dead endpoint must now be in cooldown; the live one must have been
+	// Recovered despite being pre-penalized above. dialTarget's aLeg.Respond
+	// (the 200 OK above) blocks server-side until OUR ACK is processed, and
+	// only then does dialTarget return so placeCall can call Recover — but
+	// sess.Ack just fires the ACK packet and returns, without waiting for
+	// the server to finish processing it, so there is a short unavoidable
+	// race between "ACK sent" and "Recover has run"; poll briefly rather
+	// than asserting immediately.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.health.Available(Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}) {
 		t.Error("dead endpoint should be cooled down after failDial")
 	}
 	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}) {

@@ -276,6 +276,12 @@ const (
 // kind/code/reason are only meaningful when retryable is true; placeCall
 // uses them solely to remember the last failReal code, for the case where
 // every target is exhausted.
+//
+// penalize marks a result as a genuine connect failure (no response from a
+// reachable endpoint / caller still present) that should cool the endpoint
+// down. Only set true at true connect-failure sites; everything relying on
+// the zero-value default (caller CANCEL, auth challenge, raced/stale
+// response) stays false.
 type attemptResult struct {
 	ok        bool
 	aAnswer   []byte
@@ -283,6 +289,7 @@ type attemptResult struct {
 	kind      failKind
 	code      int
 	reason    string
+	penalize  bool
 }
 
 // dialEndpoint pairs a resolved dial destination with the Target (peer) it
@@ -399,10 +406,12 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		if !res.retryable {
 			return nil, Target{}, nil, nil, false
 		}
-		// Only a genuine connect failure (no usable response at all) cools an
-		// endpoint down; a real carrier final / ring-timeout / our-side
-		// unusable answer all mean the endpoint itself is reachable.
-		if res.kind == failDial {
+		// Only a genuine connect failure (attemptResult.penalize) cools an
+		// endpoint down; failDial is a catch-all that also covers caller
+		// CANCEL, an unsatisfied auth challenge, and a raced/stale response —
+		// all cases where the endpoint was demonstrably reachable, so kind
+		// alone is not a safe signal here (see attemptResult's doc).
+		if res.penalize {
 			b.s.health.Penalize(de.Endpoint, cfg.PeerCooldown.Std())
 		}
 		if res.kind == failReal {
@@ -533,7 +542,11 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		bLeg, err = b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
 		if err != nil {
 			b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			// Invite() itself failed (dial/DNS/transport error before any
+			// request even went out, or went out and was synchronously
+			// rejected): the endpoint never had a chance to respond — a
+			// genuine connect failure, so cool it down.
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable", penalize: true}
 		}
 
 		// attemptCtx caps how long THIS target is allowed to ring before we give
@@ -604,6 +617,20 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// real ACK+BYE rather than silently abandoned to ring up ~32s of
 		// carrier billing for a call nobody is using.
 		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		// The endpoint sent NOTHING at all (no provisional, no final — not
+		// even a stale one left over from a dead transaction) and the caller
+		// is still present: this is our own ring-timeout or a transport
+		// failure with no signal that the endpoint is reachable, which is
+		// exactly the genuine-connect-failure case that should cool the
+		// endpoint down. This condition is deliberately narrower than
+		// "kind == failDial": it excludes the caller-CANCEL case
+		// (aLeg.Context().Err() != nil, handled below) and every case where
+		// InviteResponse is non-nil — a raced/stale 2xx or provisional, or an
+		// unsatisfied 401/407 challenge — all of which prove the endpoint
+		// DID respond and so must not be penalized.
+		if bLeg.InviteResponse == nil && aLeg.Context().Err() == nil {
+			res.penalize = true
+		}
 
 		// A target can answer 200 in the window between our CANCEL and its
 		// arrival (caller hangup, ring timeout, or a malformed 2xx). This
