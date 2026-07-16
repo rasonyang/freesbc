@@ -3785,9 +3785,55 @@ routes:
     to: [carrier]
 `
 
-// TestBridgePenalizesDeadEndpointThenBridges proves the M4.4 health path
-// end to end: a peer resolving to [dead, live] fails over from the dead
-// endpoint to the live one, and the dead endpoint is left in cooldown.
+// healthRecoverCfg is TestBridgeRecoversEndpointOnSuccess's config: it routes
+// local-uac to a carrier addressed by a literal host:port (127.0.0.1:45301,
+// an explicit port — see classifyAddress), which Resolve returns as exactly
+// ONE endpoint, no SRV lookup involved. A single-endpoint peer is the point:
+// with only one candidate, expandTargets' cooldown-is-skip-if-alternatives
+// filter (Task 5) has no healthy alternative to prefer, so its dial-anyway
+// fallback dials the sole endpoint regardless of its health state, and a
+// successful bridge through it can only be explained by placeCall's
+// post-answer Recover call actually firing (see the test).
+const healthRecoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45300]
+  media:
+    port_range: 46300-46303
+    public_ip: 127.0.0.1
+ring_timeout: 3s
+peer_cooldown: 60s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45301
+    transport: udp
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgePenalizesDeadEndpointThenBridges proves the M4.4 health path's
+// Penalize direction end to end: a peer resolving to [dead, live] fails over
+// from the dead endpoint to the live one, and the dead endpoint is left in
+// cooldown.
+//
+// Whole-branch-review Finding 2: earlier this test ALSO pre-penalized both
+// endpoints before the call (to make the companion Recover assertion
+// genuine — see TestBridgeRecoversEndpointOnSuccess, which now owns that
+// assertion instead). That made the dead-endpoint-cooled assertion below
+// vacuous: Available(dead) == false held from the pre-penalize alone,
+// regardless of whether placeCall's own post-dial Penalize call ever ran —
+// deleting that call from placeCall left the whole suite green. Neither
+// endpoint is pre-penalized here anymore, so the dead endpoint starts (and
+// is dialed) fully healthy; the ONLY thing that can cool it down by the time
+// the call bridges is placeCall's genuine Penalize call on the dead
+// attempt's failDial result. This test does not assert anything about the
+// live endpoint's health — that direction is TestBridgeRecoversEndpointOnSuccess's.
 func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -3862,30 +3908,13 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	// Pre-penalize the live endpoint so a successful bridge through it can
-	// only be explained by Recover actually firing (Finding 3): without
-	// this, Available(live)==true after the call would hold trivially (the
-	// live endpoint is never otherwise penalized in this test), so deleting
-	// the Recover call in placeCall would still pass. With it, Available
-	// (live) being true afterward proves Recover ran.
-	//
-	// The dead endpoint is pre-penalized too — not just live: expandTargets
-	// computes availability ONCE per call, before any target is dialed
-	// (Task 5's "skip-if-alternatives" design — see its doc comment), so if
-	// only live were cooled here, the dead endpoint would still look
-	// available at that snapshot and expandTargets would return ONLY the
-	// dead endpoint (available beats cooled whenever available is
-	// non-empty) — live would never even be attempted, and the call would
-	// fail with 503 rather than bridging. Pre-penalizing both makes every
-	// resolved endpoint cooled at that snapshot, which is exactly what
-	// drives expandTargets' dial-anyway fallback (see its doc): it dials
-	// them ALL, in the same priority order (dead first, then live), so dead
-	// still fails first (its cooldown gets extended, redundantly with what
-	// it would get anyway) and the loop then falls over to live, which
-	// bridges and Recovers.
-	srv.health.Penalize(Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}, time.Hour)
-	srv.health.Penalize(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}, time.Hour)
-
+	// Neither endpoint is pre-penalized (Finding 2's fix — see the doc
+	// comment above): both start healthy, so expandTargets' one-time
+	// snapshot at the top of placeCall's failover loop returns them in
+	// priority order [dead, live] via its normal "available" branch, no
+	// dial-anyway fallback involved. dead is tried first and fails to
+	// connect (invalid DNS syntax — see the comment above on
+	// "deadhost..invalid."); live is tried second and bridges.
 	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -3908,23 +3937,102 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	}
 	_ = sess.Ack(context.Background())
 
-	// The dead endpoint must now be in cooldown; the live one must have been
-	// Recovered despite being pre-penalized above. dialTarget's aLeg.Respond
-	// (the 200 OK above) blocks server-side until OUR ACK is processed, and
-	// only then does dialTarget return so placeCall can call Recover — but
-	// sess.Ack just fires the ACK packet and returns, without waiting for
-	// the server to finish processing it, so there is a short unavoidable
-	// race between "ACK sent" and "Recover has run"; poll briefly rather
-	// than asserting immediately.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if srv.health.Available(Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}) {
+	// The dead endpoint must now be in cooldown. Unlike the live/Recover
+	// check this replaced (moved to TestBridgeRecoversEndpointOnSuccess),
+	// this needs no poll: placeCall's Penalize call on the dead attempt runs
+	// synchronously, inside the SAME goroutine, well before the live attempt
+	// is even dialed — let alone before the A-leg's 200 OK reaches this
+	// client — so by the time WaitAnswer above returned, Penalize has
+	// already run (or, under the deleted-Penalize regression, provably has
+	// not: nothing else in this test ever touches the dead endpoint's health,
+	// so Available(dead) staying true is exactly the signal that guard is
+	// gone).
+	dead := Endpoint{Host: "deadhost..invalid", Port: deadPort, Transport: "udp"}
+	if srv.health.Available(dead) {
 		t.Error("dead endpoint should be cooled down after failDial")
 	}
-	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}) {
-		t.Error("live endpoint should be Recovered after a successful bridge")
+
+	_ = sess.Bye(context.Background())
+	waitForActiveCalls(t, srv, 0, 5*time.Second)
+}
+
+// TestBridgeRecoversEndpointOnSuccess proves the M4.4 health path's Recover
+// direction end to end, split out of TestBridgePenalizesDeadEndpointThenBridges
+// (Finding 2): a peer resolving to exactly ONE endpoint (see healthRecoverCfg)
+// — the live stub carrier — is pre-penalized before the call. Because it is
+// the only candidate, expandTargets' dial-anyway fallback (Task 5: cooldown
+// is skip-if-alternatives, never a hard block) dials it anyway despite the
+// cooldown; the call bridges, and placeCall's post-answer Recover call is the
+// ONLY thing that can explain Available(live) == true afterward — nothing
+// else in this test ever touches its health. Deleting placeCall's Recover
+// call makes this test fail.
+func TestBridgeRecoversEndpointOnSuccess(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	const livePort = 45301
+	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
+
+	srv := startServer(t, 45300, healthRecoverCfg)
+
+	liveEndpoint := Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}
+	// Pre-penalize the only endpoint this peer resolves to, BEFORE the
+	// INVITE: this is what makes the post-call Available(live) == true
+	// assertion below genuine rather than trivially true (see the doc
+	// comment above).
+	srv.health.Penalize(liveEndpoint, time.Hour)
+
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	uacUA, _ := sipgo.NewUA()
+	defer uacUA.Close()
+	uacClient, _ := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45300}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (should dial-anyway the sole, pre-penalized endpoint and bridge)", sess.InviteResponse.StatusCode)
+	}
+	select {
+	case <-live.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("live carrier never received the B-leg INVITE")
+	}
+	_ = sess.Ack(context.Background())
+
+	// dialTarget's aLeg.Respond (the 200 OK above) blocks server-side until
+	// OUR ACK is processed, and only then does dialTarget return so placeCall
+	// can call Recover — but sess.Ack just fires the ACK packet and returns,
+	// without waiting for the server to finish processing it, so there is a
+	// short unavoidable race between "ACK sent" and "Recover has run"; poll
+	// briefly, but the final assertion is unconditional.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !srv.health.Available(liveEndpoint) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !srv.health.Available(liveEndpoint) {
+		t.Fatal("live endpoint should be Recovered after a successful bridge, despite being pre-penalized")
 	}
 
 	_ = sess.Bye(context.Background())

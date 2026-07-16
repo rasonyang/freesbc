@@ -544,9 +544,18 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
 			// Invite() itself failed (dial/DNS/transport error before any
 			// request even went out, or went out and was synchronously
-			// rejected): the endpoint never had a chance to respond — a
-			// genuine connect failure, so cool it down.
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable", penalize: true}
+			// rejected): the endpoint never had a chance to respond — normally
+			// a genuine connect failure worth cooling down. But sipgo resolves
+			// a hostname/SRV endpoint using aLeg.Context() (the request is
+			// dialed via that context), so a caller CANCEL/hangup can itself
+			// make Invite() fail instantly here (a cancelled-context resolve
+			// error) for a perfectly healthy target — e.g. a 422 retry's
+			// Invite() racing a caller hangup. Gate on the same
+			// aLeg.Context().Err() signal the WaitAnswer-error classification
+			// below already uses, so only a genuine unreachable-host dial
+			// error (caller still present) cools the endpoint down; a
+			// caller-cancellation-induced Invite failure does not.
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable", penalize: aLeg.Context().Err() == nil}
 		}
 
 		// attemptCtx caps how long THIS target is allowed to ring before we give
