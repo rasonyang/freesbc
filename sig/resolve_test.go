@@ -156,8 +156,8 @@ func TestResolveWeightedSelectionZeroWeightGetsAChance(t *testing.T) {
 		r := newResolver(int64(i) + 1) // distinct seed per sample
 		r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
 			return "", []*net.SRV{
-				{Target: "zero.example.", Port: 5060, Priority: 10, Weight: 0},
 				{Target: "heavy.example.", Port: 5060, Priority: 10, Weight: 100},
+				{Target: "zero.example.", Port: 5060, Priority: 10, Weight: 0},
 			}, nil
 		}
 		eps := r.Resolve(&config.Peer{Address: "mixed.example", Transport: "udp"}, time.Minute)
@@ -175,8 +175,11 @@ func TestResolveWeightedSelectionZeroWeightGetsAChance(t *testing.T) {
 	}
 	// The old (buggy) behavior gave the weight-0 record exactly 0% chance of
 	// being first whenever it appeared after the weighted record in the DNS
-	// answer (as it does here). Seeing it first at all — across 200
-	// independent seeds — proves the fix is in effect. This is not a
+	// answer — the mock above lists heavy.example (weight 100) first and
+	// zero.example (weight 0) second, exactly that ordering, so the
+	// running-sum walk in the pre-fix code always landed on heavy.example.
+	// Seeing zero.example first at all — across 200 independent seeds —
+	// proves the fix is in effect. This is not a
 	// probabilistic near-miss: with target := rnd.Intn(101), zero.example is
 	// picked first only when target == 0 (~1% chance per sample), so getting
 	// zero hits across 200 samples would require ~200 consecutive misses of a
