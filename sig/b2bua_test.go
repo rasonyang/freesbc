@@ -1833,13 +1833,17 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	// caller as "1001" with a display name — DialogClientCache.Invite would
 	// otherwise let sipgo synthesize a default From from the UA's own
 	// name/hostname, which wouldn't exercise CLI pass-through at all.
+	// The caller's From host is set to a distinct address (203.0.113.50)
+	// different from ourIP (127.0.0.1), so assertions can prove topology
+	// hiding: the bridge must rewrite the host to ourIP, not forward the
+	// caller's claimed host.
 	inviteReq := sip.NewRequest(sip.INVITE, bridgeURI)
 	inviteReq.SetBody(testSDPBody(uacRTPStubPort(t)))
 	fromParams := sip.NewParams()
 	fromParams.Add("tag", sip.GenerateTagN(16))
 	inviteReq.AppendHeader(&sip.FromHeader{
 		DisplayName: "Caller 1001",
-		Address:     sip.Uri{Scheme: "sip", User: "1001", Host: "127.0.0.1", Port: 5070},
+		Address:     sip.Uri{Scheme: "sip", User: "1001", Host: "203.0.113.50", Port: 5070},
 		Params:      fromParams,
 	})
 
@@ -1872,8 +1876,14 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	if from.Address.User != "1001" {
 		t.Errorf("From user = %q, want caller number 1001 (CLI pass-through)", from.Address.User)
 	}
-	if from.Address.Host != "127.0.0.1" { // ourIP (public_ip) in outboundFromCfg
+	if from.Address.Host != "127.0.0.1" {
 		t.Errorf("From host = %q, want ourIP 127.0.0.1 (topology hiding; must not be the caller's own address)", from.Address.Host)
+	}
+	if from.Address.Host == "203.0.113.50" {
+		t.Error("From host = 203.0.113.50 (caller's claimed host); topology hiding failed: buildFrom forwarded the caller's host instead of rewriting to ourIP")
+	}
+	if from.Address.Port != 45203 {
+		t.Errorf("From port = %d, want bridge's outbound SIP port 45203 (from config listener)", from.Address.Port)
 	}
 	if from.DisplayName != "Caller 1001" {
 		t.Errorf("From display name = %q, want caller's display name preserved", from.DisplayName)

@@ -374,9 +374,9 @@ func (b *bridge) buildFrom(req *sip.Request, ourIP netip.Addr, port int) *sip.Fr
 
 // buildContact advertises our address for the given transport so in-dialog
 // requests (re-INVITE, BYE, ...) from the target reach us on the right leg.
-// The transport param is only needed for a non-default transport (udp is
-// SIP's own default, RFC 3261 §19.1.2); tcp/tls carry an explicit
-// transport= so the target dials us back the same way.
+// UDP is SIP's default transport per RFC 3261 §19.1.2, so the transport
+// param is omitted for udp; only tcp and tls carry an explicit transport=
+// to ensure the target dials us back on the same non-default transport.
 func (b *bridge) buildContact(ourIP netip.Addr, port int, transport string) *sip.ContactHeader {
 	c := &sip.ContactHeader{
 		Address: sip.Uri{Scheme: "sip", Host: ourIP.String(), Port: port},
@@ -398,9 +398,10 @@ func freshTag() string {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
 		// crypto/rand.Read failing is effectively unrecoverable (the OS CSPRNG
-		// is unavailable); a fixed fallback keeps call setup from panicking,
-		// at the cost of a non-unique tag in that vanishingly rare case.
-		return "freesbc-tag-fallback"
+		// is unavailable); a time-varying fallback keeps call setup from
+		// panicking while ensuring distinct tags across calls even if the
+		// CSPRNG fails repeatedly.
+		return "freesbc-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return hex.EncodeToString(b)
 }
