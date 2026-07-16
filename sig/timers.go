@@ -70,3 +70,33 @@ func isRefreshReInvite(req *sip.Request, establishedSDP []byte) bool {
 	}
 	return string(req.Body()) == string(establishedSDP)
 }
+
+// refresherOf returns the refresher parameter carried on req's own
+// Session-Expires header (e.g. "uac" from ";refresher=uac"), defaulting to
+// "uac" if the header is absent or carries no refresher param. A
+// session-timer refresh re-INVITE that we locally answer (see
+// bridge.onInvite) only ever arrives from the A-leg (the caller) in this
+// bridge — and the established call's own 200 OK always negotiated
+// refresher=uac for that leg (see b2bua.go's aLeg.Respond) — so echoing the
+// caller's own value back is always correct here without needing to
+// inspect which dialog matched.
+func refresherOf(req *sip.Request) string {
+	headers := req.GetHeaders("Session-Expires")
+	if len(headers) == 0 {
+		return "uac"
+	}
+	v := headers[0].Value()
+	i := strings.Index(v, "refresher=")
+	if i < 0 {
+		return "uac"
+	}
+	v = v[i+len("refresher="):]
+	if j := strings.IndexByte(v, ';'); j >= 0 {
+		v = v[:j]
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "uac"
+	}
+	return v
+}

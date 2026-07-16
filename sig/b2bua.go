@@ -42,20 +42,38 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	// In-dialog INVITE (re-INVITE: hold/resume, codec change, target
-	// refresh, ...) vs. initial INVITE is distinguished by the To-tag: an
-	// initial INVITE never carries one (RFC 3261 §8.1.1.2), an in-dialog
-	// INVITE always does (it's the tag the dialog was established with).
+	// refresh, session-timer refresh, ...) vs. initial INVITE is
+	// distinguished by the To-tag: an initial INVITE never carries one (RFC
+	// 3261 §8.1.1.2), an in-dialog INVITE always does (it's the tag the
+	// dialog was established with).
 	//
 	// sipgo v1.4.3's DialogServerSession.ReadInvite is single-use: calling
 	// it again for a re-INVITE on an already-established dialog corrupts
-	// that dialog's To-tag rather than answering the renegotiation. Rather
-	// than risk that corruption, reject the re-INVITE here — before ever
-	// touching dialogSrv — with 501 Not Implemented on the raw server
-	// transaction. Per RFC 3261 §14.1, a failed re-INVITE does not
-	// terminate the dialog, so the established call stays up with its
-	// existing media; the caller/target simply can't renegotiate it. Mid-
-	// dialog renegotiation support is deferred to M4.
+	// that dialog's To-tag rather than answering the renegotiation — so a
+	// re-INVITE must never be handed to ReadInvite/aLeg. A session-timer
+	// refresh re-INVITE (Session-Expires present, SDP byte-identical to what
+	// we established — isRefreshReInvite) sidesteps that entirely: it is
+	// answered locally, with a 200 OK sent directly on the re-INVITE's own
+	// raw server transaction, never touching dialogSrv. (M4.3 Task 6 spike:
+	// verified against sipgo v1.4.3 that this is safe — see timers.go and
+	// TestBridgeAnswersSessionTimerRefresh.) Any other re-INVITE (a genuine
+	// media change, or one we can't recognize as a refresh — e.g. no
+	// established SDP on record) still gets 501 Not Implemented on the raw
+	// transaction, exactly as M3.3 left it. Per RFC 3261 §14.1, a failed
+	// re-INVITE does not terminate the dialog, so the established call
+	// stays up with its existing media either way. Full mid-dialog media
+	// renegotiation support is deferred beyond M4.3.
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
+		if establishedSDP, ok := b.s.callSDP(callID(req)); ok && isRefreshReInvite(req, establishedSDP) {
+			res := sip.NewResponseFromRequest(req, 200, "OK", establishedSDP)
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.AppendHeader(sessionExpiresHeader(headerSeconds(req, "Session-Expires"), refresherOf(req)))
+			if err := tx.Respond(res); err != nil {
+				b.s.log.Error("respond session-timer refresh", "err", err, "call_id", callID(req))
+				b.reject(req, tx, 501, "Not Implemented")
+			}
+			return
+		}
 		b.reject(req, tx, 501, "Not Implemented")
 		return
 	}
@@ -153,6 +171,13 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	b.s.registry.Add(call)
 	defer b.s.registry.Remove(call.ID)
+
+	// Remember the A-leg's established offer SDP (Task 6): a later
+	// session-timer refresh re-INVITE re-sends this same offer verbatim,
+	// which is exactly what isRefreshReInvite compares against — see the
+	// in-dialog branch above.
+	b.s.sdps.set(call.ID, req.Body())
+	defer b.s.sdps.delete(call.ID)
 
 	// Hold the call open until either leg ends the dialog or media goes
 	// silent, tearing down whatever is left.

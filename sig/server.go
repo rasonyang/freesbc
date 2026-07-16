@@ -29,6 +29,11 @@ type Server struct {
 
 	registry *callstate.Registry
 
+	// sdps remembers each established call's A-leg offer SDP (Task 6),
+	// keyed by Call-ID — see callSDPStore and callSDP below. Kept separate
+	// from registry: callstate must stay dependency-free of sig/SDP.
+	sdps *callSDPStore
+
 	client    *sipgo.Client
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
@@ -48,7 +53,14 @@ func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server 
 		pool:     pool,
 		log:      log,
 		registry: callstate.NewRegistry(),
+		sdps:     newCallSDPStore(),
 	}
+}
+
+// callSDP returns callID's established (A-leg offer) SDP, or ok=false if
+// there is no established call on record for it.
+func (s *Server) callSDP(callID string) ([]byte, bool) {
+	return s.sdps.get(callID)
 }
 
 // ActiveCalls returns the number of calls currently tracked in the call
