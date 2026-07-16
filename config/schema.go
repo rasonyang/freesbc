@@ -22,6 +22,8 @@ type Config struct {
 	Admin           *AdminConfig     `yaml:"admin"`
 	RingTimeout     Duration         `yaml:"ring_timeout"`     // cancel a ringing target after this long, then failover
 	RegisterExpires Duration         `yaml:"register_expires"` // requested REGISTER lifetime (carrier may grant less)
+	SessionExpires  Duration         `yaml:"session_expires"`  // RFC 4028 Session-Expires we advertise/accept
+	MinSE           Duration         `yaml:"min_se"`           // minimum session interval accepted (else 422)
 }
 
 type ListenConfig struct {
@@ -153,5 +155,11 @@ func withDefaults(c *Config) {
 	}
 	if c.RegisterExpires == 0 {
 		c.RegisterExpires = Duration(3600 * time.Second)
+	}
+	if c.SessionExpires == 0 {
+		c.SessionExpires = Duration(1800 * time.Second)
+	}
+	if c.MinSE == 0 {
+		c.MinSE = Duration(90 * time.Second)
 	}
 }
