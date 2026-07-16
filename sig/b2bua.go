@@ -150,6 +150,41 @@ func byeContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
+// failKind classifies a non-2xx dialTarget outcome so placeCall can decide
+// what code the caller ultimately sees. Only failReal carries a genuine
+// carrier status; failDial and failUnusable are our own synthesized codes
+// and must never be allowed to clobber an earlier failReal in placeCall's
+// final pick (see attemptResult and placeCall's precedence loop below).
+//
+// failRing (ring-timeout, our own 408) is Task 4's addition — it slots in
+// here as another synthetic kind alongside failDial/failUnusable, with no
+// changes needed to placeCall's failReal-precedence logic itself.
+type failKind int
+
+const (
+	failDial     failKind = iota // couldn't reach the target / no usable final response → 503
+	failReal                     // a genuine SIP final failure from the target → its own code
+	failUnusable                 // 2xx received but unusable on our side (bad/missing SDP, ACK failure, ...) → 488/502
+)
+
+// attemptResult is dialTarget's outcome for one target. ok is the only
+// field that matters on success (a live bridge). On failure, retryable
+// tells placeCall whether there is anything left to do: true means the
+// B-leg never got past the answer (nothing committed, safe to try the next
+// candidate); false means dialTarget already finished the call itself
+// (bridged and responded, or answered-then-failed and already
+// responded/torn down) — placeCall must stop, not send anything further.
+// kind/code/reason are only meaningful when retryable is true; placeCall
+// uses them solely to remember the last failReal code, for the case where
+// every target is exhausted.
+type attemptResult struct {
+	ok        bool
+	retryable bool
+	kind      failKind
+	code      int
+	reason    string
+}
+
 // placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
 // sess's stable B-side port once — that rewrite depends only on sess's own
 // ports and ourIP, neither of which changes across attempts, so it's
@@ -168,11 +203,14 @@ func byeContext() (context.Context, context.CancelFunc) {
 // because it's already gone).
 //
 // If every target is exhausted without an answer, placeCall responds the
-// A-leg with the last target's failure code (spec: last upstream final
-// code) — the only path here that sends a final response itself, since
-// it's the only one not already covered by rewriteSDP's own failure (488,
-// target-independent — same offer, same failure, on every attempt) or
-// dialTarget's post-answer paths.
+// A-leg with the last genuine carrier code any target sent (failReal),
+// falling back to 503 only if no target ever produced one — a trailing
+// dial failure (no response, or a stale provisional; see dialTarget) must
+// never clobber an earlier target's real code just because it happened
+// last. This is the only path here that sends a final response itself,
+// since it's the only one not already covered by rewriteSDP's own failure
+// (488, target-independent — same offer, same failure, on every attempt)
+// or dialTarget's post-answer paths.
 //
 // After each retryable failure, placeCall also checks whether the A-leg is
 // still there (aLeg.Context().Err()) before starting the next candidate: a
@@ -192,16 +230,20 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	// early media, its 18x may have Started the session; a later target's
 	// answer still only Relatches (processAnswerSDP), never re-Starts.
 	var startOnce sync.Once
-	lastCode, lastReason := 503, "Service Unavailable"
+	haveReal := false
+	lastRealCode, lastRealReason := 0, ""
 	for _, target := range targets {
-		bLeg, ok, retryable, code, reason := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
-		if ok {
+		bLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
+		if res.ok {
 			return bLeg, target, true
 		}
-		if !retryable {
+		if !res.retryable {
 			return nil, Target{}, false
 		}
-		lastCode, lastReason = code, reason
+		if res.kind == failReal {
+			haveReal = true
+			lastRealCode, lastRealReason = res.code, res.reason
+		}
 
 		// The A-leg may have gone away (caller CANCEL/hangup) while this
 		// target was being dialed — dialTarget dials via aLeg.Context(), so
@@ -217,7 +259,11 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		}
 	}
 
-	_ = aLeg.Respond(lastCode, lastReason, nil)
+	if haveReal {
+		_ = aLeg.Respond(lastRealCode, lastRealReason, nil)
+	} else {
+		_ = aLeg.Respond(503, "Service Unavailable", nil)
+	}
 	return nil, Target{}, false
 }
 
@@ -234,9 +280,11 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 //     nothing to ACK or BYE, just Close (drops the local dialog-cache
 //     entry only) — and nothing target-specific has committed, so this is
 //     exactly what placeCall retries the next candidate on. No A-leg
-//     response is sent here; retryable=true and code/reason (the upstream
-//     status, or 503/"Service Unavailable" when none was received — dial
-//     error, timeout, CANCEL race) are placeCall's to use if every
+//     response is sent here; retryable=true and the result's kind/code/
+//     reason (failReal with the upstream status, or failDial/503 when no
+//     real final was received — dial error, timeout, CANCEL race, or a
+//     stale provisional left over from a dead transaction — see the
+//     InviteResponse guard below) are placeCall's to use if every
 //     candidate is exhausted.
 //
 //   - From it onward (2xx received): the B-leg is now a live, billable
@@ -245,13 +293,17 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 //     tearing the B-leg down and finalizing the A-leg on failure — rather
 //     than reporting a retryable failure. retryable=false in every path
 //     past this point: a carrier that already answered is not something
-//     you abandon to try a different one.
+//     you abandon to try a different one. These paths already send (or
+//     deliberately don't send — the RespondSDP-failure case) the A-leg's
+//     response themselves, so their result's kind/code/reason are only
+//     documentation; placeCall never consults them once retryable is
+//     false.
 //
 // Early media: for every 18x the B-leg sends, relayProvisional (via
 // WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
 // before dialTarget's own post-answer processing does; both share the same
 // startOnce so Start runs at most once regardless of which path wins.
-func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, ok, retryable bool, code int, reason string) {
+func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
 	// Align SideB's latch policy with THIS target before dialing it — not
 	// just whichever target happened to be Targets[0] at Allocate time — so
 	// early media (relayProvisional) and the eventual answer both apply the
@@ -276,7 +328,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, from, contact)
 	if err != nil {
 		b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
-		return nil, false, true, 503, "Service Unavailable"
+		return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
 	}
 
 	if err := bLeg.WaitAnswer(aLeg.Context(), sipgo.AnswerOptions{
@@ -285,7 +337,6 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		Password:   authPass(target),
 	}); err != nil {
 		b.s.log.Info("b-leg not answered", "err", err, "target", target.Name)
-		failCode, failReason := 503, "Service Unavailable"
 		// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
 		// it sees, including 1xx provisionals — not just the final one. If
 		// the transaction dies mid-ring (e.g. a transport error after a
@@ -293,16 +344,20 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// WaitAnswer returns an error but InviteResponse is left holding
 		// that stale provisional. A 1xx can never legally be relayed as a
 		// FINAL response (it would violate the SIP transaction model — see
-		// placeCall, which sends the last target's failure code/reason as
-		// the A-leg's final response when every target is exhausted), so
-		// only trust InviteResponse here when it is itself a final
-		// (non-provisional) response; otherwise fall back to 503.
+		// placeCall, which relays a real final code, when every target is
+		// exhausted), so only trust InviteResponse here when it is itself a
+		// final (non-provisional) response — that's the line between a
+		// genuine carrier failure (failReal, its own code) and one of our
+		// own synthesized ones (failDial, 503: dial error, timeout, CANCEL
+		// race, or a stale provisional).
+		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
 		if bLeg.InviteResponse != nil && !bLeg.InviteResponse.IsProvisional() {
-			failCode = bLeg.InviteResponse.StatusCode
-			failReason = bLeg.InviteResponse.Reason
+			res.kind = failReal
+			res.code = bLeg.InviteResponse.StatusCode
+			res.reason = bLeg.InviteResponse.Reason
 		}
 		_ = bLeg.Close()
-		return nil, false, true, failCode, failReason
+		return nil, res
 	}
 
 	// Past this point the B-leg is answered (2xx): a live, billable carrier
@@ -314,14 +369,14 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// reason to hold the caller's final response hostage behind it.
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		b.ackThenBye(aLeg.Context(), bLeg, target)
-		return nil, false, false, 488, "Not Acceptable Here"
+		return nil, attemptResult{kind: failUnusable, code: 488, reason: "Not Acceptable Here"}
 	}
 
 	aAnswer, err := rewriteSDP(answer, ourIP, sess.RTPPort(media.SideA))
 	if err != nil {
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		b.ackThenBye(aLeg.Context(), bLeg, target)
-		return nil, false, false, 488, "Not Acceptable Here"
+		return nil, attemptResult{kind: failUnusable, code: 488, reason: "Not Acceptable Here"}
 	}
 
 	if err := bLeg.Ack(aLeg.Context()); err != nil {
@@ -331,7 +386,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		b.s.log.Error("ack b-leg", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		return nil, false, false, 502, "Bad Gateway"
+		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
 	}
 	// RespondSDP blocks until the A-leg ACK arrives (sipgo retransmits the
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
@@ -344,10 +399,10 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		byeCtx, cancel := byeContext()
 		_ = bLeg.Bye(byeCtx)
 		cancel()
-		return nil, false, false, 0, ""
+		return nil, attemptResult{kind: failUnusable}
 	}
 
-	return bLeg, true, false, 200, "OK"
+	return bLeg, attemptResult{ok: true}
 }
 
 // buildFrom clones the caller's identity onto a B-leg From: the caller's

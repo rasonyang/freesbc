@@ -1918,3 +1918,276 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 		t.Fatal("carrier dialog never ended after BYE")
 	}
 }
+
+// --- M4.1 Task 3: response-code fidelity — real carrier final codes ---
+
+// realCodeCfg routes local-uac to a single carrier that declines with a
+// real final code (486 Busy Here) — proves that code reaches the caller
+// verbatim rather than being flattened to a synthetic 502/503. Fresh ports
+// (45210/45211, 46240-46243), disjoint from every earlier test's blocks
+// (45180-45204/46180-46233, 45250-45251/46250-46253).
+const realCodeCfg = `
+listen:
+  sip: [udp://127.0.0.1:45210]
+  media:
+    port_range: 46240-46243
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45211
+    allowed_ips: [203.0.113.20/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgePassesRealFinalCode is M4.1 Task 3's crux: a single carrier
+// declines with 486 Busy Here — a genuine SIP final failure, not a dial
+// error — and the caller must see that real code verbatim, never a
+// synthetic 502/503.
+func TestBridgePassesRealFinalCode(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45211", nil, stubCarrierConfig{
+		finalStatus: 486,
+		finalReason: "Busy Here",
+	})
+	startServer(t, 45210, realCodeCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45210}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if finalCode := sess.InviteResponse.StatusCode; finalCode != 486 {
+		t.Fatalf("caller got %d, want 486 (real carrier code, not a synthetic 502/503)", finalCode)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+}
+
+// failoverRealCodeCfg routes local-uac to two carriers, both declining with
+// real final codes: carrier-a 486, carrier-b 404 (Task 3's "last real code
+// wins" precedence test). Fresh ports (45212-45214, 46244-46247), disjoint
+// from realCodeCfg and every earlier test's blocks.
+const failoverRealCodeCfg = `
+listen:
+  sip: [udp://127.0.0.1:45212]
+  media:
+    port_range: 46244-46247
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45213
+    allowed_ips: [203.0.113.24/30]
+  carrier-b:
+    address: 127.0.0.1:45214
+    allowed_ips: [203.0.113.28/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeFailoverThenRealCode proves failover precedence: when every
+// target fails with a genuine final code (carrier-a 486, carrier-b 404),
+// the caller sees the LAST real code (404) — not the first, and not a
+// synthetic default.
+func TestBridgeFailoverThenRealCode(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45213", nil, stubCarrierConfig{
+		finalStatus: 486,
+		finalReason: "Busy Here",
+	})
+	carrierB := startStubCarrier(t, "127.0.0.1:45214", nil, stubCarrierConfig{
+		finalStatus: 404,
+		finalReason: "Not Found",
+	})
+	startServer(t, 45212, failoverRealCodeCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45212}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	err = sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{})
+	if err == nil {
+		t.Fatalf("uac wait answer: expected failure, got success (status %d)", sess.InviteResponse.StatusCode)
+	}
+	if sess.InviteResponse == nil {
+		t.Fatalf("uac never received a final response: %v", err)
+	}
+	if finalCode := sess.InviteResponse.StatusCode; finalCode != 404 {
+		t.Fatalf("caller got %d, want 404 (last real code)", finalCode)
+	}
+
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+	select {
+	case <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+}
+
+// trailingDialFailureCfg routes local-uac to two carriers: carrier-a
+// declines with a real 486 Busy Here; carrier-b (the LAST target) never
+// sends a final response at all, driving the same stale-provisional/
+// dial-classified path as TestBridgeStaleProvisionalNotRelayedAsFinal (see
+// startFloodingRingCarrier). Fresh ports (45215-45217, 46248-46251),
+// disjoint from every earlier test's blocks.
+const trailingDialFailureCfg = `
+listen:
+  sip: [udp://127.0.0.1:45215]
+  media:
+    port_range: 46248-46251
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45216
+    allowed_ips: [203.0.113.32/30]
+  carrier-b:
+    address: 127.0.0.1:45217
+    allowed_ips: [203.0.113.36/30]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeFailoverRealCodeSurvivesTrailingDialFailure is Task 3's actual
+// precedence case, distinct from TestBridgeFailoverThenRealCode (where
+// every target fails with a real code, so even M3.3's "last target's code"
+// logic happens to land on the right answer): carrier-a (first) declines
+// with a genuine 486 Busy Here; carrier-b (last) never sends a final
+// response at all — a dial-classified (synthetic) failure, not a real
+// carrier code. Before the Task 3 fix, placeCall unconditionally remembered
+// whichever target failed LAST regardless of kind, so carrier-b's synthetic
+// 503 would clobber carrier-a's real 486 even though carrier-b never
+// actually said anything. The fix tracks only failReal outcomes, so the
+// caller still sees carrier-a's real code.
+//
+// Like TestBridgeStaleProvisionalNotRelayedAsFinal, this reads raw UDP
+// datagrams instead of using sipgo's DialogClientSession.WaitAnswer:
+// carrier-b floods 11 provisionals and relayProvisional forwards each 1:1
+// to the A-leg, so a sipgo-dialog UAC would be racing its OWN identical
+// ">10 responses" cap against the bridge's — an artifact of the test
+// client, not something the bridge does wrong.
+func TestBridgeFailoverRealCodeSurvivesTrailingDialFailure(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45216", nil, stubCarrierConfig{
+		finalStatus: 486,
+		finalReason: "Busy Here",
+	})
+	carrierB := startFloodingRingCarrier(t, "127.0.0.1:45217")
+	startServer(t, 45215, trailingDialFailureCfg)
+
+	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer uac.Close()
+	local := uac.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45215}
+
+	req := sipInviteWithSDP("b2bua-trailing-dial-failure-1", local, testSDPBody(uacRTPStubPort(t)), 45215)
+	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	// Read until the first FINAL (non-1xx) status line; carrier-a's 486
+	// arrives as a relayed provisional-free final only once carrier-b's own
+	// attempt (including its flood of 11 relayed 180s) has finished.
+	var (
+		sawFinal  bool
+		finalLine string
+	)
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && !sawFinal {
+		_ = uac.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := uac.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		statusLine := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+		if strings.HasPrefix(statusLine, "SIP/2.0 1") {
+			continue // provisional (100/180/...): keep reading for the final.
+		}
+		if strings.HasPrefix(statusLine, "SIP/2.0 ") {
+			sawFinal = true
+			finalLine = statusLine
+		}
+	}
+	if !sawFinal {
+		t.Fatal("uac never received a final response")
+	}
+	if !strings.Contains(finalLine, "486") {
+		t.Fatalf("final response line = %q, want 486 (earlier real code must survive the trailing synthetic dial failure)", finalLine)
+	}
+
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-a never received the B-leg INVITE")
+	}
+	select {
+	case <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+}
