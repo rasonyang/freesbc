@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"net"
 	"net/netip"
 	"runtime/debug"
 	"strconv"
@@ -15,7 +14,6 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/callstate"
-	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
 )
 
@@ -287,6 +285,37 @@ type attemptResult struct {
 	reason    string
 }
 
+// dialEndpoint pairs a resolved dial destination with the Target (peer) it
+// came from — dialing needs the endpoint's host/port, but auth credentials,
+// From/Contact, and session-timer headers still come from the peer.
+type dialEndpoint struct {
+	Target   Target
+	Endpoint Endpoint
+}
+
+// expandTargets flattens the ordered failover Targets into the concrete
+// endpoints to dial, in order: each peer is resolved (DNS SRV → priority/
+// weight-ordered endpoints, or a single endpoint for an IP/host:port), and a
+// register:true peer we have not registered with is skipped entirely (the
+// far end has no idea who we are). Health filtering is layered on in Task 5.
+func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
+	cfg := b.s.store.Current()
+	var out []dialEndpoint
+	for _, t := range targets {
+		// b.s.registrar is nil only in tests that build a bridge without
+		// Server.Run; treat that as "no gating" rather than skipping every
+		// target (mirrors the pre-M4.4 inline gate this replaces).
+		if t.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(t.Name) {
+			b.s.log.Debug("skipping unregistered target", "peer", t.Name)
+			continue
+		}
+		for _, ep := range b.s.resolver.Resolve(t.Peer, cfg.SRVCacheTTL.Std()) {
+			out = append(out, dialEndpoint{Target: t, Endpoint: ep})
+		}
+	}
+	return out
+}
+
 // placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
 // sess's stable B-side port once — that rewrite depends only on sess's own
 // ports and ourIP, neither of which changes across attempts, so it's
@@ -344,21 +373,10 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	haveReal := false
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
-	for _, target := range targets {
-		// A register:true target we have not (yet, or no longer) actually
-		// registered with must never be dialed — the far end has no idea
-		// who we are and would reject or misroute the call. b.s.registrar
-		// is nil only in tests that build a bridge without going through
-		// Server.Run (e.g. directly constructing &bridge{s: s}); treat that
-		// the same as "no gating" rather than skipping every target.
-		if target.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(target.Name) {
-			b.s.log.Debug("skipping unregistered target", "peer", target.Name)
-			continue
-		}
-
-		dialedLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
+	for _, de := range b.expandTargets(targets) {
+		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, bOffer, sess, ourIP, &startOnce)
 		if res.ok {
-			return dialedLeg, target, res.aAnswer, bOffer, true
+			return dialedLeg, de.Target, res.aAnswer, bOffer, true
 		}
 		if !res.retryable {
 			return nil, Target{}, nil, nil, false
@@ -444,7 +462,7 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 // WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
 // before dialTarget's own post-answer processing does; both share the same
 // startOnce so Start runs at most once regardless of which path wins.
-func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
+func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep Endpoint, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
 	// Align SideB's latch policy with THIS target before dialing it — not
 	// just whichever target happened to be Targets[0] at Allocate time — so
 	// early media (relayProvisional) and the eventual answer both apply the
@@ -458,7 +476,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	// dialed number (post-transform) is the Request-URI user part, so it
 	// must be set here — without it the carrier receives an INVITE with
 	// no destination number.
-	bTarget := peerURI(target.Peer)
+	bTarget := peerURI(ep)
 	bTarget.User = outNumber
 
 	cfg := b.s.store.Current()
@@ -911,19 +929,11 @@ func callID(req *sip.Request) string {
 // startNano is wall-clock time for callstate.Call.StartUnixNano.
 func startNano() int64 { return time.Now().UnixNano() }
 
-// peerURI builds the sip.Uri sipgo needs to dial a peer, from its Address
-// (host:port) and Transport. This lives in sig, not on config.Peer,
-// because config must not import sipgo.
-func peerURI(p *config.Peer) sip.Uri {
-	host := p.Address
-	port := 5060
-	if h, portStr, err := net.SplitHostPort(p.Address); err == nil {
-		host = h
-		if n, perr := strconv.Atoi(portStr); perr == nil {
-			port = n
-		}
-	}
-	transport := p.Transport
+// peerURI builds the sip.Uri sipgo needs to dial a resolved endpoint
+// (host/port/transport). The dialed number is set separately as the
+// Request-URI user part by the caller.
+func peerURI(ep Endpoint) sip.Uri {
+	transport := ep.Transport
 	if transport == "" {
 		transport = "udp"
 	}
@@ -931,8 +941,8 @@ func peerURI(p *config.Peer) sip.Uri {
 	params.Add("transport", transport)
 	return sip.Uri{
 		Scheme:    "sip",
-		Host:      host,
-		Port:      port,
+		Host:      ep.Host,
+		Port:      ep.Port,
 		UriParams: params,
 	}
 }

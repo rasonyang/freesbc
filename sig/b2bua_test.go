@@ -17,6 +17,7 @@ import (
 	"github.com/icholy/digest"
 	"github.com/pion/sdp/v3"
 
+	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
 )
 
@@ -3666,5 +3667,40 @@ func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
 	case <-carrier.byeDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier dialog never ended after BYE")
+	}
+}
+
+// TestExpandTargetsResolvesEndpointsInOrder verifies expandTargets (M4.4
+// Task 4) resolves a single Target's peer into its ordered endpoints and
+// preserves the originating Target on each dialEndpoint, using a stubbed
+// SRV lookup so the test doesn't depend on real DNS.
+func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
+	cfg, err := config.Parse([]byte(bridgeCallCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s := NewServer(config.NewStore(cfg), nil, discardLogger())
+	// expandTargets doesn't use the cfg's carrier peer here — we stub the
+	// resolver and pass our own multi-endpoint peer.
+	b := &bridge{s: s}
+
+	peerA := &config.Peer{Address: "multi.example", Transport: "udp"}
+	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{
+			{Target: "ep1.example.", Port: 5060, Priority: 10, Weight: 0},
+			{Target: "ep2.example.", Port: 5061, Priority: 20, Weight: 0},
+		}, nil
+	}
+	targets := []Target{{Name: "a", Peer: peerA}}
+	des := b.expandTargets(targets)
+	if len(des) != 2 {
+		t.Fatalf("want 2 dialEndpoints, got %d: %+v", len(des), des)
+	}
+	if des[0].Endpoint.Host != "ep1.example" || des[1].Endpoint.Host != "ep2.example" {
+		t.Errorf("endpoint order = [%s, %s], want [ep1.example, ep2.example]",
+			des[0].Endpoint.Host, des[1].Endpoint.Host)
+	}
+	if des[0].Target.Name != "a" {
+		t.Errorf("dialEndpoint lost its Target: %+v", des[0].Target)
 	}
 }
