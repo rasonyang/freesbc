@@ -51,11 +51,12 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// it again for a re-INVITE on an already-established dialog corrupts
 	// that dialog's To-tag rather than answering the renegotiation — so a
 	// re-INVITE must never be handed to ReadInvite/aLeg. A session-timer
-	// refresh re-INVITE (Session-Expires present, SDP byte-identical to what
-	// we established — isRefreshReInvite) sidesteps that entirely: it is
-	// answered locally, with a 200 OK sent directly on the re-INVITE's own
-	// raw server transaction, never touching dialogSrv. (M4.3 Task 6 spike:
-	// verified against sipgo v1.4.3 that this is safe — see timers.go and
+	// refresh re-INVITE (Session-Expires present, offered SDP matching what
+	// we established modulo an o= version bump — isRefreshReInvite)
+	// sidesteps that entirely: it is answered locally, with a 200 OK sent
+	// directly on the re-INVITE's own raw server transaction, never
+	// touching dialogSrv. (M4.3 Task 6 spike: verified against sipgo
+	// v1.4.3 that this is safe — see timers.go and
 	// TestBridgeAnswersSessionTimerRefresh.) Any other re-INVITE (a genuine
 	// media change, or one we can't recognize as a refresh — e.g. no
 	// established SDP on record) still gets 501 Not Implemented on the raw
@@ -63,10 +64,28 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// re-INVITE does not terminate the dialog, so the established call
 	// stays up with its existing media either way. Full mid-dialog media
 	// renegotiation support is deferred beyond M4.3.
+	//
+	// req.CallID() is looked up directly — not assumed to be the A-leg's —
+	// because b.s.sdps now holds an entry per LEG (see callSDPStore): a
+	// refresh from the CALLER carries the A-leg's Call-ID and is answered
+	// with aAnswer, while a refresh from the CARRIER carries the B-leg's
+	// own, distinct Call-ID and is answered with bOffer. Same code path,
+	// correct answer either way (Fix 2).
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
-		if establishedSDP, ok := b.s.callSDP(callID(req)); ok && isRefreshReInvite(req, establishedSDP) {
-			res := sip.NewResponseFromRequest(req, 200, "OK", establishedSDP)
+		if entry, ok := b.s.callSDP(callID(req)); ok && isRefreshReInvite(req, entry.compare) {
+			// The refresh's 200 OK MUST carry a Contact (RFC 3261 §12.1.1:
+			// every 2xx to INVITE does), which
+			// sip.NewResponseFromRequest does not add on its own — build
+			// the same per-transport Contact the leg's original 200 used,
+			// from the current config and the re-INVITE's own transport
+			// (req.Transport(): whichever leg sent this refresh).
+			cfg := b.s.store.Current()
+			transport := sip.NetworkToLower(req.Transport())
+			contact := b.buildContact(b.s.ourIP(cfg), b.s.ourSigPort(cfg, transport), transport)
+
+			res := sip.NewResponseFromRequest(req, 200, "OK", entry.answer)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.AppendHeader(contact)
 			res.AppendHeader(sessionExpiresHeader(headerSeconds(req, "Session-Expires"), refresherOf(req)))
 			if err := tx.Respond(res); err != nil {
 				b.s.log.Error("respond session-timer refresh", "err", err, "call_id", callID(req))
@@ -157,7 +176,7 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	ourIP := b.s.mediaIP(cfg)
 
-	bLeg, target, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), ourIP, sess)
+	bLeg, target, aAnswer, bOffer, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), ourIP, sess)
 	if !ok {
 		return // placeCall already sent the A-leg's final response.
 	}
@@ -172,12 +191,20 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	b.s.registry.Add(call)
 	defer b.s.registry.Remove(call.ID)
 
-	// Remember the A-leg's established offer SDP (Task 6): a later
-	// session-timer refresh re-INVITE re-sends this same offer verbatim,
-	// which is exactly what isRefreshReInvite compares against — see the
-	// in-dialog branch above.
-	b.s.sdps.set(call.ID, req.Body())
+	// Remember BOTH legs' established SDP pairs (Task 6 fix wave), keyed by
+	// each leg's OWN Call-ID, so a later session-timer refresh re-INVITE on
+	// EITHER leg is recognized (isRefreshReInvite, compared against
+	// .compare) and answered with the SBC's own established answer for
+	// THAT leg (.answer) — never the peer's offer, and never the other
+	// leg's SDP. See callSDP's doc and the in-dialog branch above.
+	//
+	// A-leg: the caller offered req.Body(); we answered aAnswer.
+	// B-leg: we offered bOffer; the carrier answered bLeg.InviteResponse.Body().
+	bCallID := callID(bLeg.InviteRequest)
+	b.s.sdps.set(call.ID, callSDP{compare: req.Body(), answer: aAnswer})
+	b.s.sdps.set(bCallID, callSDP{compare: bLeg.InviteResponse.Body(), answer: bOffer})
 	defer b.s.sdps.delete(call.ID)
+	defer b.s.sdps.delete(bCallID)
 
 	// Hold the call open until either leg ends the dialog or media goes
 	// silent, tearing down whatever is left.
@@ -231,17 +258,21 @@ const (
 )
 
 // attemptResult is dialTarget's outcome for one target. ok is the only
-// field that matters on success (a live bridge). On failure, retryable
-// tells placeCall whether there is anything left to do: true means the
-// B-leg never got past the answer (nothing committed, safe to try the next
-// candidate); false means dialTarget already finished the call itself
-// (bridged and responded, or answered-then-failed and already
+// field that matters on success (a live bridge) — along with aAnswer, the
+// SBC's own established A-side answer SDP for this call (Task 6 fix wave:
+// placeCall/onInvite need it verbatim to answer a later A-leg session-timer
+// refresh with, rather than the caller's own offer — see callSDP). On
+// failure, retryable tells placeCall whether there is anything left to do:
+// true means the B-leg never got past the answer (nothing committed, safe
+// to try the next candidate); false means dialTarget already finished the
+// call itself (bridged and responded, or answered-then-failed and already
 // responded/torn down) — placeCall must stop, not send anything further.
 // kind/code/reason are only meaningful when retryable is true; placeCall
 // uses them solely to remember the last failReal code, for the case where
 // every target is exhausted.
 type attemptResult struct {
 	ok        bool
+	aAnswer   []byte
 	retryable bool
 	kind      failKind
 	code      int
@@ -285,11 +316,15 @@ type attemptResult struct {
 // caller CANCEL/hangup mid-setup cancels that context, and without this
 // check the loop would keep dialing (and waiting up to Timer B, ~32s, on)
 // remaining carriers for a caller who already left.
-func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (*sipgo.DialogClientSession, Target, bool) {
+// The bOffer return is the SBC's own B-side offer SDP (what we sent the
+// winning target) — like aAnswer (see attemptResult), the caller needs it
+// verbatim to answer a later B-LEG session-timer refresh with (Task 6 fix
+// wave), rather than the carrier's own answer.
+func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
 	bOffer, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB))
 	if err != nil {
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
-		return nil, Target{}, false
+		return nil, Target{}, nil, nil, false
 	}
 
 	// startOnce is created here — not per attempt — and threaded through
@@ -313,12 +348,12 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 			continue
 		}
 
-		bLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
+		dialedLeg, res := b.dialTarget(aLeg, target, outNumber, bOffer, sess, ourIP, &startOnce)
 		if res.ok {
-			return bLeg, target, true
+			return dialedLeg, target, res.aAnswer, bOffer, true
 		}
 		if !res.retryable {
-			return nil, Target{}, false
+			return nil, Target{}, nil, nil, false
 		}
 		if res.kind == failReal {
 			haveReal = true
@@ -338,7 +373,7 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		// aLeg.Respond below (all-targets-exhausted path) is a harmless
 		// no-op against the already-gone dialog.
 		if aLeg.Context().Err() != nil {
-			return nil, Target{}, false
+			return nil, Target{}, nil, nil, false
 		}
 	}
 
@@ -350,7 +385,7 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	default:
 		_ = aLeg.Respond(503, "Service Unavailable", nil)
 	}
-	return nil, Target{}, false
+	return nil, Target{}, nil, nil, false
 }
 
 // dialTarget places one B-leg to target and waits for its answer via
@@ -675,7 +710,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		return nil, attemptResult{kind: failUnusable}
 	}
 
-	return bLeg, attemptResult{ok: true}
+	return bLeg, attemptResult{ok: true, aAnswer: aAnswer}
 }
 
 // buildFrom clones the caller's identity onto a B-leg From: the caller's

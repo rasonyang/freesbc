@@ -246,6 +246,20 @@ type stubCarrier struct {
 	offers  chan *sip.Request
 	byeDone chan struct{}
 
+	// established (Task 6 fix wave: B-leg refresh test synchronization)
+	// closes once THIS invite's answer (RespondSDP/Respond) call has
+	// returned, i.e. once dlg.InviteResponse is set and the initial 2xx
+	// has actually gone out. sendReinvite reads dlg's internal state
+	// (dlg.InviteResponse, via buildReq/Do) from the TEST goroutine —
+	// without waiting on this channel first, that read would race under
+	// -race against WriteResponse's own unsynchronized write to
+	// dlg.InviteResponse in the handler goroutine (see sipgo's
+	// DialogServerSession.WriteResponse: a plain field assignment, no
+	// mutex), even though in practice the answer has always long since
+	// gone out by the time a test gets around to calling sendReinvite
+	// (e.g. only after the UAC's own WaitAnswer already succeeded).
+	established chan struct{}
+
 	// cancelled (Task 4) closes exactly once, the first time this carrier's
 	// dialog ends because it actually received a CANCEL request — as
 	// opposed to ending for any other reason (the test tearing the
@@ -263,6 +277,47 @@ type stubCarrier struct {
 	// race under -race.
 	mu         sync.Mutex
 	lastInvite *sip.Request
+
+	// dlg (Task 6 fix wave: B-leg session-timer refresh coverage) is the
+	// sipgo dialog session OnInvite's handler establishes for the most
+	// recent INVITE, guarded by the same mu. sendReinvite reuses it to send
+	// an in-dialog INVITE FROM this stub carrier TO whichever peer it
+	// dialogued with (the bridge, in every test that uses this) — sipgo's
+	// own DialogServerSession.Do/buildReq fills in the swapped From/To,
+	// the dialog's own Call-ID, and a fresh CSeq automatically (see
+	// dialog_server.go in the sipgo module), so this simulates a genuine
+	// carrier-initiated re-INVITE without hand-building SIP headers the
+	// way the A-leg refresh test's raw-UDP sendReInvite has to.
+	dlg *sipgo.DialogServerSession
+}
+
+// sendReinvite (Task 6 fix wave) sends an in-dialog INVITE FROM this stub
+// carrier TO the peer of its most recently established dialog (dlg) —
+// simulating a carrier-initiated session-timer refresh on the B-leg.
+// Blocks for a final response or until ctx is done; fails the test if no
+// dialog has been established yet or the request/response round trip
+// itself errors (a non-2xx final response is NOT an error here — the
+// caller inspects the status).
+func (c *stubCarrier) sendReinvite(t *testing.T, ctx context.Context, body []byte, headers ...sip.Header) *sip.Response {
+	t.Helper()
+	c.mu.Lock()
+	dlg := c.dlg
+	c.mu.Unlock()
+	if dlg == nil {
+		t.Fatal("stub carrier: no established dialog to send a re-INVITE on")
+	}
+	recipient := dlg.InviteRequest.Contact().Address
+	req := sip.NewRequest(sip.INVITE, recipient)
+	req.SetBody(body)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	for _, h := range headers {
+		req.AppendHeader(h)
+	}
+	res, err := dlg.Do(ctx, req)
+	if err != nil {
+		t.Fatalf("carrier re-INVITE: %v", err)
+	}
+	return res
 }
 
 // lastFrom returns the From header of the most recent INVITE this carrier
@@ -374,12 +429,13 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
 	c := &stubCarrier{
-		dialogSrv: sipgo.NewDialogServerCache(client, contact),
-		log:       log,
-		answerSDP: answerSDP,
-		offers:    make(chan *sip.Request, 4),
-		byeDone:   make(chan struct{}),
-		cancelled: make(chan struct{}),
+		dialogSrv:   sipgo.NewDialogServerCache(client, contact),
+		log:         log,
+		answerSDP:   answerSDP,
+		offers:      make(chan *sip.Request, 4),
+		byeDone:     make(chan struct{}),
+		cancelled:   make(chan struct{}),
+		established: make(chan struct{}),
 	}
 	if len(opts) > 0 {
 		c.earlySDP = opts[0].earlySDP
@@ -411,6 +467,7 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		}
 		c.mu.Lock()
 		c.lastInvite = req
+		c.dlg = dlg
 		c.mu.Unlock()
 
 		if c.ringForever {
@@ -463,6 +520,11 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 			log.Error("carrier respond sdp", "err", err)
 			return
 		}
+		// Signal established only now that RespondSDP/Respond has actually
+		// returned (dlg.InviteResponse is set) — see the established field's
+		// doc comment: sendReinvite must not touch dlg from another
+		// goroutine before this.
+		close(c.established)
 		<-dlg.Context().Done()
 		close(c.byeDone)
 	})
@@ -540,6 +602,20 @@ func testSDPBody(port int) []byte {
 		"t=0 0\r\n" +
 		"m=audio " + strconv.Itoa(port) + " RTP/AVP 0\r\n" +
 		"a=rtpmap:0 PCMU/8000\r\n")
+}
+
+// sipBody extracts the message body from a raw SIP message (headers +
+// blank line + body, as captured off the wire by TestBridgeAnswersSessionTimerRefresh's
+// sendReInvite) — everything after the first CRLFCRLF. Used to assert a
+// refresh re-INVITE's 200 OK carries the EXACT SDP under test, not just any
+// 200 (see Fix 1's crux assertion).
+func sipBody(t *testing.T, raw string) []byte {
+	t.Helper()
+	idx := strings.Index(raw, "\r\n\r\n")
+	if idx < 0 {
+		t.Fatalf("no header/body separator (CRLFCRLF) found in:\n%s", raw)
+	}
+	return []byte(raw[idx+4:])
 }
 
 // sdpAudioPort extracts the first audio m= line's port.
@@ -1983,15 +2059,35 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	if sess.InviteResponse.StatusCode != 200 {
 		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
 	}
+	// establishedAAnswer is the SBC's OWN A-leg answer SDP — what the
+	// caller actually received in the original 200 OK (aAnswer, rewritten
+	// to the SBC's own ports/IP; NOT byte-identical to offerSDP, which is
+	// the caller's OWN offer). This is the Critical #1 crux: a refresh
+	// re-INVITE's 200 OK must echo THIS, not offerSDP — sending offerSDP
+	// back would aim the caller's RTP at itself and let the media watchdog
+	// kill the call.
+	establishedAAnswer := sess.InviteResponse.Body()
+	if len(establishedAAnswer) == 0 {
+		t.Fatal("original 200 OK carried no SDP body; can't assert against it")
+	}
+	if string(establishedAAnswer) == string(offerSDP) {
+		t.Fatal("test setup is broken: established answer must not equal the caller's own offer, or the refresh-body assertion below can't distinguish the bug")
+	}
 	if err := sess.Ack(context.Background()); err != nil {
 		t.Fatalf("uac ack: %v", err)
 	}
 
+	// bLegOffer is the SBC's OWN B-side offer SDP — what the carrier
+	// actually received when the bridge placed the B-leg (bOffer). Needed
+	// below to assert a B-leg (carrier-initiated) refresh's 200 OK echoes
+	// THIS, not the carrier's own answer (Fix 1's B-leg counterpart, Fix 2).
+	var bLegOfferReq *sip.Request
 	select {
-	case <-carrier.offers:
+	case bLegOfferReq = <-carrier.offers:
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier never received the B-leg INVITE; call never actually bridged")
 	}
+	bLegOffer := bLegOfferReq.Body()
 
 	// --- reuse this dialog's real identifiers: the genuine Call-ID and
 	// From-tag the UAC used to place the call, and the genuine To-tag the
@@ -2072,13 +2168,78 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	if !strings.Contains(refreshResp, "Session-Expires") {
 		t.Fatalf("200 OK to a refresh re-INVITE must carry Session-Expires, got:\n%s", refreshResp)
 	}
+	// Fix 3: a 2xx to INVITE MUST carry a Contact (RFC 3261 §12.1.1) —
+	// sip.NewResponseFromRequest alone does not add one.
+	if !strings.Contains(refreshResp, "Contact:") && !strings.Contains(refreshResp, "\r\nm:") {
+		t.Fatalf("200 OK to a refresh re-INVITE must carry Contact, got:\n%s", refreshResp)
+	}
+	// Fix 1's crux assertion: the refresh's 200 OK body must be the SBC's
+	// own ESTABLISHED ANSWER (what the caller already has), never the
+	// caller's own offer echoed back — the pre-fix bug, which aims the
+	// caller's RTP at itself and lets the media watchdog kill the call.
+	refreshBody := sipBody(t, refreshResp)
+	if string(refreshBody) == string(offerSDP) {
+		t.Fatalf("refresh 200 OK answered with the CALLER'S OWN OFFER instead of the SBC's established answer (Critical #1 regression):\n%s", refreshResp)
+	}
+	if string(refreshBody) != string(establishedAAnswer) {
+		t.Fatalf("refresh 200 OK body must equal the SBC's established A-leg answer, got:\n%s\nwant body:\n%s", refreshResp, establishedAAnswer)
+	}
+
+	// --- o=-version-bump refresh (Fix 4): same c=/m= as the established
+	// offer, but the o= line's version bumped, as a real UAC commonly does
+	// on every re-offer (RFC 3264 §8) — must still be recognized as a
+	// refresh (200, established answer), not misclassified as a media
+	// change (501). ---
+	bumpedOfferSDP := []byte(strings.Replace(string(offerSDP), "o=- 1 1", "o=- 1 2", 1))
+	if string(bumpedOfferSDP) == string(offerSDP) {
+		t.Fatal("test setup is broken: o= bump did not change the SDP")
+	}
+	bumpResp := sendReInvite(t, 3, bumpedOfferSDP, "reinvite-obump", "SIP/2.0 200")
+	if !strings.Contains(bumpResp, "SIP/2.0 200") {
+		t.Fatalf("o=-version-bump refresh re-INVITE must still get 200, got:\n%s", bumpResp)
+	}
+	if bumpBody := sipBody(t, bumpResp); string(bumpBody) != string(establishedAAnswer) {
+		t.Fatalf("o=-version-bump refresh 200 body must equal the SBC's established A-leg answer, got:\n%s\nwant body:\n%s", bumpResp, establishedAAnswer)
+	}
 
 	// --- media-change re-INVITE: same Session-Expires header, but a
 	// genuinely different SDP body → still 501, exactly like M3.3. ---
 	changedSDP := testSDPBody(uacRTPPort + 1)
-	changeResp := sendReInvite(t, 3, changedSDP, "reinvite-changed", "SIP/2.0 501")
+	changeResp := sendReInvite(t, 4, changedSDP, "reinvite-changed", "SIP/2.0 501")
 	if !strings.Contains(changeResp, "SIP/2.0 501") {
 		t.Fatalf("media-changing re-INVITE must still get 501, got:\n%s", changeResp)
+	}
+
+	// --- B-leg (carrier-initiated) session-timer refresh (Fix 2): the
+	// carrier re-sends its own established answer SDP with Session-Expires
+	// — must be recognized on the SAME in-dialog branch (looked up by ITS
+	// OWN, B-leg Call-ID) and answered 200 with bLegOffer, the SBC's own
+	// established B-side offer — never the carrier's own answer, and never
+	// the A-leg's aAnswer. ---
+	//
+	// Wait for the carrier's OWN answer to have actually gone out
+	// (carrier.established) before touching its dialog session from this
+	// goroutine — required for -race correctness (see the established
+	// field's doc comment), even though by this point in the test (well
+	// after the UAC's own WaitAnswer succeeded) it always already has.
+	select {
+	case <-carrier.established:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never finished answering the B-leg INVITE")
+	}
+	bRefreshCtx, cancelBRefresh := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelBRefresh()
+	bRefreshRes := carrier.sendReinvite(t, bRefreshCtx, testSDPBody(echoRTPPort),
+		sessionExpiresHeader(1800*time.Second, "uac"),
+		sip.NewHeader("Supported", "timer"))
+	if bRefreshRes.StatusCode != 200 {
+		t.Fatalf("B-leg session-timer refresh must get 200, got %d %s", bRefreshRes.StatusCode, bRefreshRes.Reason)
+	}
+	if bRefreshRes.Contact() == nil {
+		t.Fatal("B-leg refresh 200 OK must carry Contact")
+	}
+	if string(bRefreshRes.Body()) != string(bLegOffer) {
+		t.Fatalf("B-leg refresh 200 OK body must equal the SBC's established B-side offer, got:\n%s\nwant body:\n%s", bRefreshRes.Body(), bLegOffer)
 	}
 
 	// --- prove the original call is unharmed by either re-INVITE: its BYE

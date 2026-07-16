@@ -100,3 +100,50 @@ func TestIsRefreshReInvite(t *testing.T) {
 		t.Error("no Session-Expires → not a refresh")
 	}
 }
+
+// TestIsRefreshReInviteToleratesOriginVersionBump is Fix 4: a real UAC
+// refresh commonly bumps the o= line's version number on every re-offer
+// (RFC 3264 §8) even when the rest of the SDP — in particular c=/m=, the
+// lines that actually describe the media — is unchanged. Before Fix 4,
+// isRefreshReInvite compared raw bytes, so this legitimate refresh would be
+// misclassified as a media change and answered 501 instead of 200,
+// effectively breaking session-timer refreshes against any UAC that does
+// this (which real stacks do).
+func TestIsRefreshReInviteToleratesOriginVersionBump(t *testing.T) {
+	established := []byte("v=0\r\no=- 1 1 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n")
+	// Same SDP, only the o= line's version field bumped 1 → 2 (and the
+	// session-id also differs, as some stacks do on every re-offer).
+	bumped := []byte("v=0\r\no=- 1 2 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n")
+
+	refresh := reqWith(sip.NewHeader("Session-Expires", "1800;refresher=uac"))
+	toHdr := &sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: "y", Host: "h"}, Params: sip.NewParams()}
+	toHdr.Params.Add("tag", "abc")
+	refresh.ReplaceHeader(toHdr)
+	refresh.SetBody(bumped)
+	if !isRefreshReInvite(refresh, established) {
+		t.Error("o=-version-only change should still be recognized as a refresh")
+	}
+
+	// A genuine media change (c= differs) alongside the o= bump must still
+	// be rejected — ignoring o= must not make the comparison too loose.
+	cChanged := []byte("v=0\r\no=- 1 2 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 198.51.100.9\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\n")
+	cReq := reqWith(sip.NewHeader("Session-Expires", "1800;refresher=uac"))
+	toHdr2 := &sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: "y", Host: "h"}, Params: sip.NewParams()}
+	toHdr2.Params.Add("tag", "abc")
+	cReq.ReplaceHeader(toHdr2)
+	cReq.SetBody(cChanged)
+	if isRefreshReInvite(cReq, established) {
+		t.Error("c= change alongside an o= bump must still be a media change, not a refresh")
+	}
+
+	// A genuine m= change alongside the o= bump must also still be rejected.
+	mChanged := []byte("v=0\r\no=- 1 2 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=audio 50000 RTP/AVP 0\r\n")
+	mReq := reqWith(sip.NewHeader("Session-Expires", "1800;refresher=uac"))
+	toHdr3 := &sip.ToHeader{Address: sip.Uri{Scheme: "sip", User: "y", Host: "h"}, Params: sip.NewParams()}
+	toHdr3.Params.Add("tag", "abc")
+	mReq.ReplaceHeader(toHdr3)
+	mReq.SetBody(mChanged)
+	if isRefreshReInvite(mReq, established) {
+		t.Error("m= change alongside an o= bump must still be a media change, not a refresh")
+	}
+}

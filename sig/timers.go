@@ -61,14 +61,46 @@ func sessionExpiresHeader(d time.Duration, refresher string) sip.Header {
 }
 
 // isRefreshReInvite reports whether an in-dialog INVITE is a session-timer
-// refresh: it carries a Session-Expires and its offered SDP is byte-identical
-// to the established one (a media-changing re-INVITE differs and is handled
-// separately). Callers ensure req is in-dialog (has a To-tag) before asking.
+// refresh: it carries a Session-Expires and its offered SDP matches the
+// established one modulo the o= line (a media-changing re-INVITE differs
+// even with the o= line ignored, and is handled separately). Callers ensure
+// req is in-dialog (has a To-tag) before asking.
 func isRefreshReInvite(req *sip.Request, establishedSDP []byte) bool {
 	if headerSeconds(req, "Session-Expires") == 0 {
 		return false
 	}
-	return string(req.Body()) == string(establishedSDP)
+	return sdpEqualIgnoringOrigin(req.Body(), establishedSDP)
+}
+
+// sdpEqualIgnoringOrigin reports whether a and b are identical SDP once
+// their o= (origin) lines are stripped out. RFC 3264 §8 has a real UAC bump
+// the o= line's version number on every re-offer, including a session-timer
+// refresh that re-sends otherwise-identical SDP — comparing raw bytes would
+// then wrongly treat a legitimate refresh as a media change (and 501 it,
+// killing the ability to refresh the session). Any other line differing
+// (c=, m=, ...) still fails the comparison, so a genuine media change is
+// still correctly detected.
+func sdpEqualIgnoringOrigin(a, b []byte) bool {
+	return stripOriginLine(a) == stripOriginLine(b)
+}
+
+// stripOriginLine returns sdp with its o= line (if any) removed, lines
+// rejoined with "\n" (the join separator only has to be consistent between
+// the two sides of a later equality comparison, not match SDP's own CRLF
+// convention). SDP uses CRLF line endings (RFC 4566 §5), but a bare "\n" is
+// tolerated too since callers here compare our own generated SDP against a
+// peer's, and strict CRLF-only splitting would silently fail to strip a
+// peer's o= line on any input using bare LF.
+func stripOriginLine(sdp []byte) string {
+	lines := strings.Split(strings.ReplaceAll(string(sdp), "\r\n", "\n"), "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(line, "o=") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // refresherOf returns the refresher parameter carried on req's own
