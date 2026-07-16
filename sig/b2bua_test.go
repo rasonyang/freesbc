@@ -289,6 +289,19 @@ func (c *stubCarrier) lastContact() *sip.ContactHeader {
 	return c.lastInvite.Contact()
 }
 
+// lastHeaders mirrors lastFrom for an arbitrary header name (M4.3 Task 4:
+// Supported/Session-Expires/Min-SE on the B-leg INVITE) — returns every
+// header with that name on the most recent INVITE this carrier received,
+// nil if none yet or none match.
+func (c *stubCarrier) lastHeaders(name string) []sip.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastInvite == nil {
+		return nil
+	}
+	return c.lastInvite.GetHeaders(name)
+}
+
 // stubCarrierConfig carries the Task 7 early-media and Task 8
 // failover/auth options for startStubCarrier; the zero value reproduces
 // Task 6's immediate-200 behavior (no options passed at all). When
@@ -2905,5 +2918,146 @@ func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
 	case <-carrier.offers:
 		t.Fatal("carrier received an INVITE — unregistered target was not skipped")
 	case <-time.After(1 * time.Second):
+	}
+}
+
+// --- M4.3 Task 4: session-timer headers on the A-leg 200 and B-leg INVITE ---
+
+// sessionTimerCfg mirrors outboundFromCfg's shape on a disjoint port set
+// (45180-45291/45410/45412 are already claimed by earlier tests in this
+// file — see brokenAnswerCfg's comment for the highest prior block). No
+// session_expires/min_se is set, so the config defaults apply (1800s /
+// 90s — see config/schema.go's ApplyDefaults), which is exactly what the
+// assertions below check for.
+const sessionTimerCfg = `
+listen:
+  sip: [udp://127.0.0.1:45420]
+  media:
+    port_range: 46320-46323
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45421
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// hasToken reports whether any of headers carries token (case-insensitive)
+// among its comma-separated values — e.g. a Supported header listing
+// "timer" or "100rel".
+func hasToken(headers []sip.Header, token string) bool {
+	for _, h := range headers {
+		for _, tok := range strings.Split(h.Value(), ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestBridgeSessionTimerHeaders is M4.3 Task 4's crux: the caller's
+// establishing 200 must carry Session-Expires;refresher=uac + Supported:
+// timer, and the B-leg INVITE placed at the carrier must carry Supported:
+// timer + Session-Expires;refresher=uas + Min-SE — but never Supported:
+// 100rel (this bridge declines reliable provisional responses, Task 3).
+// The A-leg INVITE here carries no Session-Expires of its own, so
+// negotiateSE falls back to cfg.SessionExpires (1800s, the config
+// default) on both legs — see sig/timers.go's negotiateSE.
+func TestBridgeSessionTimerHeaders(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45421", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 45420, sessionTimerCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45420}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	// --- B-leg INVITE (carrier-side, captured by the stub) ---
+	bSupported := carrier.lastHeaders("Supported")
+	if !hasToken(bSupported, "timer") {
+		t.Errorf("B-leg INVITE Supported = %v, want to include timer", bSupported)
+	}
+	if hasToken(bSupported, "100rel") {
+		t.Errorf("B-leg INVITE Supported = %v, must NOT include 100rel (unsupported)", bSupported)
+	}
+
+	bSE := carrier.lastHeaders("Session-Expires")
+	if len(bSE) != 1 {
+		t.Fatalf("B-leg INVITE Session-Expires header count = %d, want 1", len(bSE))
+	}
+	if got, want := bSE[0].Value(), "1800;refresher=uas"; got != want {
+		t.Errorf("B-leg INVITE Session-Expires = %q, want %q", got, want)
+	}
+
+	bMinSE := carrier.lastHeaders("Min-SE")
+	if len(bMinSE) != 1 {
+		t.Fatalf("B-leg INVITE Min-SE header count = %d, want 1", len(bMinSE))
+	}
+	if got, want := bMinSE[0].Value(), "90"; got != want {
+		t.Errorf("B-leg INVITE Min-SE = %q, want %q", got, want)
+	}
+
+	// --- A-leg 200 (UAC-side, the caller's own establishing response) ---
+	aSE := sess.InviteResponse.GetHeaders("Session-Expires")
+	if len(aSE) != 1 {
+		t.Fatalf("A-leg 200 Session-Expires header count = %d, want 1", len(aSE))
+	}
+	if got, want := aSE[0].Value(), "1800;refresher=uac"; got != want {
+		t.Errorf("A-leg 200 Session-Expires = %q, want %q", got, want)
+	}
+
+	aSupported := sess.InviteResponse.GetHeaders("Supported")
+	if !hasToken(aSupported, "timer") {
+		t.Errorf("A-leg 200 Supported = %v, want to include timer", aSupported)
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
 	}
 }

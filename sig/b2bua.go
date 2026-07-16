@@ -398,7 +398,10 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	from := b.buildFrom(aLeg.InviteRequest, ourIP, sigPort)
 	contact := b.buildContact(ourIP, sigPort, target.Peer.Transport)
 
-	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, from, contact)
+	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, from, contact,
+		sip.NewHeader("Supported", "timer"),
+		sessionExpiresHeader(cfg.SessionExpires.Std(), "uas"),
+		sip.NewHeader("Min-SE", strconv.Itoa(int(cfg.MinSE.Std().Seconds()))))
 	if err != nil {
 		b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
 		return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
@@ -586,8 +589,11 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
 	aContact := b.buildContact(ourIP, b.s.ourSigPort(cfg, aTransport), aTransport)
+	negotiatedSE := negotiateSE(headerSeconds(aLeg.InviteRequest, "Session-Expires"), cfg.SessionExpires.Std(), cfg.MinSE.Std())
 	if err := aLeg.Respond(200, "OK", aAnswer,
-		sip.NewHeader("Content-Type", "application/sdp"), aContact); err != nil {
+		sip.NewHeader("Content-Type", "application/sdp"), aContact,
+		sessionExpiresHeader(negotiatedSE, "uac"),
+		sip.NewHeader("Supported", "timer")); err != nil {
 		// The B-leg is already Acked/Confirmed here, so it's a live carrier
 		// call; the A-leg answer attempt itself failed (typically the
 		// caller CANCELed), so there is no A-leg response to send — only
