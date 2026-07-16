@@ -702,7 +702,10 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
 	aContact := b.buildContact(ourIP, b.s.ourSigPort(cfg, aTransport), aTransport)
-	negotiatedSE := negotiateSE(headerSeconds(aLeg.InviteRequest, "Session-Expires"), cfg.SessionExpires.Std(), cfg.MinSE.Std())
+	negotiatedSE := negotiateSE(
+		headerSeconds(aLeg.InviteRequest, "Session-Expires"),
+		headerSeconds(aLeg.InviteRequest, "Min-SE"),
+		cfg.SessionExpires.Std(), cfg.MinSE.Std())
 	if err := aLeg.Respond(200, "OK", aAnswer,
 		sip.NewHeader("Content-Type", "application/sdp"), aContact,
 		sessionExpiresHeader(negotiatedSE, "uac"),

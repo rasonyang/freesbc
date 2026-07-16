@@ -43,14 +43,22 @@ func requires100rel(req *sip.Request) bool {
 
 // negotiateSE picks the session interval to advertise: the smaller of the
 // peer's requested value (when present) and our configured sessionExpires,
-// never below minSE.
-func negotiateSE(peerSE, sessionExpires, minSE time.Duration) time.Duration {
+// floored at the larger of our minSE and the peer's own declared peerMinSE.
+// RFC 4028 §9 — as the UAS we MUST NOT set the interval below the peer's
+// Min-SE; a value above our sessionExpires just means less-frequent
+// refreshes, which is safe (the endpoints refresh, not us). peerMinSE 0
+// means the peer declared no Min-SE.
+func negotiateSE(peerSE, peerMinSE, sessionExpires, minSE time.Duration) time.Duration {
 	se := sessionExpires
 	if peerSE > 0 && peerSE < se {
 		se = peerSE
 	}
-	if se < minSE {
-		se = minSE
+	floor := minSE
+	if peerMinSE > floor {
+		floor = peerMinSE
+	}
+	if se < floor {
+		se = floor
 	}
 	return se
 }

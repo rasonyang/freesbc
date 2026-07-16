@@ -49,17 +49,25 @@ func TestRequires100rel(t *testing.T) {
 
 func TestNegotiateSE(t *testing.T) {
 	se, min := 1800*time.Second, 90*time.Second
-	if got := negotiateSE(3600*time.Second, se, min); got != 1800*time.Second {
+	if got := negotiateSE(3600*time.Second, 0, se, min); got != 1800*time.Second {
 		t.Errorf("caller higher → ours (1800s), got %v", got)
 	}
-	if got := negotiateSE(600*time.Second, se, min); got != 600*time.Second {
+	if got := negotiateSE(600*time.Second, 0, se, min); got != 600*time.Second {
 		t.Errorf("caller lower → caller (600s), got %v", got)
 	}
-	if got := negotiateSE(30*time.Second, se, min); got != 90*time.Second {
+	if got := negotiateSE(30*time.Second, 0, se, min); got != 90*time.Second {
 		t.Errorf("below floor → min_se (90s), got %v", got)
 	}
-	if got := negotiateSE(0, se, min); got != 1800*time.Second {
+	if got := negotiateSE(0, 0, se, min); got != 1800*time.Second {
 		t.Errorf("no caller SE → ours (1800s), got %v", got)
+	}
+	// RFC 4028 §9: never below the caller's own Min-SE, even when that
+	// exceeds our configured session_expires.
+	if got := negotiateSE(7200*time.Second, 3600*time.Second, se, min); got != 3600*time.Second {
+		t.Errorf("caller Min-SE 3600s > ours 1800s → floor at 3600s, got %v", got)
+	}
+	if got := negotiateSE(600*time.Second, 300*time.Second, se, min); got != 600*time.Second {
+		t.Errorf("caller SE 600s above caller Min-SE 300s → 600s, got %v", got)
 	}
 }
 
