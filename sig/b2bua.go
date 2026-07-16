@@ -398,38 +398,62 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 	from := b.buildFrom(aLeg.InviteRequest, ourIP, sigPort)
 	contact := b.buildContact(ourIP, sigPort, target.Peer.Transport)
 
-	bLeg, err := b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, from, contact,
+	// bHeaders carries From/Contact plus the Task 4 session-timer headers,
+	// all as one slice so it can be passed as Invite's variadic headers on
+	// every (re-)attempt. Index 3 (Session-Expires) is the only one ever
+	// rebuilt — see the 422 retry below, which replaces it with the
+	// carrier's own Min-SE while leaving From/Contact/Supported/Min-SE (our
+	// floor) untouched.
+	bHeaders := []sip.Header{
+		from,
+		contact,
 		sip.NewHeader("Supported", "timer"),
 		sessionExpiresHeader(cfg.SessionExpires.Std(), "uas"),
-		sip.NewHeader("Min-SE", strconv.Itoa(int(cfg.MinSE.Std().Seconds()))))
-	if err != nil {
-		b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
-		return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		sip.NewHeader("Min-SE", strconv.Itoa(int(cfg.MinSE.Std().Seconds()))),
 	}
 
-	// attemptCtx caps how long THIS target is allowed to ring before we give
-	// up on it and fail over — cfg.RingTimeout, not the whole-call budget.
-	// It's a child of aLeg.Context(), not context.Background(): a caller
-	// CANCEL/hangup must still abort the attempt immediately rather than
-	// waiting out the ring timer. Deriving from aLeg.Context() also means a
-	// parent cancellation (caller gone) propagates into attemptCtx as
-	// context.Canceled, while an attemptCtx-only expiry propagates as
-	// context.DeadlineExceeded — that distinction is exactly how the
-	// WaitAnswer-error classification below tells a caller CANCEL apart
-	// from a ring timeout (see the comment there). WaitAnswer's own
-	// ctx.Done() path (github.com/emiago/sipgo@v1.4.3 dialog_client.go)
-	// sends the target a real CANCEL and returns ctx.Err() from
-	// inviteCancel — so attemptCtx expiring both cancels the hung target on
-	// the wire and gives us a reliable signal to classify on.
-	attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
-	defer cancel()
+	// retried422 bounds the loop below to AT MOST ONE retry per target
+	// (Task 5): a carrier that 422s again on the retry, or 422s without a
+	// usable Min-SE, falls through to the ordinary failReal classification
+	// below instead of retrying indefinitely.
+	retried422 := false
 
-	if err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
-		OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce),
-		Username:   authUser(target),
-		Password:   authPass(target),
-	}); err != nil {
-		b.s.log.Info("b-leg not answered", "err", err, "target", target.Name)
+	for {
+		var err error
+		bLeg, err = b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
+		if err != nil {
+			b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		}
+
+		// attemptCtx caps how long THIS target is allowed to ring before we give
+		// up on it and fail over — cfg.RingTimeout, not the whole-call budget.
+		// It's a child of aLeg.Context(), not context.Background(): a caller
+		// CANCEL/hangup must still abort the attempt immediately rather than
+		// waiting out the ring timer. Deriving from aLeg.Context() also means a
+		// parent cancellation (caller gone) propagates into attemptCtx as
+		// context.Canceled, while an attemptCtx-only expiry propagates as
+		// context.DeadlineExceeded — that distinction is exactly how the
+		// WaitAnswer-error classification below tells a caller CANCEL apart
+		// from a ring timeout (see the comment there). WaitAnswer's own
+		// ctx.Done() path (github.com/emiago/sipgo@v1.4.3 dialog_client.go)
+		// sends the target a real CANCEL and returns ctx.Err() from
+		// inviteCancel — so attemptCtx expiring both cancels the hung target on
+		// the wire and gives us a reliable signal to classify on. Each loop
+		// iteration (i.e. each of up to two INVITEs) gets its own attemptCtx
+		// — a fresh ring-timeout budget for the retry, not a shared one.
+		attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
+
+		waitErr := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
+			OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce),
+			Username:   authUser(target),
+			Password:   authPass(target),
+		})
+		if waitErr == nil {
+			cancel()
+			break
+		}
+		b.s.log.Info("b-leg not answered", "err", waitErr, "target", target.Name)
 		// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
 		// it sees, including 1xx provisionals — not just the final one. If
 		// the transaction dies mid-ring (e.g. a transport error after a
@@ -443,7 +467,24 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// genuine carrier failure (failReal, its own code) and one of our
 		// own synthesized ones (failDial, 503: dial error, timeout, CANCEL
 		// race, or a stale provisional).
-		//
+
+		// Task 5: a 422 carries the carrier's Min-SE floor in a header —
+		// retry THIS target once with Session-Expires raised to meet it,
+		// rather than treating it as an ordinary carrier failure. A 422 is
+		// a non-2xx final on an unanswered B-leg (same as any other failReal
+		// candidate below), so just Close — no ACK/BYE. This must run before
+		// the raced-2xx teardown and classification switch below: a 422 is
+		// never a success, so neither of those apply to it.
+		if !retried422 && bLeg.InviteResponse != nil && bLeg.InviteResponse.StatusCode == 422 {
+			if carrierMinSE := headerSeconds(bLeg.InviteResponse, "Min-SE"); carrierMinSE > 0 {
+				retried422 = true
+				bLeg.Close()
+				cancel()
+				bHeaders[3] = sessionExpiresHeader(carrierMinSE, "uas")
+				continue
+			}
+		}
+
 		// InviteResponse can also hold a 2xx here: WaitAnswer returns an
 		// error (ctx cancellation racing a just-arrived answer, or a
 		// malformed 2xx whose DialogIDFromResponse failed) while the
@@ -511,7 +552,10 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 			bLeg.InviteResponse.StatusCode != sip.StatusProxyAuthRequired:
 			// A genuine carrier failure final (>=300), excluding 401/407:
 			// those are hop-by-hop challenges, handled in the case below,
-			// never a code the caller could act on.
+			// never a code the caller could act on. A second/unusable 422
+			// (retried422 already true, or no usable Min-SE) lands here too
+			// — 422 >= 300 and isn't 401/407 — and is reported as failReal
+			// with its own code, same as any other genuine carrier decline.
 			res.kind = failReal
 			res.code = bLeg.InviteResponse.StatusCode
 			res.reason = bLeg.InviteResponse.Reason
@@ -528,6 +572,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 			// leaking the challenge upstream as a bogus 401/407.
 			b.s.log.Debug("b-leg auth challenge unsatisfied", "code", bLeg.InviteResponse.StatusCode, "target", target.Name)
 		}
+		cancel()
 		_ = bLeg.Close()
 		return nil, res
 	}

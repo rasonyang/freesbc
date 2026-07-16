@@ -3061,3 +3061,229 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 		t.Fatal("carrier dialog never ended after BYE")
 	}
 }
+
+// minSERetryCfg sets a low session_expires (600s) so the B-leg's first
+// INVITE undershoots startMinSERetryCarrier's 1800s floor, forcing exactly
+// one 422 retry (M4.3 Task 5). Fresh ports (45422-45423, 46324-46327),
+// disjoint from sessionTimerCfg's 45420-45421/46320-46323 block.
+const minSERetryCfg = `
+listen:
+  sip: [udp://127.0.0.1:45422]
+  media:
+    port_range: 46324-46327
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45423
+    allowed_ips: [203.0.113.0/24]
+session_expires: 600s
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// startMinSERetryCarrier boots a stub UAS that declines any INVITE whose
+// Session-Expires is below minSE with 422 Session Interval Too Small and a
+// Min-SE header advertising minSE (RFC 4028 §5), and answers 200 with
+// answerSDP once an INVITE meets it — the carrier side of M4.3 Task 5's
+// retry: the bridge is expected to see this 422, read its Min-SE, and
+// re-INVITE with a Session-Expires that satisfies it. Every INVITE (422'd or
+// answered) is captured on offers/lastInvite exactly like startStubCarrier,
+// so the test can inspect both the low first attempt and the raised retry.
+func startMinSERetryCarrier(t *testing.T, addr string, answerSDP []byte, minSE time.Duration) *stubCarrier {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("carrier addr: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("carrier port: %v", err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("carrier ua: %v", err)
+	}
+	t.Cleanup(func() { ua.Close() })
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		t.Fatalf("carrier server: %v", err)
+	}
+	client, err := sipgo.NewClient(ua)
+	if err != nil {
+		t.Fatalf("carrier client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
+	c := &stubCarrier{
+		dialogSrv: sipgo.NewDialogServerCache(client, contact),
+		log:       log,
+		answerSDP: answerSDP,
+		offers:    make(chan *sip.Request, 4),
+		byeDone:   make(chan struct{}),
+	}
+
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		dlg, err := c.dialogSrv.ReadInvite(req, tx)
+		if err != nil {
+			log.Error("carrier read invite", "err", err)
+			return
+		}
+		select {
+		case c.offers <- req:
+		default:
+		}
+		c.mu.Lock()
+		c.lastInvite = req
+		c.mu.Unlock()
+
+		if headerSeconds(req, "Session-Expires") < minSE {
+			if err := dlg.Respond(422, "Session Interval Too Small", nil,
+				sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds())))); err != nil {
+				log.Error("carrier respond 422", "err", err)
+			}
+			return
+		}
+
+		if err := dlg.RespondSDP(c.answerSDP); err != nil {
+			log.Error("carrier respond sdp", "err", err)
+			return
+		}
+		<-dlg.Context().Done()
+		close(c.byeDone)
+	})
+	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := c.dialogSrv.ReadAck(req, tx); err != nil {
+			log.Debug("carrier ack", "err", err)
+		}
+	})
+	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := c.dialogSrv.ReadBye(req, tx); err != nil {
+			log.Debug("carrier bye", "err", err)
+		}
+	})
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("carrier resolve: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("carrier listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { <-ctx.Done(); conn.Close() }()
+	tl := srv.TransportLayer()
+	go func() { _ = tl.ServeUDP(conn) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		probe, err := net.Dial("udp", addr)
+		if err == nil {
+			probe.Close()
+			time.Sleep(50 * time.Millisecond)
+			return c
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stub carrier (min-se-retry) did not start")
+	return nil
+}
+
+// TestBridgeBLeg422RetriesWithMinSE is M4.3 Task 5's crux: minSERetryCfg's
+// session_expires (600s) undershoots startMinSERetryCarrier's 1800s Min-SE
+// floor, so the carrier 422s the bridge's first B-leg INVITE with
+// Min-SE: 1800. dialTarget must read that Min-SE and retry the SAME target
+// once with Session-Expires raised to meet it — the retry's 200 then flows
+// into the ordinary bridge path exactly as if it had answered outright, so
+// the caller still gets bridged rather than seeing the 422 or any failover
+// churn. Timing-based over real UDP loopback: re-run once before treating a
+// flake as failure.
+func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startMinSERetryCarrier(t, "127.0.0.1:45423", testSDPBody(echoRTPPort), 1800*time.Second)
+	startServer(t, 45422, minSERetryCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45422}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v (call must bridge despite the carrier's 422, via the Min-SE retry)", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- the carrier must have seen exactly two INVITEs: the low first
+	// attempt (422'd) and the retry that met its Min-SE ---
+	var first, second *sip.Request
+	select {
+	case first = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the first B-leg INVITE")
+	}
+	select {
+	case second = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the retried B-leg INVITE")
+	}
+
+	if got := headerSeconds(first, "Session-Expires"); got != 600*time.Second {
+		t.Errorf("first B-leg INVITE Session-Expires = %v, want 600s", got)
+	}
+	if got := headerSeconds(second, "Session-Expires"); got < 1800*time.Second {
+		t.Errorf("retried B-leg INVITE Session-Expires = %v, want >= 1800s (the carrier's Min-SE)", got)
+	}
+
+	select {
+	case <-carrier.offers:
+		t.Fatal("carrier received a THIRD B-leg INVITE; retry must happen at most once")
+	default:
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+}
