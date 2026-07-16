@@ -105,13 +105,12 @@ func stripOriginLine(sdp []byte) string {
 
 // refresherOf returns the refresher parameter carried on req's own
 // Session-Expires header (e.g. "uac" from ";refresher=uac"), defaulting to
-// "uac" if the header is absent or carries no refresher param. A
-// session-timer refresh re-INVITE that we locally answer (see
-// bridge.onInvite) only ever arrives from the A-leg (the caller) in this
-// bridge — and the established call's own 200 OK always negotiated
-// refresher=uac for that leg (see b2bua.go's aLeg.Respond) — so echoing the
-// caller's own value back is always correct here without needing to
-// inspect which dialog matched.
+// "uac" if the header is absent or carries no refresher param. We echo the
+// refresher the refreshing endpoint itself stated: a locally-answered refresh
+// re-INVITE can arrive from either leg (the caller on the A-leg, negotiated
+// refresher=uac; the carrier on the B-leg, requested refresher=uas), and
+// echoing the request's own value is correct for both without inspecting
+// which dialog matched.
 func refresherOf(req *sip.Request) string {
 	headers := req.GetHeaders("Session-Expires")
 	if len(headers) == 0 {

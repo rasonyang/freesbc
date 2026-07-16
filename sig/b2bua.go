@@ -71,6 +71,14 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// with aAnswer, while a refresh from the CARRIER carries the B-leg's
 	// own, distinct Call-ID and is answered with bOffer. Same code path,
 	// correct answer either way (Fix 2).
+	//
+	// Limitation: this bare-tx.Respond path does NOT retransmit the 2xx
+	// (sipgo's TU retransmit-until-ACK loop lives in
+	// DialogServerSession.WriteResponse, which we deliberately bypass). If
+	// the refresh 200 is lost, the refresher's re-INVITE transaction times
+	// out and per RFC 4028 §10 it may BYE at session expiry. Acceptable on a
+	// reliable link; a retransmit loop is deferred (a hand-rolled one outside
+	// the dialog layer is the "fragile hack" the M4.3 spike avoided).
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
 		if entry, ok := b.s.callSDP(callID(req)); ok && isRefreshReInvite(req, entry.compare) {
 			// The refresh's 200 OK MUST carry a Contact (RFC 3261 §12.1.1:
