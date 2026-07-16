@@ -3,6 +3,7 @@ package sig
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -299,17 +300,52 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 // onBye routes an in-dialog BYE to whichever dialog cache owns it: the
 // A-leg (we are the UAS, dialogSrv) or the B-leg (we are the UAC,
 // dialogCli). Exactly one of the two caches will recognize the dialog.
+//
+// If NEITHER does, the BYE matches no call we know about and must be
+// answered 481 Call/Transaction Does Not Exist (RFC 3261 §15) rather than
+// silently dropped — this is not the M3.1 "unknown source" shield (the
+// peer IS known; its BYE just doesn't correspond to anything). Both
+// ReadBye implementations (dialog_server.go/dialog_client.go) only ever
+// call tx.Respond after their own dialog lookup succeeds, so when
+// noMatchingDialog is true for BOTH, neither cache has responded to tx
+// yet — the 481 below is the only response sent, never a double-send. Any
+// OTHER error (e.g. sipgo.ErrDialogInvalidCseq on a dialog that WAS found)
+// is left exactly as before: merely logged, since a 481 would misreport
+// that no dialog exists when one actually does.
 func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
 	if _, _, ok := s.identify(req); !ok {
 		s.dropUnidentified(req)
 		return
 	}
-	if err := s.dialogSrv.ReadBye(req, tx); err == nil {
+	srvErr := s.dialogSrv.ReadBye(req, tx)
+	if srvErr == nil {
 		return
 	}
-	if err := s.dialogCli.ReadBye(req, tx); err != nil {
-		s.log.Debug("dialog bye", "err", err, "source", req.Source())
+	cliErr := s.dialogCli.ReadBye(req, tx)
+	if cliErr == nil {
+		return
 	}
+	if noMatchingDialog(srvErr) && noMatchingDialog(cliErr) {
+		if err := tx.Respond(sip.NewResponseFromRequest(req, 481, "Call/Transaction Does Not Exist", nil)); err != nil {
+			s.log.Error("respond 481 bye", "err", err, "source", req.Source())
+		}
+		return
+	}
+	s.log.Debug("dialog bye", "srvErr", srvErr, "cliErr", cliErr, "source", req.Source())
+}
+
+// noMatchingDialog reports whether err is one of sipgo's two "this request
+// doesn't correspond to any dialog we have" sentinels:
+// sipgo.ErrDialogDoesNotExists (a valid dialog ID was computed but nothing
+// is stored under it) or sipgo.ErrDialogOutsideDialog (the request itself
+// is missing a tag needed to even compute an ID — see
+// sip.DialogIDFromRequestUAS/UAC). Both mean the same thing from onBye's
+// perspective: no dialog owns this BYE. This is distinct from e.g.
+// sipgo.ErrDialogInvalidCseq, which means a dialog WAS found but this
+// particular request is invalid against it — that must never trip the 481
+// path.
+func noMatchingDialog(err error) bool {
+	return errors.Is(err, sipgo.ErrDialogDoesNotExists) || errors.Is(err, sipgo.ErrDialogOutsideDialog)
 }
 
 // onNoRoute is sipgo's catch-all for every SIP method without a dedicated

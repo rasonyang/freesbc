@@ -274,3 +274,58 @@ func TestServerDropsUnidentifiedBye(t *testing.T) {
 		t.Fatalf("unidentified BYE must be dropped, got a response:\n%s", got)
 	}
 }
+
+// TestServerByeNoDialogGets481 is the positive-path counterpart to
+// TestServerDropsUnidentifiedBye: a BYE from a KNOWN, authorized source
+// (loopback, allowed by knownPeerCfg) still isn't silently dropped when it
+// carries a To-tag (so it's shaped like an in-dialog request) but matches
+// no dialog either dialogSrv or dialogCli actually has — neither this
+// server nor any bridge on it ever established the call the tag claims to
+// belong to. Per RFC 3261 §15 that must get 481 Call/Transaction Does Not
+// Exist, not silence (onBye's identify gate already covers the "silence"
+// case for genuinely unauthorized sources — this proves a known peer with
+// a stale/bogus dialog reference gets a real, visible error instead).
+func TestServerByeNoDialogGets481(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45079", 1)
+	startServer(t, 45079, cfg)
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer conn.Close()
+	local := conn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45079}
+
+	// Same shape as sipRequest's BYE, but the To header carries a tag —
+	// exactly the re-INVITE test's technique (TestBridgeRejectsReInvite) for
+	// making a standalone request look in-dialog without an established
+	// call behind it.
+	req := strings.Replace(
+		sipRequest("BYE", "45079", local, "bye-nodialog-1"),
+		"To: <sip:sbc@127.0.0.1>",
+		"To: <sip:sbc@127.0.0.1>;tag=bye-nodialog-tag",
+		1,
+	)
+	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write bye: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 481") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 481") {
+		t.Fatalf("BYE with no dialog must get 481, got:\n%s", got.String())
+	}
+}

@@ -69,8 +69,13 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	aLeg, err := b.s.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
-		b.s.log.Error("read invite", "err", err, "source", req.Source())
-		b.reject(req, tx, 500, "Server Internal Error")
+		// ReadInvite's failures are all request-shape problems (most
+		// commonly sipgo.ErrDialogInviteNoContact: no Contact header —
+		// see DialogUA.ReadInvite's own minimal validation) — the far
+		// end's fault, not an SBC-side failure, so 400 Bad Request
+		// rather than a 5xx that would misattribute the problem to us.
+		b.s.log.Info("malformed invite", "err", err, "source", req.Source())
+		b.reject(req, tx, 400, "Bad Request")
 		return
 	}
 	defer aLeg.Close()
@@ -435,9 +440,28 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
 		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
 	}
+	// The establishing 2xx carries a Contact built for the A-leg's actual
+	// inbound transport (spec §5), not necessarily the dialog cache's
+	// default (built once in Run from the FIRST configured listener) — so
+	// a caller on a secondary transport (e.g. tcp when udp is listeners[0])
+	// still gets back a Contact that routes its next in-dialog request
+	// (re-INVITE, BYE) to the listener that's actually reachable for that
+	// transport. sip.NewSDPResponseFromRequest (what RespondSDP wraps) does
+	// nothing beyond NewResponseFromRequest + a Content-Type header — no
+	// other dialog-critical work — so Respond here is exactly equivalent
+	// modulo the extra Contact header, which cleanly overrides the cache's
+	// default: DialogServerSession.WriteResponse only appends its own
+	// ContactHDR when the response doesn't already carry one
+	// (res.Contact() == nil), and res.Contact() finds ours by header name
+	// regardless of when it was appended (see sip/headers.go).
+	//
 	// RespondSDP blocks until the A-leg ACK arrives (sipgo retransmits the
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
-	if err := aLeg.RespondSDP(aAnswer); err != nil {
+	// Respond blocks identically (same WriteResponse underneath).
+	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
+	aContact := b.buildContact(ourIP, b.s.ourSigPort(cfg, aTransport), aTransport)
+	if err := aLeg.Respond(200, "OK", aAnswer,
+		sip.NewHeader("Content-Type", "application/sdp"), aContact); err != nil {
 		// The B-leg is already Acked/Confirmed here, so it's a live carrier
 		// call; the A-leg answer attempt itself failed (typically the
 		// caller CANCELed), so there is no A-leg response to send — only

@@ -113,6 +113,59 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	}
 }
 
+// TestBridgeMalformedInviteGets400 proves a request-shape problem — here,
+// an INVITE with no Contact header, which sipgo's DialogUA.ReadInvite
+// refuses outright (sip.ErrDialogInviteNoContact) before any dialog is
+// built — gets 400 Bad Request rather than the 500 Server Internal Error
+// bridge.onInvite used to send for every ReadInvite failure. A malformed
+// request from the far end is not an SBC-side failure, so a 5xx would
+// misattribute it.
+func TestBridgeMalformedInviteGets400(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45072", 1)
+	startServer(t, 45072, cfg)
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer conn.Close()
+	local := conn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45072}
+
+	// sipRequest always builds a Contact header; strip it to produce the
+	// malformed variant under test. No To-tag, so this is still an initial
+	// INVITE (not the re-INVITE 501 path above).
+	var lines []string
+	for _, line := range strings.Split(sipRequest("INVITE", "45072", local, "b2bua-malformed-1"), "\r\n") {
+		if strings.HasPrefix(line, "Contact:") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	req := strings.Join(lines, "\r\n")
+	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 400") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 400") {
+		t.Fatalf("malformed INVITE (no Contact) must get 400, got:\n%s", got.String())
+	}
+}
+
 // --- Task 6: happy-path bridge, stub carrier UAS ---
 
 // stubCarrier is a minimal sipgo UAS standing in for a carrier trunk. It
@@ -648,6 +701,126 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 		t.Fatalf("media ports not released after teardown: %v", err)
 	}
 	s2.Close()
+}
+
+// bridgeALegContactCfg mirrors bridgeCallCfg but lists a TCP listener
+// BEFORE the UDP one, specifically so Run's dialog-cache default Contact
+// (built once from listeners[0]'s port — see Server.Run's contactPort
+// comment) lands on the TCP port, not the UDP one the test's UAC actually
+// calls in on. That's what lets
+// TestBridgeALegContactMatchesInboundTransport tell "per-transport
+// override actually happened" (dialTarget's aLeg.Respond(..., aContact),
+// Task 5) apart from "silently fell back to the cache default": if the
+// override weren't wired up, the bridged 200 OK's Contact port would be
+// the TCP listener's (45281) instead of the UDP one (45280) the call
+// actually arrived on. The TCP listener is never dialed by the test — it
+// only needs to exist and occupy listeners[0].
+const bridgeALegContactCfg = `
+listen:
+  sip: [tcp://127.0.0.1:45281, udp://127.0.0.1:45280]
+  media:
+    port_range: 46280-46283
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45282
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeALegContactMatchesInboundTransport is Task 5's positive-path
+// proof for the A-leg's per-transport Contact (spec §5): the establishing
+// 2xx must carry a Contact for the transport/port the call actually
+// arrived on, not whichever listener happens to be listeners[0] (the
+// dialog cache's baked-in default from Server.Run). bridgeALegContactCfg
+// puts a TCP listener first specifically so the two would diverge if the
+// override weren't wired up — see its doc comment.
+func TestBridgeALegContactMatchesInboundTransport(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 46285})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45282", testSDPBody(echoRTPPort))
+	startServer(t, 45280, bridgeALegContactCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45280}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+
+	contact := sess.InviteResponse.Contact()
+	if contact == nil {
+		t.Fatal("bridged 200 OK carried no Contact header")
+	}
+	if contact.Address.Host != "127.0.0.1" {
+		t.Errorf("a-leg contact host = %q, want 127.0.0.1", contact.Address.Host)
+	}
+	if contact.Address.Port != 45280 {
+		t.Errorf("a-leg contact port = %d, want 45280 (the UDP listener the call actually arrived on, not the TCP listeners[0] port 45281 the dialog cache's default Contact would carry if the per-transport override weren't applied)", contact.Address.Port)
+	}
+	if tr, ok := contact.Address.UriParams.Get("transport"); ok && tr != "" {
+		t.Errorf("a-leg contact transport param = %q, want none (udp is the RFC 3261 §19.1.2 default, omitted by buildContact)", tr)
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
 }
 
 // --- Task 7: early media (18x with SDP) ---
