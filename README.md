@@ -79,8 +79,8 @@ routes:
 | M4 | Trunk interop: From/CLI, outbound REGISTER, session timers, PRACK, DNS SRV | in progress |
 | ├ M4.1 | Outbound-INVITE realism: From/CLI, ring cap, response codes | ✅ done |
 | ├ M4.2 | Outbound REGISTER | ✅ done |
-| ├ M4.3 | Session timers (RFC 4028) + 100rel/PRACK | next |
-| └ M4.4 | DNS SRV + peer health/cooldown | |
+| ├ M4.3 | Session timers (RFC 4028) + 100rel/PRACK | ✅ done |
+| └ M4.4 | DNS SRV + peer health/cooldown | next |
 | M5 | SRTP (SDES) | |
 | M6 | Shield: rate limiting, scanner detection, auto-ban | |
 | M7 | Admin API, embedded WebUI, Prometheus metrics | |
