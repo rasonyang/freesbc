@@ -31,10 +31,38 @@ type regParams struct {
 	ContactPort   int
 }
 
-// registerOnce performs a single REGISTER exchange for p, requesting the
-// given expires (0 = un-REGISTER). It handles a 401/407 digest challenge
-// and returns the lifetime the registrar granted, or an error.
+// registerOnce performs a REGISTER exchange for p, requesting the given
+// expires (0 = un-REGISTER). It handles a 401/407 digest challenge via
+// registerOnceNoRetry, and additionally applies at most one retry when the
+// registrar rejects the request with 423 Interval Too Brief: it reads the
+// registrar's Min-Expires and, if that minimum exceeds what was requested,
+// resends once at that minimum. The retry calls registerOnceNoRetry
+// directly (not registerOnce), so a registrar that keeps 423-ing above its
+// own advertised Min-Expires cannot cause unbounded recursion — at most two
+// REGISTER exchanges are ever sent for one registerOnce call.
 func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, expires time.Duration) (time.Duration, error) {
+	granted, res, err := registerOnceNoRetry(ctx, client, p, expires)
+	if err == nil || res == nil || res.StatusCode != sip.StatusIntervalToBrief {
+		return granted, err
+	}
+	minExp := headerSeconds(res, "Min-Expires")
+	if minExp <= expires || minExp <= 0 {
+		return granted, err
+	}
+	granted, _, err = registerOnceNoRetry(ctx, client, p, minExp)
+	return granted, err
+}
+
+// registerOnceNoRetry performs a single REGISTER exchange for p, requesting
+// the given expires (0 = un-REGISTER): builds the request, sends it,
+// answers a 401/407 digest challenge if offered, and parses the granted
+// lifetime off a 200. It does not itself retry on 423 — that one bounded
+// retry is registerOnce's job — so callers that want the 423-retry
+// behavior must call registerOnce, not this directly. On a non-200 final
+// response it returns the response alongside the error (registerOnce needs
+// it to inspect StatusCode/Min-Expires); res may be nil if the failure was
+// transport-level (no response was ever received).
+func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams, expires time.Duration) (time.Duration, *sip.Response, error) {
 	registrar := sip.Uri{Scheme: "sip", Host: p.RegistrarHost, Port: p.RegistrarPort}
 	req := sip.NewRequest(sip.REGISTER, registrar)
 
@@ -62,23 +90,23 @@ func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, expire
 	// set above, since it treats an existing CSeq as "retransmit, bump it"
 	// rather than "not yet built".
 	if err := sipgo.ClientRequestRegisterBuild(client, req); err != nil {
-		return 0, fmt.Errorf("build register: %w", err)
+		return 0, nil, fmt.Errorf("build register: %w", err)
 	}
 
 	res, err := client.Do(ctx, req)
 	if err != nil {
-		return 0, fmt.Errorf("register: %w", err)
+		return 0, nil, fmt.Errorf("register: %w", err)
 	}
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{Username: p.Username, Password: p.Password})
 		if err != nil {
-			return 0, fmt.Errorf("register digest: %w", err)
+			return 0, nil, fmt.Errorf("register digest: %w", err)
 		}
 	}
 	if res.StatusCode != sip.StatusOK {
-		return 0, fmt.Errorf("register rejected: %d %s", res.StatusCode, res.Reason)
+		return 0, res, fmt.Errorf("register rejected: %d %s", res.StatusCode, res.Reason)
 	}
-	return grantedExpires(res, expires), nil
+	return grantedExpires(res, expires), res, nil
 }
 
 // grantedExpires reads the lifetime the registrar granted: the Expires
