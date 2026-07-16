@@ -407,6 +407,24 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 		// real ACK+BYE rather than silently abandoned to ring up ~32s of
 		// carrier billing for a call nobody is using.
 		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+
+		// A target can answer 200 in the window between our CANCEL and its
+		// arrival (caller hangup, ring timeout, or a malformed 2xx). This
+		// runs UNCONDITIONALLY, above the classification switch below,
+		// because the switch's cases are mutually exclusive: if the caller
+		// also CANCELed in that same window (the common "impatient caller
+		// hangs up as the callee picks up" case), aLeg.Context().Err() != nil
+		// is ALSO true, and that case would otherwise win and skip teardown
+		// entirely — leaving a live carrier call nobody tears down for
+		// ~32s. Tear the phantom call down with ACK+BYE before classifying,
+		// regardless of which case ends up classifying the attempt.
+		// context.Background() rather than aLeg.Context(): the A-leg's
+		// context may already be cancelled (the caller-CANCEL case above),
+		// and this is best-effort teardown independent of the A-leg's fate
+		// either way; ackThenBye bounds its own BYE via byeContext's 5s.
+		if bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
+			b.ackThenBye(context.Background(), bLeg, target)
+		}
 		switch {
 		case aLeg.Context().Err() != nil:
 			// The A-leg itself is gone (caller CANCEL/hangup): placeCall's
@@ -418,18 +436,14 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, outN
 			// which would be a lie (nothing "timed out"; the caller left).
 
 		case bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess():
-			// Raced 2xx (see the comment above): tear the phantom carrier
-			// call down with a real ACK+BYE — context.Background() rather
-			// than aLeg.Context() (already cancelled in the caller-CANCEL
-			// case, and this is best-effort teardown independent of the
-			// A-leg's fate either way). This 2xx must never be relayed to
+			// Raced 2xx (see the comment above the switch — teardown already
+			// ran there, unconditionally). This 2xx must never be relayed to
 			// the caller as a success (dialTarget already returned
 			// retryable=true; the caller only ever sees the eventual
 			// classification below) or counted as failReal (it isn't a
 			// failure); it classifies exactly like any other outcome on
 			// this attempt — failRing if the ring deadline had already
 			// expired, failDial/503 otherwise.
-			b.ackThenBye(context.Background(), bLeg, target)
 			if attemptCtx.Err() == context.DeadlineExceeded {
 				res.kind = failRing
 				res.code = 408
