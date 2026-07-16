@@ -115,6 +115,11 @@ func TestValidateErrors(t *testing.T) {
 			c.Routes[0].Match = &RouteMatch{To: `^9(\d+)$`}
 			c.Routes[0].Transform = &RouteTransform{To: "${5}"}
 		}, "capture group"},
+		{"min_se too small", func(c *Config) { c.MinSE = Duration(500 * time.Millisecond) }, "min_se"},
+		{"session_expires below min_se", func(c *Config) {
+			c.MinSE = Duration(120 * time.Second)
+			c.SessionExpires = Duration(90 * time.Second)
+		}, "session_expires"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

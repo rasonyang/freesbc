@@ -113,6 +113,42 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	}
 }
 
+// TestBridgeRejects100relRequire proves an initial INVITE that mandates
+// reliable provisional responses (Require: 100rel, RFC 3262) — a feature we
+// do not implement — is rejected at the front door with 420 Bad Extension
+// and an Unsupported: 100rel header (RFC 3261 §21.4.20's required pairing),
+// before ever reaching Resolve/ReadInvite.
+func TestBridgeRejects100relRequire(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45410", 1)
+	startServer(t, 45410, cfg)
+	got := roundTripWithHeaders(t, 45410, "INVITE", "req100rel-1", 3*time.Second, "SIP/2.0 420",
+		"Require: 100rel")
+	if !strings.Contains(got, "SIP/2.0 420") {
+		t.Fatalf("Require:100rel must get 420, got:\n%s", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "unsupported: 100rel") {
+		t.Errorf("420 should carry Unsupported: 100rel, got:\n%s", got)
+	}
+}
+
+// TestBridgeRejectsLowSessionExpires proves an initial INVITE offering a
+// Session-Expires below the configured min_se (knownPeerCfg leaves min_se at
+// its 90s default) is rejected with 422 Session Interval Too Small and a
+// Min-SE header advertising the floor (RFC 4028 §5), before ever reaching
+// Resolve/ReadInvite.
+func TestBridgeRejectsLowSessionExpires(t *testing.T) {
+	cfg := strings.Replace(knownPeerCfg, "45060", "45412", 1)
+	startServer(t, 45412, cfg)
+	got := roundTripWithHeaders(t, 45412, "INVITE", "lowse-1", 3*time.Second, "SIP/2.0 422",
+		"Session-Expires: 30")
+	if !strings.Contains(got, "SIP/2.0 422") {
+		t.Fatalf("low Session-Expires must get 422, got:\n%s", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "min-se:") {
+		t.Errorf("422 should carry Min-SE, got:\n%s", got)
+	}
+}
+
 // TestBridgeMalformedInviteGets400 proves a request-shape problem — here,
 // an INVITE with no Contact header, which sipgo's DialogUA.ReadInvite
 // refuses outright (sip.ErrDialogInviteNoContact) before any dialog is
@@ -210,6 +246,20 @@ type stubCarrier struct {
 	offers  chan *sip.Request
 	byeDone chan struct{}
 
+	// established (Task 6 fix wave: B-leg refresh test synchronization)
+	// closes once THIS invite's answer (RespondSDP/Respond) call has
+	// returned, i.e. once dlg.InviteResponse is set and the initial 2xx
+	// has actually gone out. sendReinvite reads dlg's internal state
+	// (dlg.InviteResponse, via buildReq/Do) from the TEST goroutine —
+	// without waiting on this channel first, that read would race under
+	// -race against WriteResponse's own unsynchronized write to
+	// dlg.InviteResponse in the handler goroutine (see sipgo's
+	// DialogServerSession.WriteResponse: a plain field assignment, no
+	// mutex), even though in practice the answer has always long since
+	// gone out by the time a test gets around to calling sendReinvite
+	// (e.g. only after the UAC's own WaitAnswer already succeeded).
+	established chan struct{}
+
 	// cancelled (Task 4) closes exactly once, the first time this carrier's
 	// dialog ends because it actually received a CANCEL request — as
 	// opposed to ending for any other reason (the test tearing the
@@ -227,6 +277,47 @@ type stubCarrier struct {
 	// race under -race.
 	mu         sync.Mutex
 	lastInvite *sip.Request
+
+	// dlg (Task 6 fix wave: B-leg session-timer refresh coverage) is the
+	// sipgo dialog session OnInvite's handler establishes for the most
+	// recent INVITE, guarded by the same mu. sendReinvite reuses it to send
+	// an in-dialog INVITE FROM this stub carrier TO whichever peer it
+	// dialogued with (the bridge, in every test that uses this) — sipgo's
+	// own DialogServerSession.Do/buildReq fills in the swapped From/To,
+	// the dialog's own Call-ID, and a fresh CSeq automatically (see
+	// dialog_server.go in the sipgo module), so this simulates a genuine
+	// carrier-initiated re-INVITE without hand-building SIP headers the
+	// way the A-leg refresh test's raw-UDP sendReInvite has to.
+	dlg *sipgo.DialogServerSession
+}
+
+// sendReinvite (Task 6 fix wave) sends an in-dialog INVITE FROM this stub
+// carrier TO the peer of its most recently established dialog (dlg) —
+// simulating a carrier-initiated session-timer refresh on the B-leg.
+// Blocks for a final response or until ctx is done; fails the test if no
+// dialog has been established yet or the request/response round trip
+// itself errors (a non-2xx final response is NOT an error here — the
+// caller inspects the status).
+func (c *stubCarrier) sendReinvite(t *testing.T, ctx context.Context, body []byte, headers ...sip.Header) *sip.Response {
+	t.Helper()
+	c.mu.Lock()
+	dlg := c.dlg
+	c.mu.Unlock()
+	if dlg == nil {
+		t.Fatal("stub carrier: no established dialog to send a re-INVITE on")
+	}
+	recipient := dlg.InviteRequest.Contact().Address
+	req := sip.NewRequest(sip.INVITE, recipient)
+	req.SetBody(body)
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	for _, h := range headers {
+		req.AppendHeader(h)
+	}
+	res, err := dlg.Do(ctx, req)
+	if err != nil {
+		t.Fatalf("carrier re-INVITE: %v", err)
+	}
+	return res
 }
 
 // lastFrom returns the From header of the most recent INVITE this carrier
@@ -251,6 +342,19 @@ func (c *stubCarrier) lastContact() *sip.ContactHeader {
 		return nil
 	}
 	return c.lastInvite.Contact()
+}
+
+// lastHeaders mirrors lastFrom for an arbitrary header name (M4.3 Task 4:
+// Supported/Session-Expires/Min-SE on the B-leg INVITE) — returns every
+// header with that name on the most recent INVITE this carrier received,
+// nil if none yet or none match.
+func (c *stubCarrier) lastHeaders(name string) []sip.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastInvite == nil {
+		return nil
+	}
+	return c.lastInvite.GetHeaders(name)
 }
 
 // stubCarrierConfig carries the Task 7 early-media and Task 8
@@ -325,12 +429,13 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
 	c := &stubCarrier{
-		dialogSrv: sipgo.NewDialogServerCache(client, contact),
-		log:       log,
-		answerSDP: answerSDP,
-		offers:    make(chan *sip.Request, 4),
-		byeDone:   make(chan struct{}),
-		cancelled: make(chan struct{}),
+		dialogSrv:   sipgo.NewDialogServerCache(client, contact),
+		log:         log,
+		answerSDP:   answerSDP,
+		offers:      make(chan *sip.Request, 4),
+		byeDone:     make(chan struct{}),
+		cancelled:   make(chan struct{}),
+		established: make(chan struct{}),
 	}
 	if len(opts) > 0 {
 		c.earlySDP = opts[0].earlySDP
@@ -362,6 +467,7 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		}
 		c.mu.Lock()
 		c.lastInvite = req
+		c.dlg = dlg
 		c.mu.Unlock()
 
 		if c.ringForever {
@@ -414,6 +520,11 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 			log.Error("carrier respond sdp", "err", err)
 			return
 		}
+		// Signal established only now that RespondSDP/Respond has actually
+		// returned (dlg.InviteResponse is set) — see the established field's
+		// doc comment: sendReinvite must not touch dlg from another
+		// goroutine before this.
+		close(c.established)
 		<-dlg.Context().Done()
 		close(c.byeDone)
 	})
@@ -491,6 +602,20 @@ func testSDPBody(port int) []byte {
 		"t=0 0\r\n" +
 		"m=audio " + strconv.Itoa(port) + " RTP/AVP 0\r\n" +
 		"a=rtpmap:0 PCMU/8000\r\n")
+}
+
+// sipBody extracts the message body from a raw SIP message (headers +
+// blank line + body, as captured off the wire by TestBridgeAnswersSessionTimerRefresh's
+// sendReInvite) — everything after the first CRLFCRLF. Used to assert a
+// refresh re-INVITE's 200 OK carries the EXACT SDP under test, not just any
+// 200 (see Fix 1's crux assertion).
+func sipBody(t *testing.T, raw string) []byte {
+	t.Helper()
+	idx := strings.Index(raw, "\r\n\r\n")
+	if idx < 0 {
+		t.Fatalf("no header/body separator (CRLFCRLF) found in:\n%s", raw)
+	}
+	return []byte(raw[idx+4:])
 }
 
 // sdpAudioPort extracts the first audio m= line's port.
@@ -1844,6 +1969,311 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	s2.Close()
 }
 
+// sessionTimerRefreshCfg is TestBridgeAnswersSessionTimerRefresh's own
+// listener/peer/route set, on ports not used by any other test in this
+// file.
+const sessionTimerRefreshCfg = `
+listen:
+  sip: [udp://127.0.0.1:45430]
+  media:
+    port_range: 46330-46333
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45431
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeAnswersSessionTimerRefresh is M4.3 Task 6's spike-and-implement
+// test: it establishes a real bridged call (same technique as
+// TestBridgeReInviteDuringCallDoesNotBreakCall — reusing the dialog's
+// genuine Call-ID/From-tag and the bridge's own real To-tag), then sends an
+// in-dialog re-INVITE carrying Session-Expires and the SAME SDP the call
+// was established with (a session-timer refresh). Per the Task 6 spike
+// finding (see timers.go's refresherOf doc and b2bua.go's onInvite
+// in-dialog branch), sipgo v1.4.3 lets a bare tx.Respond(200) on the
+// re-INVITE's own raw server transaction — never touching dialogSrv/aLeg —
+// answer it cleanly: the peer's ACK to that 200 is routed by onAck to
+// dialogSrv.ReadAck, which no-ops (a harmless, already-tolerated CSeq
+// mismatch — see the comment on b.s.sdps.set below) rather than mutating or
+// corrupting the established dialog's state, so the original call is
+// provably unharmed by the refresh: its real BYE still completes, the
+// carrier's dialog still ends, and the call registry/media pool still fully
+// drain. It also proves a second re-INVITE whose SDP has genuinely changed
+// still gets the M3.3 501 (media-change renegotiation stays out of scope
+// for M4.3). Timing-based over real UDP loopback: re-run once before
+// treating a flake as failure.
+func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45432})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45431", testSDPBody(echoRTPPort))
+	srv := startServer(t, 45430, sessionTimerRefreshCfg)
+
+	// --- establish the call, same shape as TestBridgePlacesCallAndBridges ---
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45430}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	offerSDP := testSDPBody(uacRTPPort)
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, offerSDP)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	// establishedAAnswer is the SBC's OWN A-leg answer SDP — what the
+	// caller actually received in the original 200 OK (aAnswer, rewritten
+	// to the SBC's own ports/IP; NOT byte-identical to offerSDP, which is
+	// the caller's OWN offer). This is the Critical #1 crux: a refresh
+	// re-INVITE's 200 OK must echo THIS, not offerSDP — sending offerSDP
+	// back would aim the caller's RTP at itself and let the media watchdog
+	// kill the call.
+	establishedAAnswer := sess.InviteResponse.Body()
+	if len(establishedAAnswer) == 0 {
+		t.Fatal("original 200 OK carried no SDP body; can't assert against it")
+	}
+	if string(establishedAAnswer) == string(offerSDP) {
+		t.Fatal("test setup is broken: established answer must not equal the caller's own offer, or the refresh-body assertion below can't distinguish the bug")
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// bLegOffer is the SBC's OWN B-side offer SDP — what the carrier
+	// actually received when the bridge placed the B-leg (bOffer). Needed
+	// below to assert a B-leg (carrier-initiated) refresh's 200 OK echoes
+	// THIS, not the carrier's own answer (Fix 1's B-leg counterpart, Fix 2).
+	var bLegOfferReq *sip.Request
+	select {
+	case bLegOfferReq = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE; call never actually bridged")
+	}
+	bLegOffer := bLegOfferReq.Body()
+
+	// --- reuse this dialog's real identifiers: the genuine Call-ID and
+	// From-tag the UAC used to place the call, and the genuine To-tag the
+	// bridge assigned in its 200 OK. ---
+	callIDHdr := sess.InviteRequest.CallID()
+	fromHdr := sess.InviteRequest.From()
+	toHdr := sess.InviteResponse.To()
+	if callIDHdr == nil || fromHdr == nil || toHdr == nil {
+		t.Fatal("established dialog missing Call-ID/From/To; can't build a faithful re-INVITE")
+	}
+	realCallID := callIDHdr.Value()
+	realFromTag, hasFromTag := fromHdr.Params.Get("tag")
+	realToTag, hasToTag := toHdr.Params.Get("tag")
+	if !hasFromTag || realFromTag == "" {
+		t.Fatal("uac's own From header carries no tag")
+	}
+	if !hasToTag || realToTag == "" {
+		t.Fatal("bridge's 200 OK carried no To-tag to reuse")
+	}
+
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45430}
+
+	// sendReInvite fires one in-dialog INVITE with the given CSeq and SDP
+	// body, over its own fresh socket (a distinct branch/local port per
+	// send, same as the M3.3 technique), and returns everything read back
+	// before wantSubstr appears or the 3s deadline elapses.
+	sendReInvite := func(t *testing.T, cseq int, body []byte, branchSuffix, wantSubstr string) string {
+		t.Helper()
+		reConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("re-invite socket: %v", err)
+		}
+		defer reConn.Close()
+		reLocal := reConn.LocalAddr().(*net.UDPAddr)
+
+		reInvite := strings.Join([]string{
+			"INVITE sip:5551234@127.0.0.1:45430 SIP/2.0",
+			fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-%s", reLocal.String(), branchSuffix),
+			fmt.Sprintf("From: <sip:tester@127.0.0.1>;tag=%s", realFromTag),
+			fmt.Sprintf("To: <sip:sbc@127.0.0.1>;tag=%s", realToTag),
+			"Call-ID: " + realCallID,
+			fmt.Sprintf("CSeq: %d INVITE", cseq),
+			"Contact: <sip:tester@" + reLocal.String() + ">",
+			"Max-Forwards: 70",
+			"Session-Expires: 1800;refresher=uac",
+			"Supported: timer",
+			"Content-Type: application/sdp",
+			fmt.Sprintf("Content-Length: %d", len(body)),
+			"", string(body),
+		}, "\r\n")
+		if _, err := reConn.WriteToUDP([]byte(reInvite), dst); err != nil {
+			t.Fatalf("write re-invite: %v", err)
+		}
+
+		var got strings.Builder
+		buf := make([]byte, 4096)
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			_ = reConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			n, _, err := reConn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			got.Write(buf[:n])
+			if strings.Contains(got.String(), wantSubstr) {
+				break
+			}
+		}
+		return got.String()
+	}
+
+	// --- refresh re-INVITE: same SDP, Session-Expires present → 200 OK,
+	// echoing a Session-Expires header, not the M3.3 501. ---
+	refreshResp := sendReInvite(t, 2, offerSDP, "reinvite-refresh", "SIP/2.0 200")
+	if !strings.Contains(refreshResp, "SIP/2.0 200") {
+		t.Fatalf("session-timer refresh re-INVITE must get 200, got:\n%s", refreshResp)
+	}
+	if !strings.Contains(refreshResp, "Session-Expires") {
+		t.Fatalf("200 OK to a refresh re-INVITE must carry Session-Expires, got:\n%s", refreshResp)
+	}
+	// Fix 3: a 2xx to INVITE MUST carry a Contact (RFC 3261 §12.1.1) —
+	// sip.NewResponseFromRequest alone does not add one.
+	if !strings.Contains(refreshResp, "Contact:") && !strings.Contains(refreshResp, "\r\nm:") {
+		t.Fatalf("200 OK to a refresh re-INVITE must carry Contact, got:\n%s", refreshResp)
+	}
+	// Fix 1's crux assertion: the refresh's 200 OK body must be the SBC's
+	// own ESTABLISHED ANSWER (what the caller already has), never the
+	// caller's own offer echoed back — the pre-fix bug, which aims the
+	// caller's RTP at itself and lets the media watchdog kill the call.
+	refreshBody := sipBody(t, refreshResp)
+	if string(refreshBody) == string(offerSDP) {
+		t.Fatalf("refresh 200 OK answered with the CALLER'S OWN OFFER instead of the SBC's established answer (Critical #1 regression):\n%s", refreshResp)
+	}
+	if string(refreshBody) != string(establishedAAnswer) {
+		t.Fatalf("refresh 200 OK body must equal the SBC's established A-leg answer, got:\n%s\nwant body:\n%s", refreshResp, establishedAAnswer)
+	}
+
+	// --- o=-version-bump refresh (Fix 4): same c=/m= as the established
+	// offer, but the o= line's version bumped, as a real UAC commonly does
+	// on every re-offer (RFC 3264 §8) — must still be recognized as a
+	// refresh (200, established answer), not misclassified as a media
+	// change (501). ---
+	bumpedOfferSDP := []byte(strings.Replace(string(offerSDP), "o=- 1 1", "o=- 1 2", 1))
+	if string(bumpedOfferSDP) == string(offerSDP) {
+		t.Fatal("test setup is broken: o= bump did not change the SDP")
+	}
+	bumpResp := sendReInvite(t, 3, bumpedOfferSDP, "reinvite-obump", "SIP/2.0 200")
+	if !strings.Contains(bumpResp, "SIP/2.0 200") {
+		t.Fatalf("o=-version-bump refresh re-INVITE must still get 200, got:\n%s", bumpResp)
+	}
+	if bumpBody := sipBody(t, bumpResp); string(bumpBody) != string(establishedAAnswer) {
+		t.Fatalf("o=-version-bump refresh 200 body must equal the SBC's established A-leg answer, got:\n%s\nwant body:\n%s", bumpResp, establishedAAnswer)
+	}
+
+	// --- media-change re-INVITE: same Session-Expires header, but a
+	// genuinely different SDP body → still 501, exactly like M3.3. ---
+	changedSDP := testSDPBody(uacRTPPort + 1)
+	changeResp := sendReInvite(t, 4, changedSDP, "reinvite-changed", "SIP/2.0 501")
+	if !strings.Contains(changeResp, "SIP/2.0 501") {
+		t.Fatalf("media-changing re-INVITE must still get 501, got:\n%s", changeResp)
+	}
+
+	// --- B-leg (carrier-initiated) session-timer refresh (Fix 2): the
+	// carrier re-sends its own established answer SDP with Session-Expires
+	// — must be recognized on the SAME in-dialog branch (looked up by ITS
+	// OWN, B-leg Call-ID) and answered 200 with bLegOffer, the SBC's own
+	// established B-side offer — never the carrier's own answer, and never
+	// the A-leg's aAnswer. ---
+	//
+	// Wait for the carrier's OWN answer to have actually gone out
+	// (carrier.established) before touching its dialog session from this
+	// goroutine — required for -race correctness (see the established
+	// field's doc comment), even though by this point in the test (well
+	// after the UAC's own WaitAnswer succeeded) it always already has.
+	select {
+	case <-carrier.established:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never finished answering the B-leg INVITE")
+	}
+	bRefreshCtx, cancelBRefresh := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelBRefresh()
+	bRefreshRes := carrier.sendReinvite(t, bRefreshCtx, testSDPBody(echoRTPPort),
+		sessionExpiresHeader(1800*time.Second, "uac"),
+		sip.NewHeader("Supported", "timer"))
+	if bRefreshRes.StatusCode != 200 {
+		t.Fatalf("B-leg session-timer refresh must get 200, got %d %s", bRefreshRes.StatusCode, bRefreshRes.Reason)
+	}
+	if bRefreshRes.Contact() == nil {
+		t.Fatal("B-leg refresh 200 OK must carry Contact")
+	}
+	if string(bRefreshRes.Body()) != string(bLegOffer) {
+		t.Fatalf("B-leg refresh 200 OK body must equal the SBC's established B-side offer, got:\n%s\nwant body:\n%s", bRefreshRes.Body(), bLegOffer)
+	}
+
+	// --- prove the original call is unharmed by either re-INVITE: its BYE
+	// still tears everything down cleanly, same as the M3.3 test's
+	// teardown proof. ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE — a re-INVITE perturbed the established call")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+
+	// The pool holds exactly one session's worth of ports (46330-46333): a
+	// fresh Allocate only succeeds if the bridge actually released them on
+	// teardown, proving neither re-INVITE leaked or corrupted the session.
+	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatalf("media ports not released after teardown: %v", err)
+	}
+	s2.Close()
+
+	// The per-call SDP store must also drain on teardown — otherwise a
+	// reused Call-ID (unlikely, but not impossible with a misbehaving UAC)
+	// could compare a later call's re-INVITE against a stale entry.
+	if _, ok := srv.callSDP(realCallID); ok {
+		t.Fatal("established SDP still on record after teardown; callSDPStore not cleared")
+	}
+}
+
 // digestAuthCfg routes local-uac to a single carrier that requires digest
 // auth (peer Auth is set); the stub challenges the first attempt and only
 // answers once WaitAnswer's built-in retry supplies a valid Authorization.
@@ -2869,5 +3299,372 @@ func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
 	case <-carrier.offers:
 		t.Fatal("carrier received an INVITE — unregistered target was not skipped")
 	case <-time.After(1 * time.Second):
+	}
+}
+
+// --- M4.3 Task 4: session-timer headers on the A-leg 200 and B-leg INVITE ---
+
+// sessionTimerCfg mirrors outboundFromCfg's shape on a disjoint port set
+// (45180-45291/45410/45412 are already claimed by earlier tests in this
+// file — see brokenAnswerCfg's comment for the highest prior block). No
+// session_expires/min_se is set, so the config defaults apply (1800s /
+// 90s — see config/schema.go's ApplyDefaults), which is exactly what the
+// assertions below check for.
+const sessionTimerCfg = `
+listen:
+  sip: [udp://127.0.0.1:45420]
+  media:
+    port_range: 46320-46323
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45421
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// hasToken reports whether any of headers carries token (case-insensitive)
+// among its comma-separated values — e.g. a Supported header listing
+// "timer" or "100rel".
+func hasToken(headers []sip.Header, token string) bool {
+	for _, h := range headers {
+		for _, tok := range strings.Split(h.Value(), ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestBridgeSessionTimerHeaders is M4.3 Task 4's crux: the caller's
+// establishing 200 must carry Session-Expires;refresher=uac + Supported:
+// timer, and the B-leg INVITE placed at the carrier must carry Supported:
+// timer + Session-Expires;refresher=uas + Min-SE — but never Supported:
+// 100rel (this bridge declines reliable provisional responses, Task 3).
+// The A-leg INVITE here carries no Session-Expires of its own, so
+// negotiateSE falls back to cfg.SessionExpires (1800s, the config
+// default) on both legs — see sig/timers.go's negotiateSE.
+func TestBridgeSessionTimerHeaders(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45421", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 45420, sessionTimerCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45420}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	// --- B-leg INVITE (carrier-side, captured by the stub) ---
+	bSupported := carrier.lastHeaders("Supported")
+	if !hasToken(bSupported, "timer") {
+		t.Errorf("B-leg INVITE Supported = %v, want to include timer", bSupported)
+	}
+	if hasToken(bSupported, "100rel") {
+		t.Errorf("B-leg INVITE Supported = %v, must NOT include 100rel (unsupported)", bSupported)
+	}
+
+	bSE := carrier.lastHeaders("Session-Expires")
+	if len(bSE) != 1 {
+		t.Fatalf("B-leg INVITE Session-Expires header count = %d, want 1", len(bSE))
+	}
+	if got, want := bSE[0].Value(), "1800;refresher=uas"; got != want {
+		t.Errorf("B-leg INVITE Session-Expires = %q, want %q", got, want)
+	}
+
+	bMinSE := carrier.lastHeaders("Min-SE")
+	if len(bMinSE) != 1 {
+		t.Fatalf("B-leg INVITE Min-SE header count = %d, want 1", len(bMinSE))
+	}
+	if got, want := bMinSE[0].Value(), "90"; got != want {
+		t.Errorf("B-leg INVITE Min-SE = %q, want %q", got, want)
+	}
+
+	// --- A-leg 200 (UAC-side, the caller's own establishing response) ---
+	aSE := sess.InviteResponse.GetHeaders("Session-Expires")
+	if len(aSE) != 1 {
+		t.Fatalf("A-leg 200 Session-Expires header count = %d, want 1", len(aSE))
+	}
+	if got, want := aSE[0].Value(), "1800;refresher=uac"; got != want {
+		t.Errorf("A-leg 200 Session-Expires = %q, want %q", got, want)
+	}
+
+	aSupported := sess.InviteResponse.GetHeaders("Supported")
+	if !hasToken(aSupported, "timer") {
+		t.Errorf("A-leg 200 Supported = %v, want to include timer", aSupported)
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+}
+
+// minSERetryCfg sets a low session_expires (600s) so the B-leg's first
+// INVITE undershoots startMinSERetryCarrier's 1800s floor, forcing exactly
+// one 422 retry (M4.3 Task 5). Fresh ports (45422-45423, 46324-46327),
+// disjoint from sessionTimerCfg's 45420-45421/46320-46323 block.
+const minSERetryCfg = `
+listen:
+  sip: [udp://127.0.0.1:45422]
+  media:
+    port_range: 46324-46327
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45423
+    allowed_ips: [203.0.113.0/24]
+session_expires: 600s
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// startMinSERetryCarrier boots a stub UAS that declines any INVITE whose
+// Session-Expires is below minSE with 422 Session Interval Too Small and a
+// Min-SE header advertising minSE (RFC 4028 §5), and answers 200 with
+// answerSDP once an INVITE meets it — the carrier side of M4.3 Task 5's
+// retry: the bridge is expected to see this 422, read its Min-SE, and
+// re-INVITE with a Session-Expires that satisfies it. Every INVITE (422'd or
+// answered) is captured on offers/lastInvite exactly like startStubCarrier,
+// so the test can inspect both the low first attempt and the raised retry.
+func startMinSERetryCarrier(t *testing.T, addr string, answerSDP []byte, minSE time.Duration) *stubCarrier {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("carrier addr: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("carrier port: %v", err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("carrier ua: %v", err)
+	}
+	t.Cleanup(func() { ua.Close() })
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		t.Fatalf("carrier server: %v", err)
+	}
+	client, err := sipgo.NewClient(ua)
+	if err != nil {
+		t.Fatalf("carrier client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
+	c := &stubCarrier{
+		dialogSrv: sipgo.NewDialogServerCache(client, contact),
+		log:       log,
+		answerSDP: answerSDP,
+		offers:    make(chan *sip.Request, 4),
+		byeDone:   make(chan struct{}),
+	}
+
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		dlg, err := c.dialogSrv.ReadInvite(req, tx)
+		if err != nil {
+			log.Error("carrier read invite", "err", err)
+			return
+		}
+		select {
+		case c.offers <- req:
+		default:
+		}
+		c.mu.Lock()
+		c.lastInvite = req
+		c.mu.Unlock()
+
+		if headerSeconds(req, "Session-Expires") < minSE {
+			if err := dlg.Respond(422, "Session Interval Too Small", nil,
+				sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds())))); err != nil {
+				log.Error("carrier respond 422", "err", err)
+			}
+			return
+		}
+
+		if err := dlg.RespondSDP(c.answerSDP); err != nil {
+			log.Error("carrier respond sdp", "err", err)
+			return
+		}
+		<-dlg.Context().Done()
+		close(c.byeDone)
+	})
+	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := c.dialogSrv.ReadAck(req, tx); err != nil {
+			log.Debug("carrier ack", "err", err)
+		}
+	})
+	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := c.dialogSrv.ReadBye(req, tx); err != nil {
+			log.Debug("carrier bye", "err", err)
+		}
+	})
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("carrier resolve: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("carrier listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { <-ctx.Done(); conn.Close() }()
+	tl := srv.TransportLayer()
+	go func() { _ = tl.ServeUDP(conn) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		probe, err := net.Dial("udp", addr)
+		if err == nil {
+			probe.Close()
+			time.Sleep(50 * time.Millisecond)
+			return c
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stub carrier (min-se-retry) did not start")
+	return nil
+}
+
+// TestBridgeBLeg422RetriesWithMinSE is M4.3 Task 5's crux: minSERetryCfg's
+// session_expires (600s) undershoots startMinSERetryCarrier's 1800s Min-SE
+// floor, so the carrier 422s the bridge's first B-leg INVITE with
+// Min-SE: 1800. dialTarget must read that Min-SE and retry the SAME target
+// once with Session-Expires raised to meet it — the retry's 200 then flows
+// into the ordinary bridge path exactly as if it had answered outright, so
+// the caller still gets bridged rather than seeing the 422 or any failover
+// churn. Timing-based over real UDP loopback: re-run once before treating a
+// flake as failure.
+func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startMinSERetryCarrier(t, "127.0.0.1:45423", testSDPBody(echoRTPPort), 1800*time.Second)
+	startServer(t, 45422, minSERetryCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45422}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v (call must bridge despite the carrier's 422, via the Min-SE retry)", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- the carrier must have seen exactly two INVITEs: the low first
+	// attempt (422'd) and the retry that met its Min-SE ---
+	var first, second *sip.Request
+	select {
+	case first = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the first B-leg INVITE")
+	}
+	select {
+	case second = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the retried B-leg INVITE")
+	}
+
+	if got := headerSeconds(first, "Session-Expires"); got != 600*time.Second {
+		t.Errorf("first B-leg INVITE Session-Expires = %v, want 600s", got)
+	}
+	if got := headerSeconds(second, "Session-Expires"); got < 1800*time.Second {
+		t.Errorf("retried B-leg INVITE Session-Expires = %v, want >= 1800s (the carrier's Min-SE)", got)
+	}
+
+	select {
+	case <-carrier.offers:
+		t.Fatal("carrier received a THIRD B-leg INVITE; retry must happen at most once")
+	default:
+	}
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
 	}
 }

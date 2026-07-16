@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -236,6 +237,133 @@ func (r *stubRegistrar) client(t *testing.T) *sipgo.Client {
 	}
 	t.Cleanup(func() { client.Close() })
 	return client
+}
+
+// startStubRegistrarMinExpires boots a stub UAS like startStubRegistrar, but
+// enforces a registrar-side minimum lifetime: any authorized REGISTER whose
+// Expires is below minExpires is rejected with 423 Interval Too Brief and a
+// Min-Expires header carrying minExpires; a REGISTER meeting or exceeding it
+// is granted (200, Expires: minExpires) — for Task 7's 423-retry test, which
+// needs registerOnce's first attempt (below the minimum) to be rejected and
+// its retry (at the minimum) to succeed.
+func startStubRegistrarMinExpires(t *testing.T, port int, user, pass string, minExpires int) *stubRegistrar {
+	t.Helper()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("registrar ua: %v", err)
+	}
+	t.Cleanup(func() { ua.Close() })
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		t.Fatalf("registrar server: %v", err)
+	}
+
+	r := &stubRegistrar{
+		user:         user,
+		pass:         pass,
+		grantExpires: minExpires,
+		challenge: &digest.Challenge{
+			Realm:     "freesbc-test",
+			Nonce:     "test-nonce-fixed",
+			Algorithm: "MD5",
+		},
+	}
+
+	srv.OnRequest(sip.REGISTER, func(req *sip.Request, tx sip.ServerTransaction) {
+		if !r.authorized(req) {
+			res := sip.NewResponseFromRequest(req, sip.StatusUnauthorized, "Unauthorized", nil)
+			res.AppendHeader(sip.NewHeader("WWW-Authenticate", r.challenge.String()))
+			if err := tx.Respond(res); err != nil {
+				log.Error("registrar respond 401", "err", err)
+			}
+			return
+		}
+
+		reqExpires := 0
+		if eh := req.GetHeader("Expires"); eh != nil {
+			reqExpires, _ = strconv.Atoi(eh.Value())
+		}
+
+		r.mu.Lock()
+		r.authorizedCount++
+		isUnregister := reqExpires == 0
+		if isUnregister {
+			r.unregisterCount++
+		}
+		r.events = append(r.events, isUnregister)
+		r.mu.Unlock()
+
+		if reqExpires < minExpires {
+			res := sip.NewResponseFromRequest(req, sip.StatusIntervalToBrief, "Interval Too Brief", nil)
+			me := sip.ExpiresHeader(uint32(minExpires))
+			res.AppendHeader(sip.NewHeader("Min-Expires", me.Value()))
+			if err := tx.Respond(res); err != nil {
+				log.Error("registrar respond 423", "err", err)
+			}
+			return
+		}
+
+		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+		exp := sip.ExpiresHeader(uint32(minExpires))
+		res.AppendHeader(&exp)
+		if err := tx.Respond(res); err != nil {
+			log.Error("registrar respond 200", "err", err)
+		}
+	})
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("registrar resolve: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("registrar listen: %v", err)
+	}
+	r.conn = conn
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { <-ctx.Done(); conn.Close() }()
+	tl := srv.TransportLayer()
+	go func() { _ = tl.ServeUDP(conn) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		probe, err := net.Dial("udp", addr)
+		if err == nil {
+			probe.Close()
+			time.Sleep(50 * time.Millisecond)
+			return r
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("stub registrar did not start")
+	return nil
+}
+
+// TestRegisterOnceRetriesOn423 proves the Task 7 retry: the stub registrar
+// rejects the first REGISTER (1800s, below its 3600s minimum) with 423 and a
+// Min-Expires: 3600 header; registerOnce must read that header and retry
+// once at 3600s, succeeding with a granted lifetime of 3600s.
+func TestRegisterOnceRetriesOn423(t *testing.T) {
+	reg := startStubRegistrarMinExpires(t, 45338, "u", "p", 3600) // 423 below 3600, then grant
+	client := reg.client(t)
+	p := regParams{
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45338,
+		Transport: "udp", Username: "u", Password: "p",
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45995,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	granted, err := registerOnce(ctx, client, p, 1800*time.Second) // below Min-Expires 3600
+	if err != nil {
+		t.Fatalf("registerOnce: %v", err)
+	}
+	if granted != 3600*time.Second {
+		t.Errorf("granted = %v, want 3600s (retried with Min-Expires)", granted)
+	}
 }
 
 // TestRegisterOnceSucceedsWithDigest proves the happy path: registerOnce

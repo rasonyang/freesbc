@@ -18,6 +18,8 @@ listen:
 
 ring_timeout: 60s   # cancel a target that rings this long without answering, then failover
 register_expires: 3600s   # requested REGISTER lifetime for register:true peers (carrier may grant less)
+session_expires: 1800s   # RFC 4028 session timer we advertise/accept (carrier may lower it)
+min_se: 90s              # smallest session interval accepted; a lower request gets 422 + Min-SE
 
 peers:
   carrier-a:

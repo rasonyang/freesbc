@@ -98,6 +98,12 @@ func TestWithDefaults(t *testing.T) {
 	if c.RegisterExpires.Std() != 3600*time.Second {
 		t.Errorf("register_expires default: %v", c.RegisterExpires.Std())
 	}
+	if c.SessionExpires.Std() != 1800*time.Second {
+		t.Errorf("session_expires default: %v", c.SessionExpires.Std())
+	}
+	if c.MinSE.Std() != 90*time.Second {
+		t.Errorf("min_se default: %v", c.MinSE.Std())
+	}
 }
 
 func TestParseRingTimeout(t *testing.T) {
@@ -162,5 +168,16 @@ register_expires: 1200s
 	}
 	if got := c.Peers["pbx"].RegisterExpires.Std(); got != 600*time.Second {
 		t.Errorf("peer register_expires override = %v, want 600s", got)
+	}
+}
+
+func TestParseSessionTimers(t *testing.T) {
+	src := minimalYAML + "session_expires: 3600s\nmin_se: 120s\n"
+	c, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.SessionExpires.Std() != 3600*time.Second || c.MinSE.Std() != 120*time.Second {
+		t.Errorf("got session_expires=%v min_se=%v", c.SessionExpires.Std(), c.MinSE.Std())
 	}
 }

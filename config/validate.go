@@ -42,6 +42,12 @@ func (c *Config) validate() error {
 	if c.RegisterExpires.Std() < time.Second {
 		fail("register_expires: must be at least 1s, got %v", c.RegisterExpires.Std())
 	}
+	if c.MinSE.Std() < time.Second {
+		fail("min_se: must be at least 1s, got %v", c.MinSE.Std())
+	}
+	if c.SessionExpires.Std() < c.MinSE.Std() {
+		fail("session_expires: must be >= min_se (%v), got %v", c.MinSE.Std(), c.SessionExpires.Std())
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
