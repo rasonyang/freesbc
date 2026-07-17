@@ -5462,3 +5462,95 @@ func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
 		t.Fatal("carrier dialog never torn down after its srtp-suite mismatch")
 	}
 }
+
+// killCallCfg routes local-uac → carrier, modeled on bridgeCallCfg, for
+// TestKillCallTearsDownBothLegs.
+const killCallCfg = `
+listen:
+  sip: [udp://127.0.0.1:45611]
+  media:
+    port_range: 46610-46613
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45610
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestKillCallTearsDownBothLegs is Task 1's crux: an admin kicking a live
+// call by its A-leg Call-ID (what /api/calls lists) must BYE both legs via
+// the SAME teardown path a natural media-silence timeout uses (byeBoth),
+// and the call registry must drain. KillCall is idempotent: a second kick
+// (or an unknown Call-ID) returns false.
+func TestKillCallTearsDownBothLegs(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	carrier := startStubCarrier(t, "127.0.0.1:45610", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
+	srv := startServer(t, 45611, killCallCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45611}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("wait answer: %v", err)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never got the INVITE")
+	}
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
+
+	// The call's ID as the SBC sees it is the A-leg Call-ID = the UAC's
+	// Call-ID.
+	callID := sess.InviteRequest.CallID().Value()
+	if !srv.KillCall(callID) {
+		t.Fatalf("KillCall(%q) returned false for a live call", callID)
+	}
+	// carrier leg gets a BYE:
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("carrier leg never BYE'd after kick")
+	}
+	// registry drains:
+	waitForActiveCalls(t, srv, 0, 10*time.Second)
+	// a second kick / unknown id → false:
+	if srv.KillCall(callID) {
+		t.Error("second KillCall should return false (call gone)")
+	}
+	if srv.KillCall("no-such-call") {
+		t.Error("KillCall of unknown id should return false")
+	}
+}

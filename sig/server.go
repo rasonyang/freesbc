@@ -69,6 +69,14 @@ type Server struct {
 	// called on every INVITE (mediaIP's per-call SDP rewrite), and without
 	// this the same warning would otherwise spam the log once per call.
 	warnAutoIPOnce sync.Once
+
+	// killMu guards killers: the admin kick-call mechanism (KillCall). Each
+	// live call's onInvite goroutine registers its own killCtx cancel func
+	// under the A-leg Call-ID right after adding itself to the registry, and
+	// unregisters it (via defer) when the call ends. Kept separate from
+	// registry: killers holds a context.CancelFunc, not call metadata.
+	killMu  sync.Mutex
+	killers map[string]context.CancelFunc // Call-ID → cancel its killCtx
 }
 
 func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
@@ -80,7 +88,42 @@ func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server 
 		sdps:     newCallSDPStore(),
 		resolver: newResolver(time.Now().UnixNano()),
 		health:   newEndpointHealth(),
+		killers:  make(map[string]context.CancelFunc),
 	}
+}
+
+// registerKiller records cancel as the way to kick the live call with the
+// given (A-leg) Call-ID — called once, right after the call is added to the
+// registry (see bridge.onInvite).
+func (s *Server) registerKiller(id string, cancel context.CancelFunc) {
+	s.killMu.Lock()
+	s.killers[id] = cancel
+	s.killMu.Unlock()
+}
+
+// unregisterKiller removes id's kill-cancel entry — called (via defer) when
+// the call ends, however it ends, so KillCall never targets a stale entry.
+func (s *Server) unregisterKiller(id string) {
+	s.killMu.Lock()
+	delete(s.killers, id)
+	s.killMu.Unlock()
+}
+
+// KillCall tears down the live call with the given A-leg Call-ID by
+// cancelling its kill context (the onInvite goroutine then BYEs both legs
+// via the normal teardown — see byeBoth). Returns false if no such active
+// call is tracked. Idempotent: cancelling an already-cancelled
+// context.CancelFunc is a safe no-op, and unregisterKiller removes the
+// entry once the call actually ends, so a second call for the same id (or
+// one racing a natural end) returns false rather than firing twice.
+func (s *Server) KillCall(id string) bool {
+	s.killMu.Lock()
+	cancel, ok := s.killers[id]
+	s.killMu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
 }
 
 // callSDP returns callID's established SDP pair (see callSDP), or ok=false
