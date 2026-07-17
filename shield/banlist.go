@@ -14,18 +14,22 @@ type banList struct {
 	mu    sync.Mutex
 	until map[netip.Addr]time.Time
 	now   func() time.Time
+	nft   *nftBackend // nil = in-process only
 }
 
 func newBanList() *banList {
 	return &banList{until: make(map[netip.Addr]time.Time), now: time.Now}
 }
 
-// ban blocks ip for dur (extending any existing ban). (Task 4 adds the
-// kernel-drop hook here.)
+// ban blocks ip for dur (extending any existing ban), then, if an nftables
+// backend is attached, also installs a matching kernel drop.
 func (b *banList) ban(ip netip.Addr, dur time.Duration) {
 	b.mu.Lock()
 	b.until[ip] = b.now().Add(dur)
 	b.mu.Unlock()
+	if b.nft != nil {
+		b.nft.ban(ip, dur)
+	}
 }
 
 // banned reports whether ip is currently banned, deleting the entry once its
