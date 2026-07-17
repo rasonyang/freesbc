@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/freesbc/freesbc/admin"
 	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
 	"github.com/freesbc/freesbc/sig"
@@ -23,6 +24,9 @@ Usage:
   freesbc run   [-c sbc.yaml]   start the SBC
   freesbc check [-c sbc.yaml]   validate a config file and exit
 `
+
+// version is the build version, overridable via `-ldflags "-X main.version=…"`.
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -96,6 +100,39 @@ func run(cfgPath string) error {
 	// The B2BUA bridge (M3.3) is wired into sipServer above (sig.NewServer /
 	// sig.Server.Run). Only the shield (M6) and admin API (M7) still attach
 	// here.
+
+	if adminCfg := store.Current().Admin; adminCfg != nil {
+		deps := admin.Deps{
+			Calls:       sipServer.Calls,
+			ActiveCalls: sipServer.ActiveCalls,
+			Ports:       pool.Stats,
+			Shield: func() admin.ShieldStats {
+				st := sipServer.ShieldStats()
+				return admin.ShieldStats{BannedCurrent: st.BannedCurrent, DropsByReason: st.DropsByReason}
+			},
+			Peers: func() []admin.PeerStatus {
+				cfg := store.Current()
+				out := make([]admin.PeerStatus, 0, len(cfg.Peers))
+				for name, p := range cfg.Peers {
+					out = append(out, admin.PeerStatus{
+						Name: name, Address: p.Address, Transport: p.Transport, SRTP: p.SRTP,
+						Register: p.Register, Registered: sipServer.IsRegistered(name),
+					})
+				}
+				return out
+			},
+			Version: version,
+		}
+		adminSrv := admin.New(adminCfg, store, deps, log)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := adminSrv.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Error("admin server exited", "err", err)
+				stop() // fatal bind error tears the process down (like the SIP listener)
+			}
+		}()
+	}
 
 	log.Info("freesbc started",
 		"config", cfgPath,
