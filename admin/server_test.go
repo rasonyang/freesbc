@@ -43,6 +43,7 @@ func emptyDeps() Deps {
 		Ports:       func() (int, int) { return 0, 0 },
 		Shield:      func() ShieldStats { return ShieldStats{DropsByReason: map[string]int64{}} },
 		ActiveCalls: func() int { return 0 },
+		KillCall:    func(string) bool { return false },
 		Version:     "test",
 	}
 }
