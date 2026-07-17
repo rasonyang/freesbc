@@ -306,6 +306,23 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		ToPeer:        target.Name,
 		StartUnixNano: startNano(),
 	}
+
+	// killCtx is this call's admin kick-call hook (Task 1): registered
+	// BEFORE the call joins the registry (KillCall looks calls up by the
+	// same A-leg Call-ID /api/calls lists), so there is never a window
+	// where a call is listed by /api/calls but KillCall would return false
+	// for it. An orphan killer entry for a not-yet-listed call is harmless.
+	// Torn down via defer no matter how this call ends — LIFO order runs
+	// killCancel first and unregisterKiller second, but the order between
+	// those two doesn't matter (killCancel firing on an already-unregistered
+	// id, or unregistering before cancelling, are both safe) — so a kick
+	// that races a natural end always finds either a live entry (fires
+	// once) or none at all (KillCall returns false), never a stale one.
+	killCtx, killCancel := context.WithCancel(context.Background())
+	b.s.registerKiller(call.ID, killCancel)
+	defer b.s.unregisterKiller(call.ID)
+	defer killCancel()
+
 	b.s.registry.Add(call)
 	defer b.s.registry.Remove(call.ID)
 
@@ -336,17 +353,27 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		_ = aLeg.Bye(byeCtx)
 		cancel()
 	case <-sess.Done():
-		// Each Bye gets its own bounded context: sharing one byeContext
-		// across both would let a slow first Bye (up to its full 5s) eat
-		// into the second leg's budget instead of each being independently
-		// bounded to 5s.
-		aByeCtx, aCancel := byeContext()
-		_ = aLeg.Bye(aByeCtx)
-		aCancel()
-		bByeCtx, bCancel := byeContext()
-		_ = bLeg.Bye(bByeCtx)
-		bCancel()
+		b.byeBoth(aLeg, bLeg)
+	case <-killCtx.Done():
+		// Admin kick-call (Task 1): neither leg initiated, so BYE both —
+		// same teardown as a media-silence timeout (byeBoth), never a
+		// separate path.
+		b.byeBoth(aLeg, bLeg)
 	}
+}
+
+// byeBoth sends an independently-5s-bounded teardown BYE to each leg (each
+// Bye gets its own byeContext so a slow first Bye can't eat into the second
+// leg's budget). Shared by both onInvite's natural media-silence teardown
+// (sess.Done) and the admin kick-call teardown (killCtx.Done) — the same
+// path, not a new one.
+func (b *bridge) byeBoth(aLeg *sipgo.DialogServerSession, bLeg *sipgo.DialogClientSession) {
+	aByeCtx, aCancel := byeContext()
+	_ = aLeg.Bye(aByeCtx)
+	aCancel()
+	bByeCtx, bCancel := byeContext()
+	_ = bLeg.Bye(bByeCtx)
+	bCancel()
 }
 
 // byeContext bounds a teardown BYE to 5s instead of inheriting a

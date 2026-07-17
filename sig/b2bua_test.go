@@ -5462,3 +5462,166 @@ func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
 		t.Fatal("carrier dialog never torn down after its srtp-suite mismatch")
 	}
 }
+
+// killCallCfg routes local-uac → carrier, modeled on bridgeCallCfg, for
+// TestKillCallTearsDownBothLegs.
+const killCallCfg = `
+listen:
+  sip: [udp://127.0.0.1:45611]
+  media:
+    port_range: 46610-46613
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45610
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestKillCallTearsDownBothLegs is Task 1's crux: an admin kicking a live
+// call by its A-leg Call-ID (what /api/calls lists) must BYE both legs via
+// the SAME teardown path a natural media-silence timeout uses (byeBoth),
+// and the call registry must drain. KillCall is idempotent: a second kick
+// (or an unknown Call-ID) returns false.
+//
+// The test UAC runs its own sipgo.Server (mirroring startStubCarrier's
+// Server+OnBye+ReadBye pattern, applied here to the A-leg side instead of
+// the B-leg side) so it can receive and answer the SBC-initiated A-leg BYE,
+// not just place the call. That proves BOTH halves of byeBoth fire — a
+// regression that BYEs only the B-leg (swapped legs, wrong ctx, an early
+// return between the two Byes) would leave the UAC's OnBye never firing,
+// failing this test — where asserting only the carrier's BYE + registry
+// drain would not have caught it. It also removes the old 5s stall: with
+// nothing to answer the A-leg BYE, aLeg.Bye used to burn its full 5s
+// byeContext every run.
+func TestKillCallTearsDownBothLegs(t *testing.T) {
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	carrier := startStubCarrier(t, "127.0.0.1:45610", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
+	srv := startServer(t, 45611, killCallCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	// A real Server (not just a Client) on the UAC side, sharing uacUA's
+	// transport layer, so the SBC's A-leg BYE — sent back to whatever
+	// Contact the UAC's INVITE carried — lands somewhere that can answer
+	// it, exactly like startStubCarrier does for the B-leg.
+	uacSrv, err := sipgo.NewServer(uacUA)
+	if err != nil {
+		t.Fatalf("uac server: %v", err)
+	}
+	uacClient, err := sipgo.NewClient(uacUA)
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	uacByeReceived := make(chan struct{})
+	uacSrv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		if err := dialogCli.ReadBye(req, tx); err != nil {
+			t.Logf("uac read bye: %v", err)
+			return
+		}
+		close(uacByeReceived)
+	})
+
+	uacAddr := "127.0.0.1:5070"
+	uacUDPAddr, err := net.ResolveUDPAddr("udp", uacAddr)
+	if err != nil {
+		t.Fatalf("uac resolve: %v", err)
+	}
+	uacConn, err := net.ListenUDP("udp", uacUDPAddr)
+	if err != nil {
+		t.Fatalf("uac listen: %v", err)
+	}
+	uacCtx, uacCancel := context.WithCancel(context.Background())
+	defer uacCancel()
+	go func() { <-uacCtx.Done(); uacConn.Close() }()
+	uacTL := uacSrv.TransportLayer()
+	go func() { _ = uacTL.ServeUDP(uacConn) }()
+	// Give the UAC's listener a moment to come up before dialing through
+	// it, mirroring startStubCarrier's own startup probe.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		probe, err := net.Dial("udp", uacAddr)
+		if err == nil {
+			probe.Close()
+			time.Sleep(50 * time.Millisecond)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("uac listener did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45611}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPStubPort(t)),
+		sip.NewHeader("Contact", "<sip:"+uacAddr+">"))
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("wait answer: %v", err)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never got the INVITE")
+	}
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
+
+	// The call's ID as the SBC sees it is the A-leg Call-ID = the UAC's
+	// Call-ID.
+	callID := sess.InviteRequest.CallID().Value()
+	killStart := time.Now()
+	if !srv.KillCall(callID) {
+		t.Fatalf("KillCall(%q) returned false for a live call", callID)
+	}
+	// A-leg gets a BYE: the UAC's own server receives and answers it.
+	select {
+	case <-uacByeReceived:
+	case <-time.After(3 * time.Second):
+		t.Fatal("A-leg (UAC) never got a BYE after kick")
+	}
+	// carrier leg gets a BYE:
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier leg never BYE'd after kick")
+	}
+	// With both legs' BYEs actually answered (not burning a full 5s
+	// byeContext apiece), the kick should resolve fast.
+	if elapsed := time.Since(killStart); elapsed > 2*time.Second {
+		t.Errorf("KillCall teardown took %v; want well under the 5s per-leg byeContext budget since both legs answer their BYE", elapsed)
+	}
+	// registry drains:
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+	// a second kick / unknown id → false:
+	if srv.KillCall(callID) {
+		t.Error("second KillCall should return false (call gone)")
+	}
+	if srv.KillCall("no-such-call") {
+		t.Error("KillCall of unknown id should return false")
+	}
+}

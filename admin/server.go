@@ -38,6 +38,7 @@ type Deps struct {
 	Ports       func() (inUse, total int)
 	Shield      func() ShieldStats
 	ActiveCalls func() int
+	KillCall    func(id string) bool
 	Version     string
 }
 
@@ -65,6 +66,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
+	mux.HandleFunc("DELETE /api/calls/{id}", s.requireAuth(s.handleKickCall))
 	mux.HandleFunc("/api/peers", s.requireAuth(s.handlePeers))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
@@ -132,6 +134,17 @@ func (s *Server) recoverMW(next http.Handler) http.Handler {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleKickCall tears down a live call by id (URL-decoded by PathValue).
+// 204 if the call was found and killed, 404 otherwise.
+func (s *Server) handleKickCall(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.deps.KillCall != nil && s.deps.KillCall(id) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.Error(w, "no such active call", http.StatusNotFound)
 }
 
 // handleStatus, handleCalls, handlePeers, handleConfig, and handleConfigGet

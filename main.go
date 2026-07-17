@@ -105,6 +105,7 @@ func run(cfgPath string) error {
 		deps := admin.Deps{
 			Calls:       sipServer.Calls,
 			ActiveCalls: sipServer.ActiveCalls,
+			KillCall:    sipServer.KillCall,
 			Ports:       pool.Stats,
 			Shield: func() admin.ShieldStats {
 				st := sipServer.ShieldStats()
