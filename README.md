@@ -83,10 +83,25 @@ routes:
 | └ M4.4 | DNS SRV + peer health/cooldown | ✅ done |
 | M5 | SRTP (SDES): a=crypto negotiation, SRTP↔RTP interworking, per-peer policy | ✅ done |
 | M6 | Shield: per-IP rate limiting, scanner fingerprinting, auto-ban (optional nftables) | ✅ done |
-| M7 | Operability: admin API, metrics, embedded WebUI | in progress |
+| M7 | Operability: admin API, metrics, embedded WebUI | ✅ done |
 | ├ M7.1 | Admin API + Prometheus metrics (read-only, bcrypt Basic Auth) | ✅ done |
 | ├ M7.2 | Config write-back (`PUT /api/config`, atomic, `${ENV}`-preserving) | ✅ done |
-| └ M7.3 | Embedded WebUI | next |
+| └ M7.3 | Embedded WebUI (dashboard + config editor) | ✅ done |
+
+## Admin & WebUI
+
+Enable the optional `admin` block (a bcrypt `password_hash` — generate with
+`htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`), then:
+
+- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard
+  (active calls, peers, port/registration status) and the raw-config editor
+  (edits are validated, written atomically, and hot-reloaded; keep secrets as
+  `${ENV}` references),
+- scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the
+  scrape config).
+
+Bind the admin listener **private** (there is no TLS on it) — front it with a
+reverse proxy for remote/TLS access.
 
 ## Development
 

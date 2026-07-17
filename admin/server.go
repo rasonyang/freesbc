@@ -68,6 +68,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/peers", s.requireAuth(s.handlePeers))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
+	mux.HandleFunc("/", s.requireAuth(s.handleUI)) // SPA catch-all (behind auth)
 	return s.recoverMW(mux)
 }
 
@@ -136,4 +137,4 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleStatus, handleCalls, handlePeers, handleConfig, and handleConfigGet
 // are implemented in api.go. handleConfigRaw and handleConfigWrite are
 // implemented in config_write.go. handleMetrics is implemented in
-// metrics.go.
+// metrics.go. handleUI is implemented in webui.go.
