@@ -238,3 +238,52 @@ routes:
 		t.Errorf("srv_cache_ttl = %v, want 120s", got)
 	}
 }
+
+func TestPeerSRTPDefaultsDisabled(t *testing.T) {
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Peers["p"].SRTP != "disabled" {
+		t.Errorf("srtp default = %q, want disabled", cfg.Peers["p"].SRTP)
+	}
+}
+
+func TestPeerSRTPParsed(t *testing.T) {
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  sec:
+    address: 127.0.0.1:5070
+    srtp: required
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: sec
+    to: [sec]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Peers["sec"].SRTP != "required" {
+		t.Errorf("srtp = %q, want required", cfg.Peers["sec"].SRTP)
+	}
+}

@@ -78,6 +78,11 @@ func (c *Config) validate() error {
 		default:
 			fail("peers.%s: media_latch must be strict or loose, got %q", name, p.MediaLatch)
 		}
+		switch p.SRTP {
+		case "disabled", "optional", "required":
+		default:
+			fail("peers.%s: srtp must be disabled, optional, or required, got %q", name, p.SRTP)
+		}
 		// Sub-second is rejected (not just <= 0): registerOnce's Expires
 		// header is uint32(expires.Seconds()), which truncates e.g. 500ms to
 		// 0 — silently turning a "register" into an un-register that then

@@ -50,6 +50,10 @@ type Peer struct {
 	// "strict" (default) requires the first RTP packet's source IP to match
 	// the SDP-signaled address; "loose" accepts any source (hard NAT).
 	MediaLatch string `yaml:"media_latch"`
+	// SRTP is this peer's media-encryption policy: "disabled" (default,
+	// plaintext RTP), "optional" (SRTP if offered/accepted, else RTP), or
+	// "required" (RTP/SAVP + a=crypto mandatory, else the leg fails). See M5.
+	SRTP string `yaml:"srtp"`
 	// RegisterExpires overrides the global register_expires for this peer
 	// (0 = use the global default). Only meaningful with register: true.
 	RegisterExpires Duration `yaml:"register_expires"`
@@ -135,6 +139,9 @@ func withDefaults(c *Config) {
 		}
 		if p.MediaLatch == "" {
 			p.MediaLatch = "strict"
+		}
+		if p.SRTP == "" {
+			p.SRTP = "disabled"
 		}
 	}
 	if c.Shield.RateLimit == "" {
