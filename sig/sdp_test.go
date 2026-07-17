@@ -1,10 +1,13 @@
 package sig
 
 import (
+	"encoding/base64"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/freesbc/freesbc/media"
 	"github.com/pion/sdp/v3"
 )
 
@@ -159,5 +162,71 @@ func TestRewriteSDPErrors(t *testing.T) {
 	noAudio := "v=0\r\no=- 1 1 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=video 40000 RTP/AVP 96\r\n"
 	if _, err := rewriteSDP([]byte(noAudio), netip.MustParseAddr("192.0.2.1"), 16400); err == nil {
 		t.Error("expected error for SDP with no audio m= line")
+	}
+}
+
+func savpOffer(port int, cryptoB64 string) []byte {
+	return []byte("v=0\r\n" +
+		"o=- 1 1 IN IP4 203.0.113.9\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.9\r\n" +
+		"t=0 0\r\n" +
+		"m=audio " + itoa(port) + " RTP/SAVP 0\r\n" +
+		"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:" + cryptoB64 + "\r\n" +
+		"a=rtpmap:0 PCMU/8000\r\n")
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+func TestOfferedCryptoDetectsSAVP(t *testing.T) {
+	secure, lines := offeredCrypto(savpOffer(6000, base64.StdEncoding.EncodeToString(make([]byte, 30))))
+	if !secure {
+		t.Fatal("RTP/SAVP offer must report secure=true")
+	}
+	if len(lines) != 1 || lines[0].suite != media.SuiteAES128CM80 {
+		t.Fatalf("want one 80-suite line, got %+v", lines)
+	}
+}
+
+func TestOfferedCryptoPlaintextIsInsecure(t *testing.T) {
+	// A plain RTP/AVP offer (reuse an existing plaintext SDP builder in tests).
+	secure, lines := offeredCrypto([]byte("v=0\r\no=- 1 1 IN IP4 203.0.113.9\r\ns=-\r\nc=IN IP4 203.0.113.9\r\nt=0 0\r\nm=audio 6000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"))
+	if secure || len(lines) != 0 {
+		t.Fatalf("plaintext offer: secure=%v lines=%+v", secure, lines)
+	}
+}
+
+func TestRewriteSDPCryptoSecureSetsSAVPAndCrypto(t *testing.T) {
+	key := make([]byte, 30)
+	out, err := rewriteSDPCrypto(savpOffer(6000, base64.StdEncoding.EncodeToString(key)),
+		netip.MustParseAddr("198.51.100.7"), 40000,
+		&sdpCrypto{suite: media.SuiteAES128CM80, keyValue: key})
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "RTP/SAVP") {
+		t.Error("secure rewrite must keep RTP/SAVP proto")
+	}
+	if !strings.Contains(s, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:") {
+		t.Error("secure rewrite must advertise our a=crypto")
+	}
+	if !strings.Contains(s, "40000") || !strings.Contains(s, "198.51.100.7") {
+		t.Error("topology rewrite (port/IP) must still apply")
+	}
+}
+
+func TestRewriteSDPCryptoPlaintextStripsCrypto(t *testing.T) {
+	out, err := rewriteSDPCrypto(savpOffer(6000, base64.StdEncoding.EncodeToString(make([]byte, 30))),
+		netip.MustParseAddr("198.51.100.7"), 40000, nil)
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	s := string(out)
+	if strings.Contains(s, "a=crypto") {
+		t.Error("plaintext rewrite must strip a=crypto")
+	}
+	if !strings.Contains(s, "RTP/AVP") || strings.Contains(s, "RTP/SAVP") {
+		t.Error("plaintext rewrite must set RTP/AVP")
 	}
 }

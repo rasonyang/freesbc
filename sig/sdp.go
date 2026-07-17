@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"strconv"
 
+	"github.com/freesbc/freesbc/media"
 	"github.com/pion/sdp/v3"
 )
 
@@ -75,6 +76,98 @@ func rewriteSDP(sdpBytes []byte, ourIP netip.Addr, rtpPort int) ([]byte, error) 
 		}
 		// Not the relayed audio section: decline it (RFC 3264 port 0) and
 		// strip any media-level c= so it can't leak the peer's address.
+		md.MediaName.Port = sdp.RangedPort{Value: 0}
+		md.ConnectionInformation = nil
+	}
+	out, err := sd.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal sdp: %w", err)
+	}
+	return out, nil
+}
+
+// sdpCrypto is what to advertise on the relayed audio section: a suite and the
+// SBC's own 30-byte inline key value. A nil *sdpCrypto means plaintext.
+type sdpCrypto struct {
+	suite    media.CryptoSuite
+	keyValue []byte
+}
+
+// offeredCrypto reports whether the first audio section is SRTP (proto
+// RTP/SAVP) and returns its parsed, supported a=crypto lines (empty if none).
+func offeredCrypto(sdpBytes []byte) (secure bool, lines []cryptoLine) {
+	var sd sdp.SessionDescription
+	if err := sd.Unmarshal(sdpBytes); err != nil {
+		return false, nil
+	}
+	md := firstAudio(&sd)
+	if md == nil {
+		return false, nil
+	}
+	isSAVP := false
+	for _, p := range md.MediaName.Protos {
+		if p == "SAVP" {
+			isSAVP = true
+		}
+	}
+	var values []string
+	for _, a := range md.Attributes {
+		if a.Key == "crypto" {
+			values = append(values, a.Value)
+		}
+	}
+	return isSAVP, parseCryptoAttrs(values)
+}
+
+// rewriteSDPCrypto is rewriteSDP plus SRTP awareness: the relayed audio
+// section's proto becomes RTP/SAVP with one a=crypto (tag 1) when crypto != nil,
+// or RTP/AVP with all a=crypto stripped when nil. Topology hiding (o=/c=/port,
+// declined sections) is identical to rewriteSDP.
+func rewriteSDPCrypto(sdpBytes []byte, ourIP netip.Addr, rtpPort int, crypto *sdpCrypto) ([]byte, error) {
+	var sd sdp.SessionDescription
+	if err := sd.Unmarshal(sdpBytes); err != nil {
+		return nil, fmt.Errorf("parse sdp: %w", err)
+	}
+	if firstAudio(&sd) == nil {
+		return nil, fmt.Errorf("sdp has no audio media")
+	}
+	addr := &sdp.Address{Address: ourIP.String()}
+	sd.ConnectionInformation = &sdp.ConnectionInformation{NetworkType: "IN", AddressType: sdpAddrType(ourIP), Address: addr}
+	sd.Origin.NetworkType = "IN"
+	sd.Origin.AddressType = sdpAddrType(ourIP)
+	sd.Origin.UnicastAddress = ourIP.String()
+
+	relayed := false
+	for _, md := range sd.MediaDescriptions {
+		if !relayed && md.MediaName.Media == "audio" {
+			md.MediaName.Port = sdp.RangedPort{Value: rtpPort}
+			md.ConnectionInformation = nil
+			// proto + crypto
+			if crypto != nil {
+				md.MediaName.Protos = []string{"RTP", "SAVP"}
+			} else {
+				md.MediaName.Protos = []string{"RTP", "AVP"}
+			}
+			// rebuild attributes: keep everything except crypto/rtcp handling,
+			// drop any inbound a=crypto, then add ours if secure.
+			var attrs []sdp.Attribute
+			for _, a := range md.Attributes {
+				if a.Key == "crypto" {
+					continue // never echo the peer's key
+				}
+				if a.Key == "rtcp" {
+					a.Value = strconv.Itoa(rtpPort + 1)
+				}
+				attrs = append(attrs, a)
+			}
+			if crypto != nil {
+				attrs = append(attrs, sdp.Attribute{Key: "crypto",
+					Value: cryptoAttrValue(1, crypto.suite, crypto.keyValue)})
+			}
+			md.Attributes = attrs
+			relayed = true
+			continue
+		}
 		md.MediaName.Port = sdp.RangedPort{Value: 0}
 		md.ConnectionInformation = nil
 	}
