@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeSBC Admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #8a90a0;
+    --accent: #4f8cff;
+    --ok: #3fbf6f;
+    --warn: #e0a72c;
+    --err: #e0533f;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.9rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 {
+    font-size: 1.15rem;
+    margin: 0;
+    letter-spacing: 0.02em;
+  }
+  header .version {
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  nav {
+    display: flex;
+    gap: 0.25rem;
+    padding: 0 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  nav button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    padding: 0.6rem 0.9rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+  nav button.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  nav button:hover { color: var(--text); }
+  main {
+    padding: 1.25rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  .view { display: none; }
+  .view.active { display: block; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+  }
+  .status-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5rem;
+    font-size: 0.95rem;
+  }
+  .status-line .item .label {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    display: block;
+  }
+  .status-line .item .value {
+    font-size: 1.1rem;
+  }
+  h2 {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    margin: 0 0 0.75rem;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+  }
+  tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
+  .empty-row td {
+    color: var(--muted);
+    font-style: italic;
+  }
+  .note {
+    font-size: 0.8rem;
+    color: var(--warn);
+    margin-top: 0.5rem;
+  }
+  .note.hidden { display: none; }
+  .badge {
+    display: inline-block;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+  }
+  .badge.yes { background: rgba(63, 191, 111, 0.15); color: var(--ok); }
+  .badge.no { background: rgba(138, 144, 160, 0.15); color: var(--muted); }
+  textarea {
+    width: 100%;
+    min-height: 420px;
+    background: #0b0d11;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    line-height: 1.4;
+    resize: vertical;
+  }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  button.action {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 0.5rem 1rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button.action:hover { filter: brightness(1.1); }
+  button.action:disabled { opacity: 0.5; cursor: default; }
+  button.action.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .status-msg {
+    font-size: 0.85rem;
+  }
+  .status-msg.ok { color: var(--ok); }
+  .status-msg.err { color: var(--err); }
+  .error-box {
+    display: none;
+    margin-top: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: rgba(224, 83, 63, 0.1);
+    border: 1px solid var(--err);
+    border-radius: 6px;
+    color: var(--err);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .error-box.visible { display: block; }
+  .session-banner {
+    display: none;
+    background: var(--err);
+    color: #fff;
+    padding: 0.5rem 1.25rem;
+    font-size: 0.85rem;
+    text-align: center;
+  }
+  .session-banner.visible { display: block; }
+</style>
+</head>
+<body>
+
+<div id="session-banner" class="session-banner">Session expired — reload the page to re-authenticate.</div>
+
+<header>
+  <h1>FreeSBC</h1>
+  <span class="version" id="header-version">version …</span>
+</header>
+
+<nav>
+  <button id="tab-dashboard" class="active" data-view="dashboard">Dashboard</button>
+  <button id="tab-config" data-view="config">Config</button>
+</nav>
+
+<main>
+  <section id="view-dashboard" class="view active">
+    <div class="panel">
+      <h2>Status</h2>
+      <div class="status-line" id="status-line">
+        <div class="item"><span class="label">Version</span><span class="value" id="stat-version">—</span></div>
+        <div class="item"><span class="label">Uptime</span><span class="value" id="stat-uptime">—</span></div>
+        <div class="item"><span class="label">Active calls</span><span class="value" id="stat-active-calls">—</span></div>
+        <div class="item"><span class="label">Ports</span><span class="value" id="stat-ports">—</span></div>
+      </div>
+      <div class="note hidden" id="dashboard-error">connection error, retrying…</div>
+    </div>
+
+    <div class="panel">
+      <h2>Calls</h2>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>From</th><th>To</th><th>Duration (s)</th></tr>
+        </thead>
+        <tbody id="calls-body">
+          <tr class="empty-row"><td colspan="4">no active calls</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Peers</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>Address</th><th>Transport</th><th>SRTP</th><th>Register</th><th>Registered</th>
+          </tr>
+        </thead>
+        <tbody id="peers-body">
+          <tr class="empty-row"><td colspan="6">no peers configured</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="view-config" class="view">
+    <div class="panel">
+      <h2>Config editor</h2>
+      <div class="toolbar">
+        <button class="action" id="btn-load">Load</button>
+        <button class="action" id="btn-save" disabled>Save</button>
+        <span class="status-msg" id="config-status"></span>
+      </div>
+      <textarea id="config-text" spellcheck="false" placeholder="Click Load to fetch the running config file."></textarea>
+      <div class="error-box" id="config-error"></div>
+      <p class="hint">Keep secrets as ${ENV} references — this file may be viewed by other operators.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var STATUS_URL = "/api/status";
+  var CALLS_URL = "/api/calls";
+  var PEERS_URL = "/api/peers";
+  var CONFIG_RAW_URL = "/api/config/raw";
+  var CONFIG_URL = "/api/config";
+
+  var POLL_MS = 5000;
+
+  var sessionExpired = false;
+  var configEtag = null;
+
+  // ---- tabs ----
+
+  var tabs = document.querySelectorAll("nav button");
+  var views = document.querySelectorAll(".view");
+
+  tabs.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      tabs.forEach(function (b) { b.classList.remove("active"); });
+      views.forEach(function (v) { v.classList.remove("active"); });
+      btn.classList.add("active");
+      document.getElementById("view-" + btn.dataset.view).classList.add("active");
+    });
+  });
+
+  // ---- session-expired handling ----
+
+  function showSessionExpired() {
+    if (sessionExpired) return;
+    sessionExpired = true;
+    document.getElementById("session-banner").classList.add("visible");
+  }
+
+  // fetchJSON performs a same-origin GET and parses JSON. Basic Auth
+  // credentials are already attached by the browser (same-origin reuse).
+  // On 401 it flags the session as expired; on other failures it rejects
+  // so the caller can keep last-known-good data on screen.
+  function fetchJSON(url) {
+    return fetch(url, { credentials: "same-origin" }).then(function (res) {
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error("unauthorized");
+      }
+      if (!res.ok) {
+        throw new Error(url + ": " + res.status);
+      }
+      return res.json();
+    });
+  }
+
+  // ---- dashboard ----
+
+  var headerVersion = document.getElementById("header-version");
+  var dashboardError = document.getElementById("dashboard-error");
+
+  function fmtDuration(sec) {
+    sec = Math.max(0, sec | 0);
+    var h = Math.floor(sec / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    var parts = [];
+    if (h) parts.push(h + "h");
+    if (h || m) parts.push(m + "m");
+    parts.push(s + "s");
+    return parts.join(" ");
+  }
+
+  function renderStatus(data) {
+    headerVersion.textContent = "v" + data.version;
+    document.getElementById("stat-version").textContent = data.version;
+    document.getElementById("stat-uptime").textContent = fmtDuration(data.uptime_seconds);
+    document.getElementById("stat-active-calls").textContent = data.active_calls;
+    var ports = data.ports || {};
+    document.getElementById("stat-ports").textContent =
+      (ports.in_use != null ? ports.in_use : "—") + " / " + (ports.total != null ? ports.total : "—");
+  }
+
+  function renderCalls(calls) {
+    var body = document.getElementById("calls-body");
+    body.innerHTML = "";
+    if (!calls || calls.length === 0) {
+      body.innerHTML = '<tr class="empty-row"><td colspan="4">no active calls</td></tr>';
+      return;
+    }
+    calls.forEach(function (c) {
+      var tr = document.createElement("tr");
+      [c.id, c.from, c.to, c.duration_seconds].forEach(function (v) {
+        var td = document.createElement("td");
+        td.textContent = v == null ? "" : v;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  function badge(v) {
+    var span = document.createElement("span");
+    span.className = "badge " + (v ? "yes" : "no");
+    span.textContent = v ? "yes" : "no";
+    return span;
+  }
+
+  function renderPeers(peers) {
+    var body = document.getElementById("peers-body");
+    body.innerHTML = "";
+    if (!peers || peers.length === 0) {
+      body.innerHTML = '<tr class="empty-row"><td colspan="6">no peers configured</td></tr>';
+      return;
+    }
+    peers.forEach(function (p) {
+      var tr = document.createElement("tr");
+      [p.Name, p.Address, p.Transport, p.SRTP].forEach(function (v) {
+        var td = document.createElement("td");
+        td.textContent = v == null ? "" : v;
+        tr.appendChild(td);
+      });
+      var tdReg = document.createElement("td");
+      tdReg.appendChild(badge(p.Register));
+      tr.appendChild(tdReg);
+      var tdRegistered = document.createElement("td");
+      tdRegistered.appendChild(badge(p.Registered));
+      tr.appendChild(tdRegistered);
+      body.appendChild(tr);
+    });
+  }
+
+  function pollDashboard() {
+    Promise.all([
+      fetchJSON(STATUS_URL),
+      fetchJSON(CALLS_URL),
+      fetchJSON(PEERS_URL)
+    ]).then(function (results) {
+      renderStatus(results[0]);
+      renderCalls(results[1]);
+      renderPeers(results[2]);
+      dashboardError.classList.add("hidden");
+    }).catch(function () {
+      // keep last-known-good data on screen; just flag the problem.
+      if (!sessionExpired) {
+        dashboardError.classList.remove("hidden");
+      }
+    });
+  }
+
+  pollDashboard();
+  setInterval(pollDashboard, POLL_MS);
+
+  // ---- config editor ----
+
+  var btnLoad = document.getElementById("btn-load");
+  var btnSave = document.getElementById("btn-save");
+  var configText = document.getElementById("config-text");
+  var configStatus = document.getElementById("config-status");
+  var configError = document.getElementById("config-error");
+
+  function setConfigStatus(msg, kind) {
+    configStatus.textContent = msg;
+    configStatus.className = "status-msg" + (kind ? " " + kind : "");
+  }
+
+  function clearConfigError() {
+    configError.textContent = "";
+    configError.classList.remove("visible");
+  }
+
+  function showConfigError(text) {
+    configError.textContent = text;
+    configError.classList.add("visible");
+  }
+
+  btnLoad.addEventListener("click", function () {
+    setConfigStatus("Loading…");
+    clearConfigError();
+    fetch(CONFIG_RAW_URL, { credentials: "same-origin" }).then(function (res) {
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error("unauthorized");
+      }
+      return res.text().then(function (text) {
+        if (!res.ok) {
+          throw new Error("load failed: " + res.status + " " + text);
+        }
+        configEtag = res.headers.get("ETag");
+        configText.value = text;
+        btnSave.disabled = false;
+        setConfigStatus("Loaded", "ok");
+      });
+    }).catch(function (err) {
+      setConfigStatus("Load failed", "err");
+      showConfigError(String(err.message || err));
+    });
+  });
+
+  btnSave.addEventListener("click", function () {
+    setConfigStatus("Saving…");
+    clearConfigError();
+    var headers = { "Content-Type": "application/x-yaml" };
+    if (configEtag) headers["If-Match"] = configEtag;
+    fetch(CONFIG_URL, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: headers,
+      body: configText.value
+    }).then(function (res) {
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error("unauthorized");
+      }
+      return res.text().then(function (text) {
+        if (res.status === 200) {
+          configEtag = res.headers.get("ETag") || configEtag;
+          setConfigStatus("Saved ✓", "ok");
+          return;
+        }
+        if (res.status === 400) {
+          setConfigStatus("Validation error", "err");
+          showConfigError(text);
+          return;
+        }
+        if (res.status === 409) {
+          setConfigStatus("Config changed on disk — click Load to refresh", "err");
+          return;
+        }
+        if (res.status === 413) {
+          setConfigStatus("Config too large", "err");
+          return;
+        }
+        setConfigStatus("Save failed (" + res.status + ")", "err");
+        showConfigError(text);
+      });
+    }).catch(function (err) {
+      if (String(err.message || err) !== "unauthorized") {
+        setConfigStatus("Save failed", "err");
+        showConfigError(String(err.message || err));
+      }
+    });
+  });
+})();
+</script>
+
+</body>
+</html>
