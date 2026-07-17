@@ -98,7 +98,10 @@ Enable the optional `admin` block (a bcrypt `password_hash` — generate with
   (edits are validated, written atomically, and hot-reloaded; keep secrets as
   `${ENV}` references),
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the
-  scrape config).
+  scrape config),
+- tear down a stuck call: `curl -u admin:… -X DELETE
+  http://<admin.listen>/api/calls/<call-id>` (204 killed, 404 already gone) —
+  the `<call-id>` is the `id` from `GET /api/calls`.
 
 Bind the admin listener **private** (there is no TLS on it) — front it with a
 reverse proxy for remote/TLS access.
