@@ -118,6 +118,9 @@ type Session struct {
 	rtcp    [2]*latch
 	timeout time.Duration
 
+	srtpIn  [2]*SRTPContext // decrypt packets received FROM this side (nil = plaintext)
+	srtpOut [2]*SRTPContext // encrypt packets sent TO this side (nil = plaintext)
+
 	lastRx    atomic.Int64 // unix nanos of the last accepted packet
 	done      chan struct{}
 	closeOnce sync.Once
@@ -190,6 +193,15 @@ func ParseLatchMode(s string) LatchMode {
 		return LatchLoose
 	}
 	return LatchStrict
+}
+
+// SetSRTP installs the SRTP contexts for one side: inbound decrypts what we
+// receive from that side, outbound encrypts what we send to it. A nil context
+// means that direction is plaintext. Call before Start (the forward loops read
+// these once running; setting after Start races the relay goroutines).
+func (s *Session) SetSRTP(side Side, inbound, outbound *SRTPContext) {
+	s.srtpIn[side] = inbound
+	s.srtpOut[side] = outbound
 }
 
 // Done is closed when the session ends (Close or silence timeout).
