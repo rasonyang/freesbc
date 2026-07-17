@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"net/netip"
 	"runtime/debug"
 	"strconv"
@@ -16,6 +18,51 @@ import (
 	"github.com/freesbc/freesbc/callstate"
 	"github.com/freesbc/freesbc/media"
 )
+
+// legSRTP is the negotiated SRTP state for one leg. secure=false means the
+// leg is plaintext and inbound/outbound are nil. When secure, inbound
+// decrypts what we receive from the peer (built from the peer's advertised
+// key) and outbound encrypts what we send to the peer (built from
+// ourKeyValue, which we advertise to the peer in SDP). suite is the
+// negotiated suite. Keys are never copied between legs: each leg's inbound
+// context is built from THAT peer's own advertised key, and each leg's
+// outbound context is built from a key WE generated fresh for that leg.
+type legSRTP struct {
+	secure      bool
+	suite       media.CryptoSuite
+	inbound     *media.SRTPContext // nil until the peer's key is known
+	outbound    *media.SRTPContext
+	ourKeyValue []byte // advertised to the peer (a=crypto)
+
+	// tag is the a=crypto tag WE advertise this leg's key under. For the
+	// A-leg (the SBC as answerer), it must echo the tag of the offered line
+	// selectCrypto picked — RFC 4568 §5.1.3 — so it's copied from sel.tag in
+	// onInvite, not left at zero. For the B-leg (the SBC as offerer), the
+	// SBC always offers exactly one line, so its offer always uses tag 1
+	// directly rather than via this field.
+	tag int
+
+	// required is true only when this leg's peer policy is "srtp: required"
+	// (never for "optional", even when the leg ended up secure=true because
+	// the other leg happened to be secure). processAnswerSDP consults it to
+	// decide how to treat an answer with no usable/matching crypto: required
+	// fails the attempt (→ failover); optional bridges as plaintext instead
+	// (RFC 3264-style graceful downgrade — "SRTP if the peer accepts, else
+	// plaintext"). Currently only ever set on the B-leg's legSRTP built in
+	// dialTarget; the A-leg already rejects an insecure offer against a
+	// required policy with 488 in onInvite, before any legSRTP is built, so
+	// it has no analogous use there.
+	required bool
+}
+
+// errSRTPRequiredMismatch marks a processAnswerSDP failure caused
+// specifically by a B-leg policy of required SRTP whose answer turned out
+// not to be secure. Unlike a malformed/unparseable answer (a genuine carrier
+// failure that ends the call with 502 — see TestBridgeBrokenAnswerSDPGets502),
+// this one is retryable: the carrier answered and is reachable, it just
+// doesn't meet our policy, so placeCall should fail over to the next target
+// instead of giving up on the whole call.
+var errSRTPRequiredMismatch = errors.New("srtp required by policy but answer has no usable a=crypto")
 
 // bridge is the B2BUA: it pairs an inbound A-leg with an outbound B-leg,
 // anchoring media and hiding topology. One bridge instance is shared; each
@@ -161,6 +208,65 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
+	// A-leg SRTP negotiation (M5 Task 6): decide, from fromPeer's srtp
+	// policy and what the caller actually offered, whether this leg will be
+	// secure — and if so, build both SRTP contexts up front so they can be
+	// installed on sess (via SetSRTP, right after Allocate below) before
+	// anything Starts relaying. "required" never silently downgrades to
+	// plaintext: an insecure offer against a required policy is rejected
+	// here with 488, before any B-leg is even dialed. "optional" mirrors
+	// whatever the caller offered; "disabled" (including any unrecognized
+	// value) is always plaintext, byte-identical to pre-M5 behavior.
+	aSecureOffer, aLines := offeredCrypto(req.Body())
+	var aSRTP legSRTP
+	switch fromPeer.SRTP {
+	case "required":
+		if !aSecureOffer || len(aLines) == 0 {
+			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+			return
+		}
+		aSRTP.secure = true
+	case "optional":
+		aSRTP.secure = aSecureOffer && len(aLines) > 0
+	default: // "disabled" (config's normalized default) or anything unrecognized
+		aSRTP.secure = false
+	}
+	if aSRTP.secure {
+		sel, ok := selectCrypto(aLines)
+		ourKey, keyErr := newCryptoKeyValue()
+		var inbound, outbound *media.SRTPContext
+		var ctxErr error
+		if ok && keyErr == nil {
+			inbound, ctxErr = media.NewSRTPContext(sel.suite, sel.keyValue)
+		}
+		if ok && keyErr == nil && ctxErr == nil {
+			outbound, ctxErr = media.NewSRTPContext(sel.suite, ourKey)
+		}
+		if !ok || keyErr != nil || ctxErr != nil {
+			// Unusable crypto (no supported suite selected, key generation
+			// failed, or a malformed key rejected by NewSRTPContext) under a
+			// policy that requires SRTP: treat exactly like "not secure" —
+			// 488, never a silent plaintext fallback.
+			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+			return
+		}
+		aSRTP.suite = sel.suite
+		aSRTP.ourKeyValue = ourKey
+		aSRTP.inbound = inbound
+		aSRTP.outbound = outbound
+		aSRTP.tag = sel.tag
+
+		// Non-TLS warn: SDES carries the master key in the clear inside the
+		// SDP body, so negotiating it over a non-TLS signaling transport
+		// leaks it to anyone who can see the signaling. We still negotiate
+		// (the operator's policy said secure media is wanted; downgrading
+		// behind their back would be worse), but log once per secure leg.
+		if aTransport := sip.NetworkToLower(req.Transport()); aTransport != "tls" {
+			b.s.log.Warn("SDES key negotiated over non-TLS signaling transport",
+				"transport", aTransport, "peer", name)
+		}
+	}
+
 	// Side-B's latch mode here is only a pre-first-attempt default, seeded
 	// from Targets[0] because Allocate needs *some* mode before any target
 	// has been dialed. dialTarget calls sess.SetLatchMode(SideB, ...) with
@@ -179,10 +285,16 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer sess.Close()
 	sess.SetExpectedRemote(media.SideA, remoteA)
+	// Install the A-side SRTP contexts (nil/nil when plaintext) before
+	// anything can Start relaying — SetSRTP must run strictly before Start,
+	// and Start is only ever reached later, once the B-leg answers (see
+	// processAnswerSDP), so doing this right after Allocate is always early
+	// enough.
+	sess.SetSRTP(media.SideA, aSRTP.inbound, aSRTP.outbound)
 
 	ourIP := b.s.mediaIP(cfg)
 
-	bLeg, target, aAnswer, bOffer, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), ourIP, sess)
+	bLeg, target, aAnswer, bOffer, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), ourIP, sess, aSRTP)
 	if !ok {
 		return // placeCall already sent the A-leg's final response.
 	}
@@ -282,9 +394,17 @@ const (
 // down. Only set true at true connect-failure sites; everything relying on
 // the zero-value default (caller CANCEL, auth challenge, raced/stale
 // response) stays false.
+//
+// bOffer (M5 Task 6) is the SBC's own B-side offer SDP actually sent to THIS
+// target — only meaningful when ok is true. It moved from a single
+// placeCall-hoisted value to a per-attempt one because each target's SRTP
+// policy can differ, so the offer (plaintext vs RTP/SAVP+a=crypto) is now
+// built fresh per attempt in dialTarget; placeCall reads it off the winning
+// attemptResult instead of building it once itself.
 type attemptResult struct {
 	ok        bool
 	aAnswer   []byte
+	bOffer    []byte
 	retryable bool
 	kind      failKind
 	code      int
@@ -336,11 +456,15 @@ func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 	return cooled
 }
 
-// placeCall is Task 8's failover loop: it rewrites the A-leg's offer to
-// sess's stable B-side port once — that rewrite depends only on sess's own
-// ports and ourIP, neither of which changes across attempts, so it's
-// hoisted out of the per-target dialTarget below — then tries targets in
-// order via dialTarget until one is bridged.
+// placeCall is Task 8's failover loop: it validates the A-leg's offer once
+// up front (a target-independent parse/no-audio check — the same offerBody
+// is used on every attempt, so a malformed offer fails identically on all of
+// them; see the pre-loop check below), then tries targets in order via
+// dialTarget until one is bridged. The actual per-target B-leg offer is no
+// longer built here (M5 Task 6): each target's SRTP policy can differ, so
+// dialTarget rebuilds bOffer fresh — plaintext or RTP/SAVP+a=crypto — for
+// every attempt; placeCall reads the winning attempt's bOffer off its
+// attemptResult.
 //
 // dialTarget draws a hard line at the B-leg's answer: everything before it
 // (dial failure, no/non-2xx WaitAnswer) is target-specific and safe to
@@ -377,9 +501,13 @@ func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 // winning target) — like aAnswer (see attemptResult), the caller needs it
 // verbatim to answer a later B-LEG session-timer refresh with (Task 6 fix
 // wave), rather than the carrier's own answer.
-func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
-	bOffer, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB))
-	if err != nil {
+func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, ourIP netip.Addr, sess *media.Session, aSRTP legSRTP) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
+	// Pre-loop validation only (the actual per-target offer, including any
+	// SRTP crypto, is built fresh inside dialTarget — see its doc comment):
+	// a parse/no-audio failure in offerBody is target-independent, so 488
+	// here before any target is dialed rather than discovering the same
+	// failure on every attempt.
+	if _, err := rewriteSDP(offerBody, ourIP, sess.RTPPort(media.SideB)); err != nil {
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		return nil, Target{}, nil, nil, false
 	}
@@ -396,12 +524,12 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
 	for _, de := range b.expandTargets(targets) {
-		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, bOffer, sess, ourIP, &startOnce)
+		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, offerBody, sess, ourIP, &startOnce, aSRTP)
 		if res.ok {
 			// A bridged call proves this endpoint is reachable — clear any
 			// prior cooldown so it is usable immediately on the next call.
 			b.s.health.Recover(de.Endpoint)
-			return dialedLeg, de.Target, res.aAnswer, bOffer, true
+			return dialedLeg, de.Target, res.aAnswer, res.bOffer, true
 		}
 		if !res.retryable {
 			return nil, Target{}, nil, nil, false
@@ -495,7 +623,20 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 // WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
 // before dialTarget's own post-answer processing does; both share the same
 // startOnce so Start runs at most once regardless of which path wins.
-func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep Endpoint, outNumber string, bOffer []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) (bLeg *sipgo.DialogClientSession, res attemptResult) {
+//
+// B-leg SRTP offer (M5 Task 6): bSecure is decided from THIS target's own
+// peer policy — required always secure, disabled always plaintext, optional
+// mirrors whatever the A-leg negotiated (aSRTP.secure) — never from a global
+// or A-leg-only decision, since failover can hop across peers with different
+// policies. When secure, the SBC offers exactly one suite (AES_CM_128_HMAC_
+// SHA1_80, tag 1) with one freshly generated key: SDES lets an offer carry
+// multiple a=crypto lines/suites, but doing so correctly means tracking
+// which suite the answerer picked across two independent keys — offering
+// suite 80 only is a documented, interop-negligible simplification (every
+// SDES peer supports it). The A-leg ANSWER side has no such restriction:
+// selectCrypto/parseCryptoAttrs already accept whichever supported suite the
+// caller offered.
+func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep Endpoint, outNumber string, offerBody []byte, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once, aSRTP legSRTP) (bLeg *sipgo.DialogClientSession, res attemptResult) {
 	// Align SideB's latch policy with THIS target before dialing it — not
 	// just whichever target happened to be Targets[0] at Allocate time — so
 	// early media (relayProvisional) and the eventual answer both apply the
@@ -504,6 +645,78 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// SideB traffic, so the winning target's policy is always what ends up
 	// governing the session.
 	sess.SetLatchMode(media.SideB, media.ParseLatchMode(target.Peer.MediaLatch))
+
+	var bSRTP legSRTP
+	switch target.Peer.SRTP {
+	case "required":
+		bSRTP.secure = true
+		bSRTP.required = true
+	case "optional":
+		bSRTP.secure = aSRTP.secure
+	default: // "disabled" (config's normalized default) or anything unrecognized
+		bSRTP.secure = false
+	}
+	var bOffer []byte
+	if bSRTP.secure {
+		// Non-TLS warn (spec §4.5: one WARN per secure leg over non-TLS
+		// signaling) — mirrors the A-leg's identical warn in onInvite. The
+		// SBC is the one dialing this leg, so the transport is what WE chose
+		// for this target (target.Peer.Transport, normalized to "udp" by
+		// config.Parse when unset), not something read off an inbound
+		// request.
+		if bTransport := target.Peer.Transport; bTransport != "tls" {
+			b.s.log.Warn("SDES key negotiated over non-TLS signaling transport",
+				"transport", bTransport, "peer", target.Name)
+		}
+		bKey, err := newCryptoKeyValue()
+		var outbound *media.SRTPContext
+		if err == nil {
+			outbound, err = media.NewSRTPContext(media.SuiteAES128CM80, bKey)
+		}
+		if err != nil {
+			// Fresh-key generation or context construction failed (e.g. the
+			// CSPRNG is unavailable) — a transient, this-attempt-only
+			// problem, not the caller's or this carrier's fault: classify
+			// like any other pre-dial failure so placeCall tries the next
+			// candidate rather than failing the whole call.
+			b.s.log.Error("build b-leg srtp context", "err", err, "target", target.Name)
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		}
+		bSRTP.suite = media.SuiteAES128CM80
+		bSRTP.ourKeyValue = bKey
+		bSRTP.outbound = outbound
+		rewritten, err := rewriteSDPCrypto(offerBody, ourIP, sess.RTPPort(media.SideB), &sdpCrypto{suite: bSRTP.suite, keyValue: bKey, tag: 1})
+		if err != nil {
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		}
+		bOffer = rewritten
+	} else {
+		// Plaintext: rewriteSDPCrypto with a nil *sdpCrypto, NOT the plain
+		// rewriteSDP — offerBody is the CALLER's raw offer, which may itself
+		// be RTP/SAVP+a=crypto when the A-leg is secure (e.g. optional/
+		// required on fromPeer while THIS target's peer is disabled).
+		// rewriteSDP only rewrites port/connection info and leaves proto and
+		// attributes (including any a=crypto) untouched — using it here
+		// would leak the caller's own SRTP proto/key straight through to a
+		// peer whose policy says plaintext. rewriteSDPCrypto(..., nil)
+		// forces RTP/AVP and strips every a=crypto line, and produces
+		// byte-identical output to rewriteSDP when offerBody was already
+		// plaintext (see TestBridgePlaintextUnchanged), so this is safe for
+		// both cases. placeCall's pre-loop check already proved offerBody
+		// parses, so this is not expected to fail here.
+		rewritten, err := rewriteSDPCrypto(offerBody, ourIP, sess.RTPPort(media.SideB), nil)
+		if err != nil {
+			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		}
+		bOffer = rewritten
+	}
+	// bsrtpArg is nil for a plaintext B-leg — both relayProvisional and
+	// processAnswerSDP treat a nil *legSRTP as "nothing to negotiate",
+	// exactly the pre-M5 behavior.
+	var bsrtpArg *legSRTP
+	if bSRTP.secure {
+		bsrtpArg = &bSRTP
+	}
 
 	// peerURI builds only the trunk endpoint (host/port/transport); the
 	// dialed number (post-transform) is the Request-URI user part, so it
@@ -577,7 +790,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
 
 		waitErr := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
-			OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce),
+			OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce, aSRTP, bsrtpArg),
 			Username:   authUser(target),
 			Password:   authPass(target),
 		})
@@ -735,7 +948,20 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// dialed), which stays 488 — that one really is about the caller's
 	// offer.
 	answer := bLeg.InviteResponse.Body()
-	if err := processAnswerSDP(sess, answer, media.SideB, startOnce); err != nil {
+	if err := processAnswerSDP(sess, answer, media.SideB, startOnce, bsrtpArg); err != nil {
+		if errors.Is(err, errSRTPRequiredMismatch) {
+			// The carrier answered for real (2xx, billable) but its answer
+			// doesn't meet our required-SRTP policy for this target: unlike
+			// a malformed/unparseable answer (a genuine, terminal carrier
+			// failure — see the non-SRTP branch below), this is retryable.
+			// The carrier is reachable, it's just unusable under policy, so
+			// tear this attempt down and let placeCall try the next
+			// candidate rather than finalizing the call with 502. "required"
+			// never silently downgrades to plaintext.
+			b.s.log.Info("b-leg srtp required by policy but answer not secure", "target", target.Name)
+			b.ackThenBye(aLeg.Context(), bLeg, target)
+			return nil, attemptResult{retryable: true, kind: failUnusable, code: 502, reason: "Bad Gateway"}
+		}
 		// Respond the A-leg before tearing the B-leg down: ackThenBye is a
 		// network round trip bounded by byeContext's 5s, and there's no
 		// reason to hold the caller's final response hostage behind it.
@@ -744,7 +970,32 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
 	}
 
-	aAnswer, err := rewriteSDP(answer, ourIP, sess.RTPPort(media.SideA))
+	// A-leg answer crypto (M5 Task 6): when the A-leg is secure, advertise
+	// the SBC's OWN A-outbound key (aSRTP.ourKeyValue) in the answer — the
+	// caller encrypts toward us with the key it offered (already used to
+	// build aSRTP.inbound in onInvite), and decrypts what we send it with
+	// whatever key WE advertise here, i.e. what WE encrypt with
+	// (aSRTP.outbound). The caller's own key is never echoed back.
+	var aAnswer []byte
+	var err error
+	if aSRTP.secure {
+		aAnswer, err = rewriteSDPCrypto(answer, ourIP, sess.RTPPort(media.SideA), &sdpCrypto{suite: aSRTP.suite, keyValue: aSRTP.ourKeyValue, tag: aSRTP.tag})
+	} else {
+		// Plaintext A-leg: rewriteSDPCrypto with a nil *sdpCrypto, NOT the
+		// plain rewriteSDP — answer is the B-LEG's (carrier's) raw answer,
+		// which may itself be RTP/SAVP+a=crypto when the B-leg is secure
+		// (e.g. this target's peer is srtp: required/optional while the
+		// A-leg is disabled). rewriteSDP only rewrites port/connection info
+		// and leaves proto and attributes (including any a=crypto) untouched
+		// — using it here would leak the CARRIER's own SRTP master key, and
+		// advertise RTP/SAVP, straight through to a plaintext caller (a
+		// critical key leak; see TestBridgeSRTPInterworksPlaintextAToSecureB).
+		// rewriteSDPCrypto(..., nil) forces RTP/AVP and strips every
+		// a=crypto line, and produces byte-identical output to rewriteSDP
+		// when answer was already plaintext (see TestBridgePlaintextUnchanged),
+		// so this is safe for both cases.
+		aAnswer, err = rewriteSDPCrypto(answer, ourIP, sess.RTPPort(media.SideA), nil)
+	}
 	if err != nil {
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
 		b.ackThenBye(aLeg.Context(), bLeg, target)
@@ -799,7 +1050,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		return nil, attemptResult{kind: failUnusable}
 	}
 
-	return bLeg, attemptResult{ok: true, aAnswer: aAnswer}
+	return bLeg, attemptResult{ok: true, aAnswer: aAnswer, bOffer: bOffer}
 }
 
 // buildFrom clones the caller's identity onto a B-leg From: the caller's
@@ -888,7 +1139,14 @@ func authPass(target Target) string {
 // media is a courtesy, not something worth tearing down the dialog over.
 // The returned callback always returns nil: WaitAnswer aborts on a non-nil
 // error, which must never happen here.
-func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once) func(res *sip.Response) error {
+//
+// aSRTP/bsrtp (M5 Task 6) mirror dialTarget's own negotiated state, so the
+// SDP relayed in early media is crypto-consistent with what the eventual
+// final answer will carry: bsrtp (nil when B is plaintext) drives
+// processAnswerSDP's B-inbound install exactly like the final-200 path, and
+// aSRTP drives whether the rewritten body relayed to the caller is
+// RTP/SAVP+a=crypto (our A-outbound key) or plain RTP/AVP.
+func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.Session, ourIP netip.Addr, startOnce *sync.Once, aSRTP legSRTP, bsrtp *legSRTP) func(res *sip.Response) error {
 	return func(res *sip.Response) error {
 		if !res.IsProvisional() {
 			return nil
@@ -907,13 +1165,27 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 			headers []sip.Header
 		)
 		if raw := res.Body(); len(raw) > 0 {
-			if err := processAnswerSDP(sess, raw, media.SideB, startOnce); err != nil {
+			if err := processAnswerSDP(sess, raw, media.SideB, startOnce, bsrtp); err != nil {
 				b.s.log.Error("early media sdp", "err", err, "code", res.StatusCode)
-			} else if rewritten, err := rewriteSDP(raw, ourIP, sess.RTPPort(media.SideA)); err != nil {
-				b.s.log.Error("early media rewrite", "err", err, "code", res.StatusCode)
 			} else {
-				body = rewritten
-				headers = []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
+				var rewritten []byte
+				var err error
+				if aSRTP.secure {
+					rewritten, err = rewriteSDPCrypto(raw, ourIP, sess.RTPPort(media.SideA), &sdpCrypto{suite: aSRTP.suite, keyValue: aSRTP.ourKeyValue, tag: aSRTP.tag})
+				} else {
+					// Same C1 fix as dialTarget's final-200 path: raw is the
+					// B-leg's early-media SDP, which may carry the carrier's
+					// own a=crypto — rewriteSDPCrypto(..., nil) strips it and
+					// forces RTP/AVP instead of leaking it through plain
+					// rewriteSDP to a plaintext caller.
+					rewritten, err = rewriteSDPCrypto(raw, ourIP, sess.RTPPort(media.SideA), nil)
+				}
+				if err != nil {
+					b.s.log.Error("early media rewrite", "err", err, "code", res.StatusCode)
+				} else {
+					body = rewritten
+					headers = []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
+				}
 			}
 		}
 		if err := aLeg.Respond(res.StatusCode, res.Reason, body, headers...); err != nil {
@@ -930,10 +1202,79 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 // even though both paths call this. Returns the remoteMediaIP parse error
 // unchanged so callers can decide how to fail (early media falls back to a
 // status-only relay; the final path rejects the call).
-func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, startOnce *sync.Once) error {
+//
+// bsrtp (M5 Task 6) is the B-leg's offer-side SRTP state — nil when B is
+// plaintext. When non-nil and secure, the ANSWER's own crypto is parsed (the
+// peer's advertised key is what THEY encrypt with, so it becomes our
+// inbound/decrypt context) and, when it's usable, sess.SetSRTP installs both
+// contexts for side BEFORE Relatch/Start below — SetSRTP must always run
+// strictly before this call's own startOnce.Do(sess.Start), so a fresh
+// Session never Starts with a partially-installed side; on an already-Started
+// Session (a later failover target's answer, or an early-media path racing
+// the final one) SetSRTP's atomic.Pointer fields make the same call race-free
+// against the running relay loops (see media.Session.SetSRTP's own doc).
+//
+// sess.SetSRTP(side, nil, nil) is ALWAYS called for a plaintext outcome —
+// bsrtp nil, or bsrtp secure but the answer has no usable/matching crypto and
+// isn't required — never merely skipped. This matters across B-leg failover:
+// sess/startOnce are shared for the whole call (see placeCall), so an
+// EARLIER target's early media (18x) can have already installed secure B
+// contexts via this same function before a LATER, plaintext-answering target
+// wins; without an explicit clear here the later target's plaintext packets
+// would still be run through the stale SRTP contexts and fail
+// unprotectRTP/protectRTP, silently going dead (Finding I1).
+//
+// Whether an unusable/mismatched answer fails the attempt or bridges
+// plaintext depends on bsrtp.required AND on what the peer actually
+// answered (Finding I2, sharpened by the M5 final-review Finding 4): a
+// "required" leg (peer configured srtp: required) never silently
+// downgrades — it's reported via errSRTPRequiredMismatch so dialTarget can
+// fail over instead of bridging where policy demanded encryption. An
+// "optional" leg (peer configured srtp: optional, secure=true only because
+// the A-leg happened to be secure) bridges plaintext instead, per spec:
+// "SRTP if the peer accepts, else plaintext" — but ONLY when the peer
+// actually answered plaintext (RTP/AVP). If an "optional" peer answered
+// RTP/SAVP (committed to SRTP in the SDP protocol field) with an unusable or
+// mismatched suite, bridging "plaintext" would mean forwarding the peer's
+// still-SRTP-protected bytes as if they were plain RTP — garbage audio, not
+// a graceful downgrade — so that case fails over exactly like "required"
+// does (answerSecure is part of the failure condition below, not just
+// bsrtp.required). An answer whose crypto suite doesn't match what we
+// offered (Finding M1 — we offer suite 80 only; a carrier answering suite 32
+// would otherwise give one-way audio, decrypting with 32 while encrypting
+// with 80) is treated identically to "no usable crypto".
+func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, startOnce *sync.Once, bsrtp *legSRTP) error {
 	remote, err := remoteMediaIP(answer)
 	if err != nil {
 		return err
+	}
+	switch {
+	case bsrtp == nil:
+		sess.SetSRTP(side, nil, nil)
+	case !bsrtp.secure:
+		sess.SetSRTP(side, nil, nil)
+	default:
+		answerSecure, lines := offeredCrypto(answer)
+		sel, ok := selectCrypto(lines)
+		usable := answerSecure && ok && sel.suite == bsrtp.suite
+		switch {
+		case usable:
+			inbound, err := media.NewSRTPContext(sel.suite, sel.keyValue)
+			if err != nil {
+				return fmt.Errorf("srtp answer key: %w", err)
+			}
+			sess.SetSRTP(side, inbound, bsrtp.outbound)
+		case bsrtp.required || answerSecure:
+			// Either policy demanded SRTP, or the peer committed to SAVP
+			// with an unusable/mismatched suite — bridging plaintext here
+			// would forward the peer's still-protected SRTP as garbage, not
+			// a graceful downgrade. Fail over instead.
+			return errSRTPRequiredMismatch
+		default:
+			// optional AND the peer answered plain RTP/AVP: bridge as
+			// plaintext rather than fail the call.
+			sess.SetSRTP(side, nil, nil)
+		}
 	}
 	sess.Relatch(side, remote)
 	startOnce.Do(sess.Start)

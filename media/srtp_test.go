@@ -1,0 +1,120 @@
+package media
+
+import (
+	"bytes"
+	"crypto/rand"
+	"sync"
+	"testing"
+)
+
+// a minimal well-formed RTP packet (V=2, PT=0, seq=1, ts=0, ssrc=0x1234).
+func testRTPPacket() []byte {
+	return []byte{
+		0x80, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x12, 0x34,
+		0xde, 0xad, 0xbe, 0xef, // 4 bytes payload
+	}
+}
+
+// a minimal RTCP receiver report (V=2, PT=201, len=1, ssrc).
+func testRTCPPacket() []byte {
+	return []byte{
+		0x80, 0xc9, 0x00, 0x01,
+		0x00, 0x00, 0x12, 0x34,
+	}
+}
+
+func mustKey(t *testing.T) []byte {
+	t.Helper()
+	k := make([]byte, srtpMasterKeyValueLen)
+	if _, err := rand.Read(k); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	return k
+}
+
+func TestSRTPContextRoundTripRTP(t *testing.T) {
+	key := mustKey(t)
+	enc, err := NewSRTPContext(SuiteAES128CM80, key)
+	if err != nil {
+		t.Fatalf("enc ctx: %v", err)
+	}
+	dec, err := NewSRTPContext(SuiteAES128CM80, key)
+	if err != nil {
+		t.Fatalf("dec ctx: %v", err)
+	}
+	plain := testRTPPacket()
+	cipher, ok := enc.protectRTP(append([]byte(nil), plain...))
+	if !ok {
+		t.Fatal("protectRTP failed")
+	}
+	if bytes.Equal(cipher, plain) {
+		t.Fatal("ciphertext equals plaintext (not encrypted)")
+	}
+	got, ok := dec.unprotectRTP(cipher)
+	if !ok {
+		t.Fatal("unprotectRTP failed")
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("round trip mismatch: got %x want %x", got, plain)
+	}
+}
+
+func TestSRTPContextRoundTripRTCP(t *testing.T) {
+	key := mustKey(t)
+	enc, _ := NewSRTPContext(SuiteAES128CM32, key)
+	dec, _ := NewSRTPContext(SuiteAES128CM32, key)
+	plain := testRTCPPacket()
+	cipher, ok := enc.protectRTCP(append([]byte(nil), plain...))
+	if !ok {
+		t.Fatal("protectRTCP failed")
+	}
+	got, ok := dec.unprotectRTCP(cipher)
+	if !ok {
+		t.Fatal("unprotectRTCP failed")
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("rtcp round trip mismatch: got %x want %x", got, plain)
+	}
+}
+
+func TestSRTPContextTamperedPacketDropped(t *testing.T) {
+	key := mustKey(t)
+	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
+	dec, _ := NewSRTPContext(SuiteAES128CM80, key)
+	cipher, _ := enc.protectRTP(testRTPPacket())
+	cipher[len(cipher)-1] ^= 0xff // corrupt the auth tag
+	if _, ok := dec.unprotectRTP(cipher); ok {
+		t.Fatal("tampered packet must fail auth (ok=false)")
+	}
+}
+
+func TestSRTPContextWrongKeyDropped(t *testing.T) {
+	enc, _ := NewSRTPContext(SuiteAES128CM80, mustKey(t))
+	dec, _ := NewSRTPContext(SuiteAES128CM80, mustKey(t)) // different key
+	cipher, _ := enc.protectRTP(testRTPPacket())
+	if _, ok := dec.unprotectRTP(cipher); ok {
+		t.Fatal("wrong-key decrypt must fail (ok=false)")
+	}
+}
+
+func TestSRTPContextBadKeyLength(t *testing.T) {
+	if _, err := NewSRTPContext(SuiteAES128CM80, make([]byte, 10)); err == nil {
+		t.Fatal("want error for short key value")
+	}
+}
+
+// One context shared by an RTP goroutine and an RTCP goroutine (as the relay
+// does) must be race-free — the wrapper's mutex guards pion's lockless Context.
+func TestSRTPContextConcurrentRTPandRTCP(t *testing.T) {
+	key := mustKey(t)
+	enc, _ := NewSRTPContext(SuiteAES128CM80, key)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); enc.protectRTP(testRTPPacket()) }()
+		go func() { defer wg.Done(); enc.protectRTCP(testRTCPPacket()) }()
+	}
+	wg.Wait() // -race is the assertion
+}

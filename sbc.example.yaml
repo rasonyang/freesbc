@@ -33,6 +33,7 @@ peers:
     # media_latch: strict          # strict (default): first RTP packet must
     #                              # come from the SDP-signaled IP; use loose
     #                              # for peers behind hard NAT
+    srtp: disabled   # media encryption: disabled (default) | optional | required (RTP/SAVP + a=crypto)
   internal-pbx:
     address: 10.0.0.10:5060
     allowed_ips: [10.0.0.0/8]

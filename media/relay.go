@@ -26,10 +26,10 @@ func (s *Session) Start() {
 // session, never the process (spec §7).
 func (s *Session) forward(from, to Side, rtpKind bool) {
 	in, inLatch := s.pairs[from].RTCP, s.rtcp[from]
-	out, outLatch := s.pairs[to].RTCP, s.rtcp[to]
+	outSock, outLatch := s.pairs[to].RTCP, s.rtcp[to]
 	if rtpKind {
 		in, inLatch = s.pairs[from].RTP, s.rtp[from]
-		out, outLatch = s.pairs[to].RTP, s.rtp[to]
+		outSock, outLatch = s.pairs[to].RTP, s.rtp[to]
 	}
 	go func() {
 		defer s.recoverRelayPanic()
@@ -43,8 +43,34 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
 			s.lastRx.Store(time.Now().UnixNano())
+			pkt := buf[:n]
+			// Decrypt what a secure sending leg gave us, then (re-)encrypt for
+			// a secure receiving leg. A failure at either step drops the packet
+			// (bad auth tag / replay) — fail-closed, call stays up.
+			if ic := s.srtpIn[from].Load(); ic != nil {
+				var ok bool
+				if rtpKind {
+					pkt, ok = ic.unprotectRTP(pkt)
+				} else {
+					pkt, ok = ic.unprotectRTCP(pkt)
+				}
+				if !ok {
+					continue
+				}
+			}
+			if oc := s.srtpOut[to].Load(); oc != nil {
+				var ok bool
+				if rtpKind {
+					pkt, ok = oc.protectRTP(pkt)
+				} else {
+					pkt, ok = oc.protectRTCP(pkt)
+				}
+				if !ok {
+					continue
+				}
+			}
 			if dst := outLatch.target(); dst != nil {
-				_, _ = out.WriteToUDP(buf[:n], dst)
+				_, _ = outSock.WriteToUDP(pkt, dst)
 			}
 		}
 	}()

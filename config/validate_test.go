@@ -249,3 +249,25 @@ func TestValidateTransformEdgeCasesNotFalseRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestValidatePeerSRTPInvalid(t *testing.T) {
+	_, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    srtp: bogus
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err == nil || !strings.Contains(err.Error(), "srtp") {
+		t.Fatalf("want srtp validation error, got %v", err)
+	}
+}
