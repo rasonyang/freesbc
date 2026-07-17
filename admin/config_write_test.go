@@ -1,10 +1,17 @@
 package admin
 
 import (
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/freesbc/freesbc/config"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestWriteFileAtomic(t *testing.T) {
@@ -54,5 +61,163 @@ func TestEtagOf(t *testing.T) {
 	}
 	if !strings.HasPrefix(a, `"`) || !strings.HasSuffix(a, `"`) {
 		t.Errorf("etag must be quoted: %s", a)
+	}
+}
+
+// newTestServerWithFile writes yaml to a temp config file, builds a Store
+// from it (via config.Parse, same as production startup), and returns a
+// Server whose cfgPath points at that file, plus the file's path.
+func newTestServerWithFile(t *testing.T, yaml string) (*Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sbc.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse test config: %v", err)
+	}
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	admincfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
+	admincfg.Auth.Username = "admin"
+	admincfg.Auth.PasswordHash = string(hash)
+	store := config.NewStore(cfg)
+	s := New(admincfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), path)
+	return s, path
+}
+
+// authGETraw performs an authenticated GET against s.handler() and returns
+// the raw ResponseRecorder (unlike authGET, it does not assert on status so
+// callers can check non-200 outcomes too).
+func authGETraw(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.SetBasicAuth("admin", "secret")
+	s.handler().ServeHTTP(rr, req)
+	return rr
+}
+
+// authPUT performs an authenticated PUT with the given body and optional
+// If-Match header against s.handler().
+func authPUT(t *testing.T, s *Server, path, body, ifMatch string) *httptest.ResponseRecorder {
+	t.Helper()
+	return authREQ(t, s, http.MethodPut, path, body, ifMatch)
+}
+
+// authREQ performs an authenticated request of the given method, body, and
+// optional If-Match header against s.handler().
+func authREQ(t *testing.T, s *Server, method, path, body, ifMatch string) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.SetBasicAuth("admin", "secret")
+	if ifMatch != "" {
+		req.Header.Set("If-Match", ifMatch)
+	}
+	s.handler().ServeHTTP(rr, req)
+	return rr
+}
+
+const validCfg = `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+
+func TestConfigRawReturnsFileAndEtag(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	_ = path
+	rr := authGETraw(t, s, "/api/config/raw") // helper: basic-auth GET, returns *httptest.ResponseRecorder
+	if rr.Code != 200 {
+		t.Fatalf("raw GET: %d", rr.Code)
+	}
+	if rr.Body.String() != validCfg {
+		t.Fatalf("raw body not verbatim")
+	}
+	if rr.Header().Get("ETag") == "" {
+		t.Fatal("missing ETag")
+	}
+}
+
+func TestConfigWriteValidUpdatesFile(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	// a valid edited config (add a comment + a second route target is overkill;
+	// just append a harmless comment to prove verbatim write)
+	edited := validCfg + "# edited via API\n"
+	rr := authPUT(t, s, "/api/config", edited, "") // helper: basic-auth PUT with body, optional If-Match
+	if rr.Code != 200 {
+		t.Fatalf("PUT valid: %d body=%s", rr.Code, rr.Body.String())
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != edited {
+		t.Fatalf("file not updated verbatim:\n%s", got)
+	}
+}
+
+func TestConfigWriteInvalidRejectedFileUnchanged(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	rr := authPUT(t, s, "/api/config", "not: [valid yaml: for: this: schema", "")
+	if rr.Code != 400 {
+		t.Fatalf("PUT invalid: %d, want 400", rr.Code)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != validCfg {
+		t.Fatal("invalid PUT must not touch the file")
+	}
+}
+
+func TestConfigWriteStaleIfMatch409(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	_ = path
+	rr := authPUT(t, s, "/api/config", validCfg+"# x\n", `"deadbeef"`) // wrong etag
+	if rr.Code != 409 {
+		t.Fatalf("stale If-Match: %d, want 409", rr.Code)
+	}
+}
+
+func TestConfigWritePreservesEnvRef(t *testing.T) {
+	t.Setenv("CFGTEST_PW", "s3cr3t")
+	// Block style, not flow style: an unquoted ${VAR} contains '{' and '}',
+	// which are flow indicators forbidden inside a flow-mapping plain scalar
+	// (YAML spec, ns-plain-safe-in) — `{ password: ${CFGTEST_PW} }` fails to
+	// parse. Block style has no such restriction.
+	base := strings.Replace(validCfg,
+		"    allowed_ips: [127.0.0.1/32]",
+		"    allowed_ips: [127.0.0.1/32]\n    auth:\n      username: u\n      password: ${CFGTEST_PW}", 1)
+	s, path := newTestServerWithFile(t, validCfg)
+	rr := authPUT(t, s, "/api/config", base, "")
+	if rr.Code != 200 {
+		t.Fatalf("PUT with env ref: %d body=%s", rr.Code, rr.Body.String())
+	}
+	got, _ := os.ReadFile(path)
+	if !strings.Contains(string(got), "${CFGTEST_PW}") {
+		t.Fatal("env ref not preserved on disk (expansion leaked to file!)")
+	}
+	if strings.Contains(string(got), "s3cr3t") {
+		t.Fatal("EXPANDED secret written to disk")
+	}
+}
+
+func TestConfigMethodRouting(t *testing.T) {
+	s, _ := newTestServerWithFile(t, validCfg)
+	// GET → redacted view (200); DELETE → 405
+	if rr := authGETraw(t, s, "/api/config"); rr.Code != 200 {
+		t.Fatalf("GET /api/config: %d", rr.Code)
+	}
+	rr := authREQ(t, s, "DELETE", "/api/config", "", "")
+	if rr.Code != 405 {
+		t.Fatalf("DELETE /api/config: %d, want 405", rr.Code)
 	}
 }

@@ -57,8 +57,24 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, peers)
 }
 
-// handleConfig returns the running configuration with secrets redacted. See
-// redact.go: redactConfig never returns a live secret value.
-func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+// handleConfigGet returns the running configuration with secrets redacted.
+// See redact.go: redactConfig never returns a live secret value.
+func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, redactConfig(s.store.Current()))
+}
+
+// handleConfig dispatches /api/config by method: GET returns the redacted
+// running config (handleConfigGet); PUT validates and atomically writes a
+// new config file (handleConfigWrite, in config_write.go); any other method
+// is rejected.
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleConfigGet(w, r)
+	case http.MethodPut:
+		s.handleConfigWrite(w, r)
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
