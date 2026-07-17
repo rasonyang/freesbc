@@ -12,6 +12,10 @@ import (
 // salt.
 const srtpMasterKeyValueLen = 30
 
+// SrtpMasterKeyValueLen is the SDES inline value length (key‖salt) for the
+// supported suites, exported so the signaling package can validate keys.
+func SrtpMasterKeyValueLen() int { return srtpMasterKeyValueLen }
+
 // CryptoSuite identifies an SDES/SRTP crypto suite. Only the two AES_CM_128
 // suites are supported (spec §1.3).
 type CryptoSuite int
