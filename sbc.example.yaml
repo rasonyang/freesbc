@@ -60,6 +60,8 @@ shield:                            # sensible defaults; the whole section is opt
 #   listen: 127.0.0.1:8080          # bind PRIVATE — there is no TLS on this listener (front with a reverse proxy)
 #   auth:
 #     username: admin
-#     # bcrypt hash of the admin password; generate with:
+#     # bcrypt hash of the admin password — REPLACE this placeholder (an invalid
+#     # value here fails config validation on purpose, so you can't accidentally
+#     # ship a known/default password). Generate with:
 #     #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
-#     password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+#     password_hash: "REPLACE-WITH-YOUR-OWN-BCRYPT-HASH"
