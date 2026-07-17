@@ -82,8 +82,8 @@ routes:
 | ├ M4.3 | Session timers (RFC 4028) + 100rel/PRACK | ✅ done |
 | └ M4.4 | DNS SRV + peer health/cooldown | ✅ done |
 | M5 | SRTP (SDES): a=crypto negotiation, SRTP↔RTP interworking, per-peer policy | ✅ done |
-| M6 | Shield: rate limiting, scanner detection, auto-ban | next |
-| M7 | Admin API, embedded WebUI, Prometheus metrics | |
+| M6 | Shield: per-IP rate limiting, scanner fingerprinting, auto-ban (optional nftables) | ✅ done |
+| M7 | Admin API, embedded WebUI, Prometheus metrics | next |
 
 ## Development
 

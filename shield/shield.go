@@ -1,0 +1,185 @@
+package shield
+
+import (
+	"context"
+	"log/slog"
+	"net/netip"
+	"sync"
+	"time"
+
+	"github.com/freesbc/freesbc/config"
+)
+
+// Verdict is Shield.Check's decision.
+type Verdict int
+
+const (
+	Allow Verdict = iota
+	Drop
+)
+
+// Shield is FreeSBC's front-door security plane. It is consulted before peer
+// identification on every inbound request; configured peers are exempt, and
+// every denial is a silent Drop. Params (rate limit, auto_ban) hot-reload from
+// the config store per call; the nftables mode is fixed at construction.
+type Shield struct {
+	store   *config.Store
+	log     *slog.Logger
+	limiter *rateLimiter
+	bans    *banList
+	counter *failCounter
+
+	// cached parse of the rate_limit string (re-parsed only when it changes).
+	rlMu   sync.Mutex
+	rlStr  string
+	rlOpts config.RateLimit
+
+	stop context.CancelFunc
+	done chan struct{}
+}
+
+// New builds a Shield over store, installs the nftables backend from the
+// current config's shield.nftables mode, and starts a background prune loop.
+func New(store *config.Store, log *slog.Logger) *Shield {
+	cfg := store.Current()
+	bl := newBanList()
+	bl.nft = newNFTBackend(cfg.Shield.NFTables, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Shield{
+		store:   store,
+		log:     log,
+		limiter: newRateLimiter(),
+		bans:    bl,
+		counter: newFailCounter(),
+		stop:    cancel,
+		done:    make(chan struct{}),
+	}
+	go s.pruneLoop(ctx)
+	return s
+}
+
+// Check is the per-request gate (spec §3): configured peers are exempt; a
+// banned source, a scanner UA (which also bans), and a rate-limit violation
+// all Drop; otherwise Allow.
+func (s *Shield) Check(src netip.Addr, userAgent string) Verdict {
+	cfg := s.store.Current()
+	if isConfiguredPeer(cfg, src) {
+		return Allow
+	}
+	if s.bans.banned(src) {
+		return Drop
+	}
+	if isScanner(userAgent) {
+		s.bans.ban(src, cfg.Shield.AutoBan.Duration.Std())
+		s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
+		return Drop
+	}
+	rl := s.rateLimit(cfg)
+	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
+		s.log.Debug("shield rate-limited", "source", src)
+		return Drop
+	}
+	return Allow
+}
+
+// RecordUnidentified counts an unidentified-source request; the Nth within the
+// window bans the source (spec §3).
+func (s *Shield) RecordUnidentified(src netip.Addr) {
+	cfg := s.store.Current()
+	if isConfiguredPeer(cfg, src) {
+		return // defensive: exempt peers never counted
+	}
+	n := s.counter.record(src, cfg.Shield.AutoBan.Window.Std())
+	if n >= cfg.Shield.AutoBan.Failures {
+		s.bans.ban(src, cfg.Shield.AutoBan.Duration.Std())
+		s.log.Warn("shield auto-banned source", "source", src, "failures", n, "duration", cfg.Shield.AutoBan.Duration.Std())
+	}
+}
+
+// Close stops the prune loop and tears down the nftables ruleset.
+func (s *Shield) Close() error {
+	s.stop()
+	<-s.done
+	if s.bans.nft != nil {
+		return s.bans.nft.close()
+	}
+	return nil
+}
+
+func (s *Shield) rateLimit(cfg *config.Config) config.RateLimit {
+	s.rlMu.Lock()
+	defer s.rlMu.Unlock()
+	if cfg.Shield.RateLimit != s.rlStr {
+		if rl, err := config.ParseRateLimit(cfg.Shield.RateLimit); err == nil {
+			s.rlOpts = rl
+			s.rlStr = cfg.Shield.RateLimit
+		}
+	}
+	return s.rlOpts
+}
+
+func (s *Shield) pruneLoop(ctx context.Context) {
+	defer close(s.done)
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.limiter.prune()
+			s.bans.prune()
+			s.counter.prune(s.store.Current().Shield.AutoBan.Window.Std())
+		}
+	}
+}
+
+// isConfiguredPeer reports whether src matches any peer's allowed_ips.
+func isConfiguredPeer(cfg *config.Config, src netip.Addr) bool {
+	for _, p := range cfg.Peers {
+		if p.AllowsIP(src) {
+			return true
+		}
+	}
+	return false
+}
+
+// failCounter is a per-IP sliding-window count of unidentified-source hits.
+type failCounter struct {
+	mu   sync.Mutex
+	hits map[netip.Addr][]time.Time
+	now  func() time.Time
+}
+
+func newFailCounter() *failCounter {
+	return &failCounter{hits: make(map[netip.Addr][]time.Time), now: time.Now}
+}
+
+// record adds a hit for src and returns the number of hits within window.
+func (c *failCounter) record(src netip.Addr, window time.Duration) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	cutoff := now.Add(-window)
+	kept := c.hits[src][:0]
+	for _, t := range c.hits[src] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	c.hits[src] = kept
+	return len(kept)
+}
+
+// prune drops IPs whose most recent hit has aged out of the window.
+func (c *failCounter) prune(window time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cutoff := c.now().Add(-window)
+	for ip, hits := range c.hits {
+		if len(hits) == 0 || !hits[len(hits)-1].After(cutoff) {
+			delete(c.hits, ip)
+		}
+	}
+}
