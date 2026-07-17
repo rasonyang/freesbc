@@ -56,6 +56,10 @@ shield:                            # sensible defaults; the whole section is opt
   auto_ban: { failures: 5, window: 60s, duration: 1h }
   nftables: auto
 
-admin:
-  listen: 127.0.0.1:8080
-  auth: { username: admin, password_hash: "$2a$10$replace-me" }
+# admin:                            # optional operator API + Prometheus /metrics (bcrypt HTTP Basic Auth)
+#   listen: 127.0.0.1:8080          # bind PRIVATE — there is no TLS on this listener (front with a reverse proxy)
+#   auth:
+#     username: admin
+#     # bcrypt hash of the admin password; generate with:
+#     #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
+#     password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
