@@ -48,6 +48,13 @@ func (b *banList) banned(ip netip.Addr) bool {
 	return true
 }
 
+// size returns the number of currently-tracked (possibly expired) ban entries.
+func (b *banList) size() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.until)
+}
+
 // prune drops expired entries (the kernel handles nftables element timeouts
 // on its own).
 func (b *banList) prune() {

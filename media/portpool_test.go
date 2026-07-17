@@ -71,6 +71,23 @@ func TestPoolSkipsForeignBoundPort(t *testing.T) {
 	}
 }
 
+func TestPoolStats(t *testing.T) {
+	p := NewPool(testStore(41000, 41007)) // 8 ports → 4 pairs
+	inUse, total := p.Stats()
+	if inUse != 0 || total != 4 {
+		t.Fatalf("empty pool: inUse=%d total=%d, want 0/4", inUse, total)
+	}
+	pair, err := p.allocatePair()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	defer pair.Close()
+	inUse, total = p.Stats()
+	if inUse != 1 || total != 4 {
+		t.Fatalf("after 1 alloc: inUse=%d total=%d, want 1/4", inUse, total)
+	}
+}
+
 func TestPoolConcurrentAllocate(t *testing.T) {
 	p := NewPool(testStore(40200, 40263)) // 32 pairs
 	var wg sync.WaitGroup
