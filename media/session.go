@@ -118,8 +118,16 @@ type Session struct {
 	rtcp    [2]*latch
 	timeout time.Duration
 
-	srtpIn  [2]*SRTPContext // decrypt packets received FROM this side (nil = plaintext)
-	srtpOut [2]*SRTPContext // encrypt packets sent TO this side (nil = plaintext)
+	// srtpIn/srtpOut are atomic.Pointer, not plain fields: the relay's forward
+	// loops (media/relay.go) read them per-packet from already-running
+	// goroutines, and SetSRTP can legitimately be called again after Start —
+	// e.g. a failover target's answer replacing an earlier target's early-media
+	// contexts (see processAnswerSDP in sig/b2bua.go). Plain fields would be a
+	// data race under -race and, worse, could tear under concurrent
+	// read/write. atomic.Pointer makes every Store/Load a single atomic op, so
+	// SetSRTP is safe to call at any point in the session's lifecycle.
+	srtpIn  [2]atomic.Pointer[SRTPContext] // decrypt packets received FROM this side (nil = plaintext)
+	srtpOut [2]atomic.Pointer[SRTPContext] // encrypt packets sent TO this side (nil = plaintext)
 
 	lastRx    atomic.Int64 // unix nanos of the last accepted packet
 	done      chan struct{}
@@ -197,11 +205,14 @@ func ParseLatchMode(s string) LatchMode {
 
 // SetSRTP installs the SRTP contexts for one side: inbound decrypts what we
 // receive from that side, outbound encrypts what we send to it. A nil context
-// means that direction is plaintext. Call before Start (the forward loops read
-// these once running; setting after Start races the relay goroutines).
+// means that direction is plaintext. Safe to call at any point in the
+// session's lifecycle, including after Start and more than once for the same
+// side (srtpIn/srtpOut are atomic.Pointer) — e.g. a B-leg failover target's
+// answer must be able to replace (or clear) the contexts an earlier target's
+// early media already installed, without racing the relay's forward loops.
 func (s *Session) SetSRTP(side Side, inbound, outbound *SRTPContext) {
-	s.srtpIn[side] = inbound
-	s.srtpOut[side] = outbound
+	s.srtpIn[side].Store(inbound)
+	s.srtpOut[side].Store(outbound)
 }
 
 // Done is closed when the session ends (Close or silence timeout).

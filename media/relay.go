@@ -47,7 +47,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// Decrypt what a secure sending leg gave us, then (re-)encrypt for
 			// a secure receiving leg. A failure at either step drops the packet
 			// (bad auth tag / replay) — fail-closed, call stays up.
-			if ic := s.srtpIn[from]; ic != nil {
+			if ic := s.srtpIn[from].Load(); ic != nil {
 				var ok bool
 				if rtpKind {
 					pkt, ok = ic.unprotectRTP(pkt)
@@ -58,7 +58,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 					continue
 				}
 			}
-			if oc := s.srtpOut[to]; oc != nil {
+			if oc := s.srtpOut[to].Load(); oc != nil {
 				var ok bool
 				if rtpKind {
 					pkt, ok = oc.protectRTP(pkt)

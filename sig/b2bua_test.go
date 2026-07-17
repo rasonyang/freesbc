@@ -4781,3 +4781,356 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 		t.Fatal("carrier dialog never ended after BYE")
 	}
 }
+
+// srtpInterworkReversedCfg (TestBridgeSRTPInterworksPlaintextAToSecureB) is
+// srtpInterworkCfg REVERSED: local-uac's srtp policy is unset (normalizes to
+// "disabled" — a plaintext caller); the carrier peer is srtp: required. This
+// is Finding C1's crux config: the SECURE leg is now B, not A, so the A-leg
+// answer — built from the carrier's RTP/SAVP+a=crypto response — must never
+// leak the carrier's key or SAVP proto through to the plaintext caller.
+const srtpInterworkReversedCfg = `
+listen:
+  sip: [udp://127.0.0.1:45540]
+  media:
+    port_range: 46540-46543
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45542
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+    srtp: required
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeSRTPInterworksPlaintextAToSecureB is Finding C1's regression
+// guard: before the fix, the A-leg answer for a plaintext caller was built
+// with plain rewriteSDP, which preserves proto and ALL attributes verbatim —
+// so when the B-leg (carrier) answered SRTP, the carrier's own a=crypto
+// (master key) was relayed straight through to the plaintext caller,
+// advertising RTP/SAVP to a UA that never asked for it and leaking the
+// carrier's key. This test is TestBridgeSRTPInterworksSecureAToPlaintextB
+// reversed: the caller offers plain RTP/AVP (srtp disabled), the carrier is
+// srtp: required and answers RTP/SAVP+a=crypto with its own freshly
+// generated key.
+//
+// Asserts: (a) the A-leg 200 answer the caller receives has NO a=crypto and
+// proto RTP/AVP, never SAVP — proving the carrier's key is not leaked; (b)
+// end to end, a packet the CARRIER SRTP-encrypts (with the key it
+// advertised) is relayed to the plaintext caller as genuine, already-
+// decrypted plaintext RTP — proving srtpIn[B] was actually built from the
+// carrier's key and srtpOut[A] is nil, not merely that the SDP looks right.
+func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45543})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	bKey, err := newCryptoKeyValue()
+	if err != nil {
+		t.Fatalf("gen carrier key: %v", err)
+	}
+	carrier := startStubCarrier(t, "127.0.0.1:45542", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bKey))
+	startServer(t, 45540, srtpInterworkReversedCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	offer := testSDPBody(uacRTPPort)
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45540}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, offer)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", sess.InviteResponse.StatusCode)
+	}
+
+	answerBody := sess.InviteResponse.Body()
+	// The crux assertion: the caller's answer must be plain RTP/AVP with NO
+	// a=crypto — never the carrier's raw RTP/SAVP+key relayed straight
+	// through (the C1 bug: plain rewriteSDP preserves proto/attributes
+	// verbatim).
+	if secure, lines := offeredCrypto(answerBody); secure || len(lines) != 0 {
+		t.Fatalf("a-leg answer is secure (RTP/SAVP or has a=crypto) — the carrier's own SRTP key leaked to the plaintext caller:\n%s", answerBody)
+	}
+	sideAPort := sdpAudioPort(t, answerBody)
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	var carrierOffer *sip.Request
+	select {
+	case carrierOffer = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+	// carrier (srtp: required) must have been offered RTP/SAVP+a=crypto.
+	if bSecure, bLines := offeredCrypto(carrierOffer.Body()); !bSecure || len(bLines) == 0 {
+		t.Fatalf("b-leg offer is not RTP/SAVP+a=crypto (carrier peer is srtp: required):\n%s", carrierOffer.Body())
+	}
+	sideBPort := sdpAudioPort(t, carrierOffer.Body())
+
+	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
+	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+
+	// Arm side A's (strict) latch before relying on the B->A direction: the
+	// relay only forwards to a side once that side's own latch has recorded a
+	// remote target from an actually-received packet (see media/relay.go
+	// forward's outLatch.target() check). local-uac's media_latch defaults to
+	// strict, but the source IP (127.0.0.1) matches the offer's c= address
+	// (SetExpectedRemote), so a plain packet from uacRTP itself latches it —
+	// same pattern as the other srtp interworking tests' "arm-b" step,
+	// mirrored onto side A here since B is the side that's loose/pre-armed by
+	// convention in those tests.
+	if _, err := uacRTP.WriteToUDP([]byte("arm-a"), sideAAddr); err != nil {
+		t.Fatalf("arm side a: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// The carrier encrypts with bKey (the key it advertised in its SAVP
+	// answer) — the bridge's B-inbound context was built from that same key
+	// in processAnswerSDP. The caller's socket must receive the DECRYPTED
+	// plaintext, unmodified: an exact plain RTP packet, never the
+	// still-encrypted bytes and never a size mismatch.
+	bCtx := newTestSRTPContext(t, media.SuiteAES128CM80, bKey)
+	const payload = "ping-b-to-a"
+	got := sendUntilSRTPArrives(t, bCtx, echoRTP, sideBAddr, uacRTP, payload)
+	wantLen := 12 + len(payload)
+	if len(got) != wantLen {
+		t.Fatalf("caller received %d bytes, want %d (a plain RTP packet — a longer packet means the bridge relayed still-SRTP-protected bytes instead of decrypting)", len(got), wantLen)
+	}
+	if got[0] != 0x80 {
+		t.Fatalf("caller received malformed RTP header byte %#x, want 0x80", got[0])
+	}
+	if string(got[12:]) != payload {
+		t.Fatalf("caller payload = %q, want %q", got[12:], payload)
+	}
+
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+}
+
+// srtpOptionalBPlaintextCfg (TestBridgeSRTPOptionalBAnswersPlaintextBridges):
+// local-uac is srtp: required (A-leg must be secure); the carrier peer is
+// srtp: optional — the bridge must still OFFER it SRTP (mirroring the
+// secure A-leg) but must bridge, not fail over, if the carrier answers
+// plain RTP/AVP.
+const srtpOptionalBPlaintextCfg = `
+listen:
+  sip: [udp://127.0.0.1:45550]
+  media:
+    port_range: 46550-46553
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+    srtp: required
+  carrier:
+    address: 127.0.0.1:45552
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+    srtp: optional
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeSRTPOptionalBAnswersPlaintextBridges is Finding I2's regression
+// guard: before the fix, ANY secure B offer whose answer lacked usable
+// crypto returned errSRTPRequiredMismatch unconditionally, failing the leg
+// over — even for a B peer configured srtp: optional, whose whole point is
+// "SRTP if the peer accepts, else plaintext." With only one target
+// configured, that bug would exhaust failover and give the caller a
+// non-2xx; this test proves the call BRIDGES instead: the A-leg stays
+// secure (independent of the B-leg's answer) and the B-leg ends up
+// plaintext.
+func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45553})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45552", testSDPBody(echoRTPPort))
+	startServer(t, 45550, srtpOptionalBPlaintextCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	aKey, err := newCryptoKeyValue()
+	if err != nil {
+		t.Fatalf("gen a-leg key: %v", err)
+	}
+	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45550}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, offer)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v (want 200 — an optional b-leg answering plaintext must bridge, not fail over/exhaust to a non-2xx)", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", sess.InviteResponse.StatusCode)
+	}
+
+	answerBody := sess.InviteResponse.Body()
+	if secure, lines := offeredCrypto(answerBody); !secure || len(lines) == 0 {
+		t.Fatalf("a-leg answer is not secure — the a-leg must stay srtp (required by local-uac's policy) independent of the b-leg's plaintext answer:\n%s", answerBody)
+	}
+	sideAPort := sdpAudioPort(t, answerBody)
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	var carrierOffer *sip.Request
+	select {
+	case carrierOffer = <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+	// carrier (srtp: optional) must still have been OFFERED srtp, mirroring
+	// the secure A-leg, even though it goes on to answer plaintext.
+	if bSecure, bLines := offeredCrypto(carrierOffer.Body()); !bSecure || len(bLines) == 0 {
+		t.Fatalf("b-leg offer is not RTP/SAVP+a=crypto (carrier peer is srtp: optional, a-leg is secure — the offer should mirror it):\n%s", carrierOffer.Body())
+	}
+	sideBPort := sdpAudioPort(t, carrierOffer.Body())
+
+	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
+	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+
+	// Arm side B's (loose) latch before relying on the A->B direction — same
+	// pattern as the other srtp interworking tests.
+	if _, err := echoRTP.WriteToUDP([]byte("arm-b"), sideBAddr); err != nil {
+		t.Fatalf("arm side b: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// A->B: the caller encrypts with aKey; the B-leg is plaintext, so the
+	// carrier's socket must receive genuine, already-decrypted plaintext RTP.
+	aCtx := newTestSRTPContext(t, media.SuiteAES128CM80, aKey)
+	const abPayload = "ping-a-to-b"
+	gotAtB := sendUntilSRTPArrives(t, aCtx, uacRTP, sideAAddr, echoRTP, abPayload)
+	wantLen := 12 + len(abPayload)
+	if len(gotAtB) != wantLen {
+		t.Fatalf("carrier received %d bytes, want %d (plain RTP — a longer packet means the bridge left the a-leg packet SRTP-protected)", len(gotAtB), wantLen)
+	}
+	if string(gotAtB[12:]) != abPayload {
+		t.Fatalf("carrier payload = %q, want %q", gotAtB[12:], abPayload)
+	}
+
+	// B->A: the carrier sends plaintext; the A-leg is still secure, so it
+	// must arrive at the caller RE-ENCRYPTED with the SBC's own A-outbound
+	// key (the same key advertised in the a-leg's answer) — proving the
+	// stale/absent B-side SRTP context was cleared (SetSRTP(side, nil, nil))
+	// without disturbing the A-side context installed at Allocate time.
+	aAnswerSecure, aAnswerLines := offeredCrypto(answerBody)
+	if !aAnswerSecure || len(aAnswerLines) == 0 {
+		t.Fatalf("a-leg answer unexpectedly lost its crypto line:\n%s", answerBody)
+	}
+	aAnswerSel, ok := selectCrypto(aAnswerLines)
+	if !ok {
+		t.Fatalf("a-leg answer crypto line unusable:\n%s", answerBody)
+	}
+	aDecCtx := newTestSRTPContext(t, aAnswerSel.suite, aAnswerSel.keyValue)
+	const baPayload = "pong-b-to-a"
+	buf := make([]byte, 1500)
+	deadline := time.Now().Add(5 * time.Second)
+	seq := uint16(2000)
+	var decrypted []byte
+	for time.Now().Before(deadline) {
+		// A real RTP packet, not a bare payload string: protectRTP (what the
+		// relay applies toward the still-secure A-leg) operates on the RTP
+		// header, so the carrier's plaintext send must look like genuine RTP.
+		plain := rawRTPPacket(seq, 0xFEEDFACE, baPayload)
+		seq++
+		if _, err := echoRTP.WriteToUDP(plain, sideBAddr); err != nil {
+			t.Fatalf("write plain packet: %v", err)
+		}
+		_ = uacRTP.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		n, err := uacRTP.Read(buf)
+		if err == nil {
+			if d, derr := aDecCtx.DecryptRTP(nil, buf[:n], nil); derr == nil && len(d) >= 12 && string(d[12:]) == baPayload {
+				decrypted = d
+				break
+			}
+		}
+	}
+	if decrypted == nil {
+		t.Fatal("plaintext b-to-a packet never arrived at the caller re-encrypted with the sbc's a-outbound key")
+	}
+
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+}
