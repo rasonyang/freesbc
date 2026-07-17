@@ -83,6 +83,24 @@ func (p *Pool) allocatePair() (*PortPair, error) {
 	return nil, ErrPortsExhausted
 }
 
+// Stats returns the number of RTP port pairs currently allocated and the
+// total number of pairs the configured range can hold.
+func (p *Pool) Stats() (inUse, total int) {
+	media := p.store.Current().Listen.Media
+	lo, hi := int(media.PortRange.Min), int(media.PortRange.Max)
+	if lo%2 != 0 {
+		lo++
+	}
+	total = (hi - lo + 1) / 2
+	if total < 0 {
+		total = 0
+	}
+	p.mu.Lock()
+	inUse = len(p.inUse)
+	p.mu.Unlock()
+	return inUse, total
+}
+
 // release returns an RTP port to the pool. The caller closes the sockets.
 func (p *Pool) release(rtpPort int) {
 	p.mu.Lock()

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/freesbc/freesbc/config"
@@ -28,6 +29,13 @@ type Shield struct {
 	limiter *rateLimiter
 	bans    *banList
 	counter *failCounter
+
+	// Cumulative drop counters by reason, for the admin API's metrics
+	// snapshot (Stats). Incremented in Check at each of its three drop
+	// points; read via Stats' atomic Load.
+	dropsBanned  atomic.Int64
+	dropsScanner atomic.Int64
+	dropsRate    atomic.Int64
 
 	// cached parse of the rate_limit string (re-parsed only when it changes).
 	rlMu   sync.Mutex
@@ -67,19 +75,40 @@ func (s *Shield) Check(src netip.Addr, userAgent string) Verdict {
 		return Allow
 	}
 	if s.bans.banned(src) {
+		s.dropsBanned.Add(1)
 		return Drop
 	}
 	if isScanner(userAgent) {
 		s.bans.ban(src, cfg.Shield.AutoBan.Duration.Std())
 		s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
+		s.dropsScanner.Add(1)
 		return Drop
 	}
 	rl := s.rateLimit(cfg)
 	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
 		s.log.Debug("shield rate-limited", "source", src)
+		s.dropsRate.Add(1)
 		return Drop
 	}
 	return Allow
+}
+
+// Stats is a snapshot of shield activity for metrics.
+type Stats struct {
+	BannedCurrent int
+	DropsByReason map[string]int64
+}
+
+// Stats returns a snapshot of current bans and cumulative drops by reason.
+func (s *Shield) Stats() Stats {
+	return Stats{
+		BannedCurrent: s.bans.size(),
+		DropsByReason: map[string]int64{
+			"banned":  s.dropsBanned.Load(),
+			"scanner": s.dropsScanner.Load(),
+			"rate":    s.dropsRate.Load(),
+		},
+	}
 }
 
 // RecordUnidentified counts an unidentified-source request; the Nth within the

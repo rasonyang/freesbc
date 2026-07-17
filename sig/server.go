@@ -93,6 +93,28 @@ func (s *Server) callSDP(callID string) (callSDP, bool) {
 // registry, for metrics.
 func (s *Server) ActiveCalls() int { return s.registry.Count() }
 
+// IsRegistered reports whether the peer is currently registered (nil-safe:
+// false before Run builds the registrar).
+func (s *Server) IsRegistered(name string) bool {
+	if s.registrar == nil {
+		return false
+	}
+	return s.registrar.IsRegistered(name)
+}
+
+// ShieldStats returns the current shield activity snapshot (nil-safe: zero
+// value before Run builds the shield).
+func (s *Server) ShieldStats() shield.Stats {
+	sh := s.shield.Load()
+	if sh == nil {
+		return shield.Stats{DropsByReason: map[string]int64{}}
+	}
+	return sh.Stats()
+}
+
+// Calls returns a snapshot of the active-call registry (for the admin API).
+func (s *Server) Calls() []callstate.Call { return s.registry.Snapshot() }
+
 // Run builds the sipgo server, binds every listen.sip entry, and blocks
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
 // a bind failure), or nil on clean shutdown.

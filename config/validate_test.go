@@ -250,6 +250,47 @@ func TestValidateTransformEdgeCasesNotFalseRejected(t *testing.T) {
 	}
 }
 
+func TestValidateAdminAuth(t *testing.T) {
+	// a real bcrypt hash of "secret"
+	good := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	base := func(admin string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+` + admin + `
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	// valid admin block
+	if _, err := Parse([]byte(base("admin:\n  listen: 127.0.0.1:8080\n  auth: { username: admin, password_hash: \"" + good + "\" }"))); err != nil {
+		t.Fatalf("valid admin block should parse: %v", err)
+	}
+	// empty username
+	_, err := Parse([]byte(base("admin:\n  listen: 127.0.0.1:8080\n  auth: { username: \"\", password_hash: \"" + good + "\" }")))
+	if err == nil || !strings.Contains(err.Error(), "username") {
+		t.Fatalf("empty username should fail, got %v", err)
+	}
+	// non-bcrypt password_hash
+	_, err = Parse([]byte(base("admin:\n  listen: 127.0.0.1:8080\n  auth: { username: admin, password_hash: notbcrypt }")))
+	if err == nil || !strings.Contains(err.Error(), "password_hash") {
+		t.Fatalf("non-bcrypt hash should fail, got %v", err)
+	}
+	// no admin block → fine
+	if _, err := Parse([]byte(base(""))); err != nil {
+		t.Fatalf("no admin block should parse: %v", err)
+	}
+}
+
 func TestValidatePeerSRTPInvalid(t *testing.T) {
 	_, err := Parse([]byte(`
 listen:

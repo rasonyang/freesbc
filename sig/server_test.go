@@ -140,6 +140,30 @@ routes:
     to: [local-uac]
 `
 
+// mustMinimalCfg parses a tiny valid config for tests that only need a
+// *Server to exist (e.g. exercising the nil-safe accessors before Run has
+// built the registrar/shield) — reuses knownPeerCfg's shape.
+func mustMinimalCfg(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.Parse([]byte(knownPeerCfg))
+	if err != nil {
+		t.Fatalf("parse minimal config: %v", err)
+	}
+	return cfg
+}
+
+// TestServerAccessorsNilSafe proves the admin-API accessors don't panic on a
+// *Server built directly by NewServer (registrar/shield are only assigned in
+// Run, which this test never calls).
+func TestServerAccessorsNilSafe(t *testing.T) {
+	s := NewServer(config.NewStore(mustMinimalCfg(t)), nil, discardLogger())
+	// registrar/shield are nil before Run — accessors must not panic.
+	if s.IsRegistered("nobody") {
+		t.Error("nil registrar → not registered")
+	}
+	_ = s.ShieldStats() // must not panic; zero-value stats
+}
+
 func TestServerAnswersOptionsFromKnownPeer(t *testing.T) {
 	startServer(t, 45060, knownPeerCfg)
 	got := roundTrip(t, 45060, "OPTIONS", "opt-known-1", 3*time.Second, "SIP/2.0 200")

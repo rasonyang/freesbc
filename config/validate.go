@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // validate checks cross-references and value constraints, collecting every
@@ -165,6 +167,12 @@ func (c *Config) validate() error {
 	if c.Admin != nil {
 		if _, err := netip.ParseAddrPort(c.Admin.Listen); err != nil {
 			fail("admin.listen: %q is not host:port", c.Admin.Listen)
+		}
+		if c.Admin.Auth.Username == "" {
+			fail("admin.auth.username: required when admin is configured")
+		}
+		if _, err := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash)); err != nil {
+			fail("admin.auth.password_hash: must be a bcrypt hash: %v", err)
 		}
 	}
 

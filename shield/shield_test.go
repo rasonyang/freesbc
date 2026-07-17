@@ -85,6 +85,23 @@ func TestCheckRateLimitDropsButDoesNotBan(t *testing.T) {
 	}
 }
 
+func TestShieldStatsCountsDrops(t *testing.T) {
+	s := testShield(t, shieldCfg) // rate 2/s, nftables off; from earlier tasks
+	bad := netip.MustParseAddr("198.51.100.20")
+	s.Check(bad, "sipvicious") // scanner drop (+ ban)
+	s.Check(bad, "")           // now banned → banned drop
+	st := s.Stats()
+	if st.DropsByReason["scanner"] < 1 {
+		t.Errorf("scanner drops = %d, want >=1", st.DropsByReason["scanner"])
+	}
+	if st.DropsByReason["banned"] < 1 {
+		t.Errorf("banned drops = %d, want >=1", st.DropsByReason["banned"])
+	}
+	if st.BannedCurrent < 1 {
+		t.Errorf("banned current = %d, want >=1", st.BannedCurrent)
+	}
+}
+
 func TestRecordUnidentifiedBansAtThreshold(t *testing.T) {
 	s := testShield(t, shieldCfg)
 	bad := netip.MustParseAddr("198.51.100.7")
