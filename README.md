@@ -85,8 +85,8 @@ routes:
 | M6 | Shield: per-IP rate limiting, scanner fingerprinting, auto-ban (optional nftables) | ✅ done |
 | M7 | Operability: admin API, metrics, embedded WebUI | in progress |
 | ├ M7.1 | Admin API + Prometheus metrics (read-only, bcrypt Basic Auth) | ✅ done |
-| ├ M7.2 | Config write-back (`PUT /api/config`) | next |
-| └ M7.3 | Embedded WebUI | |
+| ├ M7.2 | Config write-back (`PUT /api/config`, atomic, `${ENV}`-preserving) | ✅ done |
+| └ M7.3 | Embedded WebUI | next |
 
 ## Development
 
