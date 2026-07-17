@@ -48,13 +48,14 @@ type Server struct {
 	deps    Deps
 	log     *slog.Logger
 	started time.Time
+	cfgPath string
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
 }
 
-func New(cfg *config.AdminConfig, store *config.Store, deps Deps, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, store: store, deps: deps, log: log, started: time.Now()}
+func New(cfg *config.AdminConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
+	return &Server{cfg: cfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
 }
 
 // handler composes the mux with the recover and (per-route) auth middleware.

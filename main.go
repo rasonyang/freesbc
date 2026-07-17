@@ -123,7 +123,7 @@ func run(cfgPath string) error {
 			},
 			Version: version,
 		}
-		adminSrv := admin.New(adminCfg, store, deps, log)
+		adminSrv := admin.New(adminCfg, store, deps, log, cfgPath)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -54,7 +54,7 @@ func newTestServer(t *testing.T, deps Deps) *Server {
 	cfg.Auth.Username = "admin"
 	cfg.Auth.PasswordHash = string(hash)
 	store := config.NewStore(mustCfg(t))
-	return New(cfg, store, deps, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(cfg, store, deps, slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 }
 
 func testServer(t *testing.T) *Server { return newTestServer(t, emptyDeps()) }
@@ -78,7 +78,7 @@ func testServerWithSecretConfig(t *testing.T, peerPassword string) *Server {
 	cfg.Auth.Username = "admin"
 	cfg.Auth.PasswordHash = string(hash)
 	store := config.NewStore(mustCfgWithSecret(t, peerPassword, "$2a$10$...adminhash..."))
-	return New(cfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(cfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 }
 
 // authGET performs an authenticated GET against s.handler(), fails the test
