@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -18,6 +19,7 @@ import (
 	"github.com/freesbc/freesbc/callstate"
 	"github.com/freesbc/freesbc/config"
 	"github.com/freesbc/freesbc/media"
+	"github.com/freesbc/freesbc/shield"
 )
 
 // Server is the SIP signaling front door. It binds the configured
@@ -41,6 +43,19 @@ type Server struct {
 	dialogCli *sipgo.DialogClientCache
 	br        *bridge
 	registrar *Registrar
+
+	// shield is the front-door security plane (M6): consulted before
+	// identify() on every inbound request (see withShield). Built in Run,
+	// so it is nil on a *Server constructed directly by unit tests (e.g.
+	// NewServer without Run) — withShield and dropUnidentified nil-guard
+	// against that. Stored via atomic.Pointer (rather than a plain field)
+	// because integration tests deliberately reach into it from the test
+	// goroutine (srv.shield.Load().Check(...)) after Run has started on its
+	// own goroutine — a plain field there would be an unsynchronized
+	// cross-goroutine access (no happens-before edge exists between Run's
+	// assignment and a test goroutine merely polling the listener socket for
+	// readiness), which the race detector correctly flags.
+	shield atomic.Pointer[shield.Shield]
 
 	// resolver turns a peer into ordered dialable endpoints (DNS SRV with
 	// A/AAAA fallback, priority/weight); health tracks per-endpoint cooldowns
@@ -123,11 +138,24 @@ func (s *Server) Run(ctx context.Context) error {
 	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
 	s.br = &bridge{s: s}
 
-	srv.OnRequest(sip.OPTIONS, s.onOptions)
-	srv.OnInvite(s.br.onInvite)
-	srv.OnAck(s.onAck)
-	srv.OnBye(s.onBye)
-	srv.OnNoRoute(s.onNoRoute)
+	// s.shield is built here (not in NewServer) so unit tests that
+	// construct a *Server directly (without Run) exercise handlers with a
+	// nil shield — see the nil guards in withShield/dropUnidentified.
+	// Close is deferred immediately: Run's body only returns after the
+	// synchronous shutdown tail below (registrar drained, then listener
+	// sockets closed, then their goroutines joined via wg.Wait()), so this
+	// defer necessarily fires after every listener has stopped accepting
+	// requests — never while an in-flight Check/RecordUnidentified could
+	// still race the nftables teardown.
+	sh := shield.New(s.store, s.log)
+	defer sh.Close()
+	s.shield.Store(sh)
+
+	srv.OnRequest(sip.OPTIONS, s.withShield(s.onOptions))
+	srv.OnInvite(s.withShield(s.br.onInvite))
+	srv.OnAck(s.withShield(s.onAck))
+	srv.OnBye(s.withShield(s.onBye))
+	srv.OnNoRoute(s.withShield(s.onNoRoute))
 
 	// Shutdown sequencing (deliberately NOT one shared ctx for the registrar
 	// and the listeners): in sipgo, a UDP listener's connection is pooled
@@ -268,15 +296,52 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 // source address. sipgo sets req.Source() from the real remote socket on
 // receive, so this is the trust boundary — never the Via/From host.
 func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
-	host, _, err := net.SplitHostPort(req.Source())
-	if err != nil {
-		return "", nil, false
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
+	addr, ok := sourceAddr(req)
+	if !ok {
 		return "", nil, false
 	}
 	return IdentifyPeer(s.store.Current(), addr)
+}
+
+// withShield wraps a request handler so every inbound request passes the
+// security plane before identification. A Drop verdict silently discards the
+// request (no response); sipgo terminates the unfinalized transaction when the
+// handler returns (see dropUnidentified). s.shield is nil on a *Server built
+// directly by unit tests (without Run), so this is nil-guarded to a no-op in
+// that case.
+func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func(*sip.Request, sip.ServerTransaction) {
+	return func(req *sip.Request, tx sip.ServerTransaction) {
+		sh := s.shield.Load()
+		src, ok := sourceAddr(req)
+		if sh != nil && ok && sh.Check(src, userAgent(req)) == shield.Drop {
+			return // silent
+		}
+		next(req, tx)
+	}
+}
+
+// sourceAddr parses the transport source of req into a netip.Addr. sipgo
+// sets req.Source() from the real remote socket on receive, so this is the
+// trust boundary — never the Via/From host.
+func sourceAddr(req *sip.Request) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(req.Source())
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr, true
+}
+
+// userAgent returns req's User-Agent header value, or "" if absent.
+func userAgent(req *sip.Request) string {
+	hs := req.GetHeaders("User-Agent")
+	if len(hs) == 0 {
+		return ""
+	}
+	return hs[0].Value()
 }
 
 // dropUnidentified is the shield seam (M6): a request from a source that
@@ -288,6 +353,14 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 func (s *Server) dropUnidentified(req *sip.Request) {
 	s.log.Info("dropping request from unidentified source",
 		"method", req.Method.String(), "source", req.Source())
+	// Feed the shield's auto-ban failure counter so repeated unidentified
+	// traffic from the same source eventually bans it (spec §3). Nil-guarded:
+	// unit tests build a *Server directly (without Run), where s.shield is nil.
+	if sh := s.shield.Load(); sh != nil {
+		if src, ok := sourceAddr(req); ok {
+			sh.RecordUnidentified(src)
+		}
+	}
 }
 
 // ourIP resolves the IP the SBC advertises as its own to the outside world:
