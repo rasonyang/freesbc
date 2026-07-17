@@ -306,19 +306,25 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		ToPeer:        target.Name,
 		StartUnixNano: startNano(),
 	}
-	b.s.registry.Add(call)
-	defer b.s.registry.Remove(call.ID)
 
-	// killCtx is this call's admin kick-call hook (Task 1): registered right
-	// after the call joins the registry (KillCall looks calls up by the same
-	// A-leg Call-ID /api/calls lists), and torn down (unregistered, then
-	// cancelled) via defer no matter how this call ends — so a kick that
-	// races a natural end always finds either a live entry (fires once) or
-	// none at all (KillCall returns false), never a stale one.
+	// killCtx is this call's admin kick-call hook (Task 1): registered
+	// BEFORE the call joins the registry (KillCall looks calls up by the
+	// same A-leg Call-ID /api/calls lists), so there is never a window
+	// where a call is listed by /api/calls but KillCall would return false
+	// for it. An orphan killer entry for a not-yet-listed call is harmless.
+	// Torn down via defer no matter how this call ends — LIFO order runs
+	// killCancel first and unregisterKiller second, but the order between
+	// those two doesn't matter (killCancel firing on an already-unregistered
+	// id, or unregistering before cancelling, are both safe) — so a kick
+	// that races a natural end always finds either a live entry (fires
+	// once) or none at all (KillCall returns false), never a stale one.
 	killCtx, killCancel := context.WithCancel(context.Background())
 	b.s.registerKiller(call.ID, killCancel)
 	defer b.s.unregisterKiller(call.ID)
 	defer killCancel()
+
+	b.s.registry.Add(call)
+	defer b.s.registry.Remove(call.ID)
 
 	// Remember BOTH legs' established SDP pairs (Task 6 fix wave), keyed by
 	// each leg's OWN Call-ID, so a later session-timer refresh re-INVITE on
