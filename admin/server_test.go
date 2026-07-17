@@ -59,6 +59,42 @@ func newTestServer(t *testing.T, deps Deps) *Server {
 
 func testServer(t *testing.T) *Server { return newTestServer(t, emptyDeps()) }
 
+// testServerWithCalls returns a test server whose Deps.Calls is overridden to
+// return the given calls, for exercising /api/calls.
+func testServerWithCalls(t *testing.T, calls []callstate.Call) *Server {
+	t.Helper()
+	deps := emptyDeps()
+	deps.Calls = func() []callstate.Call { return calls }
+	return newTestServer(t, deps)
+}
+
+// testServerWithSecretConfig returns a test server backed by a config.Store
+// whose only peer ("carrier") carries the given password, for exercising
+// /api/config redaction.
+func testServerWithSecretConfig(t *testing.T, peerPassword string) *Server {
+	t.Helper()
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:0"}
+	cfg.Auth.Username = "admin"
+	cfg.Auth.PasswordHash = string(hash)
+	store := config.NewStore(mustCfgWithSecret(t, peerPassword, "$2a$10$...adminhash..."))
+	return New(cfg, store, emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// authGET performs an authenticated GET against s.handler(), fails the test
+// on a non-200 response, and returns the response body.
+func authGET(t *testing.T, s *Server, path string) []byte {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", path, nil)
+	req.SetBasicAuth("admin", "secret")
+	s.handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET %s: got %d want 200, body=%s", path, rr.Code, rr.Body.String())
+	}
+	return rr.Body.Bytes()
+}
+
 func TestAuthRequired(t *testing.T) {
 	s := testServer(t)
 	h := s.handler()
@@ -76,7 +112,17 @@ func TestAuthRequired(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong pass: got %d want 401", rr.Code)
 	}
-	// correct → not 401 (stub returns 501 until Task 4)
+	// wrong username → 401 (a security-boundary case: guards against an
+	// inverted or missing username compare that would pass any username
+	// through as long as the password matches)
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/api/status", nil)
+	req.SetBasicAuth("wronguser", "secret")
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong username: got %d want 401", rr.Code)
+	}
+	// correct → not 401
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest("GET", "/api/status", nil)
 	req.SetBasicAuth("admin", "secret")

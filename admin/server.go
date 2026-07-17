@@ -107,6 +107,13 @@ func (s *Server) recoverMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				// http.ErrAbortHandler is the stdlib's signal to abort the
+				// response without logging or writing an error body; the
+				// net/http server itself handles it. Re-panic so that
+				// convention is honored instead of being swallowed here.
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				s.log.Error("admin handler panic", "err", rec, "path", r.URL.Path)
 				http.Error(w, "internal error", http.StatusInternalServerError)
 			}
@@ -120,11 +127,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-// The following are stubs replaced in Tasks 4 (api) and 5 (metrics).
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request)  { stub(w) }
-func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request)   { stub(w) }
-func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request)   { stub(w) }
-func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request)  { stub(w) }
+// handleStatus, handleCalls, handlePeers, and handleConfig are implemented in
+// api.go. The following is a stub replaced in Task 5.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) { stub(w) }
 
 func stub(w http.ResponseWriter) { http.Error(w, "not implemented", http.StatusNotImplemented) }
