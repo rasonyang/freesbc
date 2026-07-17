@@ -1,6 +1,7 @@
 package sig
 
 import (
+	"bytes"
 	"encoding/base64"
 	"net/netip"
 	"strconv"
@@ -197,10 +198,18 @@ func TestOfferedCryptoPlaintextIsInsecure(t *testing.T) {
 }
 
 func TestRewriteSDPCryptoSecureSetsSAVPAndCrypto(t *testing.T) {
-	key := make([]byte, 30)
-	out, err := rewriteSDPCrypto(savpOffer(6000, base64.StdEncoding.EncodeToString(key)),
+	// Peer's offered key and our advertised key must be DISTINCT so a
+	// regression that echoes the peer's inbound a=crypto (instead of
+	// stripping it and inserting our own fresh key) is caught: with
+	// identical keys, echoing and regenerating would be indistinguishable.
+	peerKey := bytes.Repeat([]byte{0x11}, 30)
+	ourKey := bytes.Repeat([]byte{0x22}, 30)
+	peerKeyB64 := base64.StdEncoding.EncodeToString(peerKey)
+	ourKeyB64 := base64.StdEncoding.EncodeToString(ourKey)
+
+	out, err := rewriteSDPCrypto(savpOffer(6000, peerKeyB64),
 		netip.MustParseAddr("198.51.100.7"), 40000,
-		&sdpCrypto{suite: media.SuiteAES128CM80, keyValue: key})
+		&sdpCrypto{suite: media.SuiteAES128CM80, keyValue: ourKey})
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
@@ -208,8 +217,14 @@ func TestRewriteSDPCryptoSecureSetsSAVPAndCrypto(t *testing.T) {
 	if !strings.Contains(s, "RTP/SAVP") {
 		t.Error("secure rewrite must keep RTP/SAVP proto")
 	}
-	if !strings.Contains(s, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:") {
-		t.Error("secure rewrite must advertise our a=crypto")
+	if !strings.Contains(s, "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"+ourKeyB64) {
+		t.Error("secure rewrite must advertise OUR crypto key")
+	}
+	if strings.Contains(s, peerKeyB64) {
+		t.Error("secure rewrite must not echo the peer's crypto key")
+	}
+	if got := strings.Count(s, "a=crypto:"); got != 1 {
+		t.Errorf("secure rewrite must contain exactly one a=crypto line, got %d", got)
 	}
 	if !strings.Contains(s, "40000") || !strings.Contains(s, "198.51.100.7") {
 		t.Error("topology rewrite (port/IP) must still apply")
