@@ -62,6 +62,11 @@ const maxConfigBytes = 1 << 20 // 1 MiB
 // for an operator to edit and PUT back. Unlike handleConfigGet, this is NOT
 // redacted — the caller is already authenticated as an admin.
 func (s *Server) handleConfigRaw(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	data, err := os.ReadFile(s.cfgPath)
 	if err != nil {
 		s.log.Error("read config for raw view", "err", err)

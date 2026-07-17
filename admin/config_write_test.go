@@ -221,3 +221,78 @@ func TestConfigMethodRouting(t *testing.T) {
 		t.Fatalf("DELETE /api/config: %d, want 405", rr.Code)
 	}
 }
+
+// TestConfigWriteTooLargeRejectedFileUnchanged proves the maxConfigBytes cap
+// is enforced BEFORE any write is attempted: a >1MiB body must come back 413
+// and must never touch the file, not even a truncated write. If the size
+// check in handleConfigWrite were removed or reordered after
+// writeFileAtomic, this test would fail (either a non-413 status, or a
+// mutated file).
+func TestConfigWriteTooLargeRejectedFileUnchanged(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	oversized := validCfg + strings.Repeat(" ", 1<<20) // > maxConfigBytes (1<<20)
+	rr := authPUT(t, s, "/api/config", oversized, "")
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT oversized: %d, want 413", rr.Code)
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != validCfg {
+		t.Fatal("oversized PUT must not touch the file")
+	}
+}
+
+// TestConfigRawRequiresAuth proves the write-adjacent read route is behind
+// auth too (TestAuthRequired in server_test.go only covers /api/status).
+func TestConfigRawRequiresAuth(t *testing.T) {
+	s, _ := newTestServerWithFile(t, validCfg)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/config/raw", nil)
+	// no credentials set
+	s.handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/config/raw no creds: %d, want 401", rr.Code)
+	}
+}
+
+// TestConfigRawRejectsNonGET proves handleConfigRaw's method guard: a PUT to
+// /api/config/raw must never be mistaken for a successful write — it should
+// 405, not silently return the (unwritten) file with a 200.
+func TestConfigRawRejectsNonGET(t *testing.T) {
+	s, _ := newTestServerWithFile(t, validCfg)
+	rr := authPUT(t, s, "/api/config/raw", validCfg+"# edited\n", "")
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /api/config/raw: %d, want 405", rr.Code)
+	}
+	if allow := rr.Header().Get("Allow"); allow != "GET" {
+		t.Errorf("Allow header = %q, want %q", allow, "GET")
+	}
+}
+
+// TestConfigWritePreservesFileMode proves a valid PUT preserves the
+// pre-existing file's permission bits rather than overwriting them with a
+// hardcoded default.
+func TestConfigWritePreservesFileMode(t *testing.T) {
+	s, path := newTestServerWithFile(t, validCfg)
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := validCfg + "# mode-preserved\n"
+	rr := authPUT(t, s, "/api/config", edited, "")
+	if rr.Code != 200 {
+		t.Fatalf("PUT valid: %d body=%s", rr.Code, rr.Body.String())
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("mode changed: before=%v after=%v", before.Mode().Perm(), after.Mode().Perm())
+	}
+	if after.Mode().Perm() != 0o640 {
+		t.Fatalf("mode = %v, want 0640", after.Mode().Perm())
+	}
+}
