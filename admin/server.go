@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/freesbc/freesbc/callstate"
@@ -47,6 +48,9 @@ type Server struct {
 	deps    Deps
 	log     *slog.Logger
 	started time.Time
+
+	metricsOnce    sync.Once
+	metricsHandler http.Handler
 }
 
 func New(cfg *config.AdminConfig, store *config.Store, deps Deps, log *slog.Logger) *Server {
@@ -128,7 +132,4 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStatus, handleCalls, handlePeers, and handleConfig are implemented in
-// api.go. The following is a stub replaced in Task 5.
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) { stub(w) }
-
-func stub(w http.ResponseWriter) { http.Error(w, "not implemented", http.StatusNotImplemented) }
+// api.go. handleMetrics is implemented in metrics.go.
