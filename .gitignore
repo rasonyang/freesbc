@@ -13,3 +13,6 @@ coverage.html
 .DS_Store
 .idea/
 .vscode/
+
+# Local tooling state
+/.superpowers/
