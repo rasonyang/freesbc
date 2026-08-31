@@ -267,7 +267,7 @@
         <button class="action" id="btn-save" disabled>Save</button>
         <span class="status-msg" id="config-status"></span>
       </div>
-      <textarea id="config-text" spellcheck="false" placeholder="Click Load to fetch the running config file."></textarea>
+      <textarea id="config-text" spellcheck="false" placeholder="Opening the Config tab loads the running config automatically — use Load to re-fetch."></textarea>
       <div class="error-box" id="config-error"></div>
       <p class="hint">Keep secrets as ${ENV} references — this file may be viewed by other operators.</p>
     </div>
@@ -299,7 +299,11 @@
       tabs.forEach(function (b) { b.classList.remove("active"); });
       views.forEach(function (v) { v.classList.remove("active"); });
       btn.classList.add("active");
-      document.getElementById("view-" + btn.dataset.view).classList.add("active");
+      var view = document.getElementById("view-" + btn.dataset.view);
+      view.classList.add("active");
+      // First time the Config tab is opened, fetch the running config
+      // automatically instead of showing an empty editor.
+      if (btn.dataset.view === "config") loadConfigIfEmpty();
     });
   });
 
@@ -448,7 +452,11 @@
     configError.classList.add("visible");
   }
 
-  btnLoad.addEventListener("click", function () {
+  var configLoading = false;
+
+  function loadConfig() {
+    if (configLoading) return;
+    configLoading = true;
     setConfigStatus("Loading…");
     clearConfigError();
     fetch(CONFIG_RAW_URL, { credentials: "same-origin" }).then(function (res) {
@@ -468,8 +476,18 @@
     }).catch(function (err) {
       setConfigStatus("Load failed", "err");
       showConfigError(String(err.message || err));
+    }).then(function () {
+      configLoading = false;
     });
-  });
+  }
+
+  // Auto-load on first open of the Config tab; the Load button stays as a
+  // manual refresh (e.g. after a 409 "changed on disk").
+  function loadConfigIfEmpty() {
+    if (!configText.value) loadConfig();
+  }
+
+  btnLoad.addEventListener("click", loadConfig);
 
   btnSave.addEventListener("click", function () {
     setConfigStatus("Saving…");
