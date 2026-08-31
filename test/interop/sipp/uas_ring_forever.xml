@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!-- carrier UAS: send 180 Ringing and never answer.
+     The SBC's ring_timeout (4s in the test config) must CANCEL us;
+     we then answer the CANCEL and finish the INVITE transaction with 487.
+     The CANCEL recv is MANDATORY: receiving it is the test's assertion. -->
+<scenario name="uas_ring_forever">
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv request="CANCEL" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 487 Request Terminated
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      CSeq: [cseq] INVITE
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <recv request="ACK" crlf="true" optional="true"/>
+</scenario>

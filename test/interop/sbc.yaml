@@ -1,0 +1,70 @@
+# FreeSBC interop test config.
+# Topology (single host 192.168.31.5):
+#   SIPp  (carrier-a) 127.0.0.2:5090  --lo-->  FreeSBC 0.0.0.0:5070  --lan-->  FreeSWITCH 192.168.31.5:5060
+#   SIPp  (carrier-b) 127.0.0.2:5092  (failover target)
+#
+# Peer identification is by SOURCE IP only (allowed_ips):
+#   - SIPp must send from 127.0.0.2 (loopback alias) to be identified as carrier-a/b
+#   - FreeSWITCH sends from 192.168.31.5 (its sofia internal bind) = internal-pbx
+#
+# rtp_timeout 20s and ring_timeout 4s are shortened for the test scenarios.
+# For the SRTP scenario (T11), change internal-pbx `srtp` to `optional` and
+# hot-reload; FreeSWITCH needs rtp_secure_media=optional on the internal profile.
+#
+# NOTE: this instance listens on UDP 5070, which collides with the fake UAC
+# ports used by the sig package integration tests (127.0.0.1:5070). Stop the
+# running instance before `go test ./... -race`.
+
+listen:
+  sip:
+    - udp://0.0.0.0:5070
+  media:
+    port_range: 16384-32768
+    public_ip: 192.168.31.5        # must be a real address on this host (media SDP anchor)
+    rtp_timeout: 20s               # shortened: T7 (RTP silence teardown) expects ~20s
+
+ring_timeout: 4s                   # shortened: T3 (ring timeout) and T4 (failover) expect ~4s
+session_expires: 1800s
+min_se: 90s
+peer_cooldown: 30s
+srv_cache_ttl: 300s
+
+peers:
+  carrier-a:
+    address: 127.0.0.2:5090
+    transport: udp
+    register: false
+    allowed_ips: [127.0.0.2/32]
+    srtp: disabled
+  carrier-b:
+    address: 127.0.0.2:5092
+    transport: udp
+    register: false
+    allowed_ips: [127.0.0.2/32]
+    srtp: disabled
+  internal-pbx:
+    address: 192.168.31.5:5060
+    transport: udp
+    allowed_ips: [192.168.31.5/32]
+    srtp: disabled
+
+routes:
+  - name: outbound
+    from: internal-pbx
+    match: { to: "^9(\\d+)$" }     # dial 9 + number, strip the 9 before carrier-a
+    transform: { to: "$1" }
+    to: [carrier-a, carrier-b]     # list order = failover order
+  - name: inbound
+    from: carrier-a
+    to: [internal-pbx]
+
+shield:
+  rate_limit: 200/s per_ip
+  auto_ban: { failures: 10, window: 60s, duration: 1h }
+  nftables: off                    # no kernel ban table on this test host
+
+admin:
+  listen: 192.168.31.5:8080
+  auth:
+    username: admin
+    password_hash: "$2a$10$GXryET6y6ypv5Suod3pvlebGERgjHUGNPbLsm0Lx3uTyBo4rqsBbW"
