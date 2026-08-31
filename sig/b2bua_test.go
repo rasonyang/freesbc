@@ -1303,6 +1303,231 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 	s2.Close()
 }
 
+// silentFailoverCfg routes local-uac to a SILENT (blackholed) carrier-a and
+// an answering carrier-b, with a short ring budget. Regression test for F1:
+// sipgo's inviteCancel blocks until the INVITE transaction dies on Timer_B
+// (~32s) when the target never responds, which used to pin the attempt and
+// defeat ring_timeout/failover entirely. The bridge must give up at
+// ring_timeout (2s) regardless of sipgo's internal wait.
+const silentFailoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:45260]
+  media:
+    port_range: 46260-46263
+    public_ip: 127.0.0.1
+ring_timeout: 2s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45261
+    allowed_ips: [203.0.113.0/24]
+  carrier-b:
+    address: 127.0.0.1:45262
+    allowed_ips: [198.51.100.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+func TestBridgeFailoverSilentTarget(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45263})
+	if err != nil {
+		t.Fatalf("carrier-b echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	// carrier-a (127.0.0.1:45261) is deliberately left UNBOUND: a silent,
+	// blackholed endpoint that never answers anything — not even 100 Trying.
+	carrierB := startStubCarrier(t, "127.0.0.1:45262", testSDPBody(echoRTPPort))
+	srv := startServer(t, 45260, silentFailoverCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45260}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelInvite()
+
+	start := time.Now()
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	elapsed := time.Since(start)
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200 (carrier-b should have answered after the silent carrier-a timed out)", sess.InviteResponse.StatusCode)
+	}
+	// The bug under regression: the silent target pinned the attempt until
+	// Timer_B (~32s). With ring_timeout=2s the answer must arrive in ~2s;
+	// 8s leaves room for race-detector and CI slowness while still being a
+	// hard fail against the old ~32s behavior.
+	if elapsed >= 8*time.Second {
+		t.Fatalf("failover to carrier-b took %v — ring_timeout not honored for a silent target (F1 regression)", elapsed)
+	}
+
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	var carrierBOffer *sip.Request
+	select {
+	case carrierBOffer = <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b never received the B-leg INVITE")
+	}
+
+	// The silent endpoint never responded within the ring budget — it must
+	// be cooled down so the next call skips it, unlike a merely-ringing
+	// target (see TestBridgeFailoverToSecondTarget / the cancel test).
+	if srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45261, Transport: "udp"}) {
+		t.Error("silent carrier-a should be cooled down after the ring timeout")
+	}
+
+	// --- RTP round trip against carrier-b's echo socket ---
+	answerBody := sess.InviteResponse.Body()
+	sideAPort := sdpAudioPort(t, answerBody)
+	sideBPort := sdpAudioPort(t, carrierBOffer.Body())
+	if sideAPort < 46260 || sideAPort > 46263 {
+		t.Errorf("answer m=audio port %d not in media pool range 46260-46263", sideAPort)
+	}
+	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
+	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+	if _, err := echoRTP.WriteToUDP([]byte("arm-b"), sideBAddr); err != nil {
+		t.Fatalf("arm side b: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	sendUntilReceived(t, uacRTP, sideAAddr, echoRTP, "ping-a-to-b")
+	sendUntilReceived(t, echoRTP, sideBAddr, uacRTP, "pong-b-to-a")
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrierB.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b dialog never ended after BYE")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// silentCancelCfg mirrors silentFailoverCfg on fresh ports; used by
+// TestBridgeCancelSilentTarget.
+const silentCancelCfg = `
+listen:
+  sip: [udp://127.0.0.1:45270]
+  media:
+    port_range: 46270-46273
+    public_ip: 127.0.0.1
+ring_timeout: 2s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45271
+    allowed_ips: [203.0.113.0/24]
+  carrier-b:
+    address: 127.0.0.1:45272
+    allowed_ips: [198.51.100.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeCancelSilentTarget cancels while carrier-a is a silent blackhole
+// (no 180 to wait for, unlike TestBridgeCancelStopsFailover): the caller
+// must get its 487 promptly, the failover loop must stop, and the silent
+// endpoint must NOT be cooled down (the caller left — not the endpoint's
+// fault).
+func TestBridgeCancelSilentTarget(t *testing.T) {
+	carrierB := startStubCarrier(t, "127.0.0.1:45272", testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 45270, silentCancelCfg)
+
+	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer uac.Close()
+	local := uac.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45270}
+
+	const callID = "b2bua-cancel-silent-1"
+	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 45270)
+	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	// Give the B-leg INVITE a moment to go out, then CANCEL while carrier-a
+	// is still silent (there is no 180 to observe this time).
+	time.Sleep(500 * time.Millisecond)
+	cancelReq := sipCancel(callID, local, 45270)
+	if _, err := uac.WriteToUDP([]byte(cancelReq), dst); err != nil {
+		t.Fatalf("write cancel: %v", err)
+	}
+
+	// The caller must get the transaction finished promptly (487 for the
+	// cancelled INVITE), not ~32s later.
+	var sawTerminated bool
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !sawTerminated {
+		_ = uac.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := uac.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(string(buf[:n]), "SIP/2.0 487") {
+			sawTerminated = true
+		}
+	}
+	if !sawTerminated {
+		t.Fatal("uac never received 487 after cancelling against a silent target")
+	}
+
+	// The failover loop must have stopped: carrier-b never gets dialed.
+	select {
+	case <-carrierB.offers:
+		t.Fatal("carrier-b received a B-leg INVITE after the caller CANCELed — failover loop did not stop")
+	case <-time.After(2 * time.Second):
+	}
+
+	// A caller CANCEL must not cool the silent endpoint down.
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45271, Transport: "udp"}) {
+		t.Error("carrier-a should not be cooled down after a caller CANCEL, only after a genuine connect failure")
+	}
+
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
 // allFailCfg routes local-uac to two carriers that both always decline —
 // proves the failover loop exhausts every target and gives up, rather than
 // looping forever or leaving the A-leg unanswered.

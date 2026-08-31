@@ -93,15 +93,23 @@ RTP 静默超时拆除、admin 踢话、OPTIONS/盾牌自动封禁、30 路并�
 
 - **T4a(目标振铃不接)✅**:carrier-a ring-forever + carrier-b 应答。carrier-a 在 **4.001s**
   被 CANCEL,carrier-b 即时接续,`/api/calls` 显示 `to=carrier-b`,RTP 双向全通,通话正常建立拆除。
-- **T4b(目标黑洞)⚠️ 问题 F1**:5090 无监听 + carrier-b 应答。主叫(SIPp 冒充 internal-pbx)
-  INVITE 后 **32.004s** 才收到 200(预期 ~4s)。三方证据互证:
-  - SBC 日志:`b-leg not answered err="transaction terminated … Timer_B timed out" target=carrier-a`(03:30:35.062)
-  - carrier-b 的 INVITE 在 03:30:35.062 才到达(黑洞腿死于 Timer_B 后才转移)
+- **T4b(目标黑洞)⚠️ 问题 F1 → 已修复并复验**:5090 无监听 + carrier-b 应答。**修复前**主叫
+  (SIPp 冒充 internal-pbx)INVITE 后 **32.004s** 才收到 200(预期 ~4s);**修复后实测
+  4.256s**(4s ring_timeout + 250ms 收尾宽限 + 6ms),carrier-b 在 deadline 后 2ms 收到 INVITE。
+  三方证据互证:
+  - 修复前 SBC 日志:`b-leg not answered err="transaction terminated … Timer_B timed out" target=carrier-a`(03:30:35.062);
+    修复后:`b-leg not answered err="context deadline exceeded" target=carrier-a`(04:13:01.624)
+  - 修复前 carrier-b 的 INVITE 在 03:30:35.062 才到达(黑洞腿死于 Timer_B 后才转移);
+    修复后在 deadline 后 2ms 到达(04:13:01.625)
   - **根因**(读代码确认):sipgo v1.4.3 `dialog_client.go:355-366` `inviteCancel()`——目标零响应时
     `s.InviteResponse == nil`,阻塞等任意响应或 `tx.Done()`(Timer_B=32s),**不发送 CANCEL 也不返回**;
-    FreeSBC `b2bua.go:811-815` 的注释明确假设 4s 内必然 CANCEL,与实际行为矛盾。
-  - **影响**:运营商静默故障(无任何响应)时,每个目标的故障转移/最终码透传被拖延 ~32s;
-    叠加多目标时延迟线性放大。呼叫方(如 FreeSWITCH)通常 ~8s 就自行放弃。
+    FreeSBC 的 ring 预算注释明确假设超时必 CANCEL,与实际行为矛盾。
+  - **修复**(commit 见 §6 F1):`dialTarget` 把 WaitAnswer 放入 goroutine 与 `attemptCtx` 竞速,
+    超时先给 250ms 宽限窗(振铃/取消场景走回原有顺序分类,保证 `aLeg.Respond` 不被两个
+    goroutine 并发调用),宽限到期即放弃本腿按 failRing 分类并转移;goroutine 自生自灭
+    (迟到响应走 CANCEL 流程,迟到 2xx 由它 ACK+BYE 拆除;黑洞时按 RFC 3261 §9.1 无
+    CANCEL 可发,事务自生自灭于 Timer_B,与修复前相同的后台资源占用,但不再阻塞主流程)。
+    回归测试:`TestBridgeFailoverSilentTarget`、`TestBridgeCancelSilentTarget`(sig/b2bua_test.go)。
 
 ### T5 486 透传 ✅ PASS(狩猎语义确认)
 
@@ -157,7 +165,7 @@ RTP 静默超时拆除、admin 踢话、OPTIONS/盾牌自动封禁、30 路并�
 | T2 | 入局基本呼叫 | ✅ | 注册表生命周期完整、RTP 双向 |
 | T3 | 振铃超时 | ✅ | CANCEL 4.002s/4.005s、408 回主叫 |
 | T4a | 故障转移(振铃) | ✅ | 4.001s CANCEL 后 2ms 接续 |
-| T4b | 故障转移(黑洞) | ⚠️ F1 | 延迟 32.004s(应为 ~4s) |
+| T4b | 故障转移(黑洞) | ✅(修复后复验) | 修复前 32.004s → 修复后 **4.256s** |
 | T5 | 486 透传 | ✅ | 狩猎语义;全目标响应时毫秒级透传 |
 | T6 | 无路由 404 | ✅ | FS 挂断原因 UNALLOCATED_NUMBER |
 | T7 | RTP 静默超时 | ✅ | 20.012s 主动 BYE |
@@ -169,15 +177,21 @@ RTP 静默超时拆除、admin 踢话、OPTIONS/盾牌自动封禁、30 路并�
 
 ## 6. 发现的问题
 
-### F1(重要):黑洞(零响应)目标的故障转移延迟约 32s,ring_timeout 不生效
+### F1(重要,已修复):黑洞(零响应)目标的故障转移延迟约 32s,ring_timeout 不生效
 
-- **现象**:T4b 实测 32.004s;T5 附带观察一致。
+- **现象**:T4b 修复前实测 32.004s;T5 附带观察一致。修复后 T4b 复验 **4.256s**。
 - **根因**:sipgo v1.4.3 `inviteCancel()`(dialog_client.go:355-366)在目标从未发送任何响应时
   阻塞至事务 Timer_B,不发送 CANCEL、不返回 ctx.Err();FreeSBC `placeCall` 的 4s ring 预算
   (b2bua.go:817)因此形同虚设。目标只要发过 1xx(哪怕 100 Trying),行为即正常(T3/T4a 验证)。
-- **影响**:运营商静默故障时故障转移/最终码透传延迟 ~32s/目标;真实呼叫方常在 ~8s 内放弃。
-- **建议**:在 FreeSBC 侧将 `WaitAnswer` 与 `attemptCtx.Done()` 做显式竞速(goroutine + select),
-  超时即按 failRing 处理并 `bLeg.Close()`/终止事务;或上游修复 sipgo。
+- **修复**(`sig/b2bua.go` `dialTarget`):WaitAnswer 移入 goroutine,主流程 `select` 在
+  `waited` 与 `attemptCtx.Done()` 间竞速;deadline 先到则给 250ms 宽限窗等 goroutine 交付
+  (振铃场景毫秒级交付,分类走原有顺序路径,避免两个 goroutine 并发 `aLeg.Respond`),宽限
+  到期即放弃本腿按 failRing 分类(黑洞端点按原语义冷却);goroutine 保留 ackThenBye 逻辑
+  拆除迟到 2xx 的幻影呼叫。回归测试:`TestBridgeFailoverSilentTarget`(2s ring_timeout 下
+  ~2.3s 完成转移并断言黑洞端点被冷却、RTP 全通)、`TestBridgeCancelSilentTarget`(主叫取消
+  快速收 487、循环停止、端点不冷却)。
+- **注意**:黑洞时 RFC 3261 §9.1 禁止在无响应前发 CANCEL,放弃的 INVITE 事务仍会在后台
+  重传至 Timer_B(~32s)——与修复前资源占用相同,但不再阻塞故障转移。
 
 ### F2(信息):媒体 latch 为 fail-closed,不向未 latch 的腿转发
 
@@ -236,8 +250,8 @@ sudo ip addr add 127.0.0.2/8 dev lo
 
 ## 10. 建议
 
-1. **优先修复 F1**(黑洞目标 32s 延迟):影响核心故障转移场景,修复面小(placeCall 处竞速或
-   上游 sipgo 修复),可用 T4b 场景回归。
+1. ~~优先修复 F1~~ ✅ **已修复并回归**(sig/b2bua.go dialTarget 竞速 + 250ms 宽限,
+   `TestBridgeFailoverSilentTarget`/`TestBridgeCancelSilentTarget`,T4b 实景复验 4.256s)。
 2. FS 重编译(libsrtp2-dev)后补跑 T11 SRTP 场景;或改用 Asterisk/Kamailio 做 SRTP 对端。
 3. 考虑把本套场景纳入 CI(设计文档 freesbc-allinone-design.md §8 的既定目标):SIPp XML +
    测试配置已随仓库提交,依赖仅为 SIPp 二进制与一个 FreeSWITCH/Asterisk 实例。

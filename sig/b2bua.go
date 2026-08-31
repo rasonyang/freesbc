@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -816,11 +817,106 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// — a fresh ring-timeout budget for the retry, not a shared one.
 		attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
 
-		waitErr := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
-			OnResponse: b.relayProvisional(aLeg, sess, ourIP, startOnce, aSRTP, bsrtpArg),
-			Username:   authUser(target),
-			Password:   authPass(target),
-		})
+		// F1 fix: WaitAnswer alone cannot be trusted to honor attemptCtx.
+		// When the target never sends ANY response, sipgo's WaitAnswer enters
+		// inviteCancel, which — per RFC 3261 §9.1 (no CANCEL before a
+		// provisional) — blocks until the target responds or the INVITE
+		// transaction dies on Timer_B (~32s). A silent/blackholed target
+		// would therefore pin this attempt for ~32s and ring_timeout/failover
+		// would never fire. Race WaitAnswer against the deadline so the
+		// per-attempt ring budget always holds; the goroutine finishes on its
+		// own (CANCEL+487 once a late response arrives, or Timer_B teardown),
+		// which costs nothing extra — the transaction would retransmit for
+		// the same ~32s regardless.
+		//
+		// responded tracks whether the target answered within the ring
+		// budget: the deadline path below cools the endpoint down only when
+		// nothing at all was heard in time (a mere ring timeout — 180
+		// received, no answer — must not penalize, same as the
+		// InviteResponse==nil check in the classification path).
+		var responded atomic.Bool
+		var abandoned atomic.Bool
+		waited := make(chan error, 1)
+		relay := b.relayProvisional(aLeg, sess, ourIP, startOnce, aSRTP, bsrtpArg)
+		// bLeg and attemptCtx are passed as ARGUMENTS, not captured: the
+		// compiler may share the captured bLeg cell with dialTarget's return
+		// slot (bLeg escapes both ways), and the deadline path's return below
+		// would then race the goroutine's read of it (-race catches this as a
+		// write at the return statement vs the closure's WaitAnswer call).
+		// Argument copies are written once at goroutine start, so the
+		// goroutine owns its values and the main flow can return freely.
+		go func(bLeg *sipgo.DialogClientSession, attemptCtx context.Context) {
+			err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
+				OnResponse: func(res *sip.Response) error {
+					responded.Store(true)
+					return relay(res)
+				},
+				Username: authUser(target),
+				Password: authPass(target),
+			})
+			// A 2xx can race the deadline: inviteCancel consumes it and
+			// returns an error, but the carrier now thinks the call is up —
+			// tear that phantom call down here, because the main loop below
+			// has already moved on and must never read InviteResponse again
+			// for this attempt.
+			if abandoned.Load() && bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
+				b.ackThenBye(context.Background(), bLeg, target)
+			}
+			waited <- err
+		}(bLeg, attemptCtx)
+
+		var waitErr error
+		select {
+		case waitErr = <-waited:
+			// WaitAnswer returned first: classify below, exactly as before.
+		case <-attemptCtx.Done():
+			// The ring budget expired before WaitAnswer returned. Give the
+			// goroutine a short grace to finish before abandoning the
+			// attempt: it may be mid-relay of a provisional response (an
+			// aLeg.Respond from OnResponse) or already in the CANCEL dance.
+			// Once it delivers, classification runs on this goroutine's
+			// sequential path below, so aLeg.Respond is never invoked from
+			// two goroutines at once. A target that never sent ANY response
+			// leaves the goroutine blocked in sipgo's inviteCancel (RFC 3261
+			// §9.1 forbids CANCEL before a provisional) until the INVITE
+			// transaction dies on Timer_B (~32s) — the grace expires and we
+			// abandon the attempt, so ring_timeout/failover still hold (the
+			// F1 fix). 250ms is far more than the relay/CANCEL dance needs;
+			// in the abandoned case the goroutine never touches the A-leg
+			// again (OnResponse only runs once a response arrived, and an
+			// abandoned attempt means none did within the budget).
+			grace := time.NewTimer(250 * time.Millisecond)
+			defer grace.Stop()
+			select {
+			case waitErr = <-waited:
+				// Delivered within the grace window: fall through to the
+				// normal classification below (attemptCtx.Err() is
+				// DeadlineExceeded here for a ring timeout, Canceled for a
+				// caller hangup — both classified by the existing cases).
+			case <-grace.C:
+				abandoned.Store(true)
+				cancel()
+				b.s.log.Info("b-leg not answered", "err", attemptCtx.Err(), "target", target.Name)
+				if attemptCtx.Err() == context.DeadlineExceeded {
+					// Caller still present (else attemptCtx would carry
+					// Canceled, not DeadlineExceeded — it derives from
+					// aLeg.Context()).
+					return nil, attemptResult{
+						retryable: true,
+						kind:      failRing,
+						code:      408,
+						reason:    "Request Timeout",
+						penalize:  !responded.Load(),
+					}
+				}
+				// Parent context cancelled: the caller is gone. Mirror the
+				// aLeg.Context().Err() classification case below (zero-value
+				// kind/code — nothing reaches a caller that no longer
+				// exists) and never penalize: this wasn't the endpoint's
+				// fault.
+				return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			}
+		}
 		if waitErr == nil {
 			cancel()
 			break
