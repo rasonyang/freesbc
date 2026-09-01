@@ -7,18 +7,21 @@ import (
 	"time"
 )
 
-// pumpTransform resends `send` from src until dst reads exactly `expect`,
-// tolerating loopback loss. pion/srtp CreateContext defaults to NO replay
-// protection, so resending the identical SRTP packet decrypts to the same
-// plaintext every time — this retry loop is safe for SRTP.
+// pumpTransform sends `send` from src exactly ONCE and reads dst until it
+// reads exactly `expect` or the deadline expires. It deliberately does not
+// resend on timeout (T-08/F-09): with replay protection enabled, a resent
+// identical SRTP ciphertext is a replay and would be dropped by the relay,
+// so retrying could only guarantee failure — the old resend loop relied on
+// pion's default no-replay behavior. A single UDP datagram over loopback is
+// not lost in practice.
 func pumpTransform(t *testing.T, src, dst *net.UDPConn, send, expect []byte) {
 	t.Helper()
+	if _, err := src.Write(send); err != nil {
+		t.Fatal(err)
+	}
 	buf := make([]byte, 1500)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, err := src.Write(send); err != nil {
-			t.Fatal(err)
-		}
 		_ = dst.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n, err := dst.Read(buf)
 		if err == nil && bytes.Equal(buf[:n], expect) {
@@ -118,13 +121,16 @@ func TestRelaySRTPToSRTPRekeyed(t *testing.T) {
 		t.Fatal("encrypt failed")
 	}
 
+	// Send ONCE (T-08/F-09): resending the identical ciphertext would be a
+	// replay to the relay's now replay-protected inbound context, i.e. a
+	// guaranteed drop instead of loss tolerance.
+	if _, err := ea.Write(cipherA); err != nil {
+		t.Fatal(err)
+	}
 	buf := make([]byte, 1500)
 	deadline := time.Now().Add(3 * time.Second)
 	var received []byte
 	for {
-		if _, err := ea.Write(cipherA); err != nil {
-			t.Fatal(err)
-		}
 		_ = eb.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		n, err := eb.Read(buf)
 		if err == nil {

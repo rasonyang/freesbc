@@ -42,19 +42,38 @@ type SRTPContext struct {
 }
 
 // NewSRTPContext builds a context from a 30-byte SDES inline value
-// (16-byte master key followed by a 14-byte master salt).
+// (16-byte master key followed by a 14-byte master salt), with replay
+// protection enabled (T-08/F-09, RFC 3711 §3.3.2/§3.4.2 MUST): a
+// replayed/too-old packet fails unprotect and is dropped by the relay's
+// existing fail-closed path — pion's default is no replay protection, which
+// would let a captured valid packet be re-injected indefinitely. The
+// windows are per-context (one context protects exactly one stream of one
+// direction), so they don't interact across legs or sides.
 func NewSRTPContext(suite CryptoSuite, keyValue []byte) (*SRTPContext, error) {
 	if len(keyValue) != srtpMasterKeyValueLen {
 		return nil, fmt.Errorf("srtp key value must be %d bytes, got %d", srtpMasterKeyValueLen, len(keyValue))
 	}
 	masterKey := keyValue[:16]
 	masterSalt := keyValue[16:30]
-	ctx, err := srtp.CreateContext(masterKey, masterSalt, suite.profile())
+	ctx, err := srtp.CreateContext(masterKey, masterSalt, suite.profile(),
+		srtp.SRTPReplayProtection(srtpReplayWindow),
+		srtp.SRTCPReplayProtection(srtcpReplayWindow))
 	if err != nil {
 		return nil, fmt.Errorf("srtp create context: %w", err)
 	}
 	return &SRTPContext{ctx: ctx}, nil
 }
+
+// srtpReplayWindow and srtcpReplayWindow are the replay-protection window
+// sizes passed to pion (T-08/F-09). 64 covers any plausible jitter/out-of-
+// order arrival on a single media stream; RTCP gets 128 since its
+// compounds are rarer and arrive more irregularly. Both bound the index
+// space a replayer can claim: anything older than the window (or already
+// seen) fails authentication.
+const (
+	srtpReplayWindow  = 64
+	srtcpReplayWindow = 128
+)
 
 // protectRTP encrypts a plaintext RTP packet in place-ish (pion allocates the
 // output). ok=false on failure (the caller drops the packet).

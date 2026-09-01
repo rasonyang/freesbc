@@ -30,6 +30,15 @@ func startServer(t *testing.T, port int, cfgYAML string) *Server {
 // call-handling goroutine reads them (no data race under -race).
 func startServerConfigured(t *testing.T, port int, cfgYAML string, configure func(*Server)) *Server {
 	t.Helper()
+	return startServerAt(t, port, "127.0.0.1", cfgYAML, configure)
+}
+
+// startServerAt is startServerConfigured with an explicit listener host to
+// probe for readiness — tests whose config binds a non-127.0.0.1 loopback
+// address (e.g. server_preparse_test.go's 127.0.0.2) can't use the default
+// probe target, which would dial an address nothing is bound to.
+func startServerAt(t *testing.T, port int, probeHost string, cfgYAML string, configure func(*Server)) *Server {
+	t.Helper()
 	cfg, err := config.Parse([]byte(cfgYAML))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
@@ -46,7 +55,7 @@ func startServerConfigured(t *testing.T, port int, cfgYAML string, configure fun
 	// Wait until the UDP port answers (bind completed).
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		c, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		c, err := net.Dial("udp", net.JoinHostPort(probeHost, fmt.Sprintf("%d", port)))
 		if err == nil {
 			c.Close()
 			time.Sleep(100 * time.Millisecond)

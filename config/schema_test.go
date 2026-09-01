@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -62,6 +63,219 @@ admin:
 	}
 	if c.Admin == nil || c.Admin.Listen != "127.0.0.1:8080" {
 		t.Errorf("admin: %+v", c.Admin)
+	}
+}
+
+// TestTLSConfigFieldsParse (T-26b red test): the admin TLS fields — and
+// allow_remote — unmarshal under the Strict parser, so a LAN deployment can
+// serve the admin API over HTTPS.
+func TestTLSConfigFieldsParse(t *testing.T) {
+	src := `
+listen:
+  sip: [udp://127.0.0.1:5060]
+peers:
+  carrier:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: out
+    from: carrier
+    to: [carrier]
+admin:
+  listen: 192.168.1.10:8443
+  allow_remote: true
+  tls_cert: /etc/freesbc/admin-cert.pem
+  tls_key: /etc/freesbc/admin-key.pem
+  auth: { username: admin, password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy" }
+`
+	cfg, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Admin == nil || !cfg.Admin.AllowRemote ||
+		cfg.Admin.TLSCert != "/etc/freesbc/admin-cert.pem" ||
+		cfg.Admin.TLSKey != "/etc/freesbc/admin-key.pem" {
+		t.Fatalf("admin tls fields: %+v", cfg.Admin)
+	}
+}
+
+// TestPeerAuthRealmParses is the T-19 (F-20) red test: the optional
+// auth.realm pin on a peer parses under the Strict parser.
+func TestPeerAuthRealmParses(t *testing.T) {
+	src := `
+listen:
+  sip: [udp://127.0.0.1:5060]
+peers:
+  carrier:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+    auth: { username: acct01, password: secret, realm: carrier-realm }
+routes:
+  - name: out
+    from: carrier
+    to: [carrier]
+`
+	cfg, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Peers["carrier"].Auth == nil || cfg.Peers["carrier"].Auth.Realm != "carrier-realm" {
+		t.Fatalf("auth realm: %+v", cfg.Peers["carrier"].Auth)
+	}
+	// The field stays optional: no realm parses as the zero value.
+	src2 := `
+listen:
+  sip: [udp://127.0.0.1:5060]
+peers:
+  carrier:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+    auth: { username: acct01, password: secret }
+routes:
+  - name: out
+    from: carrier
+    to: [carrier]
+`
+	cfg2, err := Parse([]byte(src2))
+	if err != nil {
+		t.Fatalf("parse (no realm): %v", err)
+	}
+	if cfg2.Peers["carrier"].Auth.Realm != "" {
+		t.Fatalf("absent realm should be empty, got %q", cfg2.Peers["carrier"].Auth.Realm)
+	}
+}
+
+// TestSIPTLSConfigFieldsParse is the T-17 (F-13) red test: the SIP-plane
+// TLS fields — inbound listen.tls_cert/tls_key/tls_client_ca and outbound
+// per-peer tls_ca/tls_client_cert/tls_client_key — unmarshal under the
+// Strict parser.
+func TestSIPTLSConfigFieldsParse(t *testing.T) {
+	src := `
+listen:
+  sip: [udp://127.0.0.1:5060, tls://127.0.0.1:5061]
+  tls_cert: /etc/freesbc/sip-cert.pem
+  tls_key: /etc/freesbc/sip-key.pem
+  tls_client_ca: /etc/freesbc/client-ca.pem
+peers:
+  carrier:
+    address: carrier.example.com:5061
+    transport: tls
+    allowed_ips: [203.0.113.0/24]
+    tls_ca: /etc/freesbc/carrier-ca.pem
+    tls_client_cert: /etc/freesbc/carrier-client.pem
+    tls_client_key: /etc/freesbc/carrier-client-key.pem
+routes:
+  - name: out
+    from: carrier
+    to: [carrier]
+`
+	cfg, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.Listen.TLSCert != "/etc/freesbc/sip-cert.pem" ||
+		cfg.Listen.TLSKey != "/etc/freesbc/sip-key.pem" ||
+		cfg.Listen.TLSClientCA != "/etc/freesbc/client-ca.pem" {
+		t.Fatalf("listen tls fields: %+v", cfg.Listen)
+	}
+	p := cfg.Peers["carrier"]
+	if p == nil || p.TLSCA != "/etc/freesbc/carrier-ca.pem" ||
+		p.TLSClientCert != "/etc/freesbc/carrier-client.pem" ||
+		p.TLSClientKey != "/etc/freesbc/carrier-client-key.pem" {
+		t.Fatalf("peer tls fields: %+v", p)
+	}
+}
+
+// TestValidateSIPTLSPairs (T-17): half-configured TLS pairs must be
+// rejected — an operator who sets only one half believes verification (or
+// mTLS) is on while it silently isn't.
+func TestValidateSIPTLSPairs(t *testing.T) {
+	base := func(extra string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+` + extra + `
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	_, err := Parse([]byte(base("  tls_cert: /tmp/c.pem")))
+	if err == nil || !strings.Contains(err.Error(), "tls_key") {
+		t.Fatalf("listen tls_cert without tls_key should fail, got %v", err)
+	}
+	_, err = Parse([]byte(base("  tls_key: /tmp/k.pem")))
+	if err == nil {
+		t.Fatal("listen tls_key without tls_cert should fail")
+	}
+	_, err = Parse([]byte(base("  tls_client_ca: /tmp/ca.pem")))
+	if err == nil || !strings.Contains(err.Error(), "tls_client_ca") {
+		t.Fatalf("listen tls_client_ca without cert should fail, got %v", err)
+	}
+	_, err = Parse([]byte(base("")))
+	if err != nil {
+		t.Fatalf("plain config should parse: %v", err)
+	}
+	// Peer client pair rules.
+	peerBase := `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+` + "    tls_client_cert: /tmp/c.pem" + `
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	_, err = Parse([]byte(peerBase))
+	if err == nil || !strings.Contains(err.Error(), "tls_client_key") {
+		t.Fatalf("peer tls_client_cert without key should fail, got %v", err)
+	}
+}
+
+// TestValidateAdminTLSCertRequiresKey (T-26b): a half-configured TLS pair
+// must be rejected — an operator who sets only tls_cert believes TLS is on
+// while the listener would silently stay plaintext.
+func TestValidateAdminTLSCertRequiresKey(t *testing.T) {
+	good := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	base := func(admin string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+` + admin + `
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	_, err := Parse([]byte(base("admin:\n  listen: 127.0.0.1:8443\n  tls_cert: /tmp/c.pem\n  auth: { username: admin, password_hash: \"" + good + "\" }")))
+	if err == nil || !strings.Contains(err.Error(), "tls_cert") {
+		t.Fatalf("tls_cert without tls_key should fail mentioning tls_cert, got %v", err)
+	}
+	if _, err := Parse([]byte(base("admin:\n  listen: 127.0.0.1:8443\n  tls_key: /tmp/k.pem\n  auth: { username: admin, password_hash: \"" + good + "\" }"))); err == nil {
+		t.Fatal("tls_key without tls_cert should fail")
 	}
 }
 
@@ -285,5 +499,70 @@ routes:
 	}
 	if cfg.Peers["sec"].SRTP != "required" {
 		t.Errorf("srtp = %q, want required", cfg.Peers["sec"].SRTP)
+	}
+}
+
+// TestPeerMaxConcurrentCallsParses is the T-06 (F-06) red test: the new
+// per-peer and global concurrent-call quota fields must parse (Strict YAML
+// rejects unknown keys today, so this fails until the schema grows them).
+func TestPeerMaxConcurrentCallsParses(t *testing.T) {
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+    max_concurrent_calls: 3
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+max_concurrent_calls: 10
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.Peers["pbx"].MaxConcurrentCalls; got != 3 {
+		t.Errorf("peer max_concurrent_calls = %d, want 3", got)
+	}
+	if got := cfg.MaxConcurrentCalls; got != 10 {
+		t.Errorf("global max_concurrent_calls = %d, want 10", got)
+	}
+}
+
+// TestMaxConcurrentCallsRejectsNegative proves a negative quota (which would
+// make acquire's `peerMax > 0` guard silently read as unlimited — the
+// opposite of what the operator asked for) is rejected at parse time.
+func TestMaxConcurrentCallsRejectsNegative(t *testing.T) {
+	if _, err := Parse([]byte(`
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+    max_concurrent_calls: -1
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+`)); err == nil {
+		t.Fatal("negative peer max_concurrent_calls must fail Parse")
+	}
+	if _, err := Parse([]byte(`
+listen:
+  sip: [udp://0.0.0.0:5060]
+peers:
+  pbx:
+    address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.0/8]
+routes:
+  - name: in
+    from: pbx
+    to: [pbx]
+max_concurrent_calls: -5
+`)); err == nil {
+		t.Fatal("negative global max_concurrent_calls must fail Parse")
 	}
 }

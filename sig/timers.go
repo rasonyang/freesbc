@@ -28,6 +28,42 @@ func headerSeconds(m sip.Message, name string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// challengeRealm extracts the realm from a 401/407 digest challenge
+// response (T-19/F-20): WWW-Authenticate for 401, Proxy-Authenticate for
+// 407. Returns "" when the header is absent or unparseable — callers
+// compare it against a pinned realm, so "" simply never matches (fail
+// closed). Both double- and single-quoted realms are accepted (some
+// servers violate the quoted-string convention).
+func challengeRealm(res *sip.Response) string {
+	name := "WWW-Authenticate"
+	if res.StatusCode == sip.StatusProxyAuthRequired {
+		name = "Proxy-Authenticate"
+	}
+	headers := res.GetHeaders(name)
+	if len(headers) == 0 {
+		return ""
+	}
+	v := headers[0].Value()
+	i := strings.Index(v, "realm=")
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(v[i+len("realm="):])
+	if rest == "" {
+		return ""
+	}
+	if rest[0] == '"' || rest[0] == '\'' {
+		if j := strings.IndexByte(rest[1:], rest[0]); j >= 0 {
+			return rest[1 : 1+j]
+		}
+		return ""
+	}
+	if j := strings.IndexAny(rest, ", "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 // requires100rel reports whether any Require header lists the 100rel option
 // tag (reliable provisional responses, which we do not support).
 func requires100rel(req *sip.Request) bool {

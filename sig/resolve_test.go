@@ -2,6 +2,8 @@ package sig
 
 import (
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,9 +70,133 @@ func TestResolveHostNoSRVFallsBackToHostname(t *testing.T) {
 	r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
 		return "", nil, &net.DNSError{Err: "no such host", IsNotFound: true}
 	}
+	// T-30 (D8-4): the tls fallback port is 5061 (RFC 3263 §4.1), not 5060.
 	eps := r.Resolve(&config.Peer{Address: "plain.example", Transport: "tls"}, time.Minute)
-	if len(eps) != 1 || eps[0] != (Endpoint{Host: "plain.example", Port: 5060, Transport: "tls"}) {
-		t.Fatalf("no-SRV fallback → %+v, want plain.example:5060/tls", eps)
+	if len(eps) != 1 || eps[0] != (Endpoint{Host: "plain.example", Port: 5061, Transport: "tls"}) {
+		t.Fatalf("no-SRV fallback → %+v, want plain.example:5061/tls", eps)
+	}
+}
+
+// TestResolveTLSUsesDefaultPort5061 (T-30/D8-4): a tls peer with no
+// explicit port and no SRV must fall back to 5061 — dialing 5060 over TLS
+// was a real call-failure bug. udp keeps 5060.
+func TestResolveTLSUsesDefaultPort5061(t *testing.T) {
+	r := newResolver(1)
+	r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", nil, &net.DNSError{Err: "no such host", IsNotFound: true}
+	}
+	eps := r.Resolve(&config.Peer{Address: "1.2.3.4", Transport: "tls"}, time.Minute)
+	if len(eps) != 1 || eps[0].Port != 5061 {
+		t.Fatalf("tls literal IP → %+v, want port 5061", eps)
+	}
+	eps = r.Resolve(&config.Peer{Address: "1.2.3.4", Transport: "udp"}, time.Minute)
+	if len(eps) != 1 || eps[0].Port != 5060 {
+		t.Fatalf("udp literal IP → %+v, want port 5060", eps)
+	}
+}
+
+// TestResolveSRVSkipsUnusableRecords (T-29/D8-2): RFC 2782 Target "."
+// ("service unavailable") and port-0 records must not become dialable
+// endpoints; an all-filtered record set falls back like a no-SRV answer.
+func TestResolveSRVSkipsUnusableRecords(t *testing.T) {
+	r := newResolver(1)
+	r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{
+			{Target: ".", Port: 5060, Priority: 10, Weight: 0},
+			{Target: "good.example.", Port: 0, Priority: 10, Weight: 0},
+			{Target: "ok.example.", Port: 5060, Priority: 10, Weight: 0},
+		}, nil
+	}
+	eps := r.Resolve(&config.Peer{Address: "mixed.example", Transport: "udp"}, time.Minute)
+	if len(eps) != 1 || eps[0].Host != "ok.example" || eps[0].Port != 5060 {
+		t.Fatalf("filtered SRV → %+v, want only ok.example:5060", eps)
+	}
+
+	r2 := newResolver(1)
+	r2.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		return "", []*net.SRV{{Target: ".", Port: 5060, Priority: 10, Weight: 0}}, nil
+	}
+	eps = r2.Resolve(&config.Peer{Address: "dead.example", Transport: "udp"}, time.Minute)
+	if len(eps) != 1 || eps[0] != (Endpoint{Host: "dead.example", Port: 5060, Transport: "udp"}) {
+		t.Fatalf("all-filtered SRV → %+v, want fallback dead.example:5060/udp", eps)
+	}
+}
+
+// TestResolveNegativeCacheIsShort (T-28/D8-1): a transient lookup failure
+// must not pin the fallback endpoint for the full srv_cache_ttl — it is
+// cached only for srvFailCacheTTL, then re-queried.
+func TestResolveNegativeCacheIsShort(t *testing.T) {
+	r := newResolver(1)
+	fakeNow := time.Unix(1000, 0)
+	r.now = func() time.Time { return fakeNow }
+	calls := 0
+	r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		calls++
+		return "", nil, &net.DNSError{Err: "timeout"}
+	}
+	peer := &config.Peer{Address: "flaky.example", Transport: "udp"}
+	r.Resolve(peer, 5*time.Minute) // failure → short negative cache
+	r.Resolve(peer, 5*time.Minute)
+	if calls != 1 {
+		t.Fatalf("lookupSRV called %d times, want 1 (short-cached failure)", calls)
+	}
+	fakeNow = fakeNow.Add(srvFailCacheTTL + time.Second)
+	r.Resolve(peer, 5*time.Minute) // short TTL expired → re-query, not 300s
+	if calls != 2 {
+		t.Fatalf("lookupSRV called %d times, want 2 (failure must re-query after %v, not the full TTL)", calls, srvFailCacheTTL)
+	}
+}
+
+// TestResolveConcurrentLookupSingleflighted (T-28/D8-1): a burst of
+// concurrent Resolves for the same uncached host triggers exactly ONE DNS
+// lookup — the rest share the in-flight result or the cache.
+func TestResolveConcurrentLookupSingleflighted(t *testing.T) {
+	r := newResolver(1)
+	var calls atomic.Int32
+	release := make(chan struct{})
+	r.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
+		calls.Add(1)
+		<-release
+		return "", []*net.SRV{{Target: "a.example.", Port: 5060, Priority: 10, Weight: 0}}, nil
+	}
+	peer := &config.Peer{Address: "burst.example", Transport: "udp"}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eps := r.Resolve(peer, time.Minute)
+			if len(eps) != 1 || eps[0].Host != "a.example" {
+				t.Errorf("unexpected result: %+v", eps)
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond) // let the burst pile up on the flight
+	close(release)
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("lookupSRV called %d times, want exactly 1 for a concurrent burst", got)
+	}
+}
+
+// TestResolveLookupTimeoutFallsBack (T-28/D8-1): a resolver that hangs past
+// srvLookupTimeout must not pin the call — it falls back like any other
+// lookup failure, bounded in time.
+func TestResolveLookupTimeoutFallsBack(t *testing.T) {
+	r := newResolver(1)
+	block := make(chan struct{})
+	defer close(block)
+	r.lookupSRV = lookupSRVTimeout(func(_, _, _ string) (string, []*net.SRV, error) {
+		<-block // hang past the wrapper's deadline
+		return "", nil, &net.DNSError{Err: "late"}
+	})
+	start := time.Now()
+	eps := r.Resolve(&config.Peer{Address: "hung.example", Transport: "udp"}, time.Minute)
+	if elapsed := time.Since(start); elapsed > 2*srvLookupTimeout {
+		t.Fatalf("lookup took %v, want bounded by ~%v", elapsed, srvLookupTimeout)
+	}
+	if len(eps) != 1 || eps[0] != (Endpoint{Host: "hung.example", Port: 5060, Transport: "udp"}) {
+		t.Fatalf("timeout fallback → %+v, want hung.example:5060/udp", eps)
 	}
 }
 

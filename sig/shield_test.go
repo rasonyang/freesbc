@@ -54,12 +54,16 @@ routes:
 `
 
 // TestShieldBansAfterFailures drives `failures` unidentified OPTIONS
-// requests from one source through dropUnidentified (each silently
-// dropped, exactly as before the shield existed), then asserts the source
-// is now banned by calling srv.shield.Check directly. This proves the
-// RecordUnidentified -> auto-ban wiring end-to-end: dropUnidentified feeds
-// the shield's failure counter, and the Nth failure within the window
-// bans the source (shield.Shield.RecordUnidentified, spec §3).
+// requests from one source and asserts both halves of the T-01 boundary:
+// the client hears nothing, and the shield is never fed — pre-parse
+// filtering drops the bytes before dropUnidentified/RecordUnidentified
+// could run, so no auto-ban exists for this source (Check returns Allow,
+// all drop counters zero). Before T-01 this test asserted the opposite —
+// that the Nth unidentified failure within the window auto-banned the
+// source via dropUnidentified's RecordUnidentified wiring. That path is
+// now unreachable over the wire (non-peer bytes never become requests),
+// and the shield-side auto-ban logic is covered by the shield package's
+// own TestRecordUnidentifiedBansAtThreshold.
 func TestShieldBansAfterFailures(t *testing.T) {
 	const port = 45700
 	srv := startServer(t, port, fmt.Sprintf(unidentifiedShieldCfg, port))
@@ -76,8 +80,11 @@ func TestShieldBansAfterFailures(t *testing.T) {
 		t.Fatal("srv.shield is nil after Run — construction wiring broken")
 	}
 	src := netip.MustParseAddr("127.0.0.1")
-	if v := sh.Check(src, ""); v != shield.Drop {
-		t.Fatalf("after 3 unidentified failures, Check(%s) = %v, want Drop (auto-ban)", src, v)
+	if v := sh.Check(src, "", "udp"); v != shield.Allow {
+		t.Fatalf("pre-parse drop must keep the shield clean: Check(%s) = %v, want Allow (no ban recorded)", src, v)
+	}
+	if stats := sh.Stats(); stats.BannedCurrent != 0 || stats.DropsByReason["banned"] != 0 || stats.DropsByReason["scanner"] != 0 || stats.DropsByReason["rate"] != 0 {
+		t.Fatalf("shield saw non-peer traffic it should never have received: %+v", stats)
 	}
 }
 
@@ -99,11 +106,15 @@ func TestShieldConfiguredPeerNotThrottled(t *testing.T) {
 	}
 }
 
-// TestShieldScannerInstantBan proves a single request bearing a known
-// scanner User-Agent bans its source immediately (spec §3), without
-// needing to cross the auto_ban.failures threshold: after one OPTIONS from
-// an unidentified source with User-Agent: friendly-scanner, that source's
-// next Check is Drop.
+// TestShieldScannerInstantBan proves a scanner-UA request from an
+// unidentified source is dropped at the T-01 pre-parse boundary: the
+// client hears nothing and the shield never sees the scanner User-Agent,
+// so no instant ban exists for this source (Check returns Allow, the
+// scanner drop counter is zero). Before T-01 this test asserted the
+// opposite — that one OPTIONS with User-Agent: friendly-scanner from an
+// unidentified source instantly banned it. Non-peer bytes never reach the
+// shield's scanner check anymore; that check itself is covered by the
+// shield package's own TestCheckScannerInstantBan.
 func TestShieldScannerInstantBan(t *testing.T) {
 	const port = 45702
 	srv := startServer(t, port, fmt.Sprintf(unidentifiedShieldCfg, port))
@@ -119,7 +130,10 @@ func TestShieldScannerInstantBan(t *testing.T) {
 		t.Fatal("srv.shield is nil after Run — construction wiring broken")
 	}
 	src := netip.MustParseAddr("127.0.0.1")
-	if v := sh.Check(src, ""); v != shield.Drop {
-		t.Fatalf("after one scanner-UA request, Check(%s) = %v, want Drop (instant ban)", src, v)
+	if v := sh.Check(src, "", "udp"); v != shield.Allow {
+		t.Fatalf("pre-parse drop must keep the shield clean: Check(%s) = %v, want Allow (no scanner ban)", src, v)
+	}
+	if drops := sh.Stats().DropsByReason["scanner"]; drops != 0 {
+		t.Fatalf("shield scanner-ban counter = %d, want 0 (pre-parse drop keeps non-peer bytes away)", drops)
 	}
 }

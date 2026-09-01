@@ -56,6 +56,9 @@ func (c *Config) validate() error {
 	if c.SRVCacheTTL.Std() < time.Second {
 		fail("srv_cache_ttl: must be at least 1s, got %v", c.SRVCacheTTL.Std())
 	}
+	if c.MaxConcurrentCalls < 0 {
+		fail("max_concurrent_calls: must be >= 0 (0 = unlimited), got %d", c.MaxConcurrentCalls)
+	}
 
 	if len(c.Peers) == 0 {
 		fail("peers: at least one peer required")
@@ -95,14 +98,43 @@ func (c *Config) validate() error {
 		if p.Register && p.Auth == nil {
 			fail("peers.%s: register: true requires auth credentials", name)
 		}
+		if p.MaxConcurrentCalls < 0 {
+			fail("peers.%s: max_concurrent_calls: must be >= 0 (0 = unlimited), got %d", name, p.MaxConcurrentCalls)
+		}
 		p.allowedNets = nil
+		if len(p.AllowedIPs) == 0 {
+			// T-11 (F-16): an empty list silently failed closed before —
+			// the peer could never be identified and the operator got no
+			// signal. That's a config mistake, not a posture: refuse it.
+			fail("peers.%s: allowed_ips: at least one prefix required", name)
+		}
 		for _, s := range p.AllowedIPs {
 			pfx, err := parsePrefixOrAddr(s)
 			if err != nil {
 				fail("peers.%s: allowed_ips: %v", name, err)
 				continue
 			}
-			p.allowedNets = append(p.allowedNets, pfx)
+			// T-11 (F-16): cap prefix width. allowed_ips IS the whole
+			// inbound trust boundary (source-IP identification), so a
+			// fat-fingered 0.0.0.0/0 — or an over-wide range — silently
+			// opens toll fraud to every host it covers. The floors are /8
+			// (IPv4) and /32 (IPv6): the widest real-world allocation
+			// boundaries (10/8, an RIR site allocation), deliberately more
+			// permissive than the review's suggested /16//48 because this
+			// repo's own example config ships a 10.0.0.0/8 peer. A bare IP
+			// parses as its full-length prefix and always passes.
+			minBits := 8
+			if pfx.Addr().Is6() {
+				minBits = 32
+			}
+			if pfx.Bits() < minBits {
+				fail("peers.%s: allowed_ips: %q is wider than /%d (T-11 width cap)", name, s, minBits)
+				continue
+			}
+			// Store the canonical (Masked) form: a non-canonical input like
+			// 10.0.1.5/16 matches exactly what the operator intended once
+			// normalized, instead of silently mismatching netip semantics.
+			p.allowedNets = append(p.allowedNets, pfx.Masked())
 		}
 	}
 
@@ -145,6 +177,9 @@ func (c *Config) validate() error {
 	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
 		fail("shield.rate_limit: %v", err)
 	}
+	if _, err := ParseRateLimit(c.Shield.PeerRateLimit); err != nil {
+		fail("shield.peer_rate_limit: %v", err)
+	}
 	switch c.Shield.NFTables {
 	case "auto", "on", "off":
 	default:
@@ -165,14 +200,45 @@ func (c *Config) validate() error {
 	}
 
 	if c.Admin != nil {
-		if _, err := netip.ParseAddrPort(c.Admin.Listen); err != nil {
+		ap, err := netip.ParseAddrPort(c.Admin.Listen)
+		if err != nil {
 			fail("admin.listen: %q is not host:port", c.Admin.Listen)
+		} else if !ap.Addr().IsLoopback() && !c.Admin.AllowRemote {
+			// T-26 (D4-6): the admin API is the full-config exposure point
+			// guarded only by Basic auth — non-loopback binding must be an
+			// explicit opt-in, and the error points at the TLS route.
+			fail("admin.listen: %q is not loopback; set admin.allow_remote: true to bind it "+
+				"(prefer admin.tls_cert/tls_key or a TLS reverse proxy — this listener serves the full config over plaintext otherwise)", c.Admin.Listen)
 		}
 		if c.Admin.Auth.Username == "" {
 			fail("admin.auth.username: required when admin is configured")
 		}
-		if _, err := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash)); err != nil {
-			fail("admin.auth.password_hash: must be a bcrypt hash: %v", err)
+		cost, cerr := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash))
+		if cerr != nil {
+			fail("admin.auth.password_hash: must be a bcrypt hash: %v", cerr)
+		} else if cost < 10 {
+			// T-26 (D4-6): cost 4 (min) makes offline cracking ~50x cheaper;
+			// the hash travels in backups, logs, and the config itself.
+			fail("admin.auth.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
+		}
+		if (c.Admin.TLSCert == "") != (c.Admin.TLSKey == "") {
+			// T-26b: both-or-neither, so a half-configured pair can't leave
+			// the operator believing TLS is on while it silently isn't.
+			fail("admin: tls_cert and tls_key must be set together")
+		}
+	}
+
+	// T-17 (F-13): SIP-plane TLS pairs — same both-or-neither rationale as
+	// the admin pair above.
+	if (c.Listen.TLSCert == "") != (c.Listen.TLSKey == "") {
+		fail("listen: tls_cert and tls_key must be set together")
+	}
+	if c.Listen.TLSClientCA != "" && c.Listen.TLSCert == "" {
+		fail("listen.tls_client_ca requires listen.tls_cert and tls_key")
+	}
+	for name, p := range c.Peers {
+		if (p.TLSClientCert == "") != (p.TLSClientKey == "") {
+			fail("peers.%s: tls_client_cert and tls_client_key must be set together", name)
 		}
 	}
 

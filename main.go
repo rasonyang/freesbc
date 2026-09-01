@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -106,10 +107,17 @@ func run(cfgPath string) error {
 			Calls:       sipServer.Calls,
 			ActiveCalls: sipServer.ActiveCalls,
 			KillCall:    sipServer.KillCall,
-			Ports:       pool.Stats,
+			Unban: func(ip string) bool {
+				addr, err := netip.ParseAddr(ip)
+				if err != nil {
+					return false
+				}
+				return sipServer.Unban(addr)
+			},
+			Ports: pool.Stats,
 			Shield: func() admin.ShieldStats {
 				st := sipServer.ShieldStats()
-				return admin.ShieldStats{BannedCurrent: st.BannedCurrent, DropsByReason: st.DropsByReason}
+				return admin.ShieldStats{BannedCurrent: st.BannedCurrent, BanAddsRejected: st.BanAddsRejected, DropsByReason: st.DropsByReason}
 			},
 			Peers: func() []admin.PeerStatus {
 				cfg := store.Current()

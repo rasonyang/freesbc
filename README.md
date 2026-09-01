@@ -26,6 +26,8 @@ Explicit non-goals: transcoding, registrar (serving phone registrations), CDR, c
 
 Requires Go ≥ 1.22.
 
+> **公网部署前必读** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md)（部署安全基线：公网暴露策略 + admin 监听基线）。
+
 ```sh
 go build -o freesbc .
 cp sbc.example.yaml sbc.yaml   # edit peers/routes for your setup
@@ -104,7 +106,9 @@ Enable the optional `admin` block (a bcrypt `password_hash` — generate with
   the `<call-id>` is the `id` from `GET /api/calls`.
 
 Bind the admin listener **private** (there is no TLS on it) — front it with a
-reverse proxy for remote/TLS access.
+reverse proxy for remote/TLS access. Deployment baseline: loopback-only by
+policy; non-loopback requires the checklist in
+[`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (G-2).
 
 ## Development
 

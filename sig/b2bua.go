@@ -65,12 +65,67 @@ type legSRTP struct {
 // instead of giving up on the whole call.
 var errSRTPRequiredMismatch = errors.New("srtp required by policy but answer has no usable a=crypto")
 
+// testHookBWaiterPanic, set only by tests, is invoked at the top of the
+// orphan B-leg waiter goroutine in dialTarget so the S-01 recover path can
+// be exercised deterministically: a real panic there (see the S-01 defer in
+// that goroutine) would otherwise have to be provoked with a production
+// condition, and the regression test only needs to prove the panic stays
+// contained to that goroutine rather than killing the process. It is an
+// atomic pointer because the test clears it while waiter goroutines of an
+// earlier attempt may still read it — the test goroutine and the bridge's
+// waiter goroutines share no synchronization except network I/O, so a plain
+// package var would be a real data race under -race.
+var testHookBWaiterPanic atomic.Pointer[func()]
+
 // bridge is the B2BUA: it pairs an inbound A-leg with an outbound B-leg,
 // anchoring media and hiding topology. One bridge instance is shared; each
 // call runs in its own onInvite goroutine (sipgo dispatches OnInvite in a
 // fresh goroutine per request).
 type bridge struct {
 	s *Server
+}
+
+// callQuota counts in-flight initial INVITEs per peer and globally (T-06,
+// F-06/D6-8): a single peer source (forgable, given source-IP-only
+// identification) could otherwise stream ~70 INVITE/s and exhaust the whole
+// media port pool, each one also triggering a real outbound leg. The caps
+// come from peers.<name>.max_concurrent_calls and the global
+// max_concurrent_calls; a cap of 0 means unlimited. The zero value is
+// usable (nil map is lazily initialized on first acquire).
+type callQuota struct {
+	mu     sync.Mutex
+	peers  map[string]int
+	global int
+}
+
+// acquire admits one initial INVITE for peer under both caps (a cap of 0
+// skips that bound) and returns the release func to call when the call
+// ends. onInvite defers it immediately, so every path out of onInvite —
+// success, any failure response, or a panic unwind — frees the slot
+// exactly once.
+func (q *callQuota) acquire(peer string, peerMax, globalMax int) (release func(), admitted bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if peerMax > 0 && q.peers[peer] >= peerMax {
+		return nil, false
+	}
+	if globalMax > 0 && q.global >= globalMax {
+		return nil, false
+	}
+	if q.peers == nil {
+		q.peers = make(map[string]int)
+	}
+	q.peers[peer]++
+	q.global++
+	return func() {
+		q.mu.Lock()
+		q.peers[peer]--
+		if q.peers[peer] == 0 {
+			delete(q.peers, peer)
+		}
+		q.global--
+		q.mu.Unlock()
+	}, true
 }
 
 // onInvite handles an inbound INVITE end to end: identify the source,
@@ -84,6 +139,15 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	name, fromPeer, ok := b.s.identify(req)
 	if !ok {
 		b.s.dropUnidentified(req)
+		return
+	}
+
+	// T-20 (D1-8): a request missing any dialog-critical header used to
+	// nil-deref somewhere below and vanish into recoverCall with no
+	// response at all — refuse it explicitly with 400 (RFC 3261 §8.1.1
+	// mandates all three on an INVITE).
+	if req.From() == nil || req.To() == nil || req.CallID() == nil {
+		b.reject(req, tx, 400, "Bad Request")
 		return
 	}
 
@@ -118,6 +182,15 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// own, distinct Call-ID and is answered with bOffer. Same code path,
 	// correct answer either way (Fix 2).
 	//
+	// T-07 (F-08): the Call-ID naming a live leg is not enough — the
+	// request must also prove it IS on that leg's dialog before any
+	// established state is handed back. Both tags are checked against the
+	// pair recorded when the leg was established (entry.fromTag/entry.toTag,
+	// RFC 3261 §12.2.2 dialog match), so a request that merely replays a
+	// sniffed Call-ID and the established SDP gets 481 with no body — never
+	// entry.answer, which on a secure leg carries the SDES master key. A
+	// matching dialog is then held to the same refresh test as before.
+	//
 	// Limitation: this bare-tx.Respond path does NOT retransmit the 2xx
 	// (sipgo's TU retransmit-until-ACK loop lives in
 	// DialogServerSession.WriteResponse, which we deliberately bypass). If
@@ -126,7 +199,12 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// reliable link; a retransmit loop is deferred (a hand-rolled one outside
 	// the dialog layer is the "fragile hack" the M4.3 spike avoided).
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
-		if entry, ok := b.s.callSDP(callID(req)); ok && isRefreshReInvite(req, entry.compare) {
+		entry, known := b.s.callSDP(callID(req))
+		if known && (fromTagOf(req) != entry.fromTag || tag != entry.toTag) {
+			b.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+			return
+		}
+		if known && isRefreshReInvite(req, entry.compare) {
 			// The refresh's 200 OK MUST carry a Contact (RFC 3261 §12.1.1:
 			// every 2xx to INVITE does), which
 			// sip.NewResponseFromRequest does not add on its own — build
@@ -152,6 +230,20 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 
 	cfg := b.s.store.Current()
+
+	// T-06 (F-06/D6-8) call-quota gate for initial INVITEs (the in-dialog
+	// re-INVITE branch above already returned — a refresh never consumes a
+	// new slot): an INVITE past either the peer's or the global
+	// concurrent-call cap is refused with 503 + Retry-After (RFC 3261
+	// §21.5.4) before routing, dialing, or a media port are spent on it.
+	// The slot is released by defer no matter how this onInvite ends, so
+	// failed calls can't leak quota.
+	release, admitted := b.s.quota.acquire(name, fromPeer.MaxConcurrentCalls, cfg.MaxConcurrentCalls)
+	if !admitted {
+		b.reject(req, tx, 503, "Call Quota Exceeded", sip.NewHeader("Retry-After", "30"))
+		return
+	}
+	defer release()
 
 	// M4.3 front-door gating for INITIAL INVITEs only (the in-dialog
 	// re-INVITE branch above already returned): reject anything we cannot
@@ -336,9 +428,35 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	//
 	// A-leg: the caller offered req.Body(); we answered aAnswer.
 	// B-leg: we offered bOffer; the carrier answered bLeg.InviteResponse.Body().
+	//
+	// Each entry also records the From/To tags the leg's REMOTE endpoint
+	// will carry in an in-dialog request on this leg (T-07/F-08) for the
+	// in-dialog branch's dialog-match check: From always identifies the
+	// sender, so the A-leg (caller is remote) stores the caller's From-tag
+	// (off the initial INVITE) with OUR To-tag — the one sipgo prebuilt onto
+	// ReadInvite's clone (aLeg.InviteRequest.To), which is exactly the tag
+	// our 200 OK went out with (WriteResponse validates that equality) —
+	// while the B-leg (carrier is remote, and IT was the UAS) stores the
+	// carrier's own tag — the To-tag off ITS 200 OK (bLeg.InviteResponse.To)
+	// — with OUR From-tag (set by buildFrom on bLeg.InviteRequest), swapped
+	// relative to the establishment headers because the carrier's in-dialog
+	// request carries ITS identity in From and ours in To. fromTagOf/toTagOf
+	// read both kinds of message and return "" on a missing header, which
+	// simply never matches a stored tag (stored tags are never empty on an
+	// established leg).
 	bCallID := callID(bLeg.InviteRequest)
-	b.s.sdps.set(call.ID, callSDP{compare: req.Body(), answer: aAnswer})
-	b.s.sdps.set(bCallID, callSDP{compare: bLeg.InviteResponse.Body(), answer: bOffer})
+	b.s.sdps.set(call.ID, callSDP{
+		compare: req.Body(),
+		answer:  aAnswer,
+		fromTag: fromTagOf(req),
+		toTag:   toTagOf(aLeg.InviteRequest),
+	})
+	b.s.sdps.set(bCallID, callSDP{
+		compare: bLeg.InviteResponse.Body(),
+		answer:  bOffer,
+		fromTag: toTagOf(bLeg.InviteResponse),
+		toTag:   fromTagOf(bLeg.InviteRequest),
+	})
 	defer b.s.sdps.delete(call.ID)
 	defer b.s.sdps.delete(bCallID)
 
@@ -846,8 +964,61 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// Argument copies are written once at goroutine start, so the
 		// goroutine owns its values and the main flow can return freely.
 		go func(bLeg *sipgo.DialogClientSession, attemptCtx context.Context) {
+			// S-01: this goroutine outlives onInvite's recoverCall umbrella —
+			// it keeps running (inviteCancel, ackThenBye) for up to Timer_B
+			// (~32s) after dialTarget has already returned on an abandoned or
+			// raced attempt — so a panic here (including a nil-deref induced
+			// by a data race on shared dialog state, see S-02) would kill the
+			// WHOLE process, not just this call. Contain it: log and exit the
+			// goroutine. Nothing is sent on waited after a panic; the main
+			// path then simply runs out its ring budget and grace and
+			// classifies the attempt as a timeout, which is the same outcome
+			// an in-band error would have produced.
+			defer func() {
+				if r := recover(); r != nil {
+					b.s.log.Error("b-leg waiter goroutine panic",
+						"panic", r, "stack", string(debug.Stack()), "target", target.Name)
+				}
+			}()
+			if hook := testHookBWaiterPanic.Load(); hook != nil {
+				(*hook)()
+			}
 			err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
 				OnResponse: func(res *sip.Response) error {
+					// S-02: once the main path has abandoned this attempt
+					// (ring deadline AND grace both expired), stop touching
+					// any shared dialog/media state — relay can reach
+					// aLeg.Respond, and the main flow may concurrently be
+					// responding the A-leg or dialing the next target, so a
+					// late relay racing an abandoned attempt is an
+					// unsynchronized WriteResponse (a data race, not just a
+					// mis-aimed response — SECURITY-REVIEW-20260831 §S-02).
+					// responded also stays unset for late responses, so the
+					// penalize read on the deadline path reflects only what
+					// arrived in time. (A post-abandon OnResponse is rare —
+					// WaitAnswer enters inviteCancel once attemptCtx is done
+					// and inviteCancel never calls OnResponse — but its
+					// select can pick a just-arrived response over ctx.Done
+					// in the same instant, and that is the window this
+					// closes.)
+					if abandoned.Load() {
+						return nil
+					}
+					// T-19 (F-20): realm pinning — when THIS target's auth
+					// pins a realm, a challenge naming any other realm must
+					// never be answered with a digest of our credentials
+					// (a rogue or compromised server would harvest the
+					// response for offline cracking). OnResponse runs
+					// BEFORE sipgo's built-in digest retry, so returning an
+					// error here aborts WaitAnswer without any
+					// Authorization header ever being sent for this
+					// attempt; the classification below then reports it as
+					// the ordinary unsatisfied-challenge failDial.
+					if auth := target.Peer.Auth; auth != nil && auth.Realm != "" &&
+						(res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired) &&
+						challengeRealm(res) != auth.Realm {
+						return fmt.Errorf("auth challenge realm %q does not match pinned realm %q", challengeRealm(res), auth.Realm)
+					}
 					responded.Store(true)
 					return relay(res)
 				},
@@ -860,7 +1031,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// has already moved on and must never read InviteResponse again
 			// for this attempt.
 			if abandoned.Load() && bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
-				b.ackThenBye(context.Background(), bLeg, target)
+				b.ackThenBye(bLeg, target)
 			}
 			waited <- err
 		}(bLeg, attemptCtx)
@@ -986,13 +1157,12 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// is ALSO true, and that case would otherwise win and skip teardown
 		// entirely — leaving a live carrier call nobody tears down for
 		// ~32s. Tear the phantom call down with ACK+BYE before classifying,
-		// regardless of which case ends up classifying the attempt.
-		// context.Background() rather than aLeg.Context(): the A-leg's
-		// context may already be cancelled (the caller-CANCEL case above),
-		// and this is best-effort teardown independent of the A-leg's fate
-		// either way; ackThenBye bounds its own BYE via byeContext's 5s.
+		// regardless of which case ends up classifying the attempt. Best
+		// effort, independent of the A-leg's fate (which may already be
+		// cancelled — the caller-CANCEL case above): ackThenBye bounds both
+		// its own ACK and BYE via byeContext's 5s (S-04).
 		if bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
-			b.ackThenBye(context.Background(), bLeg, target)
+			b.ackThenBye(bLeg, target)
 		}
 		switch {
 		case aLeg.Context().Err() != nil:
@@ -1082,14 +1252,15 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// candidate rather than finalizing the call with 502. "required"
 			// never silently downgrades to plaintext.
 			b.s.log.Info("b-leg srtp required by policy but answer not secure", "target", target.Name)
-			b.ackThenBye(aLeg.Context(), bLeg, target)
+			b.ackThenBye(bLeg, target)
 			return nil, attemptResult{retryable: true, kind: failUnusable, code: 502, reason: "Bad Gateway"}
 		}
 		// Respond the A-leg before tearing the B-leg down: ackThenBye is a
-		// network round trip bounded by byeContext's 5s, and there's no
-		// reason to hold the caller's final response hostage behind it.
+		// network round trip bounded by its own 5s contexts (S-04), and
+		// there's no reason to hold the caller's final response hostage
+		// behind it.
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		b.ackThenBye(aLeg.Context(), bLeg, target)
+		b.ackThenBye(bLeg, target)
 		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
 	}
 
@@ -1121,7 +1292,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	}
 	if err != nil {
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		b.ackThenBye(aLeg.Context(), bLeg, target)
+		b.ackThenBye(bLeg, target)
 		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
 	}
 
@@ -1409,8 +1580,20 @@ func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, start
 // isn't Confirmed, so this Acks first (best-effort) and only then Byes
 // (also best-effort) — both errors are logged, not returned, since the
 // caller has already decided to abandon this bLeg regardless.
-func (b *bridge) ackThenBye(ctx context.Context, bLeg *sipgo.DialogClientSession, target Target) {
-	if err := bLeg.Ack(ctx); err != nil {
+//
+// S-04: both sends get their OWN 5s-bounded contexts (byeContext), never a
+// caller's ctx. The raced-2xx and orphan-waiter paths used to pass
+// context.Background(), and a blackholed B-leg TCP transport would block
+// the Ack write forever (outbound connections have no write timeout),
+// leaking the goroutine permanently; the post-answer paths passed
+// aLeg.Context(), which is cancelled the moment the caller hangs up — mid
+// teardown. Two separate budgets, like byeBoth, so a slow Ack can't eat
+// the Bye's budget.
+func (b *bridge) ackThenBye(bLeg *sipgo.DialogClientSession, target Target) {
+	ackCtx, ackCancel := byeContext()
+	err := bLeg.Ack(ackCtx)
+	ackCancel()
+	if err != nil {
 		b.s.log.Error("ack b-leg for teardown", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		return
@@ -1422,9 +1605,15 @@ func (b *bridge) ackThenBye(ctx context.Context, bLeg *sipgo.DialogClientSession
 	}
 }
 
-// reject answers an INVITE we will not bridge, before any dialog is created.
-func (b *bridge) reject(req *sip.Request, tx sip.ServerTransaction, code int, reason string) {
-	_ = tx.Respond(sip.NewResponseFromRequest(req, code, reason, nil))
+// reject answers an INVITE we will not bridge, before any dialog is
+// created. Extra headers (e.g. the quota gate's Retry-After) are appended
+// to the response.
+func (b *bridge) reject(req *sip.Request, tx sip.ServerTransaction, code int, reason string, headers ...sip.Header) {
+	res := sip.NewResponseFromRequest(req, code, reason, nil)
+	for _, h := range headers {
+		res.AppendHeader(h)
+	}
+	_ = tx.Respond(res)
 	b.s.log.Info("rejected invite", "code", code, "reason", reason, "source", req.Source())
 }
 
@@ -1446,6 +1635,27 @@ func (b *bridge) recoverCall(req *sip.Request) {
 func callID(req *sip.Request) string {
 	if cid := req.CallID(); cid != nil {
 		return cid.Value()
+	}
+	return ""
+}
+
+// fromTagOf and toTagOf read a message's From/To tag, returning "" when the
+// header is absent or tagless (T-07/F-08). They work on both *sip.Request
+// and *sip.Response; callers only ever compare the result against a stored
+// dialog tag, which is never empty on an established leg, so a missing
+// header fails the match — never a nil-deref panic on malformed input.
+func fromTagOf(msg sip.Message) string {
+	if f := msg.From(); f != nil {
+		tag, _ := f.Params.Get("tag")
+		return tag
+	}
+	return ""
+}
+
+func toTagOf(msg sip.Message) string {
+	if t := msg.To(); t != nil {
+		tag, _ := t.Params.Get("tag")
+		return tag
 	}
 	return ""
 }

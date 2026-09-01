@@ -27,8 +27,13 @@ type regParams struct {
 	Transport     string
 	Username      string
 	Password      string
-	ContactIP     netip.Addr
-	ContactPort   int
+	// Realm pins the digest realm we answer challenges for (T-19/F-20);
+	// empty = accept any. Part of the struct (and thus the reconcile
+	// comparison) so a realm change re-registers like any other param
+	// change.
+	Realm       string
+	ContactIP   netip.Addr
+	ContactPort int
 }
 
 // registerOnce performs a REGISTER exchange for p, requesting the given
@@ -98,6 +103,13 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 		return 0, nil, fmt.Errorf("register: %w", err)
 	}
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
+		// T-19 (F-20): when this peer pins a realm, a challenge naming any
+		// other realm is never answered — computing a digest of our
+		// credentials for it would let a rogue registrar harvest the
+		// response for offline cracking. Fail the registration as-is.
+		if p.Realm != "" && challengeRealm(res) != p.Realm {
+			return 0, res, fmt.Errorf("register challenge realm %q does not match pinned realm %q", challengeRealm(res), p.Realm)
+		}
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{Username: p.Username, Password: p.Password})
 		if err != nil {
 			return 0, nil, fmt.Errorf("register digest: %w", err)
@@ -391,7 +403,7 @@ func (r *Registrar) paramsFor(cfg *config.Config, name string, p *config.Peer) r
 	ourIP := r.srv.ourIP(cfg)
 	return regParams{
 		Name: name, RegistrarHost: host, RegistrarPort: port,
-		Transport: p.Transport, Username: p.Auth.Username, Password: p.Auth.Password,
+		Transport: p.Transport, Username: p.Auth.Username, Password: p.Auth.Password, Realm: p.Auth.Realm,
 		ContactIP: ourIP, ContactPort: r.srv.ourSigPort(cfg, p.Transport),
 	}
 }

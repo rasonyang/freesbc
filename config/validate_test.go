@@ -3,6 +3,8 @@ package config
 import (
 	"net/netip"
 	"strings"
+
+	"golang.org/x/crypto/bcrypt"
 	"testing"
 	"time"
 )
@@ -288,6 +290,172 @@ routes:
 	// no admin block → fine
 	if _, err := Parse([]byte(base(""))); err != nil {
 		t.Fatalf("no admin block should parse: %v", err)
+	}
+}
+
+// TestValidateRejectsNonLoopbackAdmin is the T-26 (D4-6) red test: a
+// non-loopback admin.listen is a full-config exposure point, so it must not
+// pass silently — only an explicit admin.allow_remote: true admits it (the
+// operator has signed off on the exposure; the error message itself points
+// at the TLS route).
+func TestValidateRejectsNonLoopbackAdmin(t *testing.T) {
+	good := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	base := func(admin string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+` + admin + `
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	auth := `  auth: { username: admin, password_hash: "` + good + `" }`
+	// 0.0.0.0 without allow_remote → rejected.
+	_, err := Parse([]byte(base("admin:\n  listen: 0.0.0.0:8080\n" + auth)))
+	if err == nil || !strings.Contains(err.Error(), "allow_remote") {
+		t.Fatalf("non-loopback admin listen without allow_remote should fail mentioning allow_remote, got %v", err)
+	}
+	// A LAN address without allow_remote → rejected too.
+	_, err = Parse([]byte(base("admin:\n  listen: 192.168.1.10:8080\n" + auth)))
+	if err == nil {
+		t.Fatal("LAN admin listen without allow_remote should fail")
+	}
+	// With allow_remote → admitted.
+	if _, err := Parse([]byte(base("admin:\n  listen: 0.0.0.0:8080\n  allow_remote: true\n" + auth))); err != nil {
+		t.Fatalf("allow_remote should admit non-loopback listen: %v", err)
+	}
+	// Loopback needs no opt-in.
+	if _, err := Parse([]byte(base("admin:\n  listen: 127.0.0.1:8080\n" + auth))); err != nil {
+		t.Fatalf("loopback admin listen should parse without allow_remote: %v", err)
+	}
+}
+
+// TestValidateRejectsLowBcryptCost is the T-26 (D4-6) red test: a cost-4
+// hash makes offline cracking cheap; the config gate demands cost >= 10.
+func TestValidateRejectsLowBcryptCost(t *testing.T) {
+	lowCost, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("generate low-cost hash: %v", err)
+	}
+	if cost, cerr := bcrypt.Cost(lowCost); cerr != nil || cost >= 10 {
+		t.Fatalf("test setup: want a cost <10 hash, got cost %d err %v", cost, cerr)
+	}
+	base := func(hash string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+admin:
+  listen: 127.0.0.1:8080
+  auth: { username: admin, password_hash: "` + hash + `" }
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	_, err = Parse([]byte(base(string(lowCost))))
+	if err == nil || !strings.Contains(err.Error(), "cost") {
+		t.Fatalf("low-cost hash should fail mentioning cost, got %v", err)
+	}
+	// cost 10 passes.
+	if _, err := Parse([]byte(base("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"))); err != nil {
+		t.Fatalf("cost-10 hash should parse: %v", err)
+	}
+}
+
+// TestValidateRejectsWildcardPrefix is the T-11 (F-16) red test: a
+// wildcard/over-wide allowed_ips silently opened the whole inbound trust
+// boundary — Parse must refuse it, and the empty list (which silently
+// fail-closed before) must be refused too.
+func TestValidateRejectsWildcardPrefix(t *testing.T) {
+	base := func(prefix string) string {
+		return `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: ["` + prefix + `"]
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	}
+	_, err := Parse([]byte(base("0.0.0.0/0")))
+	if err == nil || !strings.Contains(err.Error(), "allowed_ips") {
+		t.Fatalf("wildcard prefix should fail mentioning allowed_ips, got %v", err)
+	}
+	if _, err := Parse([]byte(base("10.0.0.0/7"))); err == nil {
+		t.Fatal("ipv4 prefix wider than /8 must be refused")
+	}
+	if _, err := Parse([]byte(base("2001:db8::/24"))); err == nil {
+		t.Fatal("ipv6 prefix wider than /32 must be refused")
+	}
+	empty := `
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+    public_ip: 127.0.0.1
+peers:
+  p:
+    address: 127.0.0.1:5070
+    allowed_ips: []
+routes:
+  - name: r
+    from: p
+    to: [p]
+`
+	if _, err := Parse([]byte(empty)); err == nil || !strings.Contains(err.Error(), "allowed_ips") {
+		t.Fatalf("empty allowed_ips should fail, got %v", err)
+	}
+	// The floors themselves pass: /8 (this repo's own example uses it) and
+	// an IPv6 site allocation /32.
+	if _, err := Parse([]byte(base("10.0.0.0/8"))); err != nil {
+		t.Fatalf("exactly /8 should pass: %v", err)
+	}
+	if _, err := Parse([]byte(base("2001:db8::/32"))); err != nil {
+		t.Fatalf("exactly /32 (v6) should pass: %v", err)
+	}
+}
+
+// TestValidateAllowedIPsCanonicalized (T-11): a non-canonical prefix is
+// stored masked, so 10.0.1.5/16 matches exactly what the operator meant
+// instead of silently mismatching netip's unmasked semantics.
+func TestValidateAllowedIPsCanonicalized(t *testing.T) {
+	c := validConfig()
+	c.Peers["pbx"].AllowedIPs = []string{"10.0.1.5/16"}
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Peers["pbx"].AllowsIP(netip.MustParseAddr("10.0.2.3")) {
+		t.Error("10.0.2.3 should be allowed under the masked 10.0.1.5/16")
+	}
+	if !c.Peers["pbx"].AllowsIP(netip.MustParseAddr("10.0.1.5")) {
+		t.Error("10.0.1.5 itself should be allowed")
+	}
+	if c.Peers["pbx"].AllowsIP(netip.MustParseAddr("10.1.0.1")) {
+		t.Error("10.1.0.1 must not be allowed")
 	}
 }
 

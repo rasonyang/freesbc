@@ -10,6 +10,9 @@ listen:
   sip:
     - udp://0.0.0.0:5060
     - tls://0.0.0.0:5061          # cert auto-generated (self-signed) if not configured
+  # tls_cert: /etc/freesbc/sip-cert.pem    # serve a REAL certificate on tls listeners (TLS >= 1.2);
+  # tls_key:  /etc/freesbc/sip-key.pem     #   without these, each start mints a self-signed cert (warned)
+  # tls_client_ca: /etc/freesbc/client-ca.pem  # optional mTLS: clients must present a cert chaining to this CA
   media:
     port_range: 16384-32768
     public_ip: 203.0.113.10        # your SBC's public IP (advertised in SDP/Contact).
@@ -22,18 +25,26 @@ session_expires: 1800s   # RFC 4028 session timer we advertise/accept (carrier m
 min_se: 90s              # smallest session interval accepted; a lower request gets 422 + Min-SE
 peer_cooldown: 30s   # after a connect failure (no response) to a peer endpoint, skip it this long before retrying
 srv_cache_ttl: 300s  # cache DNS SRV/A resolutions this long (Go's resolver exposes no record TTL, so this is a fixed window)
+# max_concurrent_calls: 100        # global cap on in-flight bridged calls (0 = unlimited, default)
 
 peers:
   carrier-a:
     address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA (M4.4, not yet implemented)
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
+    # realm 固定（T-19）：加到 auth 行内即可——auth: { username: ..., password: ..., realm: carrier-a-realm }
+    # 设置后，realm 不匹配的 401/407 质询将不再被应答（防恶意/被攻陷服务器收割 digest 响应）
     register: true                 # registration-based trunk: SBC periodically sends REGISTER, un-registers on shutdown
     allowed_ips: [203.0.113.0/24]  # inbound calls matched to this peer by source IP
     # media_latch: strict          # strict (default): first RTP packet must
     #                              # come from the SDP-signaled IP; use loose
     #                              # for peers behind hard NAT
+    # max_concurrent_calls: 50     # per-peer cap on concurrent calls from this peer (0 = unlimited, default); excess gets 503 + Retry-After
     srtp: disabled   # media encryption: disabled (default) | optional | required (RTP/SAVP + a=crypto)
+    # tls_ca: /etc/freesbc/carrier-ca.pem   # for transport: tls — ADD this CA bundle to the outbound trust
+    #                                       #   anchors, so a private-CA carrier verifies (still strict)
+    # tls_client_cert: /etc/freesbc/carrier-client.pem   # present OUR cert when the carrier wants
+    # tls_client_key:  /etc/freesbc/carrier-client-key.pem   # mTLS (both-or-neither)
   internal-pbx:
     address: 10.0.0.10:5060
     allowed_ips: [10.0.0.0/8]
@@ -53,15 +64,19 @@ routes:
 
 shield:                            # sensible defaults; the whole section is optional
   rate_limit: 20/s per_ip
+  peer_rate_limit: 200/s per_ip    # looser per-IP ceiling for CONFIGURED peer sources (they skip the ban/scanner plane, not this)
   auto_ban: { failures: 5, window: 60s, duration: 1h }
   nftables: auto
 
 # admin:                            # optional operator API + Prometheus /metrics (bcrypt HTTP Basic Auth)
-#   listen: 127.0.0.1:8080          # bind PRIVATE — there is no TLS on this listener (front with a reverse proxy)
+#   listen: 127.0.0.1:8080          # default must be loopback; see docs/DEPLOYMENT-SECURITY.md (G-2)
+#   # allow_remote: true            # REQUIRED to bind a non-loopback (e.g. LAN) address — refused otherwise
+#   # tls_cert: /etc/freesbc/admin-cert.pem   # serve HTTPS (TLS >= 1.2) instead of plaintext —
+#   # tls_key:  /etc/freesbc/admin-key.pem    #   strongly recommended whenever allow_remote is on
 #   auth:
 #     username: admin
 #     # bcrypt hash of the admin password — REPLACE this placeholder (an invalid
 #     # value here fails config validation on purpose, so you can't accidentally
-#     # ship a known/default password). Generate with:
+#     # ship a known/default password). Cost 10 or higher is enforced. Generate with:
 #     #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
 #     password_hash: "REPLACE-WITH-YOUR-OWN-BCRYPT-HASH"

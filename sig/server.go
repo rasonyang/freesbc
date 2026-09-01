@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,24 @@ type Server struct {
 	// registry: killers holds a context.CancelFunc, not call metadata.
 	killMu  sync.Mutex
 	killers map[string]context.CancelFunc // Call-ID → cancel its killCtx
+
+	// T-05 (F-02) TCP/TLS listener resource bounds — see listenerlimit.go.
+	// tcpConns counts live connections across every tcp/tls listener; a
+	// single shared counter makes the cap global (N listeners can't each
+	// admit the full quota). tcpMaxConns is the cap itself and tcpIdleTimeout
+	// the per-connection idle read deadline; both are set by NewServer and
+	// only tests override them (via startServerConfigured's hook, which runs
+	// before the Run goroutine spawns — never a cross-goroutine write).
+	// The values may move into config later (REMEDIATION-PLAN T-05 defers
+	// that).
+	tcpConns       atomic.Int64
+	tcpMaxConns    int64
+	tcpIdleTimeout time.Duration
+
+	// quota counts in-flight initial INVITEs per peer and globally (T-06,
+	// F-06 — see callQuota in b2bua.go and bridge.onInvite's gate). The
+	// zero value is usable; it needs no Run-time wiring.
+	quota callQuota
 }
 
 func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
@@ -89,6 +108,11 @@ func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server 
 		resolver: newResolver(time.Now().UnixNano()),
 		health:   newEndpointHealth(),
 		killers:  make(map[string]context.CancelFunc),
+
+		// T-05 defaults (see listenerlimit.go): 1024 concurrent TCP/TLS
+		// connections and a 120s idle read deadline per connection.
+		tcpMaxConns:    1024,
+		tcpIdleTimeout: 120 * time.Second,
 	}
 }
 
@@ -155,6 +179,17 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
+// Unban removes any shield ban on ip (in-memory table + kernel set) and
+// reports whether one existed. Nil-safe: false before Run builds the
+// shield. Wired to the admin API's DELETE /api/bans/{ip} (T-02, F-04).
+func (s *Server) Unban(ip netip.Addr) bool {
+	sh := s.shield.Load()
+	if sh == nil {
+		return false
+	}
+	return sh.Unban(ip)
+}
+
 // Calls returns a snapshot of the active-call registry (for the admin API).
 func (s *Server) Calls() []callstate.Call { return s.registry.Snapshot() }
 
@@ -163,10 +198,27 @@ func (s *Server) Calls() []callstate.Call { return s.registry.Snapshot() }
 // a bind failure), or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
 	sipgoLog := s.log.With("caller", "sipgo")
-	ua, err := sipgo.NewUA(
-		sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerLogger(sipgoLog)),
+	// T-17 (F-13): outbound TLS trust anchors/client certs, merged from the
+	// per-peer config into sipgo's single UA-wide tls.Config (see
+	// buildClientTLSConfig). Built once at startup — cert material is not
+	// hot-rotated.
+	clientTLS, err := buildClientTLSConfig(s.store.Current().Peers)
+	if err != nil {
+		return fmt.Errorf("client tls config: %w", err)
+	}
+	uaOpts := []sipgo.UserAgentOption{
+		sipgo.WithUserAgentTransportLayerOptions(
+			sip.WithTransportLayerLogger(sipgoLog),
+			// T-01 (F-01/F-10): drop non-peer source bytes before parsing
+			// (see preParseFilter in readfilter.go).
+			sip.WithTransportLayerReadFilter(s.preParseFilter()),
+		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
-	)
+	}
+	if clientTLS != nil {
+		uaOpts = append(uaOpts, sipgo.WithUserAgenTLSConfig(clientTLS))
+	}
+	ua, err := sipgo.NewUA(uaOpts...)
 	if err != nil {
 		return fmt.Errorf("sipgo ua: %w", err)
 	}
@@ -330,19 +382,35 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 			return err
 		}
 		go func() { <-ctx.Done(); ln.Close() }()
-		return tl.ServeTCP(ln)
+		return tl.ServeTCP(newTCPLimitListener(ln, s))
 	case "tls":
-		tlsConf, err := selfSignedTLSConfig()
-		if err != nil {
-			return err
+		// T-17 (F-13): a CONFIGURED certificate replaces the fallback
+		// self-signed one — clients (or our own outbound side, with a
+		// matching trust anchor) can then verify this listener for real.
+		// mTLS engages when tls_client_ca is set. Read at bind time from
+		// the startup config; cert material is not hot-rotated.
+		cfg := s.store.Current()
+		var tlsConf *tls.Config
+		if cfg.Listen.TLSCert != "" {
+			conf, err := loadServerTLSConfig(cfg.Listen.TLSCert, cfg.Listen.TLSKey, cfg.Listen.TLSClientCA)
+			if err != nil {
+				return err
+			}
+			tlsConf = conf
+		} else {
+			conf, err := selfSignedTLSConfig()
+			if err != nil {
+				return err
+			}
+			tlsConf = conf
+			s.log.Warn("TLS listener using self-signed certificate", "addr", addr)
 		}
-		s.log.Warn("TLS listener using self-signed certificate", "addr", addr)
 		ln, err := tls.Listen("tcp", addr, tlsConf)
 		if err != nil {
 			return err
 		}
 		go func() { <-ctx.Done(); ln.Close() }()
-		return tl.ServeTLS(ln)
+		return tl.ServeTLS(newTCPLimitListener(ln, s))
 	default: // "udp"
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
@@ -371,14 +439,31 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 // withShield wraps a request handler so every inbound request passes the
 // security plane before identification. A Drop verdict silently discards the
 // request (no response); sipgo terminates the unfinalized transaction when the
-// handler returns (see dropUnidentified). s.shield is nil on a *Server built
-// directly by unit tests (without Run), so this is nil-guarded to a no-op in
-// that case.
+// handler returns (see dropUnidentified). Since T-01, non-peer source bytes
+// are dropped by the transport-layer read filter before they can become a
+// request (see preParseFilter), so the shield here only ever sees requests
+// from allowed sources — configured-peer exemptions apply. s.shield is nil on
+// a *Server built directly by unit tests (without Run), so this is
+// nil-guarded to a no-op in that case.
 func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func(*sip.Request, sip.ServerTransaction) {
 	return func(req *sip.Request, tx sip.ServerTransaction) {
+		// T-20 (D1-8): ONE panic umbrella for every handler path — a panic
+		// anywhere in handler code (onOptions/onAck/onBye/onNoRoute and the
+		// sipgo dialog code they call) kills only this request, never the
+		// process, and leaves a forensic trace. onInvite additionally keeps
+		// its own recoverCall (call-ID-annotated); the inner recover runs
+		// first and this one simply never sees its panics.
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("sip handler panic",
+					"panic", r, "stack", string(debug.Stack()), "method", req.Method.String())
+				// Best-effort 500 — the transaction may already be gone.
+				_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Internal Error", nil))
+			}
+		}()
 		sh := s.shield.Load()
 		src, ok := sourceAddr(req)
-		if sh != nil && ok && sh.Check(src, userAgent(req)) == shield.Drop {
+		if sh != nil && ok && sh.Check(src, userAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
 			return // silent
 		}
 		next(req, tx)
@@ -415,6 +500,12 @@ func userAgent(req *sip.Request) string {
 // returns (server.go handleRequest), which terminates the unfinalized
 // transaction right away — stopping its auto-100 timer and keeping the
 // drop silent instead of merely letting the transaction age out.
+//
+// Since T-01 this handler never runs for udp/tcp/tls traffic: the
+// pre-parse read filter drops non-peer bytes before parsing, so no such
+// request can reach identify() over the wire. It remains as the guard for
+// any future transport path that bypasses the filter, and for *Server
+// instances unit tests build directly.
 func (s *Server) dropUnidentified(req *sip.Request) {
 	s.log.Info("dropping request from unidentified source",
 		"method", req.Method.String(), "source", req.Source())

@@ -56,6 +56,15 @@ type stubRegistrar struct {
 // shutdown race). Ports for this file's tests: 45320-45339.
 func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires int) *stubRegistrar {
 	t.Helper()
+	return startStubRegistrarRealm(t, port, user, pass, grantExpires, "freesbc-test")
+}
+
+// startStubRegistrarRealm is startStubRegistrar with an explicit challenge
+// realm — T-19's rogue-registrar test needs a realm the peer hasn't pinned.
+// The realm is set at construction (before the handler goroutine exists),
+// never mutated afterward, so -race stays clean.
+func startStubRegistrarRealm(t *testing.T, port int, user, pass string, grantExpires int, realm string) *stubRegistrar {
+	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -74,7 +83,7 @@ func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires 
 		pass:         pass,
 		grantExpires: grantExpires,
 		challenge: &digest.Challenge{
-			Realm:     "freesbc-test",
+			Realm:     realm,
 			Nonce:     "test-nonce-fixed",
 			Algorithm: "MD5",
 		},
@@ -393,6 +402,42 @@ func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
 	}
 }
 
+// TestRegisterRejectsUnexpectedRealm is the T-19 (F-20) red test: when the
+// peer's auth pins a realm, a challenge naming any other realm must never
+// be answered — no digest of our credentials leaves the SBC for it (a
+// rogue or compromised registrar would harvest the response for offline
+// cracking). Pre-fix, DoDigestAuth answered any challenge unconditionally.
+// The matching-realm half proves the pin only blocks mismatches.
+func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
+	// Rogue registrar: challenges with a realm the peer has NOT pinned.
+	evil := startStubRegistrarRealm(t, 45321, "reguser", "regpass", 1800, "evil")
+	client := evil.client(t)
+	p := regParams{
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45321,
+		Transport: "udp", Username: "reguser", Password: "regpass", Realm: "good",
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45997,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := registerOnce(ctx, client, p, time.Hour); err == nil {
+		t.Fatal("expected error for mismatched challenge realm")
+	}
+	if evil.sawAuthorizedRegister() {
+		t.Fatal("digest credentials must never be sent for a foreign realm")
+	}
+
+	// Matching realm: the normal digest flow resumes.
+	good := startStubRegistrarRealm(t, 45323, "reguser", "regpass", 1800, "good")
+	client = good.client(t)
+	p.RegistrarPort = 45323
+	if _, err := registerOnce(ctx, client, p, time.Hour); err != nil {
+		t.Fatalf("matching realm should register: %v", err)
+	}
+	if !good.sawAuthorizedRegister() {
+		t.Fatal("matching realm must be answered with digest")
+	}
+}
+
 // TestRegisterOnceBadCredentialsFails proves the wrong password never
 // satisfies the challenge: the registrar keeps rejecting with 401, and
 // registerOnce surfaces that as an error rather than silently reporting a
@@ -547,8 +592,10 @@ peers:
     transport: udp
     auth: { username: %s, password: %s }
     register: %v
+    allowed_ips: [127.0.0.1/32] # T-11: allowed_ips is required on every peer
   internal-pbx:
     address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.10/32]
 `, port, user, pass, registerCarrier)
 }
 
@@ -675,8 +722,10 @@ peers:
     transport: udp
     auth: { username: %s, password: %s }
     register: %v
+    allowed_ips: [127.0.0.1/32] # T-11: allowed_ips is required on every peer
   internal-pbx:
     address: 10.0.0.10:5060
+    allowed_ips: [10.0.0.10/32]
 `, publicIP, port, user, pass, registerCarrier)
 }
 

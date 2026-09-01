@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,6 +117,49 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	got2 := roundTrip(t, 45071, "INVITE", "b2bua-reinvite-followup", 3*time.Second, "SIP/2.0 404")
 	if !strings.Contains(got2, "SIP/2.0 404") {
 		t.Fatalf("server did not survive re-INVITE rejection; follow-up initial INVITE got:\n%s", got2)
+	}
+}
+
+// TestInviteMissingToGets400 is the T-20 (D1-8) red test: an INVITE from a
+// peer source that lacks a To header used to nil-deref inside onInvite and
+// vanish into recoverCall with NO response at all. Post-fix the front door
+// refuses it explicitly with 400 (RFC 3261 §8.1.1 mandates To on every
+// request).
+func TestInviteMissingToGets400(t *testing.T) {
+	cfg := strings.Replace(bridgeNoRouteCfg, "45070", "45760", 1)
+	startServer(t, 45760, cfg)
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac socket: %v", err)
+	}
+	defer conn.Close()
+	local := conn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45760}
+
+	// sipRequest's shape minus the To line entirely.
+	req := sipRequest("INVITE", "45760", local, "b2bua-missing-to")
+	req = strings.Replace(req, "To: <sip:sbc@127.0.0.1>\r\n", "", 1)
+	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write invite: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 400") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 400") {
+		t.Fatalf("INVITE missing To must get 400 Bad Request, got:\n%s", got.String())
 	}
 }
 
@@ -242,12 +286,19 @@ type stubCarrier struct {
 	digestChallenge *digest.Challenge
 	digestUser      string
 	digestPass      string
+	// digestRealm (T-19 tests) overrides the challenge realm (default
+	// "freesbc-test") so a rogue carrier can name a realm the peer has
+	// NOT pinned.
+	digestRealm string
 
 	// ringForever (Fix 1): see stubCarrierConfig.ringForever.
 	ringForever bool
 
 	// brokenAnswer (Fix 3 regression test): see stubCarrierConfig.brokenAnswer.
 	brokenAnswer bool
+
+	// answerDelay (S-batch regression tests): see stubCarrierConfig.answerDelay.
+	answerDelay time.Duration
 
 	offers  chan *sip.Request
 	byeDone chan struct{}
@@ -265,6 +316,11 @@ type stubCarrier struct {
 	// gone out by the time a test gets around to calling sendReinvite
 	// (e.g. only after the UAC's own WaitAnswer already succeeded).
 	established chan struct{}
+
+	// sawAuthz (T-19 tests) records whether ANY INVITE carrying an
+	// Authorization header reached this carrier — the realm-pinning
+	// assertion is exactly that none ever does.
+	sawAuthz atomic.Bool
 
 	// cancelled (Task 4) closes exactly once, the first time this carrier's
 	// dialog ends because it actually received a CANCEL request — as
@@ -383,6 +439,11 @@ type stubCarrierConfig struct {
 	digestUser string
 	digestPass string
 
+	// digestRealm (T-19 tests) overrides the challenge realm (default
+	// "freesbc-test") so the carrier can name a realm the peer has NOT
+	// pinned.
+	digestRealm string
+
 	// ringForever (Fix 1's CANCEL-stops-failover regression test): send a
 	// single 180 Ringing and then block until the dialog ends (e.g. the
 	// bridge CANCELs this leg because the A-leg went away) or the test
@@ -397,6 +458,13 @@ type stubCarrierConfig struct {
 	// the A-leg 502 Bad Gateway (not 488, which would wrongly blame the
 	// caller's own offer for a problem in the carrier's answer).
 	brokenAnswer bool
+
+	// answerDelay (S-batch regression tests): sleep this long before sending
+	// the first response (183 and/or 200) — simulates a carrier whose first
+	// response lands only after the bridge's ring budget (and the 250ms
+	// grace) has already expired, i.e. the raced/late-response window
+	// around attempt abandonment that S-02/S-04 guard.
+	answerDelay time.Duration
 }
 
 // startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
@@ -452,9 +520,15 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		c.digestPass = opts[0].digestPass
 		c.ringForever = opts[0].ringForever
 		c.brokenAnswer = opts[0].brokenAnswer
+		c.answerDelay = opts[0].answerDelay
+		c.digestRealm = opts[0].digestRealm
 		if c.digestUser != "" {
+			realm := c.digestRealm
+			if realm == "" {
+				realm = "freesbc-test"
+			}
 			c.digestChallenge = &digest.Challenge{
-				Realm:     "freesbc-test",
+				Realm:     realm,
 				Nonce:     "test-nonce-fixed",
 				Algorithm: "MD5",
 			}
@@ -492,6 +566,9 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 		}
 
 		if c.digestChallenge != nil && !c.digestAuthorized(req) {
+			if req.GetHeader("Authorization") != nil {
+				c.sawAuthz.Store(true)
+			}
 			if err := dlg.Respond(401, "Unauthorized", nil,
 				sip.NewHeader("WWW-Authenticate", c.digestChallenge.String())); err != nil {
 				log.Error("carrier respond 401", "err", err)
@@ -504,6 +581,14 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 				log.Error("carrier respond final", "err", err)
 			}
 			return
+		}
+
+		if c.answerDelay > 0 {
+			select {
+			case <-time.After(c.answerDelay):
+			case <-dlg.Context().Done():
+				return // the dialog died while we were waiting to answer
+			}
 		}
 
 		if len(c.earlySDP) > 0 {
@@ -523,7 +608,15 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 				return
 			}
 		} else if err := dlg.RespondSDP(c.answerSDP); err != nil {
+			// The answer never went out (typically a CANCEL from the bridge
+			// raced it), but the dialog is still ending — signal its end the
+			// way the happy path does, so tests can wait on byeDone
+			// uniformly. established is deliberately NOT closed here: it
+			// means "the answer actually went out" (see its doc), which is
+			// false on this path.
 			log.Error("carrier respond sdp", "err", err)
+			<-dlg.Context().Done()
+			close(c.byeDone)
 			return
 		}
 		// Signal established only now that RespondSDP/Respond has actually
@@ -1528,6 +1621,484 @@ func TestBridgeCancelSilentTarget(t *testing.T) {
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }
 
+// rawMethod returns the SIP method of a raw request's request line ("" if
+// the line is malformed).
+func rawMethod(text string) string {
+	if i := strings.IndexByte(text, ' '); i > 0 {
+		return text[:i]
+	}
+	return ""
+}
+
+// rawHeaderLines returns a raw SIP message's header lines verbatim (the
+// request/status line and everything after the blank-line separator are
+// dropped).
+func rawHeaderLines(text string) []string {
+	if bodyIdx := strings.Index(text, "\r\n\r\n"); bodyIdx >= 0 {
+		text = text[:bodyIdx]
+	}
+	return strings.Split(text, "\r\n")[1:]
+}
+
+// rawFinalResponse builds a SIP response to the request whose header lines
+// are in reqLines: Via/From/To/Call-ID/CSeq are copied verbatim (a To tag
+// is appended when toTag is non-empty — for answering an initial INVITE,
+// whose To carries none), plus the carrier's own Contact and the body.
+func rawFinalResponse(code int, reason string, reqLines []string, toTag, contact string, body []byte) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "SIP/2.0 %d %s\r\n", code, reason)
+	for _, l := range reqLines {
+		switch {
+		case strings.HasPrefix(l, "Via:"), strings.HasPrefix(l, "From:"),
+			strings.HasPrefix(l, "Call-ID:"), strings.HasPrefix(l, "CSeq:"):
+			b.WriteString(l + "\r\n")
+		case strings.HasPrefix(l, "To:"):
+			b.WriteString(l)
+			if toTag != "" {
+				b.WriteString(";tag=" + toTag)
+			}
+			b.WriteString("\r\n")
+		}
+	}
+	fmt.Fprintf(&b, "Contact: <sip:raw-carrier@%s>\r\n", contact)
+	if len(body) > 0 {
+		b.WriteString("Content-Type: application/sdp\r\n")
+	}
+	fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n", len(body))
+	b.Write(body)
+	return b.String()
+}
+
+// rawSilentCarrier is a raw-UDP fake carrier for the S-batch regression
+// tests. Unlike the sipgo-based stubCarrier — whose server transaction
+// auto-sends a 100 Trying, which lets the bridge CANCEL immediately at the
+// ring deadline instead of abandoning the attempt — it stays COMPLETELY
+// silent (not even a 100) until delay elapses after the first INVITE, so
+// the bridge's attempt is truly abandoned before any response lands. It
+// then sends respCode (183 or 200) built from the INVITE's own headers, and
+// afterwards delivers every further request it receives (the bridge's
+// CANCEL, or the ACK+BYE teardown) to reqs for the test to assert on; BYE
+// and CANCEL are answered 200 OK. A 487 for the cancelled INVITE is
+// deliberately not sent — the bridge's waiter then just sits out its
+// 64*T1 fallback, which is bounded and irrelevant to the assertions.
+type rawSilentCarrier struct {
+	conn    *net.UDPConn
+	contact string
+	reqs    chan string
+}
+
+// startRawSilentCarrier binds addr and returns once it is ready. respCode
+// must be 183 or 200; respBody is only meaningful with a 200 (a 183 goes
+// out without a body).
+func startRawSilentCarrier(t *testing.T, addr string, delay time.Duration, respCode int, respBody []byte) *rawSilentCarrier {
+	t.Helper()
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("raw carrier resolve %s: %v", addr, err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		t.Fatalf("raw carrier listen %s: %v", addr, err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	c := &rawSilentCarrier{
+		conn:    conn,
+		contact: conn.LocalAddr().String(),
+		reqs:    make(chan string, 8),
+	}
+	go func() {
+		buf := make([]byte, 65535)
+		var inviteLines []string
+		answered := false
+		for {
+			n, src, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			text := string(buf[:n])
+			method := rawMethod(text)
+			if !answered {
+				if method != "INVITE" || inviteLines != nil {
+					continue // not the (first) INVITE yet / retransmission
+				}
+				inviteLines = rawHeaderLines(text)
+				time.Sleep(delay)
+				_, _ = conn.WriteToUDP([]byte(rawFinalResponse(respCode,
+					map[int]string{183: "Session Progress", 200: "OK"}[respCode],
+					inviteLines, "raw-carrier-tag", c.contact, respBody)), src)
+				answered = true
+				continue
+			}
+			if method == "INVITE" {
+				continue // late retransmission of the original INVITE
+			}
+			select {
+			case c.reqs <- text:
+			default:
+			}
+			if method == "BYE" || method == "CANCEL" {
+				_, _ = conn.WriteToUDP([]byte(rawFinalResponse(200, "OK", rawHeaderLines(text), "", c.contact, nil)), src)
+			}
+		}
+	}()
+	return c
+}
+
+// waitRawReq returns the next non-INVITE request the raw carrier received,
+// failing the test if none arrives within the deadline.
+func (c *rawSilentCarrier) waitRawReq(t *testing.T, deadline time.Duration, want string) {
+	t.Helper()
+	select {
+	case req := <-c.reqs:
+		if got := rawMethod(req); got != want {
+			t.Fatalf("raw carrier: expected %s, got %s (request:\n%s)", want, got, req)
+		}
+	case <-time.After(deadline):
+		t.Fatalf("raw carrier never received a %s within %v", want, deadline)
+	}
+}
+
+// lateProvisionalCfg (S-batch regression, S-02): a single carrier whose
+// FIRST response (a 183) lands only after the bridge's ring budget (500ms)
+// AND the 250ms abandon grace have both expired.
+const lateProvisionalCfg = `
+listen:
+  sip: [udp://127.0.0.1:45730]
+  media:
+    port_range: 46730-46733
+    public_ip: 127.0.0.1
+ring_timeout: 500ms
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45731
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeLateProvisionalAfterAbandonNotRelayed (S-batch regression, S-02):
+// the carrier is completely silent until 1.5s — past the ring deadline
+// (500ms) and the 250ms abandon grace — and only THEN sends a 183. The
+// abandoned attempt must never relay that late 18x to the caller:
+// WaitAnswer is already inside inviteCancel, which consumes the late
+// provisional itself and reacts with a CANCEL, and the OnResponse
+// short-circuit checks `abandoned` before touching aLeg/media state for the
+// select-randomness window where a just-arrived response could otherwise
+// still reach relay (a concurrent, unsynchronized WriteResponse against the
+// main flow's own — SECURITY-REVIEW-20260831 §S-02). The caller sees
+// exactly the synthesized 408 ring-timeout final, never a 183; and the
+// bridge must CANCEL the attempt once the late provisional proves the
+// carrier is alive. Timing-based over real UDP loopback: re-run once before
+// treating a flake as failure.
+func TestBridgeLateProvisionalAfterAbandonNotRelayed(t *testing.T) {
+	carrier := startRawSilentCarrier(t, "127.0.0.1:45731", 1500*time.Millisecond, 183, nil)
+	srv := startServer(t, 45730, lateProvisionalCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45730}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	var saw18x []int
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{
+		OnResponse: func(res *sip.Response) error {
+			if res.IsProvisional() && res.StatusCode > 100 {
+				saw18x = append(saw18x, res.StatusCode)
+			}
+			return nil
+		},
+	}); err == nil {
+		t.Fatal("uac wait answer: expected the ring-timeout failure, got success")
+	}
+	if sess.InviteResponse == nil || sess.InviteResponse.StatusCode != 408 {
+		t.Fatalf("caller must get 408 Request Timeout once the ring budget expired, got %+v", sess.InviteResponse)
+	}
+	if len(saw18x) > 0 {
+		t.Fatalf("late 183 after abandonment must never be relayed to the caller, got %v", saw18x)
+	}
+
+	// Once the late 183 proves the carrier is alive, the bridge must CANCEL
+	// the abandoned attempt rather than leave the INVITE transaction running
+	// to Timer_B.
+	carrier.waitRawReq(t, 3*time.Second, "CANCEL")
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// raced2xxCfg is TestBridgeRaced2xxAfterAbandonTearsDown's config: same
+// shape as lateProvisionalCfg, but the carrier answers 200 directly (no
+// 183) after the delay.
+const raced2xxCfg = `
+listen:
+  sip: [udp://127.0.0.1:45732]
+  media:
+    port_range: 46734-46737
+    public_ip: 127.0.0.1
+ring_timeout: 500ms
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45733
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeRaced2xxAfterAbandonTearsDown (S-batch regression, S-04):
+// the carrier is completely silent until 1.5s — past the abandon point —
+// and then answers 200 for real. The orphan waiter's inviteCancel consumes
+// that raced 2xx, which is a live, billable carrier call, and must tear it
+// down with a real ACK+BYE — never leak it for ~32s of carrier billing.
+// S-04 additionally bounds the ACK with its own 5s context so a blackholed
+// transport can't pin the waiter goroutine forever. The caller gets the
+// synthesized 408 either way; the raw carrier must observe the ACK and then
+// the BYE. Timing-based over real UDP loopback: re-run once before treating
+// a flake as failure.
+func TestBridgeRaced2xxAfterAbandonTearsDown(t *testing.T) {
+	carrier := startRawSilentCarrier(t, "127.0.0.1:45733", 1500*time.Millisecond, 200, testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 45732, raced2xxCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45732}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err == nil {
+		t.Fatal("uac wait answer: expected the ring-timeout failure, got success")
+	}
+	if sess.InviteResponse == nil || sess.InviteResponse.StatusCode != 408 {
+		t.Fatalf("caller must get 408 Request Timeout once the ring budget expired, got %+v", sess.InviteResponse)
+	}
+
+	// The orphan waiter must ACK the raced 2xx (confirming the phantom call
+	// so the carrier stops retransmitting) and then BYE it — in that order.
+	carrier.waitRawReq(t, 3*time.Second, "ACK")
+	carrier.waitRawReq(t, 3*time.Second, "BYE")
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// waiterPanicCfg is TestBridgeWaiterPanicContained's config: same shape as
+// raced2xxCfg, but the carrier answers immediately — the injected panic
+// kills the bridge's waiter goroutine, not the carrier's behavior.
+const waiterPanicCfg = `
+listen:
+  sip: [udp://127.0.0.1:45734]
+  media:
+    port_range: 46738-46741
+    public_ip: 127.0.0.1
+ring_timeout: 500ms
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45735
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeWaiterPanicContained (S-batch regression, S-01): a panic inside
+// the orphan B-leg waiter goroutine (injected via testHookBWaiterPanic) must
+// stay contained to that goroutine — the attempt fails with the ordinary
+// ring-timeout 408 and the server keeps serving: a second call on the same
+// server bridges normally. Pre-fix, the panic would unwind past the
+// goroutine into the Go runtime and kill the whole process, so this test
+// would die rather than fail. Timing-based over real UDP loopback: re-run
+// once before treating a flake as failure.
+func TestBridgeWaiterPanicContained(t *testing.T) {
+	carrier := startStubCarrier(t, "127.0.0.1:45735", testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 45734, waiterPanicCfg)
+
+	panicFn := func() { panic("injected waiter panic") }
+	testHookBWaiterPanic.Store(&panicFn)
+	t.Cleanup(func() { testHookBWaiterPanic.Store(nil) })
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45734}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	// Call 1: the waiter goroutine panics before WaitAnswer runs; the
+	// attempt must fail as an ordinary ring timeout — and the process must
+	// survive (this test keeps running).
+	sess1, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess1.Close()
+	if err := sess1.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err == nil {
+		t.Fatal("uac wait answer: expected the ring-timeout failure after the injected panic, got success")
+	}
+	if sess1.InviteResponse == nil || sess1.InviteResponse.StatusCode != 408 {
+		t.Fatalf("call 1 must get 408 Request Timeout, got %+v", sess1.InviteResponse)
+	}
+
+	testHookBWaiterPanic.Store(nil)
+
+	// Call 2: the same server must bridge normally — the panic stayed
+	// contained to call 1's waiter goroutine.
+	sess2, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite (post-panic): %v", err)
+	}
+	defer sess2.Close()
+	if err := sess2.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("post-panic call must bridge normally, got: %v", err)
+	}
+	if sess2.InviteResponse.StatusCode != 200 {
+		t.Fatalf("post-panic call got %d, want 200", sess2.InviteResponse.StatusCode)
+	}
+	if err := sess2.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+	if err := sess2.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after the post-panic call's BYE")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// graceEdgeCfg is TestBridgeGraceWindowEdgeRaceClean's config: the carrier's
+// first response lands just inside the ring deadline (150ms margin), so the
+// relay/CANCEL dance runs across the deadline→grace boundary.
+const graceEdgeCfg = `
+listen:
+  sip: [udp://127.0.0.1:45736]
+  media:
+    port_range: 46742-46745
+    public_ip: 127.0.0.1
+ring_timeout: 600ms
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45737
+    allowed_ips: [203.0.113.0/24]
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeGraceWindowEdgeRaceClean (S-batch regression, S-02): the
+// carrier's 183 arrives just before the ring deadline, so the relay of it
+// and the WaitAnswer cancellation dance straddle the deadline→grace
+// boundary — exactly the window where the main path may abandon the attempt
+// while the waiter goroutine is mid-relay. The carrier's 200 is gated
+// behind proceed (closed only after the final 408 is observed), so the
+// attempt can't succeed: the deadline must fire with a provisional already
+// on the wire, and the bridge must CANCEL. What must hold is the final 408,
+// the carrier's dialog ending, and -race cleanliness across the boundary.
+// Timing-based over real UDP loopback: re-run once before treating a flake
+// as failure.
+func TestBridgeGraceWindowEdgeRaceClean(t *testing.T) {
+	proceed := make(chan struct{})
+	carrier := startStubCarrier(t, "127.0.0.1:45737", testSDPBody(uacRTPStubPort(t)),
+		stubCarrierConfig{earlySDP: testSDPBody(uacRTPStubPort(t)), answerDelay: 450 * time.Millisecond, proceed: proceed})
+	srv := startServer(t, 45736, graceEdgeCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45736}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err == nil {
+		t.Fatal("uac wait answer: expected the ring-timeout failure, got success")
+	}
+	if sess.InviteResponse == nil || sess.InviteResponse.StatusCode != 408 {
+		t.Fatalf("caller must get 408 Request Timeout once the ring budget expired, got %+v", sess.InviteResponse)
+	}
+
+	// Let the carrier's gated 200 attempt run its course now that the
+	// bridge's CANCEL has already ended the dialog — its RespondSDP must
+	// fail against the dead dialog, which still ends cleanly (byeDone).
+	close(proceed)
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("carrier dialog never cleaned up after the grace-edge attempt — bridge left a live B-leg")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
 // allFailCfg routes local-uac to two carriers that both always decline —
 // proves the failover loop exhausts every target and gives up, rather than
 // looping forever or leaving the A-leg unanswered.
@@ -2352,6 +2923,24 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 		t.Fatal("bridge's 200 OK carried no To-tag to reuse")
 	}
 
+	// The per-leg SDP entries are only written once placeCall returns — i.e.
+	// once the B-leg answered, the A-leg 200 OK went out AND was ACKed — so
+	// wait for the A-leg entry to actually be on record before firing the
+	// refresh. (This genuinely races otherwise: the store write lands a full
+	// B-leg answer + A-leg ACK round trip after the UAC's own Ack() returns,
+	// and a lookup that misses the store would answer 501 and fail the
+	// assertion below for the wrong reason.)
+	entryDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := srv.callSDP(realCallID); ok {
+			break
+		}
+		if time.Now().After(entryDeadline) {
+			t.Fatal("A-leg SDP entry never went on record; call never fully bridged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45430}
 
 	// sendReInvite fires one in-dialog INVITE with the given CSeq and SDP
@@ -2518,6 +3107,219 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	}
 }
 
+// refreshReInviteWrongTagsCfg is TestRefreshReInviteWrongTagsGet481's own
+// listener/peer/route set, on ports not used by any other test in this
+// file. It adds an "intruder" peer — a real, allowed peer whose allowed_ips
+// cover 127.0.0.2 (the second loopback address, which the test binds the
+// forged refresh's socket to) — so the forged refresh passes identification
+// (the T-01 read filter and IdentifyPeer both accept it: it IS a peer)
+// while NOT being the caller whose dialog it claims. That is exactly the
+// F-08 attacker shape: any identified peer must not be able to pull a
+// leg's established answer out of the bridge by replaying the Call-ID and
+// the established SDP.
+const refreshReInviteWrongTagsCfg = `
+listen:
+  sip: [udp://127.0.0.1:45440]
+  media:
+    port_range: 46340-46343
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  intruder:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.2/32]
+  carrier:
+    address: 127.0.0.1:45441
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestRefreshReInviteWrongTagsGet481 is T-07's (F-08) regression test: it
+// establishes a real bridged call exactly like
+// TestBridgeAnswersSessionTimerRefresh, then — while it is up — sends a
+// session-timer refresh re-INVITE from ANOTHER allowed peer (the intruder,
+// sending from 127.0.0.2) that reuses the call's genuine Call-ID and the
+// caller's own established offer SDP, but with forged From/To tags. Pre-fix
+// that is enough: the in-dialog branch keys on Call-ID + SDP match alone
+// and answers 200 with the SBC's established answer — on a secure leg that
+// answer carries the SDES master key (F-08's key-leak entry). Post-fix the
+// full dialog identity (Call-ID + both tags) must be verified, and a
+// mismatch answered 481 Call/Transaction Does Not Exist (RFC 3261 §12.2.2)
+// with no SDP body — while the real call is provably unharmed: its BYE
+// still tears everything down cleanly, proving the 481 path never touched
+// the established dialog. Timing-based over real UDP loopback: re-run once
+// before treating a flake as failure.
+func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45442})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45441", testSDPBody(echoRTPPort))
+	srv := startServer(t, 45440, refreshReInviteWrongTagsCfg)
+
+	// --- establish the call, same shape as TestBridgePlacesCallAndBridges ---
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45440}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	offerSDP := testSDPBody(uacRTPPort)
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, offerSDP)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- the attacker's knowledge is only what travels in the clear: the
+	// real Call-ID and the established offer body. The dialog tags are what
+	// they don't have, so forge both sides. ---
+	callIDHdr := sess.InviteRequest.CallID()
+	fromHdr := sess.InviteRequest.From()
+	toHdr := sess.InviteResponse.To()
+	if callIDHdr == nil || fromHdr == nil || toHdr == nil {
+		t.Fatal("established dialog missing Call-ID/From/To; can't build the forged refresh")
+	}
+	realCallID := callIDHdr.Value()
+	realFromTag, hasFromTag := fromHdr.Params.Get("tag")
+	realToTag, hasToTag := toHdr.Params.Get("tag")
+	if !hasFromTag || realFromTag == "" || !hasToTag || realToTag == "" {
+		t.Fatal("established dialog missing a tag; can't prove the forged tags differ")
+	}
+
+	// The per-leg SDP entries are only written once placeCall returns — i.e.
+	// once the B-leg answered, the A-leg 200 OK went out AND was ACKed — so
+	// wait for the A-leg entry to actually be on record before firing the
+	// forged refresh. The lookup must hit the entry and be refused by the
+	// TAG check, not miss the store entirely: a 501 from a not-yet-populated
+	// store proves nothing (and this genuinely races — the store write
+	// lands a full B-leg answer + A-leg ACK round trip after anything the
+	// UAC side can observe).
+	entryDeadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := srv.callSDP(realCallID); ok {
+			break
+		}
+		if time.Now().After(entryDeadline) {
+			t.Fatal("A-leg SDP entry never went on record; call never fully bridged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	forgedFromTag, forgedToTag := "forged-from-tag", "forged-to-tag"
+	if forgedFromTag == realFromTag || forgedToTag == realToTag {
+		t.Fatal("test setup is broken: forged tags must differ from the dialog's real ones")
+	}
+
+	// --- the forged refresh, from 127.0.0.2 (identifies as the intruder
+	// peer — a different, allowed peer): same Call-ID, same established
+	// offer body, Session-Expires present (so it would classify as a
+	// session-timer refresh), but not this dialog's tags. ---
+	intruderConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2)})
+	if err != nil {
+		t.Fatalf("intruder socket on 127.0.0.2: %v", err)
+	}
+	defer intruderConn.Close()
+	intruderLocal := intruderConn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45440}
+
+	forged := strings.Join([]string{
+		"INVITE sip:5551234@127.0.0.1:45440 SIP/2.0",
+		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-forged-refresh", intruderLocal.String()),
+		fmt.Sprintf("From: <sip:evil@127.0.0.2>;tag=%s", forgedFromTag),
+		fmt.Sprintf("To: <sip:sbc@127.0.0.1>;tag=%s", forgedToTag),
+		"Call-ID: " + realCallID,
+		"CSeq: 2 INVITE",
+		"Contact: <sip:evil@" + intruderLocal.String() + ">",
+		"Max-Forwards: 70",
+		"Session-Expires: 1800;refresher=uac",
+		"Supported: timer",
+		"Content-Type: application/sdp",
+		fmt.Sprintf("Content-Length: %d", len(offerSDP)),
+		"", string(offerSDP),
+	}, "\r\n")
+	if _, err := intruderConn.WriteToUDP([]byte(forged), dst); err != nil {
+		t.Fatalf("write forged refresh: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = intruderConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := intruderConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 481") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 481") {
+		t.Fatalf("forged refresh from another allowed peer must get 481, got:\n%s", got.String())
+	}
+	if strings.Contains(got.String(), "SIP/2.0 200") {
+		t.Fatalf("forged refresh must not be answered 200 (F-08 key-leak entry), got:\n%s", got.String())
+	}
+	// The 481 must carry no SDP body: the established answer — which on a
+	// secure leg contains the SDES master key — must never leave the bridge
+	// for a request that is not on the dialog.
+	if body := sipBody(t, got.String()); len(body) > 0 {
+		t.Fatalf("481 to a forged refresh must carry no SDP body, got:\n%s", got.String())
+	}
+
+	// --- prove the real call is unharmed: its BYE still tears everything
+	// down cleanly, same teardown proof as the sibling re-INVITE tests. ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE — the forged refresh perturbed the established call")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+	if _, ok := srv.callSDP(realCallID); ok {
+		t.Fatal("established SDP still on record after teardown; callSDPStore not cleared")
+	}
+}
+
 // digestAuthCfg routes local-uac to a single carrier that requires digest
 // auth (peer Auth is set); the stub challenges the first attempt and only
 // answers once WaitAnswer's built-in retry supplies a valid Authorization.
@@ -2640,9 +3442,24 @@ func TestBridgeDigestAuth(t *testing.T) {
 
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
+	// The media session is released by onInvite's own goroutine as it
+	// unwinds its defers — asynchronously to this test, and AFTER the
+	// registry removal waitForActiveCalls observes. Retry briefly, exactly
+	// like TestBridgeAllTargetsFail does (same race, same comment there).
+	var (
+		s2       *media.Session
+		allocErr error
+	)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s2, allocErr = srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
+		if allocErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if allocErr != nil {
+		t.Fatalf("media ports not released after teardown: %v", allocErr)
 	}
 	s2.Close()
 }
@@ -2670,6 +3487,110 @@ routes:
     from: local-uac
     to: [carrier]
 `
+
+// realmPinnedCfg (T-19) pins carrier-a's digest realm to "freesbc-test";
+// carrier-b carries the same auth. The test's rogue carrier-a challenges
+// with realm "evil" — the bridge must refuse to answer it and fail over to
+// carrier-b, whose challenge matches.
+const realmPinnedCfg = `
+listen:
+  sip: [udp://127.0.0.1:45750]
+  media:
+    port_range: 46750-46753
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:45751
+    allowed_ips: [203.0.113.20/30]
+    media_latch: loose
+    auth: { username: carrieruser, password: carrierpass, realm: freesbc-test }
+  carrier-b:
+    address: 127.0.0.1:45752
+    allowed_ips: [203.0.113.24/30]
+    media_latch: loose
+    auth: { username: carrieruser, password: carrierpass, realm: freesbc-test }
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// TestBridgeRealmPinnedInvite is T-19's (F-20) INVITE-path regression:
+// carrier-a challenges with realm "evil" while the peer's auth pins
+// "freesbc-test" — the bridge must NEVER answer that challenge with a
+// digest of its credentials (a rogue/compromised carrier would harvest the
+// response for offline cracking), so carrier-a sees zero Authorization
+// headers and the call fails over to carrier-b, whose matching challenge
+// is answered normally and bridges. The caller sees one clean 200.
+func TestBridgeRealmPinnedInvite(t *testing.T) {
+	carrierA := startStubCarrier(t, "127.0.0.1:45751", testSDPBody(uacRTPStubPort(t)),
+		stubCarrierConfig{digestUser: "carrieruser", digestPass: "carrierpass", digestRealm: "evil"})
+	carrierB := startStubCarrier(t, "127.0.0.1:45752", testSDPBody(uacRTPStubPort(t)),
+		stubCarrierConfig{digestUser: "carrieruser", digestPass: "carrierpass"}) // default realm = the pinned one
+	srv := startServer(t, 45750, realmPinnedCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45750}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("caller got %d, want 200 (failover to the matching-realm carrier)", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// The crux: no Authorization header ever reached the rogue carrier.
+	if carrierA.sawAuthz.Load() {
+		t.Fatal("digest credentials must never be sent for a foreign realm")
+	}
+	// The rogue carrier did get challenged traffic (its 401 went out), and
+	// the failover target bridged the call.
+	select {
+	case <-carrierA.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rogue carrier never received the B-leg INVITE — failover scenario not exercised")
+	}
+	select {
+	case <-carrierB.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("matching-realm carrier never received the B-leg INVITE — failover did not happen")
+	}
+
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrierB.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier-b dialog never ended after BYE")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
 
 // TestBridgeOutboundFromAndContact is M4.1 Task 2's crux: it closes the
 // M3.3 blocker where the B-leg INVITE went out with sipgo's synthesized
@@ -3469,6 +4390,7 @@ peers:
     address: 127.0.0.1:45291
     auth: { username: reguser, password: regpass }
     register: true
+    allowed_ips: [203.0.113.9/32] # T-11: required on every peer; disjoint from local-uac so the caller still identifies as local-uac
 routes:
   - name: out
     from: local-uac
@@ -5849,4 +6771,350 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 	if srv.KillCall("no-such-call") {
 		t.Error("KillCall of unknown id should return false")
 	}
+}
+
+// peerCallCapCfg is TestPeerCallCapRejectsWith503's own listener/peer/route
+// set on ports no other test uses: local-uac is capped at one concurrent
+// call (T-06, F-06). Two carrier peers on disjoint numbers let the test
+// bridge two calls in sequence — startStubCarrier is single-call (its
+// established/byeDone channels close once), so each call needs its own
+// carrier.
+const peerCallCapCfg = `
+listen:
+  sip: [udp://127.0.0.1:45720]
+  media:
+    port_range: 46720-46723
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+    max_concurrent_calls: 1
+  carrier:
+    address: 127.0.0.1:45721
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+  carrier2:
+    address: 127.0.0.1:45723
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out-a
+    from: local-uac
+    match: { to: "^5551234$" }
+    to: [carrier]
+  - name: out-b
+    from: local-uac
+    match: { to: "^5559999$" }
+    to: [carrier2]
+`
+
+// TestPeerCallCapRejectsWith503 is the T-06 (F-06, D6-8) red test: with
+// local-uac capped at one concurrent call, a second initial INVITE from
+// that peer must be refused 503 with a Retry-After header before any
+// routing/dialing/port work happens — and once the first call ends, the
+// slot is released and a new INVITE is admitted again.
+func TestPeerCallCapRejectsWith503(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45722})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP2, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45724})
+	if err != nil {
+		t.Fatalf("carrier2 echo rtp socket: %v", err)
+	}
+	defer echoRTP2.Close()
+	echoRTP2Port := echoRTP2.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45721", testSDPBody(echoRTPPort))
+	carrier2 := startStubCarrier(t, "127.0.0.1:45723", testSDPBody(echoRTP2Port))
+	srv := startServer(t, 45720, peerCallCapCfg)
+
+	// --- establish the first call: fills the peer's single quota slot ---
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45720}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE; call never actually bridged")
+	}
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
+
+	// --- second initial INVITE from the same peer: over the cap. Raw UDP
+	// (like TestBridgeRejectsReInvite) so the assertion reads the exact
+	// wire response. ---
+	capConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("second uac socket: %v", err)
+	}
+	defer capConn.Close()
+	capLocal := capConn.LocalAddr().(*net.UDPAddr)
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45720}
+
+	req := sipInviteWithSDP("b2bua-quota-overcap", capLocal, testSDPBody(uacRTPPort), 45720)
+	if _, err := capConn.WriteToUDP([]byte(req), dst); err != nil {
+		t.Fatalf("write over-cap invite: %v", err)
+	}
+
+	var got strings.Builder
+	buf := make([]byte, 4096)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = capConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, _, err := capConn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		got.Write(buf[:n])
+		if strings.Contains(got.String(), "SIP/2.0 503") {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "SIP/2.0 503") {
+		t.Fatalf("second concurrent INVITE must get 503, got:\n%s", got.String())
+	}
+	if !strings.Contains(strings.ToLower(got.String()), "retry-after:") {
+		t.Fatalf("503 quota rejection must carry Retry-After, got:\n%s", got.String())
+	}
+	// The refused INVITE must not have disturbed the live call.
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
+
+	// --- release: BYE the first call, then a third INVITE is admitted ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+
+	// A fresh UAC (so the first dialog's state can't bleed in) proves the
+	// quota slot was released: this INVITE must bridge to 200 — on the
+	// second carrier, since startStubCarrier is single-call. Retried
+	// briefly: the bridge releases the media session via defer AFTER
+	// registry.Remove (defers unwind LIFO), so right after
+	// waitForActiveCalls(0) the port can still be held for an instant and
+	// Allocate answers 503 — same race TestBridgeDigestAuth retries around.
+	uac2UA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac2 ua: %v", err)
+	}
+	defer uac2UA.Close()
+	uac2Client, err := sipgo.NewClient(uac2UA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac2 client: %v", err)
+	}
+	defer uac2Client.Close()
+	dialogCli2 := sipgo.NewDialogClientCache(uac2Client, sip.ContactHeader{})
+
+	bridge2URI := sip.Uri{User: "5559999", Host: "127.0.0.1", Port: 45720}
+	var sess2 *sipgo.DialogClientSession
+	invite2Deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(invite2Deadline) {
+		invite2Ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		sess2, err = dialogCli2.Invite(invite2Ctx, bridge2URI, testSDPBody(uacRTPPort))
+		if err == nil {
+			err = sess2.WaitAnswer(invite2Ctx, sipgo.AnswerOptions{})
+			if err == nil && sess2.InviteResponse.StatusCode == 200 {
+				cancel2()
+				break
+			}
+			sess2.Close()
+		}
+		cancel2()
+		sess2 = nil
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sess2 == nil {
+		t.Fatal("post-release INVITE never bridged to 200 — quota slot not released when the call ended")
+	}
+	defer sess2.Close()
+	if err := sess2.Ack(context.Background()); err != nil {
+		t.Fatalf("uac2 ack: %v", err)
+	}
+	select {
+	case <-carrier2.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier2 never received the B-leg INVITE; post-release call never actually bridged")
+	}
+	if err := sess2.Bye(context.Background()); err != nil {
+		t.Fatalf("uac2 bye: %v", err)
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// TestCallQuotaAcquire unit-tests the T-06 counter itself: per-peer and
+// global caps, release, and the 0=unlimited convention.
+func TestCallQuotaAcquire(t *testing.T) {
+	var q callQuota
+
+	r1, ok := q.acquire("p", 1, 0)
+	if !ok {
+		t.Fatal("first acquire under a per-peer cap of 1 must be admitted")
+	}
+	if _, ok := q.acquire("p", 1, 0); ok {
+		t.Fatal("second acquire under a per-peer cap of 1 must be refused")
+	}
+	// The global cap applies across peers: with p holding the only slot of
+	// a global cap of 1, another peer is refused too.
+	if _, ok := q.acquire("other", 0, 1); ok {
+		t.Fatal("acquire under a global cap of 1 (slot held by another peer) must be refused")
+	}
+	// A refused acquire must not have consumed anything: after release,
+	// re-acquire under the same caps succeeds.
+	r1()
+	r2, ok := q.acquire("p", 1, 1)
+	if !ok {
+		t.Fatal("acquire after release must be admitted again")
+	}
+	r2()
+	if q.global != 0 || len(q.peers) != 0 {
+		t.Fatalf("quota not drained after releases: global=%d peers=%v", q.global, q.peers)
+	}
+
+	// 0 caps mean unlimited.
+	r3, ok := q.acquire("any", 0, 0)
+	if !ok {
+		t.Fatal("acquire with zero caps (unlimited) must be admitted")
+	}
+	r3()
+}
+
+// peerCallCapFailureCfg is TestPeerCallCapReleasedOnFailure's own port set
+// (peerCallCapCfg's shape, single carrier): the route only matches
+// ^5551234$, so any other number 404s after the quota gate.
+const peerCallCapFailureCfg = `
+listen:
+  sip: [udp://127.0.0.1:45726]
+  media:
+    port_range: 46726-46729
+    public_ip: 127.0.0.1
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+    max_concurrent_calls: 1
+  carrier:
+    address: 127.0.0.1:45727
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    match: { to: "^5551234$" }
+    to: [carrier]
+`
+
+// TestPeerCallCapReleasedOnFailure proves a FAILED initial INVITE (404:
+// dialed number matches no route) releases its quota slot — the card's
+// "呼叫结束（含失败路径）释放配额" requirement. With the cap at 1 and no
+// live call, a 404'd INVITE must not wedge the quota: the next valid INVITE
+// is admitted and bridges.
+func TestPeerCallCapReleasedOnFailure(t *testing.T) {
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45728})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
+
+	carrier := startStubCarrier(t, "127.0.0.1:45727", testSDPBody(echoRTPPort))
+	srv := startServer(t, 45726, peerCallCapFailureCfg)
+
+	// A failed call: 404 before any dialing, but AFTER the quota gate.
+	got := roundTrip(t, 45726, "INVITE", "b2bua-cap-fail", 3*time.Second, "SIP/2.0 404")
+	if !strings.Contains(got, "SIP/2.0 404") {
+		t.Fatalf("unroutable INVITE must get 404, got:\n%s", got)
+	}
+
+	// If the failed INVITE leaked its slot, this valid INVITE would be
+	// refused 503 Call Quota Exceeded instead of bridging.
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45726}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPPort))
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("valid INVITE after a failed one got status %d, want 200 (quota slot leaked by the failed call)", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+	select {
+	case <-carrier.offers:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }

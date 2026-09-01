@@ -1,6 +1,7 @@
 package sig
 
 import (
+	"fmt"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -10,6 +11,20 @@ import (
 	"time"
 
 	"github.com/freesbc/freesbc/config"
+	"golang.org/x/sync/singleflight"
+)
+
+const (
+	// srvLookupTimeout bounds ONE DNS resolution (T-28/D8-1): net.LookupSRV
+	// takes no context, so the lookup runs in a throwaway goroutine and the
+	// caller abandons it after this long — a slow resolver must not pin the
+	// per-call goroutine for the resolver's own (much longer) timeout.
+	srvLookupTimeout = 3 * time.Second
+	// srvFailCacheTTL is the short cache window for a FAILED or EMPTY SRV
+	// lookup (T-28/D8-1): a transient DNS fault must not pin the fallback
+	// endpoint for the whole srv_cache_ttl (300s by default) — re-query
+	// after this instead. Cap-effective: never longer than the caller's TTL.
+	srvFailCacheTTL = 10 * time.Second
 )
 
 // Endpoint is one concrete dialable trunk destination: a host (an SRV target
@@ -42,6 +57,7 @@ type cacheEntry struct {
 type Resolver struct {
 	mu        sync.Mutex
 	cache     map[string]cacheEntry
+	sf        singleflight.Group // dedupes concurrent lookups per key (T-28/D8-1)
 	rand      *rand.Rand
 	lookupSRV func(service, proto, name string) (string, []*net.SRV, error)
 	now       func() time.Time
@@ -51,8 +67,35 @@ func newResolver(seed int64) *Resolver {
 	return &Resolver{
 		cache:     make(map[string]cacheEntry),
 		rand:      rand.New(rand.NewSource(seed)),
-		lookupSRV: net.LookupSRV,
+		lookupSRV: lookupSRVTimeout(net.LookupSRV),
 		now:       time.Now,
+	}
+}
+
+// lookupSRVTimeout wraps a lookupSRV-style function with srvLookupTimeout
+// (T-28/D8-1): the wrapped function runs in a throwaway goroutine and the
+// caller abandons it when the deadline passes, falling back exactly like
+// any other lookup failure (short negative cache in resolveSRV). The
+// abandoned goroutine drains into a buffered channel and exits once the
+// underlying resolver eventually returns — never blocking the caller.
+func lookupSRVTimeout(fn func(service, proto, name string) (string, []*net.SRV, error)) func(service, proto, name string) (string, []*net.SRV, error) {
+	return func(service, proto, name string) (string, []*net.SRV, error) {
+		type result struct {
+			cname string
+			recs  []*net.SRV
+			err   error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			cname, recs, err := fn(service, proto, name)
+			ch <- result{cname, recs, err}
+		}()
+		select {
+		case r := <-ch:
+			return r.cname, r.recs, r.err
+		case <-time.After(srvLookupTimeout):
+			return "", nil, fmt.Errorf("srv lookup timed out after %v", srvLookupTimeout)
+		}
 	}
 }
 
@@ -61,12 +104,17 @@ func newResolver(seed int64) *Resolver {
 // directly (no SRV); a bare hostname triggers an SRV lookup, ordered by
 // priority then weight, falling back to the bare hostname when there is no
 // SRV record. Always returns at least one endpoint for a non-empty address.
+// The default port follows the transport (T-30/D8-4): tls → 5061
+// (RFC 3263 §4.1 sips fallback), udp/tcp → 5060.
 func (r *Resolver) Resolve(peer *config.Peer, cacheTTL time.Duration) []Endpoint {
 	transport := peer.Transport
 	if transport == "" {
 		transport = "udp"
 	}
 	host, port, explicitPort, isIP := classifyAddress(peer.Address)
+	if !explicitPort {
+		port = defaultPort(transport)
+	}
 	if isIP || explicitPort {
 		return []Endpoint{{Host: host, Port: port, Transport: transport}}
 	}
@@ -83,30 +131,65 @@ func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []
 	}
 	r.mu.Unlock()
 
-	// Do the (blocking) DNS lookup without the lock held, so a slow resolver
-	// for one host does not stall calls to other hosts.
-	service, proto := srvService(transport)
-	_, recs, err := r.lookupSRV(service, proto, host)
+	// T-28 (D8-1): concurrent Resolves for the same uncached key share ONE
+	// lookup (singleflight) — a cache-miss burst of N calls must not mean N
+	// DNS queries.
+	epsAny, _, _ := r.sf.Do(key, func() (any, error) {
+		r.mu.Lock()
+		// Another caller may have filled the cache before this flight ran.
+		if e, ok := r.cache[key]; ok && r.now().Before(e.expiry) {
+			r.mu.Unlock()
+			return e.endpoints, nil
+		}
+		r.mu.Unlock()
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Another goroutine may have filled the cache while we were looking up.
-	if e, ok := r.cache[key]; ok && r.now().Before(e.expiry) {
-		return e.endpoints
+		// Do the (blocking, timeout-bounded) DNS lookup without the lock
+		// held, so a slow resolver for one host does not stall calls to
+		// other hosts.
+		service, proto := srvService(transport)
+		_, recs, err := r.lookupSRV(service, proto, host)
+
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		var eps []Endpoint
+		ttl := cacheTTL
+		switch {
+		case err != nil || len(recs) == 0:
+			// No SRV at all, or a transient DNS failure: fall back to the
+			// bare host — but cached only briefly (srvFailCacheTTL) so a
+			// momentary resolver outage doesn't pin the fallback for the
+			// whole srv_cache_ttl (T-28/D8-1).
+			eps = []Endpoint{{Host: host, Port: defaultPort(transport), Transport: transport}}
+			ttl = min(cacheTTL, srvFailCacheTTL)
+		default:
+			eps = orderSRV(recs, transport, r.rand)
+			if len(eps) == 0 {
+				// Every record was filtered as unusable (T-29/D8-2: all
+				// Target "." / port 0) — treat like no SRV, and cache it
+				// short: the record set clearly changed recently.
+				eps = []Endpoint{{Host: host, Port: defaultPort(transport), Transport: transport}}
+				ttl = min(cacheTTL, srvFailCacheTTL)
+			}
+		}
+		r.cache[key] = cacheEntry{endpoints: eps, expiry: r.now().Add(ttl)}
+		return eps, nil
+	})
+	return epsAny.([]Endpoint)
+}
+
+// defaultPort returns the transport's default SIP port (T-30/D8-4):
+// RFC 3263 §4.1 — sips (tls) falls back to 5061, everything else 5060.
+func defaultPort(transport string) int {
+	if strings.ToLower(transport) == "tls" {
+		return 5061
 	}
-	var eps []Endpoint
-	if err != nil || len(recs) == 0 {
-		eps = []Endpoint{{Host: host, Port: 5060, Transport: transport}}
-	} else {
-		eps = orderSRV(recs, transport, r.rand)
-	}
-	r.cache[key] = cacheEntry{endpoints: eps, expiry: r.now().Add(cacheTTL)}
-	return eps
+	return 5060
 }
 
 // classifyAddress splits a peer address into host/port and reports whether a
-// port was explicitly given and whether the host is a literal IP. A missing
-// port defaults to 5060.
+// port was explicitly given and whether the host is a literal IP. The port
+// default is transport-aware in Resolve (defaultPort, T-30/D8-4); the 5060
+// here is only a placeholder for callers that don't consult the transport.
 func classifyAddress(address string) (host string, port int, explicitPort, isIP bool) {
 	port = 5060
 	if h, ps, err := net.SplitHostPort(address); err == nil {
@@ -141,10 +224,16 @@ func srvService(transport string) (service, proto string) {
 // rnd must be called under the Resolver mutex (rand.Rand is not concurrency
 // safe); resolveSRV holds it.
 func orderSRV(recs []*net.SRV, transport string, rnd *rand.Rand) []Endpoint {
-	// Group by priority (ascending).
+	// Group by priority (ascending), skipping unusable records first
+	// (T-29/D8-2): Target "." means "service unavailable" per RFC 2782, and
+	// a port-0 target is undialable — either would enter the failover chain
+	// as a bogus endpoint. resolveSRV treats an all-filtered set as no-SRV.
 	byPrio := map[uint16][]*net.SRV{}
 	var prios []uint16
 	for _, rec := range recs {
+		if rec.Target == "." || rec.Port == 0 {
+			continue
+		}
 		if _, seen := byPrio[rec.Priority]; !seen {
 			prios = append(prios, rec.Priority)
 		}
