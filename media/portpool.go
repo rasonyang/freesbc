@@ -6,7 +6,9 @@ package media
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/freesbc/freesbc/config"
@@ -33,9 +35,12 @@ func (pp *PortPair) Close() {
 	_ = pp.RTCP.Close()
 }
 
-// Pool allocates port pairs from listen.media.port_range. The range is
-// read from the config store on every allocation, so a hot-reloaded range
-// applies to new calls without disturbing established ones.
+// Pool allocates port pairs from the configured range
+// (rtp.port_min/port_max, else listen.media.port_range — see
+// Config.RTPPortRange). The range and the rtp.bind_ip the sockets bind to
+// are read from the config store on every allocation, so a hot-reloaded
+// range or bind address applies to new calls without disturbing
+// established ones.
 type Pool struct {
 	store *config.Store
 
@@ -49,11 +54,14 @@ func NewPool(store *config.Store) *Pool {
 }
 
 // allocatePair binds the next free RTP/RTCP pair. Ports occupied by other
-// processes are skipped; a full sweep with no free pair returns
-// ErrPortsExhausted.
+// processes are skipped; a full sweep with no free pair returns an
+// ErrPortsExhausted error naming the configured range. The cursor walks
+// only even ports inside [lo, hi] and wraps before hi, so a pair (port,
+// port+1) can never be bound outside the configured range — even when hi
+// is odd or lo is odd.
 func (p *Pool) allocatePair() (*PortPair, error) {
-	media := p.store.Current().Listen.Media
-	lo, hi := int(media.PortRange.Min), int(media.PortRange.Max)
+	pr := p.store.Current().RTPPortRange()
+	lo, hi := int(pr.Min), int(pr.Max)
 	if lo%2 != 0 {
 		lo++ // RTP ports are even by convention
 	}
@@ -73,21 +81,21 @@ func (p *Pool) allocatePair() (*PortPair, error) {
 		if _, used := p.inUse[port]; used {
 			continue
 		}
-		pair, err := bindPair(port)
+		pair, err := bindPair(port, p.bindIP())
 		if err != nil {
 			continue // occupied by another process
 		}
 		p.inUse[port] = struct{}{}
 		return pair, nil
 	}
-	return nil, ErrPortsExhausted
+	return nil, fmt.Errorf("%w: no free pair in %d-%d", ErrPortsExhausted, pr.Min, pr.Max)
 }
 
 // Stats returns the number of RTP port pairs currently allocated and the
 // total number of pairs the configured range can hold.
 func (p *Pool) Stats() (inUse, total int) {
-	media := p.store.Current().Listen.Media
-	lo, hi := int(media.PortRange.Min), int(media.PortRange.Max)
+	pr := p.store.Current().RTPPortRange()
+	lo, hi := int(pr.Min), int(pr.Max)
 	if lo%2 != 0 {
 		lo++
 	}
@@ -108,15 +116,39 @@ func (p *Pool) release(rtpPort int) {
 	p.mu.Unlock()
 }
 
-func bindPair(port int) (*PortPair, error) {
-	rtp, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+// bindIP returns the rtp.bind_ip the pool's sockets bind to, or the zero
+// Addr (every interface) when unset. Only the bind plane — the advertised
+// SDP address lives on the signaling side (Server.mediaIP); the two stay
+// independent so NAT/VPN deployments can bind privately and advertise
+// publicly.
+func (p *Pool) bindIP() netip.Addr {
+	if b := p.store.Current().RTP.BindIP; b != "" {
+		if ip, err := netip.ParseAddr(b); err == nil {
+			return ip
+		}
+	}
+	return netip.Addr{}
+}
+
+func bindPair(port int, bind netip.Addr) (*PortPair, error) {
+	rtp, err := net.ListenUDP("udp", udpAddr(port, bind))
 	if err != nil {
 		return nil, err
 	}
-	rtcp, err := net.ListenUDP("udp", &net.UDPAddr{Port: port + 1})
+	rtcp, err := net.ListenUDP("udp", udpAddr(port+1, bind))
 	if err != nil {
 		_ = rtp.Close()
 		return nil, err
 	}
 	return &PortPair{RTP: rtp, RTCP: rtcp}, nil
+}
+
+// udpAddr builds the local address for one socket: port with bind when it
+// is valid, else the wildcard address.
+func udpAddr(port int, bind netip.Addr) *net.UDPAddr {
+	a := &net.UDPAddr{Port: port}
+	if bind.IsValid() {
+		a.IP = net.IP(bind.AsSlice())
+	}
+	return a
 }

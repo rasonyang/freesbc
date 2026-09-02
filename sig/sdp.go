@@ -37,12 +37,12 @@ func remoteMediaIP(sdpBytes []byte) (netip.Addr, error) {
 
 // rewriteSDP points the SDP at our media, hiding the peer's topology from
 // the other side of the bridge: the o= origin and session-level c= become
-// ourIP, the first audio m= port becomes rtpPort (a=rtcp, if present,
+// mediaIP, the first audio m= port becomes rtpPort (a=rtcp, if present,
 // becomes rtpPort+1), and every other media section (additional audio,
 // video, application/T.38, etc.) is declined by zeroing its port and
 // stripping any media-level c= per RFC 3264. It returns the re-marshalled
 // SDP. Errors on unparseable input or SDP with no audio media.
-func rewriteSDP(sdpBytes []byte, ourIP netip.Addr, rtpPort int) ([]byte, error) {
+func rewriteSDP(sdpBytes []byte, mediaIP netip.Addr, rtpPort int) ([]byte, error) {
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(sdpBytes); err != nil {
 		return nil, fmt.Errorf("parse sdp: %w", err)
@@ -50,15 +50,15 @@ func rewriteSDP(sdpBytes []byte, ourIP netip.Addr, rtpPort int) ([]byte, error) 
 	if firstAudio(&sd) == nil {
 		return nil, fmt.Errorf("sdp has no audio media")
 	}
-	addr := &sdp.Address{Address: ourIP.String()}
+	addr := &sdp.Address{Address: mediaIP.String()}
 	sd.ConnectionInformation = &sdp.ConnectionInformation{
 		NetworkType: "IN",
-		AddressType: sdpAddrType(ourIP),
+		AddressType: sdpAddrType(mediaIP),
 		Address:     addr,
 	}
 	sd.Origin.NetworkType = "IN"
-	sd.Origin.AddressType = sdpAddrType(ourIP)
-	sd.Origin.UnicastAddress = ourIP.String()
+	sd.Origin.AddressType = sdpAddrType(mediaIP)
+	sd.Origin.UnicastAddress = mediaIP.String()
 
 	relayed := false
 	for _, md := range sd.MediaDescriptions {
@@ -146,7 +146,7 @@ func offeredCrypto(sdpBytes []byte) (secure bool, lines []cryptoLine) {
 // both the secure and plaintext (crypto == nil) paths: a declined section
 // leaks the peer's live key regardless of whether the relayed section itself
 // ends up secure.
-func rewriteSDPCrypto(sdpBytes []byte, ourIP netip.Addr, rtpPort int, crypto *sdpCrypto) ([]byte, error) {
+func rewriteSDPCrypto(sdpBytes []byte, mediaIP netip.Addr, rtpPort int, crypto *sdpCrypto) ([]byte, error) {
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(sdpBytes); err != nil {
 		return nil, fmt.Errorf("parse sdp: %w", err)
@@ -154,11 +154,11 @@ func rewriteSDPCrypto(sdpBytes []byte, ourIP netip.Addr, rtpPort int, crypto *sd
 	if firstAudio(&sd) == nil {
 		return nil, fmt.Errorf("sdp has no audio media")
 	}
-	addr := &sdp.Address{Address: ourIP.String()}
-	sd.ConnectionInformation = &sdp.ConnectionInformation{NetworkType: "IN", AddressType: sdpAddrType(ourIP), Address: addr}
+	addr := &sdp.Address{Address: mediaIP.String()}
+	sd.ConnectionInformation = &sdp.ConnectionInformation{NetworkType: "IN", AddressType: sdpAddrType(mediaIP), Address: addr}
 	sd.Origin.NetworkType = "IN"
-	sd.Origin.AddressType = sdpAddrType(ourIP)
-	sd.Origin.UnicastAddress = ourIP.String()
+	sd.Origin.AddressType = sdpAddrType(mediaIP)
+	sd.Origin.UnicastAddress = mediaIP.String()
 
 	relayed := false
 	for _, md := range sd.MediaDescriptions {

@@ -248,7 +248,7 @@ type runningReg struct {
 }
 
 // NewRegistrar builds a Registrar over store's config, using client to send
-// REGISTERs and srv to resolve our own Contact address (ourIP/ourSigPort).
+// REGISTERs and srv to resolve our own Contact address (sigIP/ourSigPort).
 // Callers must call Run to start reconciling.
 func NewRegistrar(store *config.Store, client *sipgo.Client, srv *Server, log *slog.Logger) *Registrar {
 	return &Registrar{
@@ -396,15 +396,19 @@ func (r *Registrar) stopAll() {
 
 // paramsFor builds the immutable regParams for a register:true peer: the
 // registrar host/port parsed from its configured address, and our own
-// Contact IP/port resolved fresh from cfg (so a hot-reloaded public_ip or
-// listener takes effect on the next reconcile without a restart).
+// Contact IP/port resolved fresh from cfg (so a hot-reloaded advertised
+// address or listener takes effect on the next reconcile without a
+// restart). The Contact advertises our SIGNALING identity (sigIP/
+// ourSigPort — sip.advertised_ip:advertised_port in a NAT/VPN topology):
+// it is the address the carrier will send inbound INVITEs to, so it must
+// be the advertised one, never the private bind address.
 func (r *Registrar) paramsFor(cfg *config.Config, name string, p *config.Peer) regParams {
 	host, port := splitHostPortDefault(p.Address, 5060)
-	ourIP := r.srv.ourIP(cfg)
+	sigIP := r.srv.sigIP(cfg)
 	return regParams{
 		Name: name, RegistrarHost: host, RegistrarPort: port,
 		Transport: p.Transport, Username: p.Auth.Username, Password: p.Auth.Password, Realm: p.Auth.Realm,
-		ContactIP: ourIP, ContactPort: r.srv.ourSigPort(cfg, p.Transport),
+		ContactIP: sigIP, ContactPort: r.srv.ourSigPort(cfg, p.Transport),
 	}
 }
 

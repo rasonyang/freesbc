@@ -19,6 +19,25 @@ listen:
                                     # "auto" (STUN) is a future milestone.
     # rtp_timeout: 5m              # tear down calls after this much RTP silence
 
+# NAT/VPN alternative: separate bind and advertised addresses. When
+# sip.bind_ip is set it REPLACES listen.sip (remove the list above — the two
+# are mutually exclusive), and advertised_ip/advertised_port default to the
+# bind values. The sip and rtp sections are independent of each other.
+#
+# sip:
+#   bind_ip: 10.77.0.2             # private VPN/NAT address the listener binds
+#   bind_port: 16060
+#   transport: udp                 # udp (default), tcp, or tls
+#   advertised_ip: 198.51.100.7    # what Contact/From/REGISTER claim (must be routable from the far side)
+#   advertised_port: 16060
+# rtp:
+#   bind_ip: 10.77.0.2             # RTP/RTCP sockets bind here (empty = every interface)
+#   advertised_ip: 203.0.113.7     # what SDP c=/o= claim; REQUIRED with sip.bind_ip
+#                                   #   unless listen.media.public_ip is a literal address
+#   port_min: 20000                # explicit RTP port range; both or neither, and it
+#   port_max: 20100                #   REPLACES listen.media.port_range (the two are
+#                                   #   mutually exclusive). port_min must be < port_max.
+
 ring_timeout: 60s   # cancel a target that rings this long without answering, then failover
 register_expires: 3600s   # requested REGISTER lifetime for register:true peers (carrier may grant less)
 session_expires: 1800s   # RFC 4028 session timer we advertise/accept (carrier may lower it)

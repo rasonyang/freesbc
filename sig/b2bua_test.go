@@ -3599,8 +3599,9 @@ func TestBridgeRealmPinnedInvite(t *testing.T) {
 // assertions below read the carrier's *received* INVITE (not the UAC's own
 // request) to prove the bridge rebuilt From/Contact rather than merely
 // forwarding the A-leg's headers: From user must still be "1001" (CLI
-// preserved) but From/Contact host must be ourIP (127.0.0.1, this config's
-// public_ip) — never the UAC's own loopback source port — and the Contact
+// preserved) but From/Contact host must be the bridge's advertised
+// signaling IP (sigIP: 127.0.0.1, this config's public_ip) — never the
+// UAC's own loopback source port — and the Contact
 // must carry our SIP listen port with no transport= param (carrier's
 // transport defaults to udp, SIP's own default per RFC 3261 §19.1.2).
 // No RTP is exercised here (Task 6/7/8 already cover the media path); this
@@ -3634,8 +3635,8 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	// otherwise let sipgo synthesize a default From from the UA's own
 	// name/hostname, which wouldn't exercise CLI pass-through at all.
 	// The caller's From host is set to a distinct address (203.0.113.50)
-	// different from ourIP (127.0.0.1), so assertions can prove topology
-	// hiding: the bridge must rewrite the host to ourIP, not forward the
+	// different from sigIP (127.0.0.1), so assertions can prove topology
+	// hiding: the bridge must rewrite the host to sigIP, not forward the
 	// caller's claimed host.
 	inviteReq := sip.NewRequest(sip.INVITE, bridgeURI)
 	inviteReq.SetBody(testSDPBody(uacRTPStubPort(t)))
@@ -3677,10 +3678,10 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 		t.Errorf("From user = %q, want caller number 1001 (CLI pass-through)", from.Address.User)
 	}
 	if from.Address.Host != "127.0.0.1" {
-		t.Errorf("From host = %q, want ourIP 127.0.0.1 (topology hiding; must not be the caller's own address)", from.Address.Host)
+		t.Errorf("From host = %q, want sigIP 127.0.0.1 (topology hiding; must not be the caller's own address)", from.Address.Host)
 	}
 	if from.Address.Host == "203.0.113.50" {
-		t.Error("From host = 203.0.113.50 (caller's claimed host); topology hiding failed: buildFrom forwarded the caller's host instead of rewriting to ourIP")
+		t.Error("From host = 203.0.113.50 (caller's claimed host); topology hiding failed: buildFrom forwarded the caller's host instead of rewriting to sigIP")
 	}
 	if from.Address.Port != 45203 {
 		t.Errorf("From port = %d, want bridge's outbound SIP port 45203 (from config listener)", from.Address.Port)
@@ -3699,7 +3700,7 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 		t.Fatal("carrier never captured a Contact header on the B-leg INVITE")
 	}
 	if contact.Address.Host != "127.0.0.1" {
-		t.Errorf("Contact host = %q, want ourIP 127.0.0.1", contact.Address.Host)
+		t.Errorf("Contact host = %q, want sigIP 127.0.0.1", contact.Address.Host)
 	}
 	if contact.Address.Port != 45203 {
 		t.Errorf("Contact port = %d, want our SIP listen port 45203", contact.Address.Port)
@@ -3717,6 +3718,217 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier dialog never ended after BYE")
 	}
+}
+
+// natTopoCfg is the bind/advertised deployment shape under test: the SIP
+// listener binds the wildcard private side (a NAT/VPN deployment's bind
+// plane) while signaling advertises a DIFFERENT address (127.0.0.2 — a
+// loopback-reachable stand-in for the public side, so the test's UAC can
+// actually route its in-dialog ACK/BYE to the advertised Contact the way a
+// real NAT device would). The media plane is fully divergent: sockets bind
+// 127.0.0.1 while SDP advertises 203.0.113.7, which nothing on loopback can
+// reach — proving the SDP advertisement really comes from rtp.advertised_ip
+// and never from the RTP bind — and the media pool draws from
+// rtp.port_min/port_max with no listen: section configured at all.
+// (Signaling advertised_PORT independence is covered by
+// TestServerNATAdvertisedAddresses and TestRegistrarNATAdvertisedContact,
+// which don't need a real NAT shim.)
+const natTopoCfg = `
+sip:
+  bind_ip: 0.0.0.0
+  bind_port: 45390
+  advertised_ip: 127.0.0.2
+  advertised_port: 45390
+rtp:
+  bind_ip: 127.0.0.1
+  advertised_ip: 203.0.113.7
+  port_min: 46390
+  port_max: 46393
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier:
+    address: 127.0.0.1:45391
+    allowed_ips: [203.0.113.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier]
+`
+
+// TestBridgeNATBindAdvertisedTopology is the end-to-end proof of the
+// bind/advertised split: the A-leg caller reaches the bridge on the BIND
+// plane (127.0.0.1:45390), while every externally visible artifact claims
+// the ADVERTISED plane — the B-leg From/Contact and the A-leg answer
+// Contact carry sip.advertised_ip:advertised_port (127.0.0.2:45390, not
+// 127.0.0.1), and SDP c=/o= on both legs carry rtp.advertised_ip
+// (203.0.113.7), not the RTP bind (127.0.0.1) and not the SIP advertised
+// IP. Media must still flow end to end between the two legs' bound
+// sockets.
+func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
+	// Real RTP sockets for both endpoints, so media can be proven to flow
+	// between the bound sockets despite the SDP advertising 203.0.113.7.
+	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("uac rtp socket: %v", err)
+	}
+	defer uacRTP.Close()
+	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
+
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("carrier echo rtp socket: %v", err)
+	}
+	defer echoRTP.Close()
+
+	carrier := startStubCarrier(t, "127.0.0.1:45391", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
+	srv := startServer(t, 45390, natTopoCfg)
+
+	uacUA, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("uac ua: %v", err)
+	}
+	defer uacUA.Close()
+	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("uac client: %v", err)
+	}
+	defer uacClient.Close()
+	// Empty Contact, same as the other UAC harnesses above (see
+	// TestBridgePlacesCallAndBridges): this UAC never receives requests.
+	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
+
+	// The caller dials the BIND address — that is all a NAT/VPN caller
+	// knows; the advertised plane is what the bridge claims on the wire.
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45390}
+	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelInvite()
+
+	inviteReq := sip.NewRequest(sip.INVITE, bridgeURI)
+	inviteReq.SetBody(testSDPBody(uacRTPPort))
+	fromParams := sip.NewParams()
+	fromParams.Add("tag", sip.GenerateTagN(16))
+	inviteReq.AppendHeader(&sip.FromHeader{
+		DisplayName: "Caller 1001",
+		Address:     sip.Uri{Scheme: "sip", User: "1001", Host: "10.99.0.50", Port: 5070},
+		Params:      fromParams,
+	})
+
+	sess, err := dialogCli.WriteInvite(inviteCtx, inviteReq)
+	if err != nil {
+		t.Fatalf("uac invite: %v", err)
+	}
+	defer sess.Close()
+
+	if err := sess.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("uac wait answer: %v", err)
+	}
+	if sess.InviteResponse.StatusCode != 200 {
+		t.Fatalf("got status %d, want 200", sess.InviteResponse.StatusCode)
+	}
+	if err := sess.Ack(context.Background()); err != nil {
+		t.Fatalf("uac ack: %v", err)
+	}
+
+	// --- A-leg answer: SDP c= is rtp.advertised_ip, Contact is
+	// sip.advertised_ip:advertised_port ---
+	answerIP, err := remoteMediaIP(sess.InviteResponse.Body())
+	if err != nil {
+		t.Fatalf("parse answer sdp: %v", err)
+	}
+	if answerIP.String() != "203.0.113.7" {
+		t.Errorf("answer c= = %v, want rtp.advertised_ip 203.0.113.7 (not the 127.0.0.1 RTP bind, not the SIP advertised IP)", answerIP)
+	}
+	sideAPort := sdpAudioPort(t, sess.InviteResponse.Body())
+	if sideAPort < 46390 || sideAPort > 46393 {
+		t.Errorf("answer m=audio port %d not in media pool range 46390-46393", sideAPort)
+	}
+	aContact := sess.InviteResponse.Contact()
+	if aContact == nil {
+		t.Fatal("A-leg 200 OK must carry a Contact")
+	}
+	if aContact.Address.Host != "127.0.0.2" {
+		t.Errorf("A-leg Contact host = %q, want sip.advertised_ip 127.0.0.2 (not the 127.0.0.1 the caller reached us on)", aContact.Address.Host)
+	}
+	if aContact.Address.Port != 45390 {
+		t.Errorf("A-leg Contact port = %d, want sip.advertised_port 45390", aContact.Address.Port)
+	}
+
+	// --- B-leg INVITE: From/Contact carry the advertised signaling
+	// identity, SDP c= the advertised media identity ---
+	var sideBPort int
+	select {
+	case carrierOffer := <-carrier.offers:
+		if carrierOffer.Recipient.User != "5551234" {
+			t.Errorf("carrier invite user = %q, want 5551234", carrierOffer.Recipient.User)
+		}
+		offerIP, err := remoteMediaIP(carrierOffer.Body())
+		if err != nil {
+			t.Fatalf("parse carrier offer sdp: %v", err)
+		}
+		if offerIP.String() != "203.0.113.7" {
+			t.Errorf("B-leg offer c= = %v, want rtp.advertised_ip 203.0.113.7", offerIP)
+		}
+		sideBPort = sdpAudioPort(t, carrierOffer.Body())
+		if sideBPort < 46390 || sideBPort > 46393 || sideBPort == sideAPort {
+			t.Errorf("B-leg offer m=audio port %d invalid (side A port %d)", sideBPort, sideAPort)
+		}
+		from := carrier.lastFrom()
+		if from == nil {
+			t.Fatal("carrier never captured a From header on the B-leg INVITE")
+		}
+		if from.Address.User != "1001" {
+			t.Errorf("From user = %q, want caller number 1001 (CLI pass-through)", from.Address.User)
+		}
+		if from.Address.Host != "127.0.0.2" {
+			t.Errorf("From host = %q, want sip.advertised_ip 127.0.0.2 (topology hiding; not the caller's 10.99.0.50, not the 127.0.0.1 bind)", from.Address.Host)
+		}
+		if from.Address.Port != 45390 {
+			t.Errorf("From port = %d, want sip.advertised_port 45390", from.Address.Port)
+		}
+		contact := carrier.lastContact()
+		if contact == nil {
+			t.Fatal("carrier never captured a Contact header on the B-leg INVITE")
+		}
+		if contact.Address.Host != "127.0.0.2" {
+			t.Errorf("Contact host = %q, want sip.advertised_ip 127.0.0.2", contact.Address.Host)
+		}
+		if contact.Address.Port != 45390 {
+			t.Errorf("Contact port = %d, want sip.advertised_port 45390", contact.Address.Port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier never received the B-leg INVITE")
+	}
+
+	// --- RTP round trip between the BOUND sockets: the SDP advertised
+	// 203.0.113.7 (unreachable on loopback), so media only flows if the
+	// relay sockets really bind rtp.bind_ip (127.0.0.1). ---
+	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
+	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
+
+	// Side B's latch is loose (media_latch: loose on the carrier peer), so
+	// any first packet arms it as the A→B relay target — send one before
+	// asserting forwarding either direction.
+	if _, err := echoRTP.WriteToUDP([]byte("arm-b"), sideBAddr); err != nil {
+		t.Fatalf("arm side b: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	sendUntilReceived(t, uacRTP, sideAAddr, echoRTP, "ping-a-to-b")
+	sendUntilReceived(t, echoRTP, sideBAddr, uacRTP, "pong-b-to-a")
+
+	// --- teardown ---
+	if err := sess.Bye(context.Background()); err != nil {
+		t.Fatalf("uac bye: %v", err)
+	}
+	select {
+	case <-carrier.byeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("carrier dialog never ended after BYE")
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }
 
 // --- M4.1 Task 3: response-code fidelity — real carrier final codes ---

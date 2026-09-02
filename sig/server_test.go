@@ -242,30 +242,32 @@ func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
 	}
 }
 
-// TestServerOurIPResolution is Fix 2's regression coverage for
-// Server.ourIP — used both for the SDP media IP (mediaIP, called per call
-// from bridge.onInvite) and for the dialog Contact host built in Run.
-// Before the fix, mediaIP's "auto" fallback used listen.sip[0]'s host
-// unconditionally, so a listener bound to 0.0.0.0 (or ::) — the normal way
-// to listen on every interface — produced c=0.0.0.0 in SDP (a media
-// blackhole) and sip:0.0.0.0:port in Contact (unroutable). The fix: prefer
-// a literal public_ip; else skip unspecified listener hosts and use the
-// first routable one; else warn once (not per call) and fall back to
-// 127.0.0.1.
-func TestServerOurIPResolution(t *testing.T) {
-	newSrv := func(t *testing.T, cfgYAML string) (*Server, *config.Config, *bytes.Buffer) {
-		t.Helper()
-		cfg, err := config.Parse([]byte(cfgYAML))
-		if err != nil {
-			t.Fatalf("parse config: %v", err)
-		}
-		var logBuf bytes.Buffer
-		srv := NewServer(config.NewStore(cfg), nil, slog.New(slog.NewTextHandler(&logBuf, nil)))
-		return srv, cfg, &logBuf
+// TestServerAdvertisedIPResolution is Fix 2's regression coverage for
+// Server.advertisedIP (now reached via sigIP for signaling headers and
+// mediaIP for SDP) — the IP the SBC advertises as its own. Before the fix,
+// mediaIP's "auto" fallback used listen.sip[0]'s host unconditionally, so a
+// listener bound to 0.0.0.0 (or ::) — the normal way to listen on every
+// interface — produced c=0.0.0.0 in SDP (a media blackhole) and
+// sip:0.0.0.0:port in Contact (unroutable). The fix: prefer a literal
+// public_ip; else skip unspecified listener hosts and use the first
+// routable one; else warn once (not per call) and fall back to 127.0.0.1.
+// newSrvForResolution parses cfgYAML and builds a *Server with a captured
+// log buffer — no listener is bound, so resolution functions can be probed
+// without network I/O.
+func newSrvForResolution(t *testing.T, cfgYAML string) (*Server, *config.Config, *bytes.Buffer) {
+	t.Helper()
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
 	}
+	var logBuf bytes.Buffer
+	srv := NewServer(config.NewStore(cfg), nil, slog.New(slog.NewTextHandler(&logBuf, nil)))
+	return srv, cfg, &logBuf
+}
 
+func TestServerAdvertisedIPResolution(t *testing.T) {
 	t.Run("literal public_ip wins even over a routable listener", func(t *testing.T) {
-		srv, cfg, _ := newSrv(t, `
+		srv, cfg, _ := newSrvForResolution(t, `
 listen:
   sip: [udp://198.51.100.1:5060]
   media: { port_range: 40000-40001, public_ip: 203.0.113.10 }
@@ -276,13 +278,13 @@ routes:
     from: p
     to: [p]
 `)
-		if got := srv.ourIP(cfg); got.String() != "203.0.113.10" {
-			t.Errorf("ourIP = %s, want 203.0.113.10 (literal public_ip)", got)
+		if got := srv.mediaIP(cfg); got.String() != "203.0.113.10" {
+			t.Errorf("mediaIP = %s, want 203.0.113.10 (literal public_ip)", got)
 		}
 	})
 
 	t.Run("auto skips an unspecified listener and picks the routable one", func(t *testing.T) {
-		srv, cfg, logBuf := newSrv(t, `
+		srv, cfg, logBuf := newSrvForResolution(t, `
 listen:
   sip: [udp://0.0.0.0:5060, udp://198.51.100.5:5061]
   media: { port_range: 40002-40003, public_ip: auto }
@@ -293,8 +295,8 @@ routes:
     from: p
     to: [p]
 `)
-		if got := srv.ourIP(cfg); got.String() != "198.51.100.5" {
-			t.Errorf("ourIP = %s, want 198.51.100.5 (first non-unspecified listen.sip host)", got)
+		if got := srv.sigIP(cfg); got.String() != "198.51.100.5" {
+			t.Errorf("sigIP = %s, want 198.51.100.5 (first non-unspecified listen.sip host)", got)
 		}
 		if strings.Contains(logBuf.String(), "falling back to 127.0.0.1") {
 			t.Errorf("unexpected fallback warning when a routable listener exists:\n%s", logBuf.String())
@@ -302,7 +304,7 @@ routes:
 	})
 
 	t.Run("auto with every listener unspecified warns once and falls back to 127.0.0.1", func(t *testing.T) {
-		srv, cfg, logBuf := newSrv(t, `
+		srv, cfg, logBuf := newSrvForResolution(t, `
 listen:
   sip: [udp://0.0.0.0:5060, "udp://[::]:5061"]
   media: { port_range: 40004-40005, public_ip: auto }
@@ -316,14 +318,82 @@ routes:
 		// Call twice: the fallback IP must be stable, and warnAutoIPOnce must
 		// gate the warning to a single log line, not one per call.
 		for i := 0; i < 2; i++ {
-			if got := srv.ourIP(cfg); got.String() != "127.0.0.1" {
-				t.Errorf("call %d: ourIP = %s, want 127.0.0.1 fallback", i, got)
+			if got := srv.mediaIP(cfg); got.String() != "127.0.0.1" {
+				t.Errorf("call %d: mediaIP = %s, want 127.0.0.1 fallback", i, got)
 			}
 		}
 		if n := strings.Count(logBuf.String(), "falling back to 127.0.0.1"); n != 1 {
 			t.Errorf("fallback warning logged %d times across 2 calls, want exactly 1 (warnAutoIPOnce)\nlog:\n%s", n, logBuf.String())
 		}
 	})
+}
+
+// TestServerNATAdvertisedAddresses covers the bind/advertised topology:
+// sip.advertised_ip and rtp.advertised_ip override the legacy resolution
+// independently — signaling and media can advertise different public
+// addresses — while the listeners themselves stay bound to the private
+// bind_ip.
+func TestServerNATAdvertisedAddresses(t *testing.T) {
+	srv, cfg, _ := newSrvForResolution(t, `
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+  advertised_ip: 198.51.100.7
+  advertised_port: 15060
+rtp:
+  bind_ip: 10.77.0.2
+  advertised_ip: 203.0.113.7
+peers:
+  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
+routes:
+  - name: r
+    from: p
+    to: [p]
+`)
+	if got := srv.sigIP(cfg); got.String() != "198.51.100.7" {
+		t.Errorf("sigIP = %s, want sip.advertised_ip 198.51.100.7", got)
+	}
+	if got := srv.mediaIP(cfg); got.String() != "203.0.113.7" {
+		t.Errorf("mediaIP = %s, want rtp.advertised_ip 203.0.113.7", got)
+	}
+	if got := srv.ourSigPort(cfg, "udp"); got != 15060 {
+		t.Errorf("ourSigPort = %d, want sip.advertised_port 15060 (never the private bind port 16060)", got)
+	}
+	ls := cfg.Listeners()
+	if len(ls) != 1 || ls[0].Host != "10.77.0.2" || ls[0].Port != 16060 {
+		t.Errorf("listeners = %+v, want the private bind 10.77.0.2:16060", ls)
+	}
+}
+
+// TestServerOurSigPortNo5060Fallback proves the port advertised for our
+// signaling always comes from configuration — an empty listener set (only
+// constructible directly, without Parse) yields 0, never a hardcoded 5060.
+func TestServerOurSigPortNo5060Fallback(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:45170]
+  media: { port_range: 40006-40007 }
+peers:
+  p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
+routes:
+  - name: r
+    from: p
+    to: [p]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	srv := NewServer(config.NewStore(cfg), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if got := srv.ourSigPort(cfg, "udp"); got != 45170 {
+		t.Errorf("ourSigPort(udp) = %d, want configured 45170", got)
+	}
+	if got := srv.ourSigPort(cfg, "tcp"); got != 45170 {
+		t.Errorf("ourSigPort(tcp) = %d, want first-listener fallback 45170", got)
+	}
+	empty := &config.Config{}
+	if got := srv.ourSigPort(empty, "udp"); got != 0 {
+		t.Errorf("ourSigPort with no listeners = %d, want 0 (no hardcoded 5060 assumption)", got)
+	}
 }
 
 func TestServerDropsUnidentifiedBye(t *testing.T) {

@@ -24,10 +24,10 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Sprintf(format, args...))
 	}
 
-	if len(c.Listen.SIP) == 0 {
-		fail("listen.sip: at least one listener required")
+	if len(c.Listen.SIP) == 0 && c.SIP.BindIP == "" {
+		fail("listen.sip or sip.bind_ip: at least one SIP listener required")
 	}
-	if pr := c.Listen.Media.PortRange; pr.Min < 1024 {
+	if pr := c.Listen.Media.PortRange; pr != (PortRange{}) && pr.Min < 1024 {
 		fail("listen.media.port_range: must start at or above 1024, got %d-%d", pr.Min, pr.Max)
 	}
 	if pub := c.Listen.Media.PublicIP; pub != "auto" {
@@ -37,6 +37,93 @@ func (c *Config) validate() error {
 	}
 	if c.Listen.Media.RTPTimeout.Std() <= 0 {
 		fail("listen.media.rtp_timeout: must be > 0, got %v", c.Listen.Media.RTPTimeout.Std())
+	}
+
+	// sip/rtp bind-advertised topology (NAT/VPN): any configured sip.*
+	// field requires the full bind pair, and the section is mutually
+	// exclusive with the legacy listen.sip list — two listener sources
+	// would be ambiguous.
+	sipSet := c.SIP.BindIP != "" || c.SIP.BindPort != 0 ||
+		c.SIP.AdvertisedIP != "" || c.SIP.AdvertisedPort != 0
+	if sipSet && c.SIP.BindIP == "" {
+		fail("sip.bind_ip: required when any sip.* field is configured")
+	}
+	if sipSet && c.SIP.BindPort == 0 {
+		fail("sip.bind_port: required when any sip.* field is configured")
+	}
+	if c.SIP.BindIP != "" {
+		if _, err := netip.ParseAddr(c.SIP.BindIP); err != nil {
+			fail("sip.bind_ip: %q is not a valid IP", c.SIP.BindIP)
+		}
+		if len(c.Listen.SIP) > 0 {
+			fail("sip.bind_ip and listen.sip are mutually exclusive: the sip section replaces the listen.sip listener list — configure one or the other")
+		}
+	}
+	if c.SIP.BindPort != 0 && (c.SIP.BindPort < 1 || c.SIP.BindPort > 65535) {
+		fail("sip.bind_port: must be 1-65535, got %d", c.SIP.BindPort)
+	}
+	switch c.SIP.Transport {
+	case "udp", "tcp", "tls":
+	default:
+		fail("sip.transport: must be udp, tcp, or tls, got %q", c.SIP.Transport)
+	}
+	if c.SIP.AdvertisedIP != "" {
+		ip, err := netip.ParseAddr(c.SIP.AdvertisedIP)
+		if err != nil {
+			fail("sip.advertised_ip: %q is not a valid IP", c.SIP.AdvertisedIP)
+		} else if ip.IsUnspecified() {
+			fail("sip.advertised_ip: %q is unspecified — advertising it in Contact/From would be unroutable", c.SIP.AdvertisedIP)
+		}
+	}
+	if c.SIP.AdvertisedPort != 0 && (c.SIP.AdvertisedPort < 1 || c.SIP.AdvertisedPort > 65535) {
+		fail("sip.advertised_port: must be 1-65535, got %d", c.SIP.AdvertisedPort)
+	}
+	if c.RTP.BindIP != "" {
+		if _, err := netip.ParseAddr(c.RTP.BindIP); err != nil {
+			fail("rtp.bind_ip: %q is not a valid IP", c.RTP.BindIP)
+		}
+	}
+	if c.RTP.AdvertisedIP != "" {
+		ip, err := netip.ParseAddr(c.RTP.AdvertisedIP)
+		if err != nil {
+			fail("rtp.advertised_ip: %q is not a valid IP", c.RTP.AdvertisedIP)
+		} else if ip.IsUnspecified() {
+			fail("rtp.advertised_ip: %q is unspecified — advertising it in SDP would blackhole media", c.RTP.AdvertisedIP)
+		}
+	}
+	// Blackhole guard for the NAT/VPN topology: with sip.bind_ip configured
+	// there are no listen.sip hosts for the SDP media IP to fall back on
+	// (see Server.mediaIP), so without an explicit rtp.advertised_ip — and
+	// with public_ip left "auto", since STUN discovery isn't implemented —
+	// every SDP would advertise 127.0.0.1.
+	if c.SIP.BindIP != "" && c.RTP.AdvertisedIP == "" && c.Listen.Media.PublicIP == "auto" {
+		fail("rtp.advertised_ip: required when sip.bind_ip is configured and listen.media.public_ip is \"auto\" — otherwise SDP media would advertise 127.0.0.1")
+	}
+
+	// rtp.port_min/port_max: both-or-neither, and mutually exclusive with
+	// the legacy listen.media.port_range — two range sources would be
+	// ambiguous. Bounds mirror the legacy range (>= 1024 keeps the pool
+	// unprivileged; <= 65535 is the UDP port ceiling).
+	rtpRangeSet := c.RTP.PortMin != 0 || c.RTP.PortMax != 0
+	if rtpRangeSet && (c.RTP.PortMin == 0 || c.RTP.PortMax == 0) {
+		fail("rtp.port_min and rtp.port_max must be set together")
+	}
+	if c.RTP.PortMin != 0 {
+		if c.Listen.Media.PortRange != (PortRange{}) {
+			fail("rtp.port_min/port_max and listen.media.port_range are mutually exclusive: the rtp section replaces the legacy range — configure one or the other")
+		}
+		if c.RTP.PortMin < 1024 || c.RTP.PortMin > 65535 {
+			fail("rtp.port_min: must be 1024-65535, got %d", c.RTP.PortMin)
+		}
+		if c.RTP.PortMax < 1024 || c.RTP.PortMax > 65535 {
+			fail("rtp.port_max: must be 1024-65535, got %d", c.RTP.PortMax)
+		}
+		if c.RTP.PortMin >= c.RTP.PortMax {
+			// A degenerate (min == max) range can never hold an RTP+RTCP
+			// pair — reject it up front rather than fail every call with
+			// "exhausted".
+			fail("rtp.port_min/port_max: port_min must be less than port_max (each call needs an RTP+RTCP port pair), got %d-%d", c.RTP.PortMin, c.RTP.PortMax)
+		}
 	}
 	if c.RingTimeout.Std() <= 0 {
 		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())

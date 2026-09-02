@@ -59,7 +59,7 @@ type Shield struct {
 func New(store *config.Store, log *slog.Logger) *Shield {
 	cfg := store.Current()
 	bl := newBanList()
-	bl.nft = newNFTBackend(cfg.Shield.NFTables, cfg.Listen.SIP, log)
+	bl.nft = newNFTBackend(cfg.Shield.NFTables, cfg.Listeners(), log)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Shield{
 		store:       store,

@@ -65,10 +65,11 @@ type Server struct {
 	resolver *Resolver
 	health   *endpointHealth
 
-	// warnAutoIPOnce gates ourIP's "can't resolve a routable address"
-	// warning to a single log line for the life of the process: ourIP is
-	// called on every INVITE (mediaIP's per-call SDP rewrite), and without
-	// this the same warning would otherwise spam the log once per call.
+	// warnAutoIPOnce gates advertisedIP's "can't resolve a routable
+	// address" warning to a single log line for the life of the process:
+	// advertisedIP is called on every INVITE (mediaIP/sigIP's per-call
+	// resolution), and without this the same warning would otherwise spam
+	// the log once per call.
 	warnAutoIPOnce sync.Once
 
 	// killMu guards killers: the admin kick-call mechanism (KillCall). Each
@@ -236,21 +237,25 @@ func (s *Server) Run(ctx context.Context) error {
 	s.client = client
 
 	cfg := s.store.Current()
-	listeners := cfg.Listen.SIP
-	contactPort := 5060
-	if len(listeners) > 0 {
-		contactPort = listeners[0].Port
-	}
+	listeners := cfg.Listeners()
 	// The Contact host must be an address the far side can actually reach —
-	// see ourIP: same resolution (public_ip literal, else a non-unspecified
-	// listen.sip host) as the SDP media IP, so a Contact built from
-	// listeners[0]'s raw host (which may be 0.0.0.0 when listening on all
-	// interfaces) doesn't advertise an unroutable sip:0.0.0.0:port. Resolved
-	// once here from the config Run started with; hot-reloaded changes to
-	// public_ip/listeners don't retroactively update this cached Contact
-	// (mediaIP/ourIP's SDP-facing use, by contrast, is resolved fresh per
-	// call from the current config).
-	contact := sip.ContactHeader{Address: sip.Uri{Host: s.ourIP(cfg).String(), Port: contactPort}}
+	// see sigIP: same resolution (sip.advertised_ip, else the public_ip
+	// literal, else a non-unspecified listen.sip host) so a Contact built
+	// from listeners[0]'s raw host (which may be 0.0.0.0 when listening on
+	// all interfaces) doesn't advertise an unroutable sip:0.0.0.0:port.
+	// The port is the advertised signaling port for listeners[0]'s
+	// transport (sip.advertised_port when configured), never a hardcoded
+	// 5060. Resolved once here from the config Run started with;
+	// hot-reloaded changes to advertised/listener settings don't
+	// retroactively update this cached Contact (mediaIP/sigIP's per-call
+	// uses, by contrast, are resolved fresh from the current config). The
+	// len guard mirrors the pre-existing listeners[0] guard: validated
+	// configs always have at least one listener, but a *Server built
+	// directly by tests (without Parse) may have none.
+	var contact sip.ContactHeader
+	if len(listeners) > 0 {
+		contact = sip.ContactHeader{Address: sip.Uri{Host: s.sigIP(cfg).String(), Port: s.ourSigPort(cfg, listeners[0].Transport)}}
+	}
 	s.dialogSrv = sipgo.NewDialogServerCache(client, contact)
 	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
 	s.br = &bridge{s: s}
@@ -519,22 +524,29 @@ func (s *Server) dropUnidentified(req *sip.Request) {
 	}
 }
 
-// ourIP resolves the IP the SBC advertises as its own to the outside world:
-// the media IP rewritten into SDP (mediaIP's per-call use, below) and the
-// dialog Contact host built in Run. Resolution order:
+// advertisedIP resolves an IP the SBC advertises as its own to the outside
+// world, preferring `preferred` — the NAT/VPN advertised address
+// (sip.advertised_ip or rtp.advertised_ip) when configured. Resolution
+// order:
 //
-//  1. The configured public_ip, when it is a literal address (not "auto" —
-//     STUN-based discovery for "auto" is a later milestone).
-//  2. Otherwise, the first listen.sip host that is NOT unspecified (0.0.0.0
+//  1. `preferred`, when set and a valid IP (validation guarantees it is not
+//     unspecified — advertising 0.0.0.0/:: would be unroutable/a blackhole).
+//  2. The configured listen.media.public_ip, when it is a literal address
+//     (not "auto" — STUN-based discovery for "auto" is a later milestone).
+//  3. Otherwise, the first listen.sip host that is NOT unspecified (0.0.0.0
 //     / ::): a listener commonly binds every interface (0.0.0.0) while the
 //     SBC still has one real, routable address to advertise, so an
 //     unspecified listener host is skipped rather than handed to the far
-//     side — advertising 0.0.0.0 in SDP is a media blackhole, and in a
-//     Contact header is unroutable.
-//  3. If every listen.sip host is itself unspecified (or there are none),
+//     side.
+//  4. If every listen.sip host is itself unspecified (or there are none),
 //     fall back to 127.0.0.1 and log a warning — once per process
 //     (warnAutoIPOnce), not per call, since this is called on every INVITE.
-func (s *Server) ourIP(cfg *config.Config) netip.Addr {
+func (s *Server) advertisedIP(cfg *config.Config, preferred string) netip.Addr {
+	if preferred != "" {
+		if ip, err := netip.ParseAddr(preferred); err == nil {
+			return ip
+		}
+	}
 	if pub := cfg.Listen.Media.PublicIP; pub != "auto" {
 		if ip, err := netip.ParseAddr(pub); err == nil {
 			return ip
@@ -546,17 +558,42 @@ func (s *Server) ourIP(cfg *config.Config) netip.Addr {
 		}
 	}
 	s.warnAutoIPOnce.Do(func() {
-		s.log.Warn("listen.media.public_ip is auto (STUN discovery isn't implemented yet) and no listen.sip host is a specific, routable address; falling back to 127.0.0.1 — SDP media and the Contact header will be unroutable from any other host")
+		s.log.Warn("no advertised address configured (sip/rtp advertised_ip unset, listen.media.public_ip is auto — STUN discovery isn't implemented yet) and no listen.sip host is a specific, routable address; falling back to 127.0.0.1 — SDP media and the Contact header will be unroutable from any other host")
 	})
 	return netip.MustParseAddr("127.0.0.1")
 }
 
-// ourSigPort returns our listening port for the given transport (the first
-// matching listen.sip entry), or the first listener's port as a fallback —
-// mirrors the Contact-port resolution Run does once at startup (see the
-// contactPort comment above), but re-resolved per call/per-target so it
-// tracks whichever transport the B-leg is actually being placed on.
+// sigIP is the IP advertised in externally visible signaling (Contact,
+// From, REGISTER Contact): sip.advertised_ip when configured, else the
+// legacy resolution chain (see advertisedIP).
+func (s *Server) sigIP(cfg *config.Config) netip.Addr {
+	return s.advertisedIP(cfg, cfg.SIP.AdvertisedIP)
+}
+
+// mediaIP is the IP advertised in SDP (o= and c=): rtp.advertised_ip when
+// configured, else the legacy resolution chain. Called once per bridged
+// INVITE (see bridge.onInvite), it re-resolves from cfg each time so a
+// hot-reloaded advertised address takes effect on the next call without
+// restarting the process.
+func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
+	return s.advertisedIP(cfg, cfg.RTP.AdvertisedIP)
+}
+
+// ourSigPort returns the port we advertise for our signaling on the given
+// transport: sip.advertised_port when the sip bind/advertised topology is
+// configured, else the first matching listen.sip port, else the first
+// listener's port — mirrors the Contact-port resolution Run does once at
+// startup (see the contact comment above), but re-resolved per call /
+// per-target so it tracks whichever transport the B-leg is actually being
+// placed on. Validation guarantees at least one listener (listen.sip or
+// sip.bind_ip), so a parsed Config never falls through to the zero return;
+// 0 only serves Configs built directly by unit tests without Parse. There
+// is deliberately no 5060 fallback: the configured ports are the source of
+// truth.
 func (s *Server) ourSigPort(cfg *config.Config, transport string) int {
+	if cfg.SIP.AdvertisedPort > 0 {
+		return cfg.SIP.AdvertisedPort
+	}
 	for _, l := range cfg.Listen.SIP {
 		if l.Transport == transport {
 			return l.Port
@@ -565,15 +602,7 @@ func (s *Server) ourSigPort(cfg *config.Config, transport string) int {
 	if len(cfg.Listen.SIP) > 0 {
 		return cfg.Listen.SIP[0].Port
 	}
-	return 5060
-}
-
-// mediaIP is ourIP's per-call entry point for the SDP media address: called
-// once per bridged INVITE (see bridge.onInvite), it re-resolves from cfg
-// each time so a hot-reloaded public_ip takes effect on the next call
-// without restarting the process.
-func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
-	return s.ourIP(cfg)
+	return 0
 }
 
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {

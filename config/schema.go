@@ -30,6 +30,22 @@ type Config struct {
 	// peer (0 = unlimited, the default). Enforced by bridge.onInvite's T-06
 	// quota gate; a per-peer cap lives on Peer.
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
+
+	// SIP and RTP configure the bind/advertised address topology for NAT/VPN
+	// deployments: the SBC sits behind a NAT/VPN with a private bind address
+	// and a public advertised one, and the two must stay independent.
+	//
+	// When sip.bind_ip is set, the sip section REPLACES listen.sip
+	// (validation rejects configuring both): the SBC binds exactly one
+	// listener at sip.bind_ip:sip.bind_port and advertises
+	// sip.advertised_ip:sip.advertised_port in Contact/From/REGISTER. When
+	// unset, the legacy listen.sip + listen.media.public_ip resolution
+	// applies (see Server.sigIP). The rtp section likewise overrides just
+	// the media plane: every RTP/RTCP socket binds to rtp.bind_ip (empty =
+	// every interface, see media.Pool), and SDP c=/o= advertises
+	// rtp.advertised_ip (empty = legacy resolution, see Server.mediaIP).
+	SIP SIPNetConfig `yaml:"sip"`
+	RTP RTPNetConfig `yaml:"rtp"`
 }
 
 type ListenConfig struct {
@@ -50,6 +66,57 @@ type MediaConfig struct {
 	PortRange  PortRange `yaml:"port_range"`
 	PublicIP   string    `yaml:"public_ip"`   // "auto" (STUN-detected) or a literal IP
 	RTPTimeout Duration  `yaml:"rtp_timeout"` // tear down a call after this much RTP silence
+}
+
+// SIPNetConfig is the signaling-plane bind/advertised pair (see Config.SIP).
+type SIPNetConfig struct {
+	// BindIP/BindPort are where the SIP listener actually binds. When
+	// BindIP is set the section replaces listen.sip (see Config.Listeners).
+	BindIP   string `yaml:"bind_ip"`
+	BindPort int    `yaml:"bind_port"`
+	// Transport of the listener: udp (default), tcp, or tls.
+	Transport string `yaml:"transport"`
+	// AdvertisedIP/AdvertisedPort are what externally visible signaling
+	// (Contact, From, REGISTER Contact) claims; the far side must be able
+	// to route to it. Default to the bind values when unset.
+	AdvertisedIP   string `yaml:"advertised_ip"`
+	AdvertisedPort int    `yaml:"advertised_port"`
+}
+
+// RTPNetConfig is the media-plane bind/advertised pair plus the explicit
+// port range (see Config.RTP).
+type RTPNetConfig struct {
+	// BindIP is the local address every RTP/RTCP socket binds to; empty
+	// (the default) binds every interface.
+	BindIP string `yaml:"bind_ip"`
+	// AdvertisedIP is the address written into SDP c=/o=; empty falls back
+	// to the legacy listen.media.public_ip resolution.
+	AdvertisedIP string `yaml:"advertised_ip"`
+	// PortMin/PortMax bound the RTP/RTCP port range when set (both or
+	// neither). They REPLACE listen.media.port_range (validation rejects
+	// configuring both) — see Config.RTPPortRange.
+	PortMin int `yaml:"port_min"`
+	PortMax int `yaml:"port_max"`
+}
+
+// Listeners returns the effective SIP listener set: the sip.bind_ip
+// topology when configured, else listen.sip. Only meaningful on a
+// validated Config (validate rejects configuring both).
+func (c *Config) Listeners() []SIPListen {
+	if c.SIP.BindIP != "" {
+		return []SIPListen{{Transport: c.SIP.Transport, Host: c.SIP.BindIP, Port: c.SIP.BindPort}}
+	}
+	return c.Listen.SIP
+}
+
+// RTPPortRange returns the configured RTP port range: rtp.port_min/port_max
+// when set, else listen.media.port_range. Only meaningful on a validated
+// Config (validate rejects configuring both).
+func (c *Config) RTPPortRange() PortRange {
+	if c.RTP.PortMin != 0 {
+		return PortRange{Min: uint16(c.RTP.PortMin), Max: uint16(c.RTP.PortMax)}
+	}
+	return c.Listen.Media.PortRange
 }
 
 // Peer is a SIP trunk counterpart (carrier or PBX).
@@ -174,7 +241,11 @@ type AdminAuth struct {
 
 // withDefaults fills spec-defined defaults on a freshly parsed Config.
 func withDefaults(c *Config) {
-	if c.Listen.Media.PortRange == (PortRange{}) {
+	// The default range only applies when NEITHER range source is set: with
+	// rtp.port_min/port_max configured, the legacy range must stay zero so
+	// validate's mutual-exclusion check (and RTPPortRange) can tell the two
+	// sources apart.
+	if c.Listen.Media.PortRange == (PortRange{}) && c.RTP.PortMin == 0 && c.RTP.PortMax == 0 {
 		c.Listen.Media.PortRange = PortRange{Min: 16384, Max: 32768}
 	}
 	if c.Listen.Media.PublicIP == "" {
@@ -182,6 +253,15 @@ func withDefaults(c *Config) {
 	}
 	if c.Listen.Media.RTPTimeout == 0 {
 		c.Listen.Media.RTPTimeout = Duration(5 * time.Minute)
+	}
+	if c.SIP.Transport == "" {
+		c.SIP.Transport = "udp"
+	}
+	if c.SIP.BindIP != "" && c.SIP.AdvertisedIP == "" {
+		c.SIP.AdvertisedIP = c.SIP.BindIP
+	}
+	if c.SIP.BindPort != 0 && c.SIP.AdvertisedPort == 0 {
+		c.SIP.AdvertisedPort = c.SIP.BindPort
 	}
 	for _, p := range c.Peers {
 		if p.Transport == "" {

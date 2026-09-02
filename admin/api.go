@@ -18,7 +18,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	inUse, total := s.deps.Ports()
 	listeners := []string{}
-	for _, l := range s.store.Current().Listen.SIP {
+	for _, l := range s.store.Current().Listeners() {
 		listeners = append(listeners, fmt.Sprintf("%s://%s:%d", l.Transport, l.Host, l.Port))
 	}
 	writeJSON(w, map[string]any{

@@ -3,6 +3,7 @@ package media
 import (
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,5 +116,128 @@ func TestPoolConcurrentAllocate(t *testing.T) {
 	}
 	if n != 32 {
 		t.Errorf("allocated %d pairs, want 32", n)
+	}
+}
+
+// TestPoolBindsRTPBindIP proves the media sockets bind to rtp.bind_ip, not
+// the wildcard: a NAT/VPN deployment binds media privately (e.g. the VPN
+// address) while the SDP advertises the public rtp.advertised_ip — the
+// signaling side handles that split (Server.mediaIP); the pool only owns
+// the bind plane.
+func TestPoolBindsRTPBindIP(t *testing.T) {
+	store := testStore(40300, 40303)
+	store.Current().RTP.BindIP = "127.0.0.1"
+	p := NewPool(store)
+	pair, err := p.allocatePair()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	defer pair.Close()
+	for name, c := range map[string]*net.UDPConn{"RTP": pair.RTP, "RTCP": pair.RTCP} {
+		ip := c.LocalAddr().(*net.UDPAddr).IP
+		if ip == nil || !ip.Equal(net.IPv4(127, 0, 0, 1)) {
+			t.Errorf("%s socket bound to %v, want 127.0.0.1 (rtp.bind_ip)", name, ip)
+		}
+	}
+
+	// A hot-reloaded empty bind_ip applies to the NEXT allocation: bind all
+	// interfaces again (wildcard), without disturbing the established pair.
+	store.Current().RTP.BindIP = ""
+	next, err := p.allocatePair()
+	if err != nil {
+		t.Fatalf("allocate after reload: %v", err)
+	}
+	defer next.Close()
+	if ip := next.RTP.LocalAddr().(*net.UDPAddr).IP; ip != nil && !ip.IsUnspecified() {
+		t.Errorf("after reload, RTP socket bound to %v, want wildcard (unspecified)", ip)
+	}
+}
+
+// TestPoolRTPRangeFromConfig proves rtp.port_min/port_max drive the pool:
+// every allocated pair lands inside the configured range (RTP even,
+// RTCP = RTP+1, never past port_max), the pool exhausts exactly at the
+// range's pair capacity with an error naming the range, and a released port
+// is reused by the next allocation.
+func TestPoolRTPRangeFromConfig(t *testing.T) {
+	cfg := &config.Config{
+		Listen: config.ListenConfig{
+			Media: config.MediaConfig{
+				PublicIP:   "auto",
+				RTPTimeout: config.Duration(5 * time.Minute),
+			},
+		},
+		RTP: config.RTPNetConfig{PortMin: 20000, PortMax: 20100},
+	}
+	p := NewPool(config.NewStore(cfg))
+
+	// 101 ports → 50 usable even-RTP pairs (20000..20098; 20100 has no
+	// room for its RTCP at 20101).
+	const wantPairs = 50
+	seen := map[int]bool{}
+	var pairs []*PortPair
+	for i := 0; i < wantPairs; i++ {
+		pair, err := p.allocatePair()
+		if err != nil {
+			t.Fatalf("pair %d: %v", i, err)
+		}
+		port := pair.RTPPort()
+		if port < 20000 || port > 20100 || port%2 != 0 {
+			t.Errorf("RTP port %d outside/odd for range 20000-20100", port)
+		}
+		if rtcp := pair.RTCP.LocalAddr().(*net.UDPAddr).Port; rtcp != port+1 || rtcp > 20100 {
+			t.Errorf("RTCP port %d, want RTP+1=%d and <= 20100", rtcp, port+1)
+		}
+		if seen[port] {
+			t.Errorf("port %d allocated twice", port)
+		}
+		seen[port] = true
+		pairs = append(pairs, pair)
+	}
+
+	// Exhaustion: the error must be errors.Is-compatible (sig maps it to
+	// 503) and name the configured range.
+	_, err := p.allocatePair()
+	if !errors.Is(err, ErrPortsExhausted) {
+		t.Fatalf("want ErrPortsExhausted, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "20000-20100") {
+		t.Errorf("exhaustion error %q does not name the configured range", err)
+	}
+
+	// Release one pair → its port is the one reused by the next allocation.
+	released := pairs[0].RTPPort()
+	pairs[0].Close()
+	p.release(released)
+	again, err := p.allocatePair()
+	if err != nil {
+		t.Fatalf("allocate after release: %v", err)
+	}
+	defer again.Close()
+	if got := again.RTPPort(); got != released {
+		t.Errorf("reused port %d, want released port %d", got, released)
+	}
+	for _, pp := range pairs[1:] {
+		pp.Close()
+	}
+}
+
+// TestPoolStatsRTPRange proves Stats totals the rtp-section range when the
+// legacy range is unset.
+func TestPoolStatsRTPRange(t *testing.T) {
+	cfg := &config.Config{
+		Listen: config.ListenConfig{Media: config.MediaConfig{RTPTimeout: config.Duration(5 * time.Minute)}},
+		RTP:    config.RTPNetConfig{PortMin: 21000, PortMax: 21003}, // 4 ports → 2 pairs
+	}
+	p := NewPool(config.NewStore(cfg))
+	if inUse, total := p.Stats(); inUse != 0 || total != 2 {
+		t.Fatalf("empty pool: inUse=%d total=%d, want 0/2", inUse, total)
+	}
+	pair, err := p.allocatePair()
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	defer pair.Close()
+	if inUse, total := p.Stats(); inUse != 1 || total != 2 {
+		t.Errorf("after 1 alloc: inUse=%d total=%d, want 1/2", inUse, total)
 	}
 }

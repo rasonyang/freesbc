@@ -480,3 +480,343 @@ routes:
 		t.Fatalf("want srtp validation error, got %v", err)
 	}
 }
+
+// --- NAT/VPN bind-advertised topology (sip/rtp sections) ---
+
+// natTopoCfg is the user-facing shape of the bind/advertised topology: a
+// private bind address (VPN) with a public advertised address, independent
+// for signaling and media.
+func natTopoCfg() string {
+	return `
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+  advertised_ip: 198.51.100.7
+  advertised_port: 15060
+rtp:
+  bind_ip: 10.77.0.2
+  advertised_ip: 203.0.113.7
+peers:
+  carrier:
+    address: 203.0.113.10:5060
+    allowed_ips: [203.0.113.0/24]
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [carrier]
+`
+}
+
+func TestValidateNATTopologyParsesAndDefaults(t *testing.T) {
+	cfg, err := Parse([]byte(natTopoCfg()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SIP.BindIP != "10.77.0.2" || cfg.SIP.BindPort != 16060 {
+		t.Errorf("sip bind: %+v", cfg.SIP)
+	}
+	if cfg.SIP.AdvertisedIP != "198.51.100.7" || cfg.SIP.AdvertisedPort != 15060 {
+		t.Errorf("sip advertised: %+v", cfg.SIP)
+	}
+	if cfg.RTP.BindIP != "10.77.0.2" || cfg.RTP.AdvertisedIP != "203.0.113.7" {
+		t.Errorf("rtp: %+v", cfg.RTP)
+	}
+	ls := cfg.Listeners()
+	if len(ls) != 1 || ls[0].Transport != "udp" || ls[0].Host != "10.77.0.2" || ls[0].Port != 16060 {
+		t.Errorf("Listeners() = %+v, want the sip.bind_ip listener", ls)
+	}
+}
+
+// TestValidateNATTopologyAdvertisedDefaultsToBind proves advertised_ip and
+// advertised_port fall back to their bind counterparts (withDefaults), so a
+// deployment that binds a public address needs no advertised section at all.
+func TestValidateNATTopologyAdvertisedDefaultsToBind(t *testing.T) {
+	cfg, err := Parse([]byte(`
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+rtp:
+  bind_ip: 10.77.0.2
+  advertised_ip: 203.0.113.7
+peers:
+  carrier:
+    address: 203.0.113.10:5060
+    allowed_ips: [203.0.113.0/24]
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [carrier]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.SIP.AdvertisedIP != "10.77.0.2" || cfg.SIP.AdvertisedPort != 16060 {
+		t.Errorf("advertised must default to bind values, got ip=%q port=%d", cfg.SIP.AdvertisedIP, cfg.SIP.AdvertisedPort)
+	}
+}
+
+func TestValidateNATTopologyErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantSub string
+	}{
+		{"no bind_ip", func(c *Config) { c.SIP.BindIP = "" }, "sip.bind_ip"},
+		{"no bind_port", func(c *Config) { c.SIP.BindPort = 0 }, "sip.bind_port"},
+		{"bad bind_ip", func(c *Config) { c.SIP.BindIP = "not-an-ip" }, "sip.bind_ip"},
+		{"bad advertised_ip", func(c *Config) { c.SIP.AdvertisedIP = "not-an-ip" }, "sip.advertised_ip"},
+		{"unspecified advertised_ip", func(c *Config) { c.SIP.AdvertisedIP = "0.0.0.0" }, "unroutable"},
+		{"bad bind_port", func(c *Config) { c.SIP.BindPort = 70000 }, "sip.bind_port"},
+		{"bad advertised_port", func(c *Config) { c.SIP.AdvertisedPort = 70000 }, "sip.advertised_port"},
+		{"bad transport", func(c *Config) { c.SIP.Transport = "sctp" }, "sip.transport"},
+		{"bad rtp bind_ip", func(c *Config) { c.RTP.BindIP = "not-an-ip" }, "rtp.bind_ip"},
+		{"bad rtp advertised_ip", func(c *Config) { c.RTP.AdvertisedIP = "not-an-ip" }, "rtp.advertised_ip"},
+		{"unspecified rtp advertised_ip", func(c *Config) { c.RTP.AdvertisedIP = "::" }, "blackhole"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(natTopoCfg()))
+			if err != nil {
+				t.Fatalf("base parse: %v", err)
+			}
+			tc.mutate(cfg)
+			if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("want validation error containing %q, got %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
+// TestValidateNATTopologyExcludesListenSIP proves the two listener sources
+// are mutually exclusive: the sip section REPLACES listen.sip, so keeping
+// both is an ambiguity error, not silent precedence.
+func TestValidateNATTopologyExcludesListenSIP(t *testing.T) {
+	_, err := Parse([]byte(`
+listen:
+  sip: [udp://0.0.0.0:5060]
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+rtp:
+  advertised_ip: 203.0.113.7
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("want mutually-exclusive error, got %v", err)
+	}
+}
+
+// TestValidateNATTopologyRequiresRTPAdvertised proves the SDP blackhole
+// guard: with sip.bind_ip configured (no listen.sip hosts to fall back on)
+// and public_ip left "auto", a missing rtp.advertised_ip would make every
+// SDP advertise 127.0.0.1.
+func TestValidateNATTopologyRequiresRTPAdvertised(t *testing.T) {
+	_, err := Parse([]byte(`
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+  advertised_ip: 198.51.100.7
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+	if err == nil || !strings.Contains(err.Error(), "rtp.advertised_ip") {
+		t.Fatalf("want rtp.advertised_ip requirement error, got %v", err)
+	}
+
+	// With a literal public_ip the legacy resolution still works, so the
+	// same config must pass.
+	_, err = Parse([]byte(`
+listen:
+  media:
+    public_ip: 203.0.113.7
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+  advertised_ip: 198.51.100.7
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+	if err != nil {
+		t.Fatalf("literal public_ip must satisfy the SDP advertised requirement, got %v", err)
+	}
+}
+
+// TestValidateNoListenerAtAll covers the both-absent case: an empty
+// listen.sip with no sip.bind_ip fails, but either source alone passes.
+func TestValidateNoListenerAtAll(t *testing.T) {
+	c := validConfig()
+	c.Listen.SIP = nil
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "sip.bind_ip") {
+		t.Fatalf("want at-least-one-listener error, got %v", err)
+	}
+	c.SIP.BindIP = "127.0.0.1"
+	c.SIP.BindPort = 5060
+	c.RTP.AdvertisedIP = "203.0.113.7" // satisfy the SDP blackhole guard too
+	if err := c.validate(); err != nil {
+		t.Fatalf("sip.bind_ip alone must satisfy the listener requirement, got %v", err)
+	}
+}
+
+// --- rtp.port_min/port_max explicit range ---
+
+// TestValidateRTPRangeParsesAndWins proves the rtp-section range drives
+// RTPPortRange (precedence over the legacy default) and parses from the
+// user-facing YAML shape.
+func TestValidateRTPRangeParsesAndWins(t *testing.T) {
+	cfg, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+rtp:
+  port_min: 20000
+  port_max: 20100
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.RTPPortRange(); got.Min != 20000 || got.Max != 20100 {
+		t.Errorf("RTPPortRange() = %d-%d, want 20000-20100", got.Min, got.Max)
+	}
+	// The legacy range must stay zero (not default-filled), so the two
+	// sources stay distinguishable.
+	if cfg.Listen.Media.PortRange != (PortRange{}) {
+		t.Errorf("listen.media.port_range = %+v, want zero (rtp range replaces it)", cfg.Listen.Media.PortRange)
+	}
+}
+
+// TestValidateRTPRangeWithNATTopology proves the explicit range composes
+// with the rest of the bind/advertised topology.
+func TestValidateRTPRangeWithNATTopology(t *testing.T) {
+	cfg, err := Parse([]byte(`
+sip:
+  bind_ip: 10.77.0.2
+  bind_port: 16060
+  advertised_ip: 198.51.100.7
+rtp:
+  bind_ip: 10.77.0.2
+  advertised_ip: 203.0.113.7
+  port_min: 20000
+  port_max: 20100
+peers:
+  carrier:
+    address: 203.0.113.10:5060
+    allowed_ips: [203.0.113.0/24]
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [carrier]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := cfg.RTPPortRange(); got.Min != 20000 || got.Max != 20100 {
+		t.Errorf("RTPPortRange() = %d-%d, want 20000-20100", got.Min, got.Max)
+	}
+}
+
+func TestValidateRTPRangeErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfgYAML string
+		wantSub string
+	}{
+		{"min only", "rtp: { port_min: 20000 }", "set together"},
+		{"max only", "rtp: { port_max: 20100 }", "set together"},
+		{"min above max", "rtp: { port_min: 20100, port_max: 20000 }", "port_min must be less than port_max"},
+		{"min equals max", "rtp: { port_min: 20000, port_max: 20000 }", "port_min must be less than port_max"},
+		{"min below 1024", "rtp: { port_min: 500, port_max: 20000 }", "rtp.port_min"},
+		{"max above 65535", "rtp: { port_min: 20000, port_max: 70000 }", "rtp.port_max"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(tc.cfgYAML + `
+listen:
+  sip: [udp://127.0.0.1:5060]
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("want validation error containing %q, got %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
+// TestValidateRTPRangeExcludesLegacyRange proves the two range sources are
+// mutually exclusive, same as sip.bind_ip vs listen.sip.
+func TestValidateRTPRangeExcludesLegacyRange(t *testing.T) {
+	_, err := Parse([]byte(`
+listen:
+  sip: [udp://127.0.0.1:5060]
+  media:
+    port_range: 16384-32768
+rtp:
+  port_min: 20000
+  port_max: 20100
+peers:
+  pbx:
+    address: 10.77.0.5:5060
+    allowed_ips: [10.77.0.0/24]
+routes:
+  - name: out
+    from: pbx
+    to: [pbx]
+`))
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("want mutually-exclusive error, got %v", err)
+	}
+}
+
+// TestValidateLegacyRangeStillDefaults proves an rtp-section-less config
+// keeps the legacy default range and rejects a too-low legacy range.
+func TestValidateLegacyRangeStillDefaults(t *testing.T) {
+	c := validConfig()
+	if got := c.RTPPortRange(); got.Min != 16384 || got.Max != 32768 {
+		t.Errorf("legacy default range = %d-%d, want 16384-32768", got.Min, got.Max)
+	}
+	c.Listen.Media.PortRange = PortRange{Min: 80, Max: 90}
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "port_range") {
+		t.Fatalf("want legacy port_range floor error, got %v", err)
+	}
+}

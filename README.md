@@ -68,6 +68,23 @@ routes:
 
 `${ENV_VAR}` references are expanded at load time only — secrets are never written back to disk and never appear in error output. See [`sbc.example.yaml`](sbc.example.yaml) for the full annotated example.
 
+For NAT/VPN deployments (private bind address, public advertised address), the optional `sip:`/`rtp:` sections replace `listen.sip` and split the bind and advertised planes independently:
+
+```yaml
+sip:
+  bind_ip: 10.77.0.2        # where the SIP listener actually binds
+  bind_port: 16060
+  advertised_ip: <PUBLIC>   # what Contact/From/REGISTER claim (defaults to bind values)
+  advertised_port: 16060
+rtp:
+  bind_ip: 10.77.0.2        # RTP/RTCP sockets bind here (empty = every interface)
+  advertised_ip: <PUBLIC>   # what SDP c=/o= claim
+  port_min: 20000           # explicit RTP port range (both or neither); replaces
+  port_max: 20100           #   listen.media.port_range, which it cannot be combined with
+```
+
+The two sections are mutually independent: SIP can advertise one public address and RTP another. `advertised_ip`/`advertised_port` default to their bind counterparts; when `sip.bind_ip` is set, `rtp.advertised_ip` is required unless `listen.media.public_ip` is a literal address (otherwise SDP would advertise `127.0.0.1`).
+
 ## Roadmap
 
 | Milestone | Scope | Status |

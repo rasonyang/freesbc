@@ -576,7 +576,7 @@ func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 // registrarConfigYAML renders a config with a "carrier" peer at
 // 127.0.0.1:port (credentials user/pass, register: registerCarrier) and a
 // non-register "internal-pbx" peer, plus a literal public_ip and a listen.sip
-// entry so ourIP/ourSigPort resolve predictably and the config validates
+// entry so sigIP/ourSigPort resolve predictably and the config validates
 // (at least one listener, at least one peer). The listen.sip port here is
 // never actually bound — serverForRegistrar never calls Server.Run, and
 // Registrar itself never binds a socket — so it doesn't need to be distinct
@@ -629,10 +629,10 @@ func withCarrierRegisterFalse(t *testing.T) *config.Config {
 }
 
 // serverForRegistrar builds the minimal *Server the Registrar needs: just
-// enough for ourIP/ourSigPort to resolve from store's config. It never
+// enough for sigIP/ourSigPort to resolve from store's config. It never
 // calls Run, so no media pool or bound socket is needed — Registrar only
 // reads the Server's config-derived Contact address, it never routes or
-// bridges through it (mirrors TestServerOurIPResolution's newSrv helper in
+// bridges through it (mirrors TestServerAdvertisedIPResolution.s newSrvForResolution helper in
 // server_test.go, which also passes a nil pool).
 func serverForRegistrar(t *testing.T, store *config.Store) *Server {
 	t.Helper()
@@ -650,7 +650,7 @@ func TestRegistrarReconcilesAndReportsRegistered(t *testing.T) {
 	// Config with one register:true peer pointing at the stub registrar.
 	store := registrarTestStore(t, 45330, "u", "p") // helper builds the config
 	client := reg.client(t)
-	srv := serverForRegistrar(t, store) // minimal Server exposing ourIP/ourSigPort
+	srv := serverForRegistrar(t, store) // minimal Server exposing sigIP/ourSigPort
 	r := NewRegistrar(store, client, srv, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = r.Run(ctx) }()
@@ -707,7 +707,7 @@ func TestSetRegisteredGenIgnoresStaleGeneration(t *testing.T) {
 
 // registrarConfigYAMLPublicIP is registrarConfigYAML with an overridable
 // public_ip, for TestRegistrarChangedPeerParamsDoNotFlapRegistered: bumping
-// public_ip alone changes the resolved ContactIP (via Server.ourIP →
+// public_ip alone changes the resolved ContactIP (via Server.sigIP →
 // Registrar.paramsFor) without touching the registrar host/port or
 // credentials, so reconcile takes the changed-peer stop+start path while the
 // new goroutine still registers against the very same stub registrar.
@@ -958,5 +958,44 @@ peers:
 
 	if !reg.sawUnregister() {
 		t.Fatal("stub registrar never saw the Expires:0 un-REGISTER — shutdown must deliver it before Run returns")
+	}
+}
+
+// TestRegistrarNATAdvertisedContact proves the REGISTER Contact advertises
+// the sip.advertised_ip:sip.advertised_port pair in a bind/advertised
+// topology — the Contact is the address the carrier will send inbound
+// INVITEs to, so it must be the PUBLIC advertised address, never the
+// private bind_ip the listener actually sits on.
+func TestRegistrarNATAdvertisedContact(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+sip:
+  bind_ip: 127.0.0.1
+  bind_port: 45395
+  advertised_ip: 198.51.100.7
+  advertised_port: 15060
+rtp:
+  advertised_ip: 203.0.113.7
+peers:
+  carrier:
+    address: 127.0.0.1:45396
+    auth: { username: u, password: p }
+    register: true
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: carrier
+    to: [carrier]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	srv := serverForRegistrar(t, config.NewStore(cfg))
+	r := NewRegistrar(config.NewStore(cfg), nil, srv, discardLogger())
+	params := r.paramsFor(cfg, "carrier", cfg.Peers["carrier"])
+	if params.ContactIP.String() != "198.51.100.7" {
+		t.Errorf("ContactIP = %v, want sip.advertised_ip 198.51.100.7", params.ContactIP)
+	}
+	if params.ContactPort != 15060 {
+		t.Errorf("ContactPort = %d, want sip.advertised_port 15060 (not the 45395 bind port)", params.ContactPort)
 	}
 }
