@@ -93,6 +93,9 @@ func run(cfgPath string) error {
 	// The trunk B2BUA plane runs only when there are trunks to serve. A
 	// proxy-only deployment configures no peers and no listen.sip, and
 	// starting the trunk listeners there would bind ports nothing uses.
+	// Validation guarantees the two go together: a trunk listener with no
+	// peers is rejected at load time, so "no peers" really does mean "no
+	// trunk plane" rather than a silently dead listener.
 	var sipServer *sig.Server
 	if len(store.Current().Peers) > 0 {
 		sipServer = sig.NewServer(store, pool, log)

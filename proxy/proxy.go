@@ -70,6 +70,42 @@ type pendingInvite struct {
 	cancel context.CancelFunc
 }
 
+// udpMTUOnce raises sipgo's UDP send ceiling, once per process.
+var udpMTUOnce sync.Once
+
+// raiseUDPSendLimit lifts the size at which sipgo refuses to send a SIP
+// message over UDP.
+//
+// sipgo defaults to UDPMTUSize=1500 and refuses anything above
+// UDPMTUSize-200, i.e. 1300 bytes. That is a faithful reading of RFC 3261
+// §18.1.1 ("larger than 1300 bytes and the path MTU is unknown ... MUST be
+// sent using a congestion-controlled transport"), and it is unusable here:
+// a perfectly ordinary FreeSWITCH INVITE — five codecs, the usual Allow /
+// Supported / User-Agent set, and the proxy's own Via and two
+// Record-Routes on top — clears 1300 bytes easily. Verified against a live
+// FreeSWITCH: every inbound call failed with "size of packet larger than
+// MTU" before this.
+//
+// The RFC's remedy is to switch to TCP, which is not available: the
+// upstream transport is UDP by design in this phase, and a UDP phone
+// cannot be switched either. So FreeSBC does what every production SIP
+// element does on UDP — send the datagram and let IP fragmentation carry
+// it — while keeping a real ceiling rather than none: 8 KiB is far above
+// any legitimate SIP message and far below anything that could be used to
+// amplify traffic.
+//
+// This is a process-wide setting in sipgo with no per-user-agent override,
+// so it also applies to the trunk plane. That plane has the same limit and
+// the same failure mode, so raising it fixes both rather than trading one
+// for the other.
+func raiseUDPSendLimit() {
+	udpMTUOnce.Do(func() {
+		if sip.UDPMTUSize < 8192 {
+			sip.UDPMTUSize = 8192
+		}
+	})
+}
+
 // New builds the proxy from the current config. It binds nothing; Run
 // does that.
 func New(store *config.Store, log *slog.Logger) (*Server, error) {
@@ -81,6 +117,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	raiseUDPSendLimit()
 	pub, priv := media.NewProxyPools(store)
 	s := &Server{
 		store:         store,
@@ -318,7 +355,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if err != nil {
 			return l, err
 		}
-		l.stream = ln
+		l.stream = s.watchConnections(ln)
 		return l, nil
 	case "wss":
 		cfg := s.store.Current().SIP.Public.WSS
@@ -345,11 +382,62 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if err != nil {
 			return l, err
 		}
-		l.stream = ln
+		l.stream = s.watchConnections(ln)
 		return l, nil
 	default:
 		return l, fmt.Errorf("unsupported transport %q", transport)
 	}
+}
+
+// watchConnections wraps a WebSocket listener so that when a client's
+// connection closes, the registration bindings made over it are dropped.
+//
+// A WebSocket registration is only reachable through its own connection —
+// there is no address to re-dial. Keeping the binding after the socket is
+// gone would make FreeSBC accept inbound calls it cannot deliver and leak
+// a table entry until the registrar-granted expiry, so spec §3's
+// "connection close" case needs an actual hook. FreeSBC owns these
+// listeners (sipgo is handed the wrapper), which is what makes the hook
+// possible at all.
+func (s *Server) watchConnections(ln net.Listener) net.Listener {
+	return &closeNotifyListener{Listener: ln, onClose: func(remote string) {
+		ap, err := netip.ParseAddrPort(remote)
+		if err != nil {
+			return
+		}
+		if n := s.loc.RemoveBySource(ap); n > 0 {
+			s.metrics.SetRegistrations(s.loc.Count())
+			s.log.Debug("websocket closed; dropped its registration bindings",
+				"public_remote", remote, "count", n)
+		}
+	}}
+}
+
+type closeNotifyListener struct {
+	net.Listener
+	onClose func(remote string)
+}
+
+func (l *closeNotifyListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &closeNotifyConn{Conn: c, onClose: l.onClose}, nil
+}
+
+type closeNotifyConn struct {
+	net.Conn
+	onClose func(remote string)
+	once    sync.Once
+}
+
+func (c *closeNotifyConn) Close() error {
+	err := c.Conn.Close()
+	// Once: sipgo's pool may close a connection more than once, and the
+	// hook must not run again after the address has been reused.
+	c.once.Do(func() { c.onClose(c.Conn.RemoteAddr().String()) })
+	return err
 }
 
 // maxMessageSize caps an inbound SIP message before the parser sees it

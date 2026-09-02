@@ -166,6 +166,120 @@ func TestWebRTCLegDTLSRole(t *testing.T) {
 	}
 }
 
+// TestWebRTCLegOnWildcardBind proves the browser leg works when the media
+// pool binds every interface (bind_ip: 0.0.0.0), which is the normal
+// production shape.
+//
+// It is worth its own test because pion's UDPMuxDefault logs a warning on
+// an unspecified local address and takes a different code path for
+// gathering. FreeSBC does not use the gathered candidates — it advertises
+// one host candidate at the configured public address — but the agent
+// still has to accept connectivity checks on that socket, and this is what
+// verifies it does.
+func TestWebRTCLegOnWildcardBind(t *testing.T) {
+	pubPool := NewPlanePool("public", func() PlaneParams {
+		return PlaneParams{
+			Range:   config.PortRange{Min: 41300, Max: 41339},
+			BindIP:  netip.Addr{}, // every interface
+			Timeout: 30 * time.Second,
+		}
+	})
+	id, err := ProcessDTLSIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lf := logging.NewDefaultLoggerFactory()
+	lf.DefaultLogLevel = logging.LogLevelError
+	browser, err := ice.NewAgent(&ice.AgentConfig{
+		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
+		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost},
+		IncludeLoopback: true,
+		LoggerFactory:   lf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+	bUfrag, bPwd, err := browser.GetLocalUserCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leg, err := NewWebRTCLeg(pubPool, WebRTCLegConfig{
+		AdvertisedIP: netip.MustParseAddr("127.0.0.1"),
+		RemoteUfrag:  bUfrag, RemotePwd: bPwd,
+		RemoteSetup: "actpass", Identity: id,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leg.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	leg.Start(ctx, 15*time.Second)
+
+	lUfrag, lPwd := leg.LocalCredentials()
+	cand, err := ice.NewCandidateHost(&ice.CandidateHostConfig{
+		Network: "udp", Address: "127.0.0.1", Port: leg.Port(), Component: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.AddRemoteCandidate(cand); err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.OnCandidate(func(ice.Candidate) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.GatherCandidates(); err != nil {
+		t.Fatal(err)
+	}
+
+	dialCh := make(chan error, 1)
+	var browserConn *ice.Conn
+	go func() {
+		c, err := browser.Dial(ctx, lUfrag, lPwd)
+		browserConn = c
+		dialCh <- err
+	}()
+
+	browserCert, err := selfSignedForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-dialCh:
+		if err != nil {
+			t.Fatalf("ICE against a wildcard-bound leg failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("ICE against a wildcard-bound leg timed out")
+	}
+	defer browserConn.Close()
+
+	bDemux := newDemux(browserConn)
+	defer bDemux.Close()
+	bDTLS, err := dtls.Client(bDemux.dtls, bDemux.dtls.RemoteAddr(), &dtls.Config{
+		Certificates:           []tls.Certificate{browserCert},
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
+		InsecureSkipVerify:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bDTLS.HandshakeContext(ctx); err != nil {
+		t.Fatalf("DTLS against a wildcard-bound leg failed: %v", err)
+	}
+	if err := leg.Err(); err != nil {
+		t.Fatalf("leg did not establish: %v", err)
+	}
+	if _, _, err := leg.SRTPContexts(); err != nil {
+		t.Fatalf("SRTP not keyed: %v", err)
+	}
+}
+
 // TestWebRTCSessionEndToEnd is the real thing: a full-ICE peer (standing
 // in for a browser) does ICE against FreeSBC's ICE-Lite leg, completes a
 // DTLS handshake, and then audio flows both ways — SRTP inbound decrypted

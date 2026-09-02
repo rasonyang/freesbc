@@ -103,9 +103,15 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 				s.reject(req, tx, 504, "Server Time-out")
 				return
 			}
+			if !forwardable(res) {
+				continue // hop-by-hop 100 Trying
+			}
 			final := res.StatusCode >= 200
 			relayed := res.Clone()
-			relayed.RemoveHeader("Via") // ours
+			if !s.popOwnVia(relayed) {
+				s.log.Debug("dropping unroutable REGISTER response", "code", res.StatusCode, "aor", aor)
+				continue
+			}
 			if final && res.StatusCode/100 == 2 {
 				granted := s.recordBinding(res, bindingInput{
 					token: token, aor: aor, user: user, callID: callIDOf(req),

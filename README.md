@@ -87,25 +87,52 @@ configuration, and the "Edge proxy plane" section of
 | Media | Every stream anchored on an SBC port pair. Symmetric RTP: the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet. Strict source latching resists off-path hijacking. |
 | WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint`. |
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
-| Lifecycle | Media is released deterministically on BYE, CANCEL, a failed final response, dialog teardown, media silence, and shutdown. |
+| re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role so media is never interrupted. |
+| Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored is ACKed and BYEd rather than left as a zombie dialog. |
 
 ### Known limitations
 
-- **re-INVITE does not renegotiate media.** An in-dialog INVITE is proxied as
-  signaling and the media session stays on the ports it holds. The
-  architecture is ready for it (`Session.Relatch` exists and the latch
-  distinguishes seeded from latched state), but the offer/answer path is not
-  wired up.
-- **Offerless INVITE is refused (488)** in both directions.
 - **An inbound call to a browser is offered plain RTP**, which a browser will
-  reject. FreeSWITCH-originated calls therefore reach SIP/UDP phones, not
-  WebRTC clients; that needs the same re-INVITE machinery.
+  reject: FreeSBC cannot make a DTLS-SRTP *offer*, because a WebRTC offer
+  needs the answerer's fingerprint and ICE credentials and an offer by
+  definition has not seen them. FreeSWITCH-originated calls therefore reach
+  SIP/UDP phones, not WebRTC clients. Browser-originated calls are
+  unaffected.
+- **Offerless INVITE is refused (488)** in both directions.
 - **One media session per Call-ID.** An upstream that forked one Call-ID into
   two dialogs would need two sessions — a B2BUA's problem, not a proxy's.
 - **Upstream is a single UDP FreeSWITCH** at a literal address. No SRV, no
   failover, no TCP/TLS upstream.
 - **IPv6 is untested** on the proxy plane, though the code paths are
   address-family agnostic.
+- **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
+  reachable media address; a client that can only reach it via a relay is
+  out of scope.
+- **SUBSCRIBE/NOTIFY are answered 405, not proxied.** FreeSWITCH sends a
+  NOTIFY for message-waiting indication after a registration; MWI and BLF
+  therefore do not reach phones through the proxy. The event framework is
+  outside this phase's method set.
+- **SIP over UDP is sent above the RFC 3261 §18.1.1 size guidance.** A
+  realistic FreeSWITCH INVITE plus the proxy's own headers clears 1300
+  bytes, and the RFC's remedy — switch to TCP — is not available when both
+  the upstream and the phone are UDP. FreeSBC raises the send ceiling to
+  8 KiB and relies on IP fragmentation, as production SIP elements do.
+
+### Verification against a real FreeSWITCH
+
+The suite includes an opt-in interop pass that runs against a live switch
+rather than a fake one, because the questions that decide whether this works
+in production are questions about sofia's behaviour:
+
+```sh
+FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./proxy/ -run TestFreeSWITCH -v
+```
+
+It confirms that sofia accepts a proxied REGISTER and **preserves the
+`fsbc=` binding token** in the contact it stores (the whole inbound-call
+path depends on this), that a switch-originated call and its hangup both
+traverse the proxy, and that audio survives a round trip through the anchor
+into FreeSWITCH's `echo` application and back.
 
 
 ## Quick start

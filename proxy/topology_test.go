@@ -165,3 +165,36 @@ func TestSameAddr(t *testing.T) {
 		}
 	}
 }
+
+// isSelfVia is what stops the proxy from popping a Via that is not its
+// own — RFC 3261 §16.7 step 3.
+func TestTopologyIsSelfVia(t *testing.T) {
+	topo := testTopology(t)
+	self := []*sip.ViaHeader{
+		{Transport: "UDP", Host: "203.0.113.7", Port: 16060},
+		{Transport: "WS", Host: "203.0.113.7", Port: 18080},
+		{Transport: "UDP", Host: "10.77.0.2", Port: 16060},
+	}
+	for _, v := range self {
+		if !topo.isSelfVia(v) {
+			t.Errorf("%s:%d not recognised as our own Via", v.Host, v.Port)
+		}
+	}
+	notSelf := []*sip.ViaHeader{
+		{Transport: "UDP", Host: "203.0.113.7", Port: 5060}, // right host, wrong port
+		{Transport: "UDP", Host: "10.77.0.10", Port: 5060},  // the upstream
+		{Transport: "UDP", Host: "198.51.100.9", Port: 5060},
+		{Transport: "UDP", Host: "phone.example", Port: 5060}, // not an IP
+		nil,
+	}
+	for _, v := range notSelf {
+		if topo.isSelfVia(v) {
+			t.Errorf("%v wrongly recognised as our own Via", v)
+		}
+	}
+	// A Via with no port falls back to the transport's default, which must
+	// not accidentally match one of our listeners.
+	if topo.isSelfVia(&sip.ViaHeader{Transport: "UDP", Host: "203.0.113.7"}) {
+		t.Error("a portless Via matched a listener on a non-default port")
+	}
+}

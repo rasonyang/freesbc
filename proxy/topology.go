@@ -230,6 +230,49 @@ func (t *topology) isSelf(u sip.Uri) bool {
 	return false
 }
 
+// isSelfVia reports whether a Via header names one of FreeSBC's own
+// signaling addresses. RFC 3261 §16.7 step 3 requires a proxy to check
+// this before removing the top Via from a response — popping blindly
+// destroys the requester's own Via whenever the far end sends a response
+// that does not carry the full stack, which is not hypothetical: sofia's
+// 100 Trying carries only the topmost Via.
+func (t *topology) isSelfVia(v *sip.ViaHeader) bool {
+	if v == nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(v.Host)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	port := v.Port
+	if port == 0 {
+		port = defaultPort(v.Transport)
+	}
+	if t.private.advIP == ip && t.private.advPort == port {
+		return true
+	}
+	for _, s := range t.public {
+		if s.advIP == ip && s.advPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultPort is the conventional port for a transport, used when a Via
+// omits one.
+func defaultPort(transport string) int {
+	switch strings.ToLower(transport) {
+	case "tls", "wss":
+		return 5061
+	case "ws":
+		return 80
+	default:
+		return 5060
+	}
+}
+
 // fromUpstream reports whether a request arrived from FreeSWITCH. The
 // transport source address is the only trustworthy signal — never a Via or
 // From host, which the sender controls.

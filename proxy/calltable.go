@@ -3,6 +3,8 @@ package proxy
 import (
 	"sync"
 	"time"
+
+	"github.com/emiago/sipgo/sip"
 )
 
 // call is one proxied dialog and the media anchored for it.
@@ -22,10 +24,25 @@ type call struct {
 	Inbound bool
 
 	// PublicRemote and PrivateRemote are the two endpoints' signaling
-	// addresses, for logs and for routing in-dialog requests.
+	// addresses — where an in-dialog request is actually SENT. They are
+	// transport source addresses, never a Contact host: a client behind
+	// NAT (and a browser, whose Contact host is a fiction) can only be
+	// reached at the address its packets came from.
 	PublicRemote  string
 	PrivateRemote string
 	Transport     string
+
+	// PublicContact and PrivateContact are the two endpoints' own Contact
+	// URIs, as they wrote them.
+	//
+	// They are needed because the proxy replaced both: each side was given
+	// FreeSBC's Contact as the dialog's remote target, so an in-dialog
+	// request from either arrives with FreeSBC's own URI as its
+	// Request-URI. Restoring the far endpoint's real Contact is what makes
+	// that request addressed to somebody — sofia tolerates the SBC's URI,
+	// a strict UA does not.
+	PublicContact  sip.Uri
+	PrivateContact sip.Uri
 
 	Media     *mediaSession
 	StartedAt time.Time

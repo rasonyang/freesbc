@@ -3,7 +3,9 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,11 +37,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	if isInDialog(req) {
-		// A re-INVITE (or an UPDATE-shaped refresh) on an established
-		// dialog. FreeSBC forwards it as signaling but does not
-		// renegotiate media: the media session stays anchored on the ports
-		// it already holds. See the README's known limitations.
-		s.onInDialog(req, tx)
+		s.onReInvite(req, tx)
 		return
 	}
 	if s.arrivedOnPrivate(req) {
@@ -111,18 +109,32 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 
 	// A CANCEL from the client terminates this server transaction; when it
 	// does, the INVITE we sent upstream must be cancelled too or
-	// FreeSWITCH would keep ringing.
-	tx.OnCancel(func(*sip.Request) { s.cancelPending(req) })
+	// FreeSWITCH would keep ringing. A false return means the transaction
+	// is ALREADY terminated — the CANCEL beat this registration — in which
+	// case the hook will never fire and the upstream leg must be cancelled
+	// right here instead.
+	if !tx.OnCancel(func(*sip.Request) { s.cancelPending(req) }) {
+		s.cancelPending(req)
+	}
 
 	final := s.pumpInvite(ctx, req, tx, clTx, offer, from, true)
 	if final != nil && final.StatusCode/100 == 2 {
 		committed = true
-		s.commitCall(req, final, offer, &call{
+		c := &call{
 			CallID: callIDOf(req), FromTag: fromTagOf(req),
 			ToTag:        toTagOf(final),
 			PublicRemote: req.Source(), PrivateRemote: s.topo.upstreamHost,
 			Transport: from.transport,
-		})
+		}
+		// The caller is public here, so its Contact came on the INVITE and
+		// FreeSWITCH's came back on the 200.
+		if u, ok := contactURI(req); ok {
+			c.PublicContact = u
+		}
+		if u, ok := contactURI(final); ok {
+			c.PrivateContact = u
+		}
+		s.commitCall(req, final, offer, c)
 	}
 }
 
@@ -192,17 +204,28 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	defer clTx.Terminate()
 	s.trackPending(req, &pendingInvite{req: out, dest: dest, side: to, cancel: cancel})
 	defer s.untrackPending(req)
-	tx.OnCancel(func(*sip.Request) { s.cancelPending(req) })
+	if !tx.OnCancel(func(*sip.Request) { s.cancelPending(req) }) {
+		s.cancelPending(req)
+	}
 
 	final := s.pumpInvite(ctx, req, tx, clTx, offer, s.topo.private, false)
 	if final != nil && final.StatusCode/100 == 2 {
 		committed = true
-		s.commitCall(req, final, offer, &call{
+		c := &call{
 			CallID: callIDOf(req), FromTag: fromTagOf(req),
 			ToTag: toTagOf(final), Inbound: true,
 			PublicRemote: dest, PrivateRemote: req.Source(),
 			Transport: binding.Transport,
-		})
+		}
+		// FreeSWITCH is the caller here, so the roles are reversed: its
+		// Contact came on the INVITE and the client's on the 200.
+		if u, ok := contactURI(req); ok {
+			c.PrivateContact = u
+		}
+		if u, ok := contactURI(final); ok {
+			c.PublicContact = u
+		}
+		s.commitCall(req, final, offer, c)
 	}
 }
 
@@ -222,8 +245,14 @@ func (s *Server) pumpInvite(ctx context.Context, req *sip.Request, tx sip.Server
 				s.reject(req, tx, 500, "Server Internal Error")
 				return nil
 			}
+			if !forwardable(res) {
+				continue // a 100 Trying is hop-by-hop; ours already went out
+			}
 			out := res.Clone()
-			out.RemoveHeader("Via") // ours
+			if !s.popOwnVia(out) {
+				s.log.Debug("dropping unroutable response", "code", res.StatusCode, "sip_call_id", callIDOf(req))
+				continue
+			}
 			// Whichever side answers, the near side must see FreeSBC as
 			// the dialog's remote target — otherwise in-dialog requests
 			// would bypass the SBC and its media anchor.
@@ -239,9 +268,15 @@ func (s *Server) pumpInvite(ctx context.Context, req *sip.Request, tx sip.Server
 				}
 				if err != nil {
 					s.log.Warn("media negotiation failed", "err", err, "sip_call_id", callIDOf(req))
-					// Tell the answering side to hang up, and the
-					// requesting side why: relaying an answer we cannot
-					// anchor would set up a call with no audio.
+					// Relaying an answer we cannot anchor would set up a
+					// call with no audio, so refuse the requesting side.
+					// If the answer came in a 2xx, the far end now believes
+					// it has a live dialog — it must be ACKed and then BYEd,
+					// or it sits there retransmitting its 200 until its own
+					// timers give up.
+					if res.StatusCode/100 == 2 {
+						go s.ackThenBye(res, near)
+					}
 					s.reject(req, tx, 488, "Not Acceptable Here")
 					return nil
 				}
@@ -278,6 +313,71 @@ func (s *Server) pumpInvite(ctx context.Context, req *sip.Request, tx sip.Server
 	}
 }
 
+// ackThenBye completes and immediately tears down a dialog FreeSBC
+// accepted at the SIP layer but cannot anchor media for. RFC 3261 requires
+// a 2xx to be ACKed; without that the far end retransmits its 200 until
+// Timer H, and the dialog lingers either way. ACK, then BYE.
+func (s *Server) ackThenBye(res *sip.Response, from side) {
+	ack := sip.NewRequest(sip.ACK, contactOrRecipient(res))
+	via := from.via(newBranch())
+	ack.PrependHeader(via)
+	sip.CopyHeaders("From", res, ack)
+	sip.CopyHeaders("To", res, ack)
+	sip.CopyHeaders("Call-ID", res, ack)
+	seq := uint32(1)
+	if c := res.CSeq(); c != nil {
+		seq = c.SeqNo
+	}
+	ack.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.ACK})
+	mf := sip.MaxForwardsHeader(70)
+	ack.AppendHeader(&mf)
+	ack.SetTransport(res.Transport())
+	ack.SetDestination(res.Source())
+	if err := s.client.WriteRequest(ack, noBuild); err != nil {
+		s.log.Debug("ack unanchorable answer", "err", err)
+		return
+	}
+
+	bye := sip.NewRequest(sip.BYE, contactOrRecipient(res))
+	bye.PrependHeader(from.via(newBranch()))
+	sip.CopyHeaders("From", res, bye)
+	sip.CopyHeaders("To", res, bye)
+	sip.CopyHeaders("Call-ID", res, bye)
+	bye.AppendHeader(&sip.CSeqHeader{SeqNo: seq + 1, MethodName: sip.BYE})
+	mf2 := sip.MaxForwardsHeader(70)
+	bye.AppendHeader(&mf2)
+	bye.SetTransport(res.Transport())
+	bye.SetDestination(res.Source())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	clTx, err := s.client.TransactionRequest(ctx, bye, noBuild)
+	if err != nil {
+		s.log.Debug("bye unanchorable dialog", "err", err)
+		return
+	}
+	defer clTx.Terminate()
+	select {
+	case <-clTx.Responses():
+	case <-clTx.Done():
+	case <-ctx.Done():
+	}
+}
+
+// contactOrRecipient is the request target for a teardown: the far end's
+// Contact when it sent one, else its transport source rendered as a URI.
+func contactOrRecipient(res *sip.Response) sip.Uri {
+	if u, ok := contactURI(res); ok {
+		return u
+	}
+	host, portStr, err := net.SplitHostPort(res.Source())
+	if err != nil {
+		return sip.Uri{Host: res.Source()}
+	}
+	port, _ := strconv.Atoi(portStr)
+	return sip.Uri{Host: host, Port: port}
+}
+
 // commitCall records an established call and ties its media session's
 // lifetime to it: whichever ends first — a BYE, or the media watchdog
 // noticing silence — tears the other down.
@@ -301,6 +401,110 @@ func (s *Server) commitCall(req *sip.Request, final *sip.Response, offer *offerR
 	}()
 }
 
+// onReInvite proxies an in-dialog INVITE — a hold or unhold from a client,
+// a session-timer refresh from FreeSWITCH, a codec change from either.
+//
+// The body MUST be rewritten. Forwarding it unchanged would hand each side
+// the other's media address mid-call, so the anchor would simply fall away
+// on the first refresh and (for a browser) FreeSWITCH would receive ICE
+// candidates and a DTLS fingerprint. What is NOT re-done is allocation:
+// the session keeps the ports and, for a WebRTC leg, the ICE and DTLS
+// state it already holds, so a renegotiation never interrupts media.
+func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
+	from, to, dest, ok := s.directionFor(req)
+	if !ok {
+		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+	body := req.Body()
+	if len(body) == 0 {
+		// An offerless re-INVITE would make FreeSBC the offerer and
+		// require answering against the ACK. Not supported; refusing is
+		// honest and leaves the existing session untouched.
+		s.reject(req, tx, 488, "Not Acceptable Here")
+		return
+	}
+	c, found := s.calls.get(callIDOf(req))
+	if !found || c.Media == nil {
+		// No anchored session to renegotiate against. Forwarding the body
+		// as-is here would be the exact leak this function exists to
+		// prevent, so refuse instead.
+		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+
+	reOffer, parsed, err := s.rebuildInDialogOffer(c.Media, body, to.plane)
+	if err != nil {
+		s.rejectMedia(req, tx, err)
+		return
+	}
+	out, err := s.prepareForward(req, from, to, dest, false)
+	if err != nil {
+		s.reject(req, tx, 483, "Too Many Hops")
+		return
+	}
+	s.retargetInDialog(req, out, to)
+	setContact(out, to.uri())
+	setSDP(out, reOffer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), inviteTimeout)
+	defer cancel()
+
+	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	if err != nil {
+		s.log.Debug("forward re-INVITE", "err", err, "sip_call_id", callIDOf(req))
+		s.reject(req, tx, 503, "Service Unavailable")
+		return
+	}
+	defer clTx.Terminate()
+
+	answered := false
+	for {
+		select {
+		case res, ok := <-clTx.Responses():
+			if !ok {
+				s.reject(req, tx, 408, "Request Timeout")
+				return
+			}
+			if !forwardable(res) {
+				continue
+			}
+			relayed := res.Clone()
+			if !s.popOwnVia(relayed) {
+				s.log.Debug("dropping unroutable re-INVITE response", "code", res.StatusCode, "sip_call_id", callIDOf(req))
+				continue
+			}
+			setContact(relayed, from.uri())
+			if len(res.Body()) > 0 && !answered {
+				reAnswer, err := s.rebuildInDialogAnswer(c.Media, parsed, res.Body(), from.plane)
+				if err != nil {
+					s.log.Warn("re-INVITE media negotiation failed", "err", err, "sip_call_id", callIDOf(req))
+					s.reject(req, tx, 488, "Not Acceptable Here")
+					return
+				}
+				setSDP(relayed, reAnswer)
+				c.Media.lastAnswer = relayed.Body()
+				answered = true
+			} else if len(res.Body()) > 0 {
+				setSDP(relayed, c.Media.lastAnswer)
+			}
+			relayed.SetDestination(req.Source())
+			s.metrics.ResponseOut(relayed.StatusCode)
+			if err := tx.Respond(relayed); err != nil {
+				s.log.Debug("relay re-INVITE response", "err", err, "sip_call_id", callIDOf(req))
+			}
+			if res.StatusCode >= 200 {
+				return
+			}
+		case <-clTx.Done():
+			s.reject(req, tx, 408, "Request Timeout")
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // onAck forwards an ACK. A 2xx ACK is a separate end-to-end transaction
 // (RFC 3261 §17.1.1.3) and must be sent statelessly, not through a client
 // transaction — sipgo enforces this by refusing an ACK in
@@ -314,11 +518,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 	if err != nil {
 		return
 	}
-	if to.plane == planePublic {
-		if b, ok := s.bindingForRequest(req); ok {
-			out.Recipient = clientRequestURI(b)
-		}
-	}
+	s.retargetInDialog(req, out, to)
 	if err := s.client.WriteRequest(out, noBuild); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", callIDOf(req))
 	}
@@ -329,8 +529,14 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 // terminates the INVITE itself, which fires the OnCancel hook that
 // cancels our upstream leg — so this path only sees an orphan.
 func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction) {
-	s.cancelPending(req)
-	s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
+	if s.cancelPending(req) {
+		s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
+		return
+	}
+	// RFC 3261 §9.2: a CANCEL matching no transaction is answered 481, not
+	// 200. Answering 200 would tell the sender its request was cancelled
+	// when nothing was.
+	s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 }
 
 // onInDialog forwards BYE, INFO and in-dialog INVITE. Direction is decided
@@ -347,11 +553,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
-	if to.plane == planePublic {
-		if b, ok := s.bindingForRequest(req); ok {
-			out.Recipient = clientRequestURI(b)
-		}
-	}
+	s.retargetInDialog(req, out, to)
 	setContact(out, to.uri())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
@@ -393,6 +595,19 @@ func (s *Server) teardown(callID string) {
 // upstream.
 func (s *Server) directionFor(req *sip.Request) (from, to side, dest string, ok bool) {
 	if s.arrivedOnPrivate(req) {
+		// An IN-DIALOG request from FreeSWITCH carries no binding token.
+		// The token only ever rides on the contact FreeSBC REGISTERED; a
+		// dialog's remote target is the Contact FreeSBC put in the INVITE
+		// or the 200, which names the SBC and nothing else. So the dialog
+		// record — not the location table — is what identifies the client
+		// here. Getting this wrong 481s every callee-side hangup.
+		if c, found := s.calls.get(callIDOf(req)); found && c.PublicRemote != "" {
+			if to, ok = s.topo.publicSide(c.Transport); ok {
+				return s.topo.private, to, c.PublicRemote, true
+			}
+		}
+		// No dialog on record: fall back to the binding token, which is
+		// how a PRE-dialog request (an inbound INVITE) is routed.
 		b, found := s.bindingForRequest(req)
 		if !found {
 			return side{}, side{}, "", false
@@ -408,6 +623,25 @@ func (s *Server) directionFor(req *sip.Request) (from, to side, dest string, ok 
 		return side{}, side{}, "", false
 	}
 	return from, s.topo.private, s.topo.upstreamHost, true
+}
+
+// farContact returns the Request-URI an in-dialog request should carry on
+// its way out: the far endpoint's own Contact, recorded when the dialog was
+// established. Returns ok=false when there is no dialog on record, in
+// which case the caller leaves the Request-URI alone.
+func (s *Server) farContact(req *sip.Request, toward plane) (sip.Uri, bool) {
+	c, found := s.calls.get(callIDOf(req))
+	if !found {
+		return sip.Uri{}, false
+	}
+	u := c.PrivateContact
+	if toward == planePublic {
+		u = c.PublicContact
+	}
+	if u.Host == "" {
+		return sip.Uri{}, false
+	}
+	return u, true
 }
 
 // publicSideFor returns the public side matching a request's transport.
@@ -481,6 +715,23 @@ func clientRequestURI(b Binding) sip.Uri {
 	return sip.Uri{User: b.User, Host: host, Port: port, UriParams: params}
 }
 
+// retargetInDialog replaces the Request-URI of a forwarded in-dialog
+// request with the far endpoint's own Contact, undoing the topology hiding
+// the proxy applied when the dialog was established. Falls back to the
+// registration binding (for a request that reaches a client outside any
+// dialog we track), and leaves the URI alone when neither is known.
+func (s *Server) retargetInDialog(req, out *sip.Request, to side) {
+	if u, ok := s.farContact(req, to.plane); ok {
+		out.Recipient = u
+		return
+	}
+	if to.plane == planePublic {
+		if b, ok := s.bindingForRequest(req); ok {
+			out.Recipient = clientRequestURI(b)
+		}
+	}
+}
+
 // trackPending / untrackPending / cancelPending manage the CANCEL bridge.
 func (s *Server) trackPending(req *sip.Request, p *pendingInvite) {
 	s.pendingMu.Lock()
@@ -501,7 +752,7 @@ func (s *Server) untrackPending(req *sip.Request) {
 // (RFC 3261 §9.1) — that is how the next hop matches the two — so it is
 // built from the forwarded request rather than from the CANCEL we
 // received, whose branch belongs to a different transaction.
-func (s *Server) cancelPending(req *sip.Request) {
+func (s *Server) cancelPending(req *sip.Request) bool {
 	s.pendingMu.Lock()
 	p, ok := s.pending[pendingKey(req)]
 	if ok {
@@ -509,7 +760,7 @@ func (s *Server) cancelPending(req *sip.Request) {
 	}
 	s.pendingMu.Unlock()
 	if !ok {
-		return
+		return false
 	}
 	// Once the CANCEL has been sent and answered, the INVITE exchange is
 	// over as far as the proxy is concerned: the caller has already been
@@ -527,7 +778,7 @@ func (s *Server) cancelPending(req *sip.Request) {
 	clTx, err := s.client.TransactionRequest(ctx, cancelReq, noBuild)
 	if err != nil {
 		s.log.Debug("forward CANCEL", "err", err, "sip_call_id", callIDOf(req))
-		return
+		return true
 	}
 	defer clTx.Terminate()
 	select {
@@ -535,6 +786,7 @@ func (s *Server) cancelPending(req *sip.Request) {
 	case <-clTx.Done():
 	case <-ctx.Done():
 	}
+	return true
 }
 
 // buildCancel constructs a CANCEL for a request FreeSBC sent, per

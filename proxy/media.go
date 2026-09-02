@@ -33,6 +33,18 @@ type mediaSession struct {
 	// codecs is the list negotiated for this call, for logs and metrics.
 	codecs []sdpx.Codec
 
+	// sessionID is the o= session identifier FreeSBC uses for every body
+	// it generates on this session. It must stay constant for the life of
+	// the session (RFC 4566): a changed id means a NEW session, which some
+	// endpoints answer by tearing the old one down.
+	sessionID uint64
+
+	// version is the o= version counter for bodies FreeSBC generates on
+	// this session. RFC 4566 requires it to increase on every re-offer for
+	// the same session id, and some endpoints use it to decide whether a
+	// re-offer changed anything.
+	version uint64
+
 	// lastAnswer is the body FreeSBC built for the near side the first
 	// time the far side answered. A 200 OK that restates the answer
 	// already sent in a reliable provisional must repeat OUR body, not
@@ -140,8 +152,8 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, offerBody []byte) (*off
 		// offer, not a relay of the client's, so it must not reuse the
 		// client's o= line (which would leak the client's session id and,
 		// in some stacks, its address).
-		SessionID:      newSessionID(),
-		SessionVersion: 1,
+		SessionID:      sess.sessionID,
+		SessionVersion: sess.nextVersion(),
 	}.Marshal()
 	if err != nil {
 		_ = sess.Close()
@@ -174,6 +186,7 @@ func (s *Server) allocateRTP(offer *sdpx.Session) (*mediaSession, error) {
 		rtp:         sess,
 		publicPort:  sess.RTPPort(media.SideA),
 		privatePort: sess.RTPPort(media.SideB),
+		sessionID:   newSessionID(),
 	}, nil
 }
 
@@ -236,6 +249,7 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdpx.Session) (*medi
 		webrtc:      sess,
 		publicPort:  sess.PublicPort(),
 		privatePort: sess.PrivateRTPPort(),
+		sessionID:   newSessionID(),
 	}, nil
 }
 
@@ -278,8 +292,8 @@ func (s *Server) applyUpstreamAnswer(res *offerResult, answerBody []byte, public
 		Port:           res.sess.publicPort,
 		Codecs:         agreed,
 		Direction:      answer.Audio.Direction,
-		SessionID:      newSessionID(),
-		SessionVersion: 1,
+		SessionID:      res.sess.sessionID,
+		SessionVersion: res.sess.nextVersion(),
 	}
 	if publicIsWebRTC {
 		leg := res.sess.webrtc.Leg()
@@ -334,14 +348,15 @@ func (s *Server) buildPublicOffer(offerBody []byte) (*offerResult, error) {
 		publicPort:  sess.RTPPort(media.SideA),
 		privatePort: sess.RTPPort(media.SideB),
 		codecs:      codecs,
+		sessionID:   newSessionID(),
 	}
 	body, err := sdpx.Build{
 		Address:        s.topo.publicMediaIP,
 		Port:           ms.publicPort,
 		Codecs:         codecs,
 		Direction:      offer.Audio.Direction,
-		SessionID:      newSessionID(),
-		SessionVersion: 1,
+		SessionID:      ms.sessionID,
+		SessionVersion: ms.nextVersion(),
 	}.Marshal()
 	if err != nil {
 		_ = ms.Close()
@@ -376,8 +391,8 @@ func (s *Server) applyPublicAnswer(res *offerResult, answerBody []byte) ([]byte,
 		Port:           res.sess.privatePort,
 		Codecs:         agreed,
 		Direction:      answer.Audio.Direction,
-		SessionID:      newSessionID(),
-		SessionVersion: 1,
+		SessionID:      res.sess.sessionID,
+		SessionVersion: res.sess.nextVersion(),
 	}.MarshalDeclining(res.offer)
 }
 
@@ -385,3 +400,108 @@ func (s *Server) applyPublicAnswer(res *offerResult, answerBody []byte) ([]byte,
 // it to be "globally unique"; a nanosecond clock reading is what every
 // implementation actually uses.
 func newSessionID() uint64 { return uint64(time.Now().UnixNano()) }
+
+// nextVersion returns the next o= version for a body generated on this
+// session.
+func (m *mediaSession) nextVersion() uint64 {
+	m.version++
+	return m.version
+}
+
+// portFor and addressFor select the anchor this session presents on one
+// plane. They are what keeps a re-negotiation on the ports it already
+// holds: nothing here allocates.
+func (m *mediaSession) portFor(p plane) int {
+	if p == planePublic {
+		return m.publicPort
+	}
+	return m.privatePort
+}
+
+func (s *Server) addressFor(p plane) netip.Addr {
+	if p == planePublic {
+		return s.topo.publicMediaIP
+	}
+	return s.topo.privateMediaIP
+}
+
+// rebuildInDialogOffer rewrites a re-INVITE's offer body for the far side.
+//
+// This exists because forwarding an in-dialog body unchanged would hand
+// each side the other's media address MID-CALL — the anchor would simply
+// fall away on the first hold, unhold or session-timer refresh, and for a
+// browser the body would carry its ICE candidates and DTLS fingerprint
+// straight to FreeSWITCH. Like the initial offer, the outgoing body is
+// CONSTRUCTED rather than derived; unlike it, nothing is allocated: the
+// session keeps the ports it already holds.
+//
+// Codec changes ARE conveyed (the offerer's list, filtered to what the
+// proxy relays, with its payload numbers), so a re-offer that drops or
+// adds a codec still works without transcoding.
+func (s *Server) rebuildInDialogOffer(sess *mediaSession, body []byte, toward plane) ([]byte, *sdpx.Session, error) {
+	offer, err := sdpx.Parse(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("proxy: in-dialog offer: %w", err)
+	}
+	codecs := sdpx.Filter(offer.Audio.Codecs)
+	if !sdpx.HasMedia(codecs) {
+		return nil, nil, fmt.Errorf("%w: re-offer had %s", errNoUsableCodec, sdpx.Describe(offer.Audio.Codecs))
+	}
+	out, err := sdpx.Build{
+		Address: s.addressFor(toward),
+		Port:    sess.portFor(toward),
+		Codecs:  codecs,
+		// The direction passes through unreversed: FreeSBC is a relay in
+		// the middle, so a caller putting the call on hold (sendonly) must
+		// present as sendonly to the far end too.
+		Direction:      offer.Audio.Direction,
+		SessionID:      sess.sessionID,
+		SessionVersion: sess.nextVersion(),
+	}.Marshal()
+	if err != nil {
+		return nil, nil, fmt.Errorf("proxy: build in-dialog offer: %w", err)
+	}
+	return out, offer, nil
+}
+
+// rebuildInDialogAnswer rewrites the answer to a re-INVITE for the near
+// side, and records the newly agreed codec list on the session.
+func (s *Server) rebuildInDialogAnswer(sess *mediaSession, offer *sdpx.Session, body []byte, toward plane) ([]byte, error) {
+	answer, err := sdpx.Parse(body)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
+	}
+	agreed, err := sdpx.Intersect(sdpx.Filter(offer.Audio.Codecs), answer.Audio.Codecs)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNoUsableCodec, err)
+	}
+	if o, a, yes := sdpx.NeedsRenumber(sdpx.Filter(offer.Audio.Codecs), answer.Audio.Codecs); yes {
+		return nil, fmt.Errorf("%w: offered %s, answered %s", errRenumbered, o, a)
+	}
+	sess.codecs = agreed
+
+	build := sdpx.Build{
+		Address:        s.addressFor(toward),
+		Port:           sess.portFor(toward),
+		Codecs:         agreed,
+		Direction:      answer.Audio.Direction,
+		SessionID:      sess.sessionID,
+		SessionVersion: sess.nextVersion(),
+	}
+	// A browser-facing answer must restate the SAME ICE credentials,
+	// fingerprint and DTLS role as the original: a re-INVITE that changed
+	// any of them would look like an ICE restart and tear down the media
+	// path the session is still using.
+	if toward == planePublic && sess.webrtc != nil {
+		leg := sess.webrtc.Leg()
+		ufrag, pwd := leg.LocalCredentials()
+		build.Secure, build.DTLS, build.RTCPMux = true, true, true
+		build.ICEUfrag, build.ICEPwd = ufrag, pwd
+		build.Setup = leg.DTLSSetup()
+		build.Fingerprint = &sdpx.Fingerprint{
+			Hash:  s.identity.FingerprintHash,
+			Value: s.identity.FingerprintValue,
+		}
+	}
+	return build.MarshalDeclining(offer)
+}

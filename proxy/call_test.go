@@ -552,3 +552,216 @@ func TestOptionsAnsweredLocally(t *testing.T) {
 		t.Errorf("OPTIONS was forwarded upstream %d times", len(got))
 	}
 }
+
+// TestByeFromUpstreamReachesClient covers the hangup direction no other
+// test drives: FreeSWITCH ends the call (callee hung up, voicemail
+// finished, dialplan hangup) and the BYE must reach the client.
+//
+// The request FreeSWITCH sends carries no binding token — the token only
+// ever rides on the REGISTERed contact, not on the dialog's remote target
+// — so routing it depends on the dialog record, not the location table.
+func TestByeFromUpstreamReachesClient(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+
+	// Capture the To tag the switch generated, so the BYE can name the
+	// dialog correctly. It travels over a channel rather than a shared
+	// variable: the hook runs on a sipgo handler goroutine.
+	tagCh := make(chan string, 1)
+	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(h.fs.answerSDP(req)))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(h.fs.addr)}})
+		tag := sip.GenerateTagN(12)
+		res.To().Params.Add("tag", tag)
+		_ = tx.Respond(res)
+		tagCh <- tag
+		return true
+	})
+
+	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(30201))
+	res := phone.do(t, invite, h.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("INVITE: %d", res.StatusCode)
+	}
+	sendAck(t, phone, invite, res, h.publicUDP)
+
+	var switchTag string
+	select {
+	case switchTag = <-tagCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the switch never answered")
+	}
+	upstreamInvites := h.fs.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(upstreamInvites) != 1 {
+		t.Fatalf("FreeSWITCH saw %d INVITEs", len(upstreamInvites))
+	}
+
+	// Drain anything the phone already received so the BYE is unambiguous.
+	drain(phone.inbound)
+
+	byeRes := h.fs.inDialog(t, sip.BYE, upstreamInvites[0], switchTag)
+	if byeRes.StatusCode != 200 {
+		t.Fatalf("BYE from FreeSWITCH: got %d, want 200", byeRes.StatusCode)
+	}
+
+	select {
+	case got := <-phone.inbound:
+		if got.Method != sip.BYE {
+			t.Fatalf("the phone received %s, want BYE", got.Method)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the phone never received the BYE — the call would hang until the media watchdog fired")
+	}
+	waitForRelease(t, h)
+}
+
+func drain(ch chan *sip.Request) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// TestReInviteKeepsMediaAnchored is acceptance criteria 9 and 10 for the
+// in-dialog case: a re-INVITE (sip.js hold/unhold, a FreeSWITCH session
+// timer refresh) must not hand either side the other's media address.
+//
+// Passing the body through untouched would point FreeSWITCH straight at
+// the client and vice versa — media would leave the SBC entirely, mid-call.
+func TestReInviteKeepsMediaAnchored(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+
+	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(30301))
+	res := phone.do(t, invite, h.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("INVITE: %d", res.StatusCode)
+	}
+	sendAck(t, phone, invite, res, h.publicUDP)
+
+	firstAnswer, err := sdpx.Parse(res.Body())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchoredPublicPort := firstAnswer.Audio.Port
+
+	// The client re-INVITEs to put the call on hold, from a DIFFERENT
+	// media port — a real endpoint may re-offer with new parameters.
+	reOffer := strings.Replace(phoneOfferSDP(30302), "a=sendrecv", "a=sendonly", 1)
+	re := sip.NewRequest(sip.INVITE, invite.Recipient)
+	sip.CopyHeaders("From", invite, re)
+	sip.CopyHeaders("Call-ID", invite, re)
+	re.AppendHeader(sip.HeaderClone(res.To()))
+	re.AppendHeader(&sip.CSeqHeader{SeqNo: invite.CSeq().SeqNo + 1, MethodName: sip.INVITE})
+	mf := sip.MaxForwardsHeader(70)
+	re.AppendHeader(&mf)
+	re.AppendHeader(&sip.ContactHeader{Address: phone.contactURI("1001")})
+	re.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: "127.0.0.1", Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	via.Params.Add("rport", "")
+	re.PrependHeader(via)
+	copyRouteFromRecordRoute(res, re)
+	re.SetBody([]byte(reOffer))
+
+	reRes := phone.do(t, re, h.publicUDP)
+	if reRes.StatusCode != 200 {
+		t.Fatalf("re-INVITE: got %d, want 200", reRes.StatusCode)
+	}
+
+	// --- what FreeSWITCH was re-offered ---
+	invites := h.fs.waitFor(sip.INVITE, 2, 3*time.Second)
+	if len(invites) < 2 {
+		t.Fatalf("FreeSWITCH saw %d INVITEs, want 2", len(invites))
+	}
+	upstream, err := sdpx.Parse(invites[1].Body())
+	if err != nil {
+		t.Fatalf("re-offer to FreeSWITCH unparseable: %v\n%s", err, invites[1].Body())
+	}
+	if upstream.Audio.Port == 30302 {
+		t.Error("the re-INVITE handed FreeSWITCH the client's own media port — media would bypass the SBC")
+	}
+	privRange := h.store.Current().RTP.Private
+	if upstream.Audio.Port < privRange.PortMin || upstream.Audio.Port > privRange.PortMax {
+		t.Errorf("re-offer media port %d is outside the private pool", upstream.Audio.Port)
+	}
+	// The direction must survive: it is what puts the call on hold.
+	if upstream.Audio.Direction != sdpx.SendOnly {
+		t.Errorf("hold direction lost: %v", upstream.Audio.Direction)
+	}
+
+	// --- what the client was answered ---
+	reAnswer, err := sdpx.Parse(reRes.Body())
+	if err != nil {
+		t.Fatalf("re-answer unparseable: %v\n%s", err, reRes.Body())
+	}
+	if reAnswer.Audio.Port == h.fs.rtpPort {
+		t.Error("the re-INVITE answer handed the client FreeSWITCH's media port")
+	}
+	// Media stays on the ports it already holds: the anchor does not move.
+	if reAnswer.Audio.Port != anchoredPublicPort {
+		t.Errorf("public media port moved on re-INVITE: %d → %d", anchoredPublicPort, reAnswer.Audio.Port)
+	}
+
+	if r := phone.do(t, buildBye(phone, invite, res), h.publicUDP); r.StatusCode != 200 {
+		t.Errorf("BYE: %d", r.StatusCode)
+	}
+	waitForRelease(t, h)
+}
+
+// TestSingleViaProvisionalIsAbsorbed guards the behaviour a live
+// FreeSWITCH exposed: sofia sends its 100 Trying with ONLY the topmost Via
+// (its peer's — ours), not the full stack. A proxy that pops the top Via
+// unconditionally leaves that response with no Via at all, and the
+// requester's transaction layer cannot match it.
+//
+// RFC 3261 §16.7 settles both halves: step 2 says a 100 Trying is
+// hop-by-hop and MUST NOT be forwarded, and step 3 says the top Via must
+// be checked against the proxy's own before it is removed.
+func TestSingleViaProvisionalIsAbsorbed(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+
+	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		// A 100 Trying carrying only the top Via, as sofia sends it.
+		trying := sip.NewResponseFromRequest(req, 100, "Trying", nil)
+		for len(trying.GetHeaders("Via")) > 1 {
+			// Keep only the first.
+			vias := trying.GetHeaders("Via")
+			trying.RemoveHeader("Via")
+			first := vias[0]
+			trying.RemoveHeader("Via")
+			trying.PrependHeader(sip.HeaderClone(first))
+			break
+		}
+		_ = tx.Respond(trying)
+
+		// A 180 with the same defect: it must not reach the caller
+		// malformed, and must not prevent the call from completing.
+		ringing := sip.NewResponseFromRequest(req, 180, "Ringing", nil)
+		ringing.RemoveHeader("Via")
+		_ = tx.Respond(ringing)
+
+		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(h.fs.answerSDP(req)))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(h.fs.addr)}})
+		_ = tx.Respond(res)
+		return true
+	})
+
+	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(30401))
+	res := phone.do(t, invite, h.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("a defective provisional broke the call: got %d, want 200", res.StatusCode)
+	}
+	sendAck(t, phone, invite, res, h.publicUDP)
+	if r := phone.do(t, buildBye(phone, invite, res), h.publicUDP); r.StatusCode != 200 {
+		t.Errorf("BYE: %d", r.StatusCode)
+	}
+	waitForRelease(t, h)
+}

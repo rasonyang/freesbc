@@ -148,16 +148,55 @@ func (s *Server) stripOwnRoutes(req *sip.Request) {
 // so "do nothing" is precisely the behaviour wanted.
 func noBuild(*sipgo.Client, *sip.Request) error { return nil }
 
-// relayResponse forwards one response from a client transaction back
-// through the server transaction.
+// popOwnVia removes the top Via from a response, but only when it is
+// actually ours, and reports whether the result can still be forwarded.
 //
-// The top Via is ours and must come off (RFC 3261 §16.7 step 3); what is
-// underneath is the requester's own Via, which the response then routes
-// by. Everything else — status, tags, Contact, body — is the far end's and
-// is left alone, apart from the Contact and SDP rewriting the caller does.
+// RFC 3261 §16.7 step 3 requires the check: a proxy compares the top Via
+// against its own value and discards the response if it does not match.
+// Removing it unconditionally is what a naive implementation does, and it
+// is wrong in a way that shows up against real switches — sofia sends its
+// 100 Trying with ONLY the topmost Via, so a blind pop leaves the response
+// with no Via at all and the requester's transaction layer cannot match
+// it.
+//
+// ok=false means the response must not be forwarded.
+func (s *Server) popOwnVia(res *sip.Response) (ok bool) {
+	top := res.Via()
+	if top == nil {
+		return false
+	}
+	if !s.topo.isSelfVia(top) {
+		// Not our Via: the response does not belong to a request we sent.
+		return false
+	}
+	res.RemoveHeader("Via")
+	// After popping ours there must be a Via left to route by.
+	return res.Via() != nil
+}
+
+// forwardable reports whether a response received on a client transaction
+// should be passed back to the requester at all.
+//
+// A 100 Trying is hop-by-hop: RFC 3261 §16.7 step 2 says a proxy MUST NOT
+// forward it. The server transaction generates its own 100 for the
+// requester, so forwarding the far end's would be both redundant and — for
+// a switch that sends it with a single Via — unroutable.
+func forwardable(res *sip.Response) bool { return res.StatusCode != 100 }
+
+// relayResponse forwards one response from a client transaction back
+// through the server transaction. Everything except the hop-by-hop Via is
+// the far end's and is left alone, apart from the Contact and SDP
+// rewriting the caller does.
 func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response) error {
+	if !forwardable(res) {
+		return nil
+	}
 	out := res.Clone()
-	out.RemoveHeader("Via") // ours
+	if !s.popOwnVia(out) {
+		s.log.Debug("dropping response that cannot be routed back",
+			"code", out.StatusCode, "sip_call_id", callIDOf(out))
+		return nil
+	}
 	out.SetDestination(orig.Source())
 	s.metrics.ResponseOut(out.StatusCode)
 	return tx.Respond(out)

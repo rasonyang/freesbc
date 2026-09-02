@@ -394,3 +394,33 @@ func TestMultipleContactsAreAllReplaced(t *testing.T) {
 		t.Errorf("the surviving Contact is not the SBC's: %s", contacts[0].Value())
 	}
 }
+
+// A WebSocket registration is reachable only through its own connection.
+// When that connection closes, the binding must go with it — otherwise
+// FreeSBC would keep accepting inbound calls it has no way to deliver.
+func TestWebSocketCloseDropsBindings(t *testing.T) {
+	h := startHarness(t, false)
+	browser := newWSClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+
+	if res := browser.do(t, browser.buildRegister("1001", "example.com", 600, ""), h.publicWS); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	if h.srv.loc.Count() != 1 {
+		t.Fatalf("bindings = %d after register", h.srv.loc.Count())
+	}
+
+	// Close the browser's user agent, which closes its WebSocket.
+	browser.cancel()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.srv.loc.Count() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("binding survived the WebSocket close: %d still registered", h.srv.loc.Count())
+}

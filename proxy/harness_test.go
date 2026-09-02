@@ -458,3 +458,86 @@ func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string) *sip.Re
 		}
 	}
 }
+
+// inDialog sends an in-dialog request from the fake switch, built the way
+// a UAS builds one: Request-URI = the remote target (the Contact it
+// received), Route = the Record-Route set from the request IN ORDER
+// (RFC 3261 §12.1.1 — the UAS does not reverse it), From/To swapped
+// relative to the INVITE because the switch is now the sender.
+func (f *fakeSwitch) inDialog(t *testing.T, method sip.RequestMethod, invite *sip.Request, toTag string) *sip.Response {
+	t.Helper()
+	target, ok := contactURI(invite)
+	if !ok {
+		t.Fatal("the INVITE the switch received carried no Contact")
+	}
+	req := sip.NewRequest(method, target)
+
+	// The switch was the UAS: its own identity was in the To, the peer's
+	// in the From. In-dialog, the sender's identity goes in From.
+	from := &sip.FromHeader{Address: invite.To().Address, Params: sip.NewParams()}
+	from.Params.Add("tag", toTag)
+	req.AppendHeader(from)
+	to := &sip.ToHeader{Address: invite.From().Address, Params: sip.NewParams()}
+	if tag, ok := invite.From().Params.Get("tag"); ok {
+		to.Params.Add("tag", tag)
+	}
+	req.AppendHeader(to)
+	sip.CopyHeaders("Call-ID", invite, req)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: method})
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	for _, h := range invite.GetHeaders("Record-Route") {
+		rr, ok := h.(*sip.RecordRouteHeader)
+		if !ok {
+			continue
+		}
+		req.AppendHeader(&sip.RouteHeader{Address: rr.Address})
+	}
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	req.PrependHeader(via)
+
+	// Route to the topmost Route value, as a loose router does.
+	dest := f.topRouteDest(t, req)
+	req.SetTransport("UDP")
+	req.SetDestination(dest)
+	req.Laddr = sip.Addr{IP: net.ParseIP("127.0.0.1"), Port: portOf(f.addr)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tx, err := f.cli.TransactionRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("fake switch %s: %v", method, err)
+	}
+	defer tx.Terminate()
+	for {
+		select {
+		case res, ok := <-tx.Responses():
+			if !ok {
+				t.Fatalf("fake switch %s: no final response", method)
+			}
+			if res.StatusCode >= 200 {
+				return res
+			}
+		case <-tx.Done():
+			t.Fatalf("fake switch %s: %v", method, tx.Err())
+		case <-ctx.Done():
+			t.Fatalf("fake switch %s timed out", method)
+		}
+	}
+}
+
+func (f *fakeSwitch) topRouteDest(t *testing.T, req *sip.Request) string {
+	t.Helper()
+	r := req.Route()
+	if r == nil {
+		t.Fatal("no Route set: the proxy did not Record-Route")
+	}
+	port := r.Address.Port
+	if port == 0 {
+		port = 5060
+	}
+	return fmt.Sprintf("%s:%d", r.Address.Host, port)
+}

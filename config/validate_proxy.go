@@ -26,6 +26,16 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		return
 	}
 
+	// A trunk listener with no peers can only drop traffic: the trunk
+	// plane identifies every inbound request by matching its source
+	// against a peer's allowed_ips, so with no peers configured the
+	// listener is dead weight. Without the edge proxy this is already
+	// rejected ("peers: at least one peer required"); with it, the
+	// listener would otherwise bind silently and serve nothing.
+	if len(c.Peers) == 0 && (len(c.Listen.SIP) > 0 || c.SIP.BindIP != "") {
+		fail("listen.sip/sip.bind_ip: configured with no peers — the trunk plane identifies callers by peer allowed_ips, so this listener could only drop traffic. Remove it, or add the peers it is for.")
+	}
+
 	// ---- upstream ----
 	if host, port, err := net.SplitHostPort(c.SIP.Upstream.Address); err != nil {
 		fail("sip.upstream.address: %q is not \"host:port\"", c.SIP.Upstream.Address)
