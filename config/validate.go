@@ -24,7 +24,12 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Sprintf(format, args...))
 	}
 
-	if len(c.Listen.SIP) == 0 && c.SIP.BindIP == "" {
+	// The trunk B2BUA plane needs a listener and at least one peer — but a
+	// proxy-only deployment (edge proxy on, no trunks) legitimately has
+	// neither. Both requirements are therefore conditional on the proxy
+	// plane being off; validateProxy enforces the proxy plane's own
+	// listener requirement.
+	if len(c.Listen.SIP) == 0 && c.SIP.BindIP == "" && !c.ProxyEnabled() {
 		fail("listen.sip or sip.bind_ip: at least one SIP listener required")
 	}
 	if pr := c.Listen.Media.PortRange; pr != (PortRange{}) && pr.Min < 1024 {
@@ -147,7 +152,7 @@ func (c *Config) validate() error {
 		fail("max_concurrent_calls: must be >= 0 (0 = unlimited), got %d", c.MaxConcurrentCalls)
 	}
 
-	if len(c.Peers) == 0 {
+	if len(c.Peers) == 0 && !c.ProxyEnabled() {
 		fail("peers: at least one peer required")
 	}
 	peerNames := make([]string, 0, len(c.Peers))
@@ -328,6 +333,8 @@ func (c *Config) validate() error {
 			fail("peers.%s: tls_client_cert and tls_client_key must be set together", name)
 		}
 	}
+
+	c.validateProxy(fail)
 
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "\n"))

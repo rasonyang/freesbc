@@ -46,6 +46,13 @@ type Config struct {
 	// rtp.advertised_ip (empty = legacy resolution, see Server.mediaIP).
 	SIP SIPNetConfig `yaml:"sip"`
 	RTP RTPNetConfig `yaml:"rtp"`
+
+	// Network and WebRTC belong to the edge-proxy plane (see
+	// config/proxy.go): the public/private topology the SIP/RTP/WebRTC
+	// proxy straddles. They are inert unless sip.upstream.address is set
+	// (Config.ProxyEnabled) — the trunk B2BUA plane above is unaffected.
+	Network NetworkConfig `yaml:"network"`
+	WebRTC  WebRTCConfig  `yaml:"webrtc"`
 }
 
 type ListenConfig struct {
@@ -81,6 +88,14 @@ type SIPNetConfig struct {
 	// to route to it. Default to the bind values when unset.
 	AdvertisedIP   string `yaml:"advertised_ip"`
 	AdvertisedPort int    `yaml:"advertised_port"`
+
+	// Public/Private/Upstream are the edge-proxy plane's listeners and
+	// upstream target (see config/proxy.go). They nest under the same
+	// `sip:` key as the flat trunk fields above but are independent of
+	// them: a config may enable the trunk plane, the proxy plane, or both.
+	Public   ProxySIPConfig  `yaml:"public"`
+	Private  ProxyPrivateSIP `yaml:"private"`
+	Upstream UpstreamConfig  `yaml:"upstream"`
 }
 
 // RTPNetConfig is the media-plane bind/advertised pair plus the explicit
@@ -97,6 +112,13 @@ type RTPNetConfig struct {
 	// configuring both) — see Config.RTPPortRange.
 	PortMin int `yaml:"port_min"`
 	PortMax int `yaml:"port_max"`
+
+	// Public/Private are the edge-proxy plane's two media pools (see
+	// config/proxy.go). Independent of the flat fields above, which serve
+	// the trunk B2BUA plane; validation rejects overlapping ranges between
+	// any two pools that could hand out the same port.
+	Public  RTPPlaneConfig `yaml:"public"`
+	Private RTPPlaneConfig `yaml:"private"`
 }
 
 // Listeners returns the effective SIP listener set: the sip.bind_ip
@@ -274,6 +296,7 @@ func withDefaults(c *Config) {
 			p.SRTP = "disabled"
 		}
 	}
+	proxyWithDefaults(c)
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
 	}

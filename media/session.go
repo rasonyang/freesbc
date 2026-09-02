@@ -37,6 +37,12 @@ type latch struct {
 	mode     LatchMode
 	expected netip.Addr // zero value = no expectation
 	remote   *net.UDPAddr
+	// latched records whether remote was fixed by an ACCEPTED INBOUND
+	// packet, as opposed to merely seeded from SDP (see seed). Only a
+	// latched remote is treated as final; a seeded one is still open to
+	// being corrected by the first genuine packet, which is what makes
+	// symmetric RTP work through NAT.
+	latched bool
 }
 
 func (l *latch) setExpected(ip netip.Addr) {
@@ -63,7 +69,36 @@ func (l *latch) relatch(ip netip.Addr) {
 	l.mu.Lock()
 	l.expected = ip
 	l.remote = nil
+	l.latched = false
 	l.mu.Unlock()
+}
+
+// seed sets both the expected source IP and a PROVISIONAL send-to address
+// taken from the far side's SDP, without latching.
+//
+// Without it the relay cannot send anything until the far side has sent
+// first: target() would be nil, so an endpoint waiting to hear audio
+// before producing any would deadlock against another doing the same. With
+// it, media flows to the signalled address immediately, and the first
+// packet that passes the strict-mode source check still overrides the
+// destination — which is exactly symmetric RTP, and is what carries the
+// stream through a NAT that rewrote the port.
+//
+// The anti-hijack property is unchanged: a seeded (not yet latched) remote
+// accepts inbound packets only from the expected IP, and once a real
+// packet has latched it, nothing moves it again short of an authorized
+// re-INVITE.
+func (l *latch) seed(addr netip.AddrPort) {
+	if !addr.IsValid() || addr.Port() == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.expected = addr.Addr()
+	if l.latched {
+		return // a real packet already fixed this; SDP does not override it
+	}
+	l.remote = &net.UDPAddr{IP: net.IP(addr.Addr().AsSlice()), Port: int(addr.Port())}
 }
 
 // accept reports whether a packet from src may be processed, latching the
@@ -71,7 +106,7 @@ func (l *latch) relatch(ip netip.Addr) {
 func (l *latch) accept(src *net.UDPAddr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.remote != nil {
+	if l.latched {
 		return l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port
 	}
 	if l.mode == LatchStrict {
@@ -88,6 +123,7 @@ func (l *latch) accept(src *net.UDPAddr) bool {
 		Port: src.Port,
 		Zone: src.Zone,
 	}
+	l.latched = true
 	return true
 }
 
@@ -112,7 +148,12 @@ type SessionConfig struct {
 // (from SDP) → Start → Close, or automatic teardown on RTP silence,
 // observable via Done. Safe for concurrent use.
 type Session struct {
-	pool    *Pool
+	// pools[side] is the pool that side's pair came from. Two entries
+	// rather than one shared pool because the edge proxy allocates side A
+	// from the PUBLIC plane and side B from the PRIVATE one (see
+	// AllocateAcross); the trunk B2BUA plane simply passes the same pool
+	// twice.
+	pools   [2]*PlanePool
 	pairs   [2]*PortPair
 	rtp     [2]*latch
 	rtcp    [2]*latch
@@ -130,29 +171,47 @@ type Session struct {
 	srtpOut [2]atomic.Pointer[SRTPContext] // encrypt packets sent TO this side (nil = plaintext)
 
 	lastRx    atomic.Int64 // unix nanos of the last accepted packet
+	counters  counters
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-// Allocate binds two port pairs (side A and side B) for one call. The
-// caller must Close the session — or rely on silence teardown — to return
-// the ports. Returns ErrPortsExhausted when the range is full.
+// Stats returns the session's packet counters (side A reported as
+// "public", side B as "private").
+func (s *Session) Stats() Stats { return s.counters.snapshot(s.lastRx.Load()) }
+
+// Allocate binds two port pairs (side A and side B) for one call from
+// this single pool — the trunk B2BUA plane's shape. The caller must Close
+// the session — or rely on silence teardown — to return the ports.
+// Returns ErrPortsExhausted when the range is full.
 func (p *Pool) Allocate(cfg SessionConfig) (*Session, error) {
+	return AllocateAcross(p.PlanePool, p.PlanePool, cfg)
+}
+
+// AllocateAcross binds side A from poolA and side B from poolB. This is
+// the edge proxy's shape: the public side's socket lives in the public
+// plane's range and binds the public address, the private side's in the
+// private plane's — so neither leg can ever be told to send media to the
+// other plane's address.
+//
+// On failure the already-bound pair is closed and released, so a partial
+// allocation never leaks a socket or a port reservation.
+func AllocateAcross(poolA, poolB *PlanePool, cfg SessionConfig) (*Session, error) {
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = p.store.Current().Listen.Media.RTPTimeout.Std()
+		cfg.Timeout = poolA.timeout()
 	}
-	a, err := p.allocatePair()
+	a, err := poolA.allocatePair()
 	if err != nil {
 		return nil, err
 	}
-	b, err := p.allocatePair()
+	b, err := poolB.allocatePair()
 	if err != nil {
 		a.Close()
-		p.release(a.RTPPort())
+		poolA.release(a.RTPPort())
 		return nil, err
 	}
 	s := &Session{
-		pool:    p,
+		pools:   [2]*PlanePool{poolA, poolB},
 		pairs:   [2]*PortPair{a, b},
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
@@ -173,6 +232,25 @@ func (s *Session) RTPPort(side Side) int { return s.pairs[side].RTPPort() }
 func (s *Session) SetExpectedRemote(side Side, ip netip.Addr) {
 	s.rtp[side].setExpected(ip)
 	s.rtcp[side].setExpected(ip)
+}
+
+// SetRemote seeds one side's send-to address AND its expected source IP
+// from that side's SDP, so media can flow to it before its first packet
+// arrives. The first accepted inbound packet still overrides the
+// destination (symmetric RTP) — see latch.seed.
+func (s *Session) SetRemote(side Side, addr netip.AddrPort) {
+	s.rtp[side].seed(addr)
+	// RTCP is conventionally RTP+1 (RFC 3550 §11); an explicit a=rtcp is
+	// handled by the caller passing the port it parsed.
+	if addr.Port() < 65535 {
+		s.rtcp[side].seed(netip.AddrPortFrom(addr.Addr(), addr.Port()+1))
+	}
+}
+
+// SetRTCPRemote overrides just the RTCP send-to address of one side, for a
+// peer whose a=rtcp names a port other than RTP+1.
+func (s *Session) SetRTCPRemote(side Side, addr netip.AddrPort) {
+	s.rtcp[side].seed(addr)
 }
 
 // Relatch re-arms both the RTP and RTCP latches of one side to ip, for an
@@ -225,8 +303,8 @@ func (s *Session) Close() error {
 		for _, pp := range s.pairs {
 			pp.Close()
 		}
-		s.pool.release(s.pairs[SideA].RTPPort())
-		s.pool.release(s.pairs[SideB].RTPPort())
+		s.pools[SideA].release(s.pairs[SideA].RTPPort())
+		s.pools[SideB].release(s.pairs[SideB].RTPPort())
 		close(s.done)
 	})
 	return nil

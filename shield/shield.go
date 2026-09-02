@@ -57,9 +57,26 @@ type Shield struct {
 // New builds a Shield over store, installs the nftables backend from the
 // current config's shield.nftables mode, and starts a background prune loop.
 func New(store *config.Store, log *slog.Logger) *Shield {
+	return newShield(store, log, true)
+}
+
+// NewNoKernel builds a Shield that bans in-process only, with no nftables
+// backend. It exists for the edge proxy, whose public listeners are not in
+// config.Listeners() — the list the kernel rules are derived from — so a
+// second kernel-managing Shield would either write rules for the wrong
+// ports or fight the trunk plane's Shield over the same nft table. The
+// in-process ban list, rate limiter and scanner detection are identical;
+// only the kernel-level enforcement is absent.
+func NewNoKernel(store *config.Store, log *slog.Logger) *Shield {
+	return newShield(store, log, false)
+}
+
+func newShield(store *config.Store, log *slog.Logger, kernel bool) *Shield {
 	cfg := store.Current()
 	bl := newBanList()
-	bl.nft = newNFTBackend(cfg.Shield.NFTables, cfg.Listeners(), log)
+	if kernel {
+		bl.nft = newNFTBackend(cfg.Shield.NFTables, cfg.Listeners(), log)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Shield{
 		store:       store,

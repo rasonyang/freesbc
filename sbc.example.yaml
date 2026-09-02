@@ -99,3 +99,79 @@ shield:                            # sensible defaults; the whole section is opt
 #     # ship a known/default password). Cost 10 or higher is enforced. Generate with:
 #     #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
 #     password_hash: "REPLACE-WITH-YOUR-OWN-BCRYPT-HASH"
+
+# ---------------------------------------------------------------------------
+# Edge proxy plane (optional): SIP/RTP/WebRTC proxy in front of FreeSWITCH
+# ---------------------------------------------------------------------------
+#
+# Everything above configures the TRUNK plane (B2BUA between carriers and a
+# PBX). The sections below configure a completely independent second plane:
+# a stateful SIP proxy for phones and browsers, with FreeSWITCH behind it as
+# the authoritative registrar and switch.
+#
+#              Public Internet                  Private LAN / VPN
+#   SIP phone  (SIP/UDP + RTP)  ─┐
+#                               ├─▶  FreeSBC  ─── SIP/UDP + RTP ──▶ FreeSWITCH
+#   Browser    (SIP/WSS + WebRTC)┘
+#
+# The plane turns on when sip.upstream.address is set. The two planes share
+# only the process: separate listeners, separate user agent, separate media
+# pools. Either may run alone; a proxy-only deployment needs no peers and no
+# listen.sip at all.
+#
+# Uncomment and adjust:
+#
+# network:
+#   public:                          # the side facing phones and browsers
+#     bind_ip: 0.0.0.0
+#     advertised_ip: 203.0.113.7     # REQUIRED when bind_ip is a wildcard —
+#                                    #   it is what Contact, Via and SDP claim
+#   private:                         # the side facing FreeSWITCH
+#     bind_ip: 10.77.0.2
+#     # advertised_ip: 10.77.0.2     # defaults to bind_ip when specific
+#
+# sip:
+#   public:
+#     udp: { enabled: true,  bind: 0.0.0.0:16060 }
+#     ws:  { enabled: true,  bind: 0.0.0.0:18080 }   # plaintext; for testing
+#     wss:
+#       enabled: true
+#       bind: 0.0.0.0:18443
+#       cert_file: /etc/freesbc/wss-cert.pem   # a browser REFUSES an untrusted
+#       key_file:  /etc/freesbc/wss-key.pem    #   certificate on a WSS socket
+#   private:
+#     bind: 10.77.0.2:5060           # FreeSBC's own FreeSWITCH-facing socket:
+#                                    #   the source of everything it sends
+#                                    #   upstream and where FreeSWITCH sends
+#                                    #   inbound calls and in-dialog requests
+#   upstream:
+#     address: 10.77.0.10:5060       # FreeSWITCH. Must be a literal IP:port —
+#                                    #   the private leg never resolves DNS
+#     transport: udp                 # the only supported value today
+#
+# rtp:
+#   public:                          # media toward phones/browsers
+#     bind_ip: 0.0.0.0
+#     advertised_ip: 203.0.113.7
+#     port_min: 30000
+#     port_max: 39999
+#   private:                         # media toward FreeSWITCH
+#     bind_ip: 10.77.0.2
+#     port_min: 40000
+#     port_max: 49999
+#   # The two ranges (and the trunk plane's own range, if that plane runs on
+#   # the same interface) must not overlap — validation rejects it, since two
+#   # pools handing out one port is a silent capacity cliff.
+#
+# webrtc:
+#   enabled: true                    # requires sip.public.ws or wss
+#   ice_mode: lite                   # the only supported mode
+#   rtcp_mux: true                   # required
+#   # dtls_cert_file: /etc/freesbc/dtls-cert.pem   # optional: pin the DTLS
+#   # dtls_key_file:  /etc/freesbc/dtls-key.pem    #   identity instead of the
+#   #                                              #   per-process self-signed one
+#
+# FreeSWITCH side: point your phones' SIP domain at FreeSWITCH as usual and
+# let FreeSBC proxy REGISTER through. FreeSBC rewrites the Contact so
+# FreeSWITCH stores an address that routes back through the SBC, and
+# rewrites it back on the way to the client.

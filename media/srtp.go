@@ -104,3 +104,41 @@ func (c *SRTPContext) unprotectRTCP(pkt []byte) ([]byte, bool) {
 	out, err := c.ctx.DecryptRTCP(nil, pkt, nil)
 	return out, err == nil
 }
+
+// NewSRTPContextFromKeys builds a context from an explicit protection
+// profile and a raw master key/salt pair — the shape DTLS-SRTP produces
+// (RFC 5764 §4.2), as opposed to NewSRTPContext's SDES inline value.
+//
+// Replay protection is enabled exactly as it is for SDES: pion defaults to
+// none, which would let a captured packet be re-injected indefinitely.
+func NewSRTPContextFromKeys(profile srtp.ProtectionProfile, masterKey, masterSalt []byte) (*SRTPContext, error) {
+	keyLen, err := profile.KeyLen()
+	if err != nil {
+		return nil, fmt.Errorf("srtp profile: %w", err)
+	}
+	saltLen, err := profile.SaltLen()
+	if err != nil {
+		return nil, fmt.Errorf("srtp profile: %w", err)
+	}
+	if len(masterKey) != keyLen || len(masterSalt) != saltLen {
+		return nil, fmt.Errorf("srtp key material: got %d/%d bytes, want %d/%d for this profile",
+			len(masterKey), len(masterSalt), keyLen, saltLen)
+	}
+	ctx, err := srtp.CreateContext(masterKey, masterSalt, profile,
+		srtp.SRTPReplayProtection(srtpReplayWindow),
+		srtp.SRTCPReplayProtection(srtcpReplayWindow))
+	if err != nil {
+		return nil, fmt.Errorf("srtp create context: %w", err)
+	}
+	return &SRTPContext{ctx: ctx}, nil
+}
+
+// ProtectRTP and UnprotectRTP expose the SRTP transforms to callers
+// outside the relay's own forward loop (the WebRTC leg, which owns its
+// packet path). The unexported lowercase forms stay the relay's API.
+func (c *SRTPContext) ProtectRTP(pkt []byte) ([]byte, bool)   { return c.protectRTP(pkt) }
+func (c *SRTPContext) UnprotectRTP(pkt []byte) ([]byte, bool) { return c.unprotectRTP(pkt) }
+
+// ProtectRTCP and UnprotectRTCP are the RTCP counterparts.
+func (c *SRTPContext) ProtectRTCP(pkt []byte) ([]byte, bool)   { return c.protectRTCP(pkt) }
+func (c *SRTPContext) UnprotectRTCP(pkt []byte) ([]byte, bool) { return c.unprotectRTCP(pkt) }

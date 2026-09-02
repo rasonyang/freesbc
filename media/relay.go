@@ -64,6 +64,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// feed garbage that failed auth yet renewed rtp_timeout
 			// indefinitely, keeping a dead call alive forever.
 			s.lastRx.Store(time.Now().UnixNano())
+			s.counters.recordRx(from, rtpKind, len(pkt))
 			if oc := s.srtpOut[to].Load(); oc != nil {
 				var ok bool
 				if rtpKind {
@@ -76,7 +77,9 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				}
 			}
 			if dst := outLatch.target(); dst != nil {
-				_, _ = outSock.WriteToUDP(pkt, dst)
+				if n, err := outSock.WriteToUDP(pkt, dst); err == nil {
+					s.counters.recordTx(to, rtpKind, n)
+				}
 			}
 		}
 	}()

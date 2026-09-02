@@ -1,0 +1,255 @@
+package config
+
+import (
+	"net"
+	"net/netip"
+	"strconv"
+)
+
+// validateProxy checks the edge-proxy plane (network/sip.public/
+// sip.private/sip.upstream/rtp.public/rtp.private/webrtc). It is a no-op
+// for a trunk-only config apart from rejecting half-written sections: a
+// public listener or a media plane configured WITHOUT an upstream is a
+// mistake worth naming, not a silent no-op.
+//
+// fail is validate's error collector, so every problem in the file is
+// reported in one pass.
+func (c *Config) validateProxy(fail func(string, ...any)) {
+	enabled := c.ProxyEnabled()
+	listeners := c.PublicSIPListeners()
+	partial := len(listeners) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
+		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero()
+	if !enabled {
+		if partial {
+			fail("sip.upstream.address: required to enable the edge proxy — sip.public/sip.private/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
+		}
+		return
+	}
+
+	// ---- upstream ----
+	if host, port, err := net.SplitHostPort(c.SIP.Upstream.Address); err != nil {
+		fail("sip.upstream.address: %q is not \"host:port\"", c.SIP.Upstream.Address)
+	} else {
+		if host == "" {
+			fail("sip.upstream.address: host required")
+		}
+		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			fail("sip.upstream.address: bad port in %q", c.SIP.Upstream.Address)
+		}
+	}
+	if c.SIP.Upstream.Transport != "udp" {
+		// Deliberately narrow: §2 of the spec scopes the private/upstream
+		// transport to UDP for this phase. Reject anything else loudly
+		// rather than binding a transport the forwarding path can't route
+		// responses back through.
+		fail("sip.upstream.transport: only \"udp\" is supported, got %q", c.SIP.Upstream.Transport)
+	}
+
+	// ---- network planes ----
+	c.validatePlane("network.public", c.Network.Public, fail)
+	c.validatePlane("network.private", c.Network.Private, fail)
+
+	// ---- public listeners ----
+	if len(listeners) == 0 {
+		fail("sip.public: at least one of udp/ws/wss must be enabled when the edge proxy is on")
+	}
+	seen := map[string]string{}
+	for _, l := range listeners {
+		label := "sip.public." + l.Transport
+		if l.Bind.IsZero() {
+			fail("%s.bind: required", label)
+			continue
+		}
+		if _, err := netip.ParseAddr(l.Bind.Host); err != nil {
+			fail("%s.bind: %q is not a valid IP", label, l.Bind.Host)
+		}
+		key := l.Transport + "/" + l.Bind.String()
+		// ws and wss are both TCP; udp shares no port space with them.
+		if l.Transport == "ws" || l.Transport == "wss" {
+			key = "tcp/" + l.Bind.String()
+		}
+		if prev, dup := seen[key]; dup {
+			fail("%s.bind: %s already bound by %s", label, l.Bind.String(), prev)
+		}
+		seen[key] = label
+		if l.Transport == "wss" {
+			if (l.CertFile == "") != (l.KeyFile == "") {
+				fail("sip.public.wss: cert_file and key_file must be set together")
+			}
+		}
+	}
+	if !c.PublicAdvertisedIP().IsValid() {
+		fail("network.public.advertised_ip: required — the public bind address is unspecified/unset, so Contact, Via and SDP would have no routable address to advertise")
+	}
+	if !c.PrivateAdvertisedIP().IsValid() {
+		fail("network.private.advertised_ip: required — the private bind address is unspecified/unset, so FreeSWITCH would have no routable address to reach the SBC on")
+	}
+
+	// ---- private SIP socket ----
+	if c.SIP.Private.Bind.IsZero() {
+		fail("sip.private.bind: required when the edge proxy is on")
+	} else if _, err := netip.ParseAddr(c.SIP.Private.Bind.Host); err != nil {
+		fail("sip.private.bind: %q is not a valid IP", c.SIP.Private.Bind.Host)
+	}
+	if c.SIP.Private.AdvertisedIP != "" {
+		if ip, err := netip.ParseAddr(c.SIP.Private.AdvertisedIP); err != nil {
+			fail("sip.private.advertised_ip: %q is not a valid IP", c.SIP.Private.AdvertisedIP)
+		} else if ip.IsUnspecified() {
+			fail("sip.private.advertised_ip: %q is unspecified — FreeSWITCH could not route to it", c.SIP.Private.AdvertisedIP)
+		}
+	}
+	if p := c.SIP.Private.AdvertisedPort; p != 0 && (p < 1 || p > 65535) {
+		fail("sip.private.advertised_port: must be 1-65535, got %d", p)
+	}
+
+	// ---- media planes ----
+	c.validateRTPPlane("rtp.public", c.RTP.Public, fail)
+	c.validateRTPPlane("rtp.private", c.RTP.Private, fail)
+	if !c.RTP.Public.configured() {
+		fail("rtp.public: port_min/port_max required when the edge proxy is on")
+	}
+	if !c.RTP.Private.configured() {
+		fail("rtp.private: port_min/port_max required when the edge proxy is on")
+	}
+	if !c.PublicRTPAdvertisedIP().IsValid() {
+		fail("rtp.public.advertised_ip: required — no advertised public media address, so SDP toward phones/browsers would be unroutable")
+	}
+	if !c.PrivateRTPAdvertisedIP().IsValid() {
+		fail("rtp.private.advertised_ip: required — no advertised private media address, so SDP toward FreeSWITCH would be unroutable")
+	}
+
+	// Overlapping pools would hand the same port to two sessions: each
+	// pool tracks its own in-use set, so the second bind merely fails and
+	// the call is rejected — a silent capacity cliff. Reject the overlap
+	// at config time instead. The trunk plane's own range is included:
+	// with a shared bind address it draws from the same port space.
+	type namedRange struct {
+		label string
+		bind  string
+		r     PortRange
+	}
+	ranges := []namedRange{
+		{"rtp.public", c.RTP.Public.BindIP, c.RTP.Public.Range()},
+		{"rtp.private", c.RTP.Private.BindIP, c.RTP.Private.Range()},
+	}
+	if tr := c.RTPPortRange(); tr != (PortRange{}) && len(c.Peers) > 0 {
+		ranges = append(ranges, namedRange{"the trunk media range (rtp.port_min/port_max or listen.media.port_range)", c.RTP.BindIP, tr})
+	}
+	for i := 0; i < len(ranges); i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			a, b := ranges[i], ranges[j]
+			if a.r == (PortRange{}) || b.r == (PortRange{}) {
+				continue
+			}
+			if !bindsCanCollide(a.bind, b.bind) {
+				continue
+			}
+			if a.r.Min <= b.r.Max && b.r.Min <= a.r.Max {
+				fail("%s and %s overlap on %d-%d: each media pool needs its own port range",
+					a.label, b.label, maxU16(a.r.Min, b.r.Min), minU16(a.r.Max, b.r.Max))
+			}
+		}
+	}
+
+	// ---- webrtc ----
+	if c.WebRTC.Enabled {
+		if c.WebRTC.ICEMode != "lite" {
+			fail("webrtc.ice_mode: only \"lite\" is supported, got %q", c.WebRTC.ICEMode)
+		}
+		if !c.WebRTC.RTCPMuxEnabled() {
+			fail("webrtc.rtcp_mux: must be true — FreeSBC allocates one ICE component per session and cannot serve a non-muxed browser leg")
+		}
+		if (c.WebRTC.DTLSCertFile == "") != (c.WebRTC.DTLSKeyFile == "") {
+			fail("webrtc: dtls_cert_file and dtls_key_file must be set together")
+		}
+		wsEnabled := c.SIP.Public.WS.Enabled || c.SIP.Public.WSS.Enabled
+		if !wsEnabled {
+			fail("webrtc.enabled: requires sip.public.ws or sip.public.wss — a browser has no other way to signal")
+		}
+	}
+}
+
+func (c *Config) validatePlane(label string, p NetworkPlane, fail func(string, ...any)) {
+	if p.BindIP != "" {
+		if _, err := netip.ParseAddr(p.BindIP); err != nil {
+			fail("%s.bind_ip: %q is not a valid IP", label, p.BindIP)
+		}
+	}
+	if p.AdvertisedIP != "" {
+		ip, err := netip.ParseAddr(p.AdvertisedIP)
+		if err != nil {
+			fail("%s.advertised_ip: %q is not a valid IP", label, p.AdvertisedIP)
+		} else if ip.IsUnspecified() {
+			fail("%s.advertised_ip: %q is unspecified — advertising it would blackhole signaling and media", label, p.AdvertisedIP)
+		}
+	}
+}
+
+func (c *Config) validateRTPPlane(label string, p RTPPlaneConfig, fail func(string, ...any)) {
+	if !p.configured() {
+		return
+	}
+	if p.BindIP != "" {
+		if _, err := netip.ParseAddr(p.BindIP); err != nil {
+			fail("%s.bind_ip: %q is not a valid IP", label, p.BindIP)
+		}
+	}
+	if p.AdvertisedIP != "" {
+		ip, err := netip.ParseAddr(p.AdvertisedIP)
+		if err != nil {
+			fail("%s.advertised_ip: %q is not a valid IP", label, p.AdvertisedIP)
+		} else if ip.IsUnspecified() {
+			fail("%s.advertised_ip: %q is unspecified — SDP would blackhole media", label, p.AdvertisedIP)
+		}
+	}
+	if (p.PortMin == 0) != (p.PortMax == 0) {
+		fail("%s: port_min and port_max must be set together", label)
+		return
+	}
+	if p.PortMin == 0 {
+		fail("%s: port_min/port_max required", label)
+		return
+	}
+	if p.PortMin < 1024 || p.PortMin > 65535 {
+		fail("%s.port_min: must be 1024-65535, got %d", label, p.PortMin)
+	}
+	if p.PortMax < 1024 || p.PortMax > 65535 {
+		fail("%s.port_max: must be 1024-65535, got %d", label, p.PortMax)
+	}
+	if p.PortMin >= p.PortMax {
+		// A degenerate range can never hold an RTP+RTCP pair.
+		fail("%s: port_min must be less than port_max (each session needs an RTP+RTCP port pair), got %d-%d", label, p.PortMin, p.PortMax)
+	}
+}
+
+// bindsCanCollide reports whether two pools' bind addresses draw from the
+// same host port space. An empty or unspecified bind means "every
+// interface", which collides with everything; two different specific
+// addresses do not.
+func bindsCanCollide(a, b string) bool {
+	wildcard := func(s string) bool {
+		if s == "" {
+			return true
+		}
+		ip, err := netip.ParseAddr(s)
+		return err != nil || ip.IsUnspecified()
+	}
+	if wildcard(a) || wildcard(b) {
+		return true
+	}
+	return a == b
+}
+
+func maxU16(a, b uint16) uint16 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minU16(a, b uint16) uint16 {
+	if a < b {
+		return a
+	}
+	return b
+}

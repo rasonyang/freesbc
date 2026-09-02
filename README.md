@@ -2,9 +2,18 @@
 
 An all-in-one open-source Session Border Controller with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
-FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration. It targets small/medium businesses and ITSPs running a single node with hundreds to a few thousand concurrent calls.
+FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**. It targets small/medium businesses and ITSPs running a single node with hundreds to a few thousand concurrent calls.
 
-> **Status: early development.** Milestone 1 (config foundation) is complete: the binary loads, validates, and hot-reloads its configuration. SIP signaling and media relay are the next milestones — FreeSBC does not process calls yet.
+It runs two independent planes, either or both of which may be enabled:
+
+- **Trunk B2BUA** — carrier/PBX interconnect over UDP/TCP/TLS, with routing,
+  failover, outbound REGISTER and SRTP (SDES). Configured with `peers:` and
+  `routes:`.
+- **Edge proxy** — a stateful SIP and media edge proxy that provides SIP
+  registration proxying, UDP/WebSocket transport interworking, RTP anchoring,
+  and WebRTC-to-RTP media relay for FreeSWITCH. Configured with
+  `network:`, `sip.public/private/upstream`, `rtp.public/private` and
+  `webrtc:`.
 
 ## Why
 
@@ -20,7 +29,84 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 - **Embedded WebUI + REST API** — an editor for the same YAML file, with hot reload
 - Carrier-grade interop baseline: OPTIONS answering, session timers (RFC 4028), 100rel/PRACK passthrough
 
-Explicit non-goals: transcoding, registrar (serving phone registrations), CDR, clustering, WebRTC gateway. See the [design doc](freesbc-allinone-design.md) (Chinese).
+Explicit non-goals: transcoding, CDR, clustering, and being a registrar in
+its own right — the edge proxy PROXIES registrations to FreeSWITCH rather
+than owning users or credentials. See the [design doc](freesbc-allinone-design.md) (Chinese).
+
+## Edge proxy (SIP / RTP / WebRTC)
+
+FreeSBC sits on the network boundary in front of FreeSWITCH:
+
+```text
+                     Public Internet
+                           │
+          ┌────────────────┴────────────────┐
+          │                                 │
+    SIP Phone                         Browser / sip.js
+    SIP/UDP + RTP                     SIP/WSS + WebRTC
+          │                                 │
+          └──────────────┐   ┌──────────────┘
+                         ▼   ▼
+                    ┌────────────┐
+                    │  FreeSBC   │
+                    │ SIP Proxy  │
+                    │ RTP Proxy  │
+                    │ WebRTC GW  │
+                    └─────┬──────┘
+                          │ Private LAN/VPN
+                          │ SIP/UDP + RTP
+                          ▼
+                    FreeSWITCH
+```
+
+- **Public side**: SIP over UDP, WS and WSS; RTP; WebRTC (ICE-Lite +
+  DTLS-SRTP).
+- **Private side**: SIP over UDP and plain RTP/RTCP to FreeSWITCH.
+- **All signaling and media stay anchored through FreeSBC.** FreeSWITCH is
+  never given a public endpoint's address, and a public client is never given
+  FreeSWITCH's.
+
+It is a **proxy, not a B2BUA**: Call-ID, From/To tags and CSeq pass through
+untouched, and FreeSBC stays on the path via RFC 5658 double Record-Route.
+FreeSWITCH remains the authoritative registrar — REGISTER and its digest
+challenge are forwarded verbatim, and FreeSBC never holds a credential.
+
+See [`edge.example.yaml`](edge.example.yaml) for a complete annotated
+configuration, and the "Edge proxy plane" section of
+[`sbc.example.yaml`](sbc.example.yaml) for running it alongside trunks.
+
+### What it does
+
+| Area | Behaviour |
+|---|---|
+| Transports | Public UDP / WS / WSS; upstream UDP. WS↔UDP is real interworking, with the WebSocket connection bound to the registration. |
+| Methods | REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO. OPTIONS is answered locally rather than multiplied onto FreeSWITCH. |
+| REGISTER | Proxied verbatim, digest and all. The Contact is rewritten toward FreeSWITCH (so inbound calls route back through the SBC) and restored on the way back (so sip.js accepts the registration). The binding expiry follows the registrar's grant, not the client's request. |
+| SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
+| Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
+| Media | Every stream anchored on an SBC port pair. Symmetric RTP: the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet. Strict source latching resists off-path hijacking. |
+| WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint`. |
+| DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
+| Lifecycle | Media is released deterministically on BYE, CANCEL, a failed final response, dialog teardown, media silence, and shutdown. |
+
+### Known limitations
+
+- **re-INVITE does not renegotiate media.** An in-dialog INVITE is proxied as
+  signaling and the media session stays on the ports it holds. The
+  architecture is ready for it (`Session.Relatch` exists and the latch
+  distinguishes seeded from latched state), but the offer/answer path is not
+  wired up.
+- **Offerless INVITE is refused (488)** in both directions.
+- **An inbound call to a browser is offered plain RTP**, which a browser will
+  reject. FreeSWITCH-originated calls therefore reach SIP/UDP phones, not
+  WebRTC clients; that needs the same re-INVITE machinery.
+- **One media session per Call-ID.** An upstream that forked one Call-ID into
+  two dialogs would need two sessions — a B2BUA's problem, not a proxy's.
+- **Upstream is a single UDP FreeSWITCH** at a literal address. No SRV, no
+  failover, no TCP/TLS upstream.
+- **IPv6 is untested** on the proxy plane, though the code paths are
+  address-family agnostic.
+
 
 ## Quick start
 
@@ -106,6 +192,7 @@ The two sections are mutually independent: SIP can advertise one public address 
 | ├ M7.1 | Admin API + Prometheus metrics (read-only, bcrypt Basic Auth) | ✅ done |
 | ├ M7.2 | Config write-back (`PUT /api/config`, atomic, `${ENV}`-preserving) | ✅ done |
 | └ M7.3 | Embedded WebUI (dashboard + config editor) | ✅ done |
+| M8 | Edge proxy: public/private topology, REGISTER proxy, WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite/DTLS-SRTP) | ✅ done |
 
 ## Admin & WebUI
 

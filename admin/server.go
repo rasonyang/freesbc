@@ -48,6 +48,38 @@ type Deps struct {
 	// element) and reports whether a ban existed (T-02, F-04).
 	Unban   func(ip string) bool
 	Version string
+	// Proxy reports the edge-proxy plane's counters, or is nil when that
+	// plane is not running (a trunk-only deployment).
+	Proxy func() ProxyStats
+}
+
+// ProxyStats is the edge proxy's operator-visible state: registrations,
+// dialogs, media sessions and the failure counters that distinguish "the
+// browser never reached us" from "it reached us and the handshake failed".
+//
+// Deliberately label-free apart from bounded sets (SIP method/transport,
+// response class): a Call-ID here would create a permanent time series per
+// call.
+type ProxyStats struct {
+	ActiveRegistrations  int64 `json:"active_registrations"`
+	ActiveDialogs        int64 `json:"active_dialogs"`
+	ActiveMediaSessions  int64 `json:"active_media_sessions"`
+	ActiveWebRTCSessions int64 `json:"active_webrtc_sessions"`
+
+	RegistrationTotal   uint64 `json:"registration_total"`
+	RegistrationFailure uint64 `json:"registration_failure_total"`
+
+	RequestsIn   map[string]uint64 `json:"sip_requests_total"`
+	ResponsesOut map[string]uint64 `json:"sip_responses_total"`
+
+	RTPPacketsRx uint64 `json:"rtp_packets_rx_total"`
+	RTPPacketsTx uint64 `json:"rtp_packets_tx_total"`
+	RTPBytesRx   uint64 `json:"rtp_bytes_rx_total"`
+	RTPBytesTx   uint64 `json:"rtp_bytes_tx_total"`
+
+	PortAllocationFailures uint64 `json:"media_port_allocation_failure_total"`
+	ICEFailures            uint64 `json:"webrtc_ice_failure_total"`
+	DTLSFailures           uint64 `json:"webrtc_dtls_failure_total"`
 }
 
 // Server is the admin HTTP server.
