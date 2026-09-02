@@ -125,7 +125,7 @@ rather than a fake one, because the questions that decide whether this works
 in production are questions about sofia's behaviour:
 
 ```sh
-FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./proxy/ -run TestFreeSWITCH -v
+FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./internal/proxy/ -run TestFreeSWITCH -v
 ```
 
 It confirms that sofia accepts a proxied REGISTER and **preserves the
@@ -142,7 +142,7 @@ Requires Go ≥ 1.22.
 > **公网部署前必读** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md)（部署安全基线：公网暴露策略 + admin 监听基线）。
 
 ```sh
-go build -o freesbc .
+go build -o freesbc ./cmd/freesbc
 cp sbc.example.yaml sbc.yaml   # edit peers/routes for your setup
 ./freesbc check -c sbc.yaml    # validate: errors name the line and field
 ./freesbc run   -c sbc.yaml
@@ -240,6 +240,25 @@ Bind the admin listener **private** (there is no TLS on it) — front it with a
 reverse proxy for remote/TLS access. Deployment baseline: loopback-only by
 policy; non-loopback requires the checklist in
 [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (G-2).
+
+## Layout
+
+```text
+cmd/freesbc/          the binary
+internal/
+  config/             sbc.yaml: parse, validate, hot reload
+  call/               active-call metadata table (no SIP/media deps)
+  trunk/              trunk plane: B2BUA between carriers and a PBX
+  proxy/              edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
+  sdp/                SDP subsystem (parse, codec negotiation, construction)
+  media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
+  shield/             per-IP rate limiting, scanner fingerprinting, auto-ban
+  admin/              operator HTTP API, Prometheus metrics, embedded WebUI
+```
+
+`trunk` and `proxy` are the two SIP planes and are named for the side each
+serves, not the protocol both speak. Everything is under `internal/`: the
+only consumer is `cmd/freesbc`, so no package here carries an API promise.
 
 ## Development
 
