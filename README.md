@@ -2,9 +2,18 @@
 
 An all-in-one open-source Session Border Controller with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
-FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration. It targets small/medium businesses and ITSPs running a single node with hundreds to a few thousand concurrent calls.
+FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**. It targets small/medium businesses and ITSPs running a single node with hundreds to a few thousand concurrent calls.
 
-> **Status: early development.** Milestone 1 (config foundation) is complete: the binary loads, validates, and hot-reloads its configuration. SIP signaling and media relay are the next milestones — FreeSBC does not process calls yet.
+It runs two independent planes, either or both of which may be enabled:
+
+- **Trunk B2BUA** — carrier/PBX interconnect over UDP/TCP/TLS, with routing,
+  failover, outbound REGISTER and SRTP (SDES). Configured with `peers:` and
+  `routes:`.
+- **Edge proxy** — a stateful SIP and media edge proxy that provides SIP
+  registration proxying, UDP/WebSocket transport interworking, RTP anchoring,
+  and WebRTC-to-RTP media relay for FreeSWITCH. Configured with
+  `network:`, `sip.public/private/upstream`, `rtp.public/private` and
+  `webrtc:`.
 
 ## Why
 
@@ -20,7 +29,111 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 - **Embedded WebUI + REST API** — an editor for the same YAML file, with hot reload
 - Carrier-grade interop baseline: OPTIONS answering, session timers (RFC 4028), 100rel/PRACK passthrough
 
-Explicit non-goals: transcoding, registrar (serving phone registrations), CDR, clustering, WebRTC gateway. See the [design doc](freesbc-allinone-design.md) (Chinese).
+Explicit non-goals: transcoding, CDR, clustering, and being a registrar in
+its own right — the edge proxy PROXIES registrations to FreeSWITCH rather
+than owning users or credentials. See the [design doc](freesbc-allinone-design.md) (Chinese).
+
+## Edge proxy (SIP / RTP / WebRTC)
+
+FreeSBC sits on the network boundary in front of FreeSWITCH:
+
+```text
+                     Public Internet
+                           │
+          ┌────────────────┴────────────────┐
+          │                                 │
+    SIP Phone                         Browser / sip.js
+    SIP/UDP + RTP                     SIP/WSS + WebRTC
+          │                                 │
+          └──────────────┐   ┌──────────────┘
+                         ▼   ▼
+                    ┌────────────┐
+                    │  FreeSBC   │
+                    │ SIP Proxy  │
+                    │ RTP Proxy  │
+                    │ WebRTC GW  │
+                    └─────┬──────┘
+                          │ Private LAN/VPN
+                          │ SIP/UDP + RTP
+                          ▼
+                    FreeSWITCH
+```
+
+- **Public side**: SIP over UDP, WS and WSS; RTP; WebRTC (ICE-Lite +
+  DTLS-SRTP).
+- **Private side**: SIP over UDP and plain RTP/RTCP to FreeSWITCH.
+- **All signaling and media stay anchored through FreeSBC.** FreeSWITCH is
+  never given a public endpoint's address, and a public client is never given
+  FreeSWITCH's.
+
+It is a **proxy, not a B2BUA**: Call-ID, From/To tags and CSeq pass through
+untouched, and FreeSBC stays on the path via RFC 5658 double Record-Route.
+FreeSWITCH remains the authoritative registrar — REGISTER and its digest
+challenge are forwarded verbatim, and FreeSBC never holds a credential.
+
+See [`edge.example.yaml`](edge.example.yaml) for a complete annotated
+configuration, and the "Edge proxy plane" section of
+[`sbc.example.yaml`](sbc.example.yaml) for running it alongside trunks.
+
+### What it does
+
+| Area | Behaviour |
+|---|---|
+| Transports | Public UDP / WS / WSS; upstream UDP. WS↔UDP is real interworking, with the WebSocket connection bound to the registration. |
+| Methods | REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO. OPTIONS is answered locally rather than multiplied onto FreeSWITCH. |
+| REGISTER | Proxied verbatim, digest and all. The Contact is rewritten toward FreeSWITCH (so inbound calls route back through the SBC) and restored on the way back (so sip.js accepts the registration). The binding expiry follows the registrar's grant, not the client's request. |
+| SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
+| Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
+| Media | Every stream anchored on an SBC port pair. Symmetric RTP: the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet. Strict source latching resists off-path hijacking. |
+| WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint`. |
+| DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
+| re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role so media is never interrupted. |
+| Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored is ACKed and BYEd rather than left as a zombie dialog. |
+
+### Known limitations
+
+- **An inbound call to a browser is offered plain RTP**, which a browser will
+  reject: FreeSBC cannot make a DTLS-SRTP *offer*, because a WebRTC offer
+  needs the answerer's fingerprint and ICE credentials and an offer by
+  definition has not seen them. FreeSWITCH-originated calls therefore reach
+  SIP/UDP phones, not WebRTC clients. Browser-originated calls are
+  unaffected.
+- **Offerless INVITE is refused (488)** in both directions.
+- **One media session per Call-ID.** An upstream that forked one Call-ID into
+  two dialogs would need two sessions — a B2BUA's problem, not a proxy's.
+- **Upstream is a single UDP FreeSWITCH** at a literal address. No SRV, no
+  failover, no TCP/TLS upstream.
+- **IPv6 is untested** on the proxy plane, though the code paths are
+  address-family agnostic.
+- **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
+  reachable media address; a client that can only reach it via a relay is
+  out of scope.
+- **SUBSCRIBE/NOTIFY are answered 405, not proxied.** FreeSWITCH sends a
+  NOTIFY for message-waiting indication after a registration; MWI and BLF
+  therefore do not reach phones through the proxy. The event framework is
+  outside this phase's method set.
+- **SIP over UDP is sent above the RFC 3261 §18.1.1 size guidance.** A
+  realistic FreeSWITCH INVITE plus the proxy's own headers clears 1300
+  bytes, and the RFC's remedy — switch to TCP — is not available when both
+  the upstream and the phone are UDP. FreeSBC raises the send ceiling to
+  8 KiB and relies on IP fragmentation, as production SIP elements do.
+
+### Verification against a real FreeSWITCH
+
+The suite includes an opt-in interop pass that runs against a live switch
+rather than a fake one, because the questions that decide whether this works
+in production are questions about sofia's behaviour:
+
+```sh
+FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./internal/proxy/ -run TestFreeSWITCH -v
+```
+
+It confirms that sofia accepts a proxied REGISTER and **preserves the
+`fsbc=` binding token** in the contact it stores (the whole inbound-call
+path depends on this), that a switch-originated call and its hangup both
+traverse the proxy, and that audio survives a round trip through the anchor
+into FreeSWITCH's `echo` application and back.
+
 
 ## Quick start
 
@@ -29,7 +142,7 @@ Requires Go ≥ 1.22.
 > **公网部署前必读** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md)（部署安全基线：公网暴露策略 + admin 监听基线）。
 
 ```sh
-go build -o freesbc .
+go build -o freesbc ./cmd/freesbc
 cp sbc.example.yaml sbc.yaml   # edit peers/routes for your setup
 ./freesbc check -c sbc.yaml    # validate: errors name the line and field
 ./freesbc run   -c sbc.yaml
@@ -106,6 +219,7 @@ The two sections are mutually independent: SIP can advertise one public address 
 | ├ M7.1 | Admin API + Prometheus metrics (read-only, bcrypt Basic Auth) | ✅ done |
 | ├ M7.2 | Config write-back (`PUT /api/config`, atomic, `${ENV}`-preserving) | ✅ done |
 | └ M7.3 | Embedded WebUI (dashboard + config editor) | ✅ done |
+| M8 | Edge proxy: public/private topology, REGISTER proxy, WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite/DTLS-SRTP) | ✅ done |
 
 ## Admin & WebUI
 
@@ -126,6 +240,25 @@ Bind the admin listener **private** (there is no TLS on it) — front it with a
 reverse proxy for remote/TLS access. Deployment baseline: loopback-only by
 policy; non-loopback requires the checklist in
 [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (G-2).
+
+## Layout
+
+```text
+cmd/freesbc/          the binary
+internal/
+  config/             sbc.yaml: parse, validate, hot reload
+  call/               active-call metadata table (no SIP/media deps)
+  trunk/              trunk plane: B2BUA between carriers and a PBX
+  proxy/              edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
+  sdp/                SDP subsystem (parse, codec negotiation, construction)
+  media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
+  shield/             per-IP rate limiting, scanner fingerprinting, auto-ban
+  admin/              operator HTTP API, Prometheus metrics, embedded WebUI
+```
+
+`trunk` and `proxy` are the two SIP planes and are named for the side each
+serves, not the protocol both speak. Everything is under `internal/`: the
+only consumer is `cmd/freesbc`, so no package here carries an API promise.
 
 ## Development
 

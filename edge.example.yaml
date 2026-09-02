@@ -1,0 +1,96 @@
+# FreeSBC — edge proxy example.
+#
+# A complete, proxy-only deployment: SIP/UDP phones and sip.js browsers on
+# the public side, one FreeSWITCH on the private side, every media stream
+# anchored through the SBC.
+#
+#                     Public Internet
+#                           │
+#          ┌────────────────┴────────────────┐
+#          │                                 │
+#    SIP Phone                         Browser / sip.js
+#    SIP/UDP + RTP                     SIP/WSS + WebRTC
+#          │                                 │
+#          └──────────────┐   ┌──────────────┘
+#                         ▼   ▼
+#                    ┌────────────┐
+#                    │  FreeSBC   │
+#                    │ SIP Proxy  │
+#                    │ RTP Proxy  │
+#                    │ WebRTC GW  │
+#                    └─────┬──────┘
+#                          │  Private LAN / VPN
+#                          │  SIP/UDP + RTP
+#                          ▼
+#                    FreeSWITCH
+#
+# There are no `peers:` or `routes:` here: those configure the separate
+# trunk B2BUA plane, which this deployment does not use. Add them alongside
+# these sections to run both planes in one process.
+#
+#   freesbc check -c edge.example.yaml
+#   freesbc run   -c edge.example.yaml
+
+network:
+  public:
+    bind_ip: 0.0.0.0            # listen on every interface...
+    advertised_ip: 203.0.113.7  # ...but tell the world THIS address
+  private:
+    bind_ip: 10.77.0.2          # a specific address, so advertised_ip
+                                #   defaults to it
+
+sip:
+  public:
+    udp:
+      enabled: true
+      bind: 0.0.0.0:16060
+    ws:
+      enabled: false            # plaintext WebSocket: development only
+      bind: 0.0.0.0:18080
+    wss:
+      enabled: true
+      bind: 0.0.0.0:18443
+      # A browser refuses an untrusted certificate on a WSS socket, and
+      # there is no way to click through the warning. Use a real one.
+      cert_file: /etc/freesbc/wss-cert.pem
+      key_file: /etc/freesbc/wss-key.pem
+
+  private:
+    bind: 10.77.0.2:5060        # FreeSBC's own FreeSWITCH-facing socket
+
+  upstream:
+    address: 10.77.0.10:5060    # FreeSWITCH — a literal IP:port
+    transport: udp
+
+rtp:
+  public:
+    bind_ip: 0.0.0.0
+    advertised_ip: 203.0.113.7
+    port_min: 30000
+    port_max: 39999
+  private:
+    bind_ip: 10.77.0.2
+    port_min: 40000
+    port_max: 49999
+
+webrtc:
+  enabled: true
+  ice_mode: lite
+  rtcp_mux: true
+
+listen:
+  media:
+    rtp_timeout: 5m             # reclaim a call after this much media silence
+
+shield:
+  rate_limit: 20/s per_ip       # public clients come from arbitrary addresses,
+  auto_ban:                     #   so the abuse plane matters here
+    failures: 5
+    window: 60s
+    duration: 1h
+
+# admin:
+#   listen: 127.0.0.1:8080
+#   auth:
+#     username: admin
+#     password_hash: "REPLACE-WITH-YOUR-OWN-BCRYPT-HASH"
