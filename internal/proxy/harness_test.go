@@ -94,6 +94,15 @@ type harness struct {
 
 // startHarness brings up the proxy and a fake FreeSWITCH.
 func startHarness(t *testing.T, webrtc bool) *harness {
+	return startHarnessOn(t, webrtc, "127.0.0.1")
+}
+
+// startHarnessOn is startHarness with the public UDP listener's bind host
+// chosen by the caller. The wildcard host is how production binds the
+// public plane (0.0.0.0) while the private plane sits on a specific
+// address — a shape some transport-pool behaviour only distinguishes by
+// the socket's local address, so the suite needs both forms.
+func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
 	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
@@ -112,7 +121,7 @@ network:
     advertised_ip: 127.0.0.1
 sip:
   public:
-    udp: {enabled: true, bind: "127.0.0.1:%d"}
+    udp: {enabled: true, bind: "%s:%d"}
     ws:  {enabled: true, bind: "127.0.0.1:%d"}
   private:
     bind: "127.0.0.1:%d"
@@ -131,7 +140,7 @@ shield:
   # 20/s per_ip would throttle the harness itself rather than the code
   # under test. The rate limiter has its own tests in package shield.
   rate_limit: "5000/s per_ip"
-`, pubUDP, pubWS, priv, up, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+`, pubBindIP, pubUDP, pubWS, priv, up, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {

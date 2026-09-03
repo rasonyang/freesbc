@@ -559,14 +559,28 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction) {
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
 	if _, err := s.forwardAndRelay(ctx, req, tx, out); err != nil {
-		s.log.Debug("forward in-dialog request", "err", err,
+		s.log.Warn("forward in-dialog request failed", "err", err,
 			"method", req.Method.String(), "sip_call_id", callIDOf(req))
-		// The far side never answered. Answering 408 locally is better
-		// than leaving the sender retransmitting into silence — and for a
-		// BYE the call is over either way, which the teardown below
-		// reflects.
+		// The far side never answered, or the request never got out. For a
+		// BYE the dialog is over either way, and answering 408 tells the
+		// switch its hangup FAILED when the proxy is the one that could
+		// not deliver — sofia treats that as a failed BYE and keeps the
+		// leg. Answer 200 instead: the dialog IS being ended, which the
+		// teardown below reflects. And make one stateless attempt to put
+		// the BYE on the wire toward the far side ourselves, so a phone
+		// that never saw it is told the call is over and stops sending
+		// media. A duplicate BYE is harmless (a dialog is only ended once);
+		// the far end's answer to it has no transaction left to match and
+		// is absorbed by the transport layer.
 		if req.Method == sip.BYE {
-			s.reject(req, tx, 408, "Request Timeout")
+			// A clone: the failed client transaction may still hold the
+			// original request (a retransmission timer winding down), so
+			// handing the same object to WriteRequest would race it.
+			if werr := s.client.WriteRequest(out.Clone(), noBuild); werr != nil {
+				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
+					"sip_call_id", callIDOf(req))
+			}
+			s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
 		}
 	}
 	if req.Method == sip.BYE {

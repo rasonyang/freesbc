@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/emiago/sipgo/sip"
 
@@ -115,8 +116,20 @@ func (s side) via(branch string) *sip.ViaHeader {
 // topology is the resolved network model the proxy runs with, built once
 // at startup from the config. Listener addresses cannot be changed under a
 // running socket, so this is deliberately a snapshot rather than something
-// re-read per request.
+// re-read per request. The only post-build adjustment is that each UDP
+// side's outbound pin is re-pointed at its bound socket's actual local
+// address when Run opens the sockets (a wildcard bind does not come up as
+// the address written in the config); nothing else is read back from the
+// kernel.
 type topology struct {
+	// mu guards the public map against a write. Production writes the map
+	// only at startup, before any request can be handled, so requests take
+	// the read lock purely as a formality — except that the wildcard-bind
+	// fix (Run.pinOutboundToSockets) and the tests that force its failure
+	// mode do re-point a pin at runtime, and the Go memory model gives the
+	// request path no other ordering with them. The lock is what keeps that
+	// legitimate late write race-free.
+	mu sync.RWMutex
 	// public holds one side per enabled public transport.
 	public map[string]side
 	// private is the single FreeSWITCH-facing side.
@@ -193,6 +206,8 @@ func (e *configError) Error() string { return "proxy: " + e.msg }
 // publicSide returns the side for a client transport, falling back to the
 // UDP side when the exact transport is not configured.
 func (t *topology) publicSide(transport string) (side, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	transport = strings.ToLower(transport)
 	if s, ok := t.public[transport]; ok {
 		return s, true
@@ -207,6 +222,8 @@ func (t *topology) publicSide(transport string) (side, bool) {
 // Only the host and port are compared; parameters are not, because a
 // downstream element may legitimately add or reorder them.
 func (t *topology) isSelf(u sip.Uri) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	ip, err := netip.ParseAddr(u.Host)
 	if err != nil {
 		return false
@@ -237,6 +254,8 @@ func (t *topology) isSelf(u sip.Uri) bool {
 // that does not carry the full stack, which is not hypothetical: sofia's
 // 100 Trying carries only the topmost Via.
 func (t *topology) isSelfVia(v *sip.ViaHeader) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if v == nil {
 		return false
 	}

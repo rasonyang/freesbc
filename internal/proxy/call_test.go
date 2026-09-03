@@ -616,6 +616,85 @@ func TestByeFromUpstreamReachesClient(t *testing.T) {
 	waitForRelease(t, h)
 }
 
+// TestByeForwardFailureAnswers200 guards what FreeSBC answers when a BYE
+// genuinely cannot be forwarded — the far side is gone, the write fails
+// before it leaves the socket. The dialog is over either way, so the
+// switch must not be told its hangup failed: answering 408 makes sofia
+// treat the BYE as failed and keep the leg. The proxy answers 200, makes
+// one best-effort stateless attempt to put the BYE on the wire itself,
+// and tears the media down.
+//
+// The failure is forced deterministically: the public side's outbound pin
+// is re-pointed at a port this test holds open, so sipgo's pool lookup
+// misses and its attempt to bind that port collides with our socket —
+// the same EADDRINUSE the wildcard-bind bug produced on every
+// FreeSWITCH-initiated request.
+func TestByeForwardFailureAnswers200(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+
+	// Sabotage the public side's outbound pin: hold a socket on a fresh
+	// port and point the pin at it. sipgo's connection pool holds nothing
+	// for that address, so the first request that must leave through the
+	// public plane fails to open a connection — EADDRINUSE before a byte is
+	// written. This is exactly the misconfiguration the wildcard-bind bug
+	// produced in production for every FreeSWITCH-initiated request. The
+	// write happens before the call so that the only topology readers that
+	// can be running are request handlers — which take the topology's read
+	// lock, so the write must take its write lock too.
+	blocker, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	h.srv.topo.mu.Lock()
+	pub := h.srv.topo.public["udp"]
+	pub.laddr = sip.Addr{IP: net.IPv4(127, 0, 0, 1), Port: blocker.LocalAddr().(*net.UDPAddr).Port}
+	h.srv.topo.public["udp"] = pub
+	h.srv.topo.mu.Unlock()
+
+	tagCh := make(chan string, 1)
+	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(h.fs.answerSDP(req)))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(h.fs.addr)}})
+		tag := sip.GenerateTagN(12)
+		res.To().Params.Add("tag", tag)
+		_ = tx.Respond(res)
+		tagCh <- tag
+		return true
+	})
+
+	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(30601))
+	res := phone.do(t, invite, h.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("INVITE: %d", res.StatusCode)
+	}
+	sendAck(t, phone, invite, res, h.publicUDP)
+	var switchTag string
+	select {
+	case switchTag = <-tagCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the switch never answered")
+	}
+	upstreamInvites := h.fs.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(upstreamInvites) != 1 {
+		t.Fatalf("FreeSWITCH saw %d INVITEs", len(upstreamInvites))
+	}
+	drain(phone.inbound)
+
+	// The BYE cannot go out, yet FreeSWITCH must be answered 200 — a 408
+	// here tells it the hangup failed — and the media must be released.
+	// (The call itself set up fine: nothing needs an outbound public-plane
+	// connection until FreeSWITCH sends a request of its own.)
+	byeRes := h.fs.inDialog(t, sip.BYE, upstreamInvites[0], switchTag)
+	if byeRes.StatusCode != 200 {
+		t.Fatalf("BYE from FreeSWITCH: got %d %s, want 200 — a failed hangup must not be "+
+			"answered 408, or the switch keeps the leg", byeRes.StatusCode, byeRes.Reason)
+	}
+	waitForRelease(t, h)
+}
+
 func drain(ch chan *sip.Request) {
 	for {
 		select {

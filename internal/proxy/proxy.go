@@ -238,6 +238,22 @@ func (s *Server) Run(ctx context.Context) error {
 		opened = append(opened, ln)
 	}
 
+	// A wildcard bind does not come up as the address it was written
+	// with. On a dual-stack host Go gives 0.0.0.0 an IPv6 socket whose
+	// local address is "[::]:port"; with IPv6 disabled it stays
+	// "0.0.0.0:port". sipgo's transport layer keys its connection pool by
+	// each socket's REAL local address (transport_udp.Serve registers
+	// conn.LocalAddr()), so an outbound request pinned to the configured
+	// address — see prepareForward — misses the pool whenever the two
+	// differ, and sipgo answers by opening a second socket on the same
+	// port, which the listener already owns: EADDRINUSE before a byte is
+	// written. Every FreeSWITCH-initiated request toward the public plane
+	// (an inbound INVITE, a session-timer refresh, a callee-side BYE) died
+	// that way in production while the phone-facing direction worked. Re-pin
+	// each UDP side to its socket's actual local address before serving
+	// begins, so the pool lookup hits the listener connection itself.
+	s.pinOutboundToSockets(opened)
+
 	errs := make(chan error, len(opened))
 	var wg sync.WaitGroup
 	for _, ln := range opened {
@@ -251,6 +267,18 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}()
 	}
+	s.log.Info("edge proxy listening",
+		"public_listeners", len(s.topo.public),
+		"private", s.topo.private.laddr.String(),
+		"upstream", s.topo.upstreamHost,
+		"webrtc", s.webrtcEnabled)
+
+	// Ready fires only after every startup read of the topology above: the
+	// close is the happens-before edge that ends the window in which the
+	// topology snapshot is single-writer. Everything that reads it after
+	// this point (request handlers) is then ordered after any write that
+	// precedes Ready, which is what makes the startup-only mutation
+	// invariant hold for the race detector as well as by convention.
 	close(s.ready)
 
 	// Registration bindings whose client vanished without un-registering
@@ -272,12 +300,6 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
-	s.log.Info("edge proxy listening",
-		"public_listeners", len(s.topo.public),
-		"private", s.topo.private.laddr.String(),
-		"upstream", s.topo.upstreamHost,
-		"webrtc", s.webrtcEnabled)
-
 	select {
 	case <-ctx.Done():
 	case err := <-errs:
@@ -292,6 +314,40 @@ func (s *Server) Run(ctx context.Context) error {
 	// port reservation or relay goroutine outlives Run.
 	s.calls.closeAll()
 	return nil
+}
+
+// pinOutboundToSockets completes the topology's outbound pins from the
+// sockets that were actually bound. The pins are built from the config in
+// buildTopology; where the config names a wildcard (0.0.0.0), the address
+// a pin must name to hit sipgo's connection pool is the listener socket's
+// real local address — see Run for why the two can differ. UDP only: the
+// ws/wss sides never pin (their outbound path is the client's own inbound
+// connection).
+func (s *Server) pinOutboundToSockets(opened []listener) {
+	// No request can be handled yet — the sockets below are only just being
+	// served — but the re-pin is a write to a map the request path reads,
+	// and the tests that sabotage a pin take the same lock; take it here so
+	// the write discipline is uniform.
+	s.topo.mu.Lock()
+	defer s.topo.mu.Unlock()
+	for _, ln := range opened {
+		if ln.packet == nil {
+			continue
+		}
+		ua, ok := ln.packet.LocalAddr().(*net.UDPAddr)
+		if !ok || ua.IP == nil {
+			continue
+		}
+		laddr := sip.Addr{IP: ua.IP, Port: ua.Port, Zone: ua.Zone}
+		switch ln.transport {
+		case "udp":
+			pub := s.topo.public["udp"]
+			pub.laddr = laddr
+			s.topo.public["udp"] = pub
+		case "udp-private":
+			s.topo.private.laddr = laddr
+		}
+	}
 }
 
 // listener is one bound socket, separated from serving it so Run can bind
