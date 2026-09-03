@@ -3,6 +3,7 @@ package trunk
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,10 +34,22 @@ func startServerConfigured(t *testing.T, port int, cfgYAML string, configure fun
 	return startServerAt(t, port, "127.0.0.1", cfgYAML, configure)
 }
 
-// startServerAt is startServerConfigured with an explicit listener host to
-// probe for readiness — tests whose config binds a non-127.0.0.1 loopback
-// address (e.g. server_preparse_test.go's 127.0.0.2) can't use the default
-// probe target, which would dial an address nothing is bound to.
+// startServerAt is startServerConfigured with an explicit listener host,
+// kept in the signature for tests whose config binds a non-127.0.0.1
+// loopback address (e.g. server_preparse_test.go's 127.0.0.2) — it now only
+// labels failures, since readiness is proved by the server, not by a probe
+// against that host.
+//
+// Readiness MUST be a real bind check, never a UDP "probe dial":
+// net.Dial("udp", addr) only sets a route on a connectionless socket and
+// succeeds even when nothing is bound, so a listener that failed to bind
+// (e.g. 127.0.0.2 on a host where that loopback alias doesn't exist) used to
+// look "ready". Every test that asserts "no response means the packet was
+// dropped" then passed vacuously against a server that never listened. So:
+// wait for srv.onListening — fired once per listener socket after its bind
+// succeeds — and race it against Run's error, which is captured on a channel
+// and reported from THIS goroutine (t.Fatalf is illegal from the Run
+// goroutine). A bind failure now fails the test immediately, with the error.
 func startServerAt(t *testing.T, port int, probeHost string, cfgYAML string, configure func(*Server)) *Server {
 	t.Helper()
 	cfg, err := config.Parse([]byte(cfgYAML))
@@ -46,25 +59,52 @@ func startServerAt(t *testing.T, port int, probeHost string, cfgYAML string, con
 	store := config.NewStore(cfg)
 	pool := media.NewPool(store)
 	srv := NewServer(store, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	listeners := cfg.Listeners()
+	bound := make(chan config.SIPListen, len(listeners)+1)
+	// Set before configure so a caller hook could still override it, and
+	// before the Run goroutine spawns so the write happens-before the read.
+	srv.onListening = func(l config.SIPListen) { bound <- l }
 	if configure != nil {
 		configure(srv)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = srv.Run(ctx) }()
-	// Wait until the UDP port answers (bind completed).
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := net.Dial("udp", net.JoinHostPort(probeHost, fmt.Sprintf("%d", port)))
-		if err == nil {
-			c.Close()
-			time.Sleep(100 * time.Millisecond)
-			return srv
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx) }()
+	exited := false
+	t.Cleanup(func() {
+		cancel()
+		if exited {
+			return // already drained (and reported) below
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case err := <-runErr:
+			// Cancellation is the normal teardown path; anything else is a
+			// real failure worth surfacing.
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("sip server Run: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("sip server did not shut down within 10s")
+		}
+	})
+	target := net.JoinHostPort(probeHost, fmt.Sprintf("%d", port))
+	deadline := time.After(5 * time.Second)
+	for n := 0; n < len(listeners); n++ {
+		select {
+		case <-bound:
+		case err := <-runErr:
+			exited = true
+			t.Fatalf("sip server (%s) exited before all %d listener(s) bound (%d up): %v",
+				target, len(listeners), n, err)
+		case <-deadline:
+			t.Fatalf("sip server (%s) bound only %d of %d listener(s) within 5s",
+				target, n, len(listeners))
+		}
 	}
-	t.Fatal("server did not start")
-	return nil
+	// The sockets are bound; give the transport read loops a moment to
+	// start before the caller sends traffic.
+	time.Sleep(100 * time.Millisecond)
+	return srv
 }
 
 // sipRequest builds a minimal valid SIP request whose Via advertises

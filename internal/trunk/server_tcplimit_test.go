@@ -26,10 +26,10 @@ routes:
     to: [local-uac]
 `
 
-// dialTCPWithRetry dials addr until the TCP listener is actually up.
-// startServer's readiness probe is a UDP dial, which "succeeds" even when
-// nothing is bound yet (UDP is connectionless), so a TCP-only config needs
-// its own retry loop.
+// dialTCPWithRetry dials addr until the connection is accepted. startServer
+// already waits for the listener socket to be bound (srv.onListening), but
+// the accept loop starts a moment later, so a short retry keeps this
+// robust.
 func dialTCPWithRetry(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
