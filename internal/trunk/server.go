@@ -97,6 +97,17 @@ type Server struct {
 	// F-06 — see callQuota in b2bua.go and bridge.onInvite's gate). The
 	// zero value is usable; it needs no Run-time wiring.
 	quota callQuota
+
+	// onListening, when non-nil, is called once per listener immediately
+	// after its socket is bound and before it is handed to the transport
+	// layer. Only tests set it (from startServerAt, before the Run
+	// goroutine is spawned, so the write happens-before bindListener's
+	// read and -race stays clean); production leaves it nil. It exists
+	// because there is no other race-free way for a test to learn that a
+	// listener is genuinely up: a UDP "probe dial" succeeds against an
+	// address nothing is bound to, so it cannot distinguish a live
+	// listener from a bind that failed.
+	onListening func(config.SIPListen)
 }
 
 func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
@@ -359,6 +370,14 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+// listening notifies the (test-only) onListening hook that l's socket is
+// bound. No-op in production, where the hook is nil.
+func (s *Server) listening(l config.SIPListen) {
+	if s.onListening != nil {
+		s.onListening(l)
+	}
+}
+
 // bindListener opens the raw socket/listener for l, drives it through
 // sipgo's transport layer, and closes it when ctx is cancelled. It blocks
 // until the listener stops (error, or ctx cancellation unblocking the
@@ -387,6 +406,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 			return err
 		}
 		go func() { <-ctx.Done(); ln.Close() }()
+		s.listening(l)
 		return tl.ServeTCP(newTCPLimitListener(ln, s))
 	case "tls":
 		// T-17 (F-13): a CONFIGURED certificate replaces the fallback
@@ -415,6 +435,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 			return err
 		}
 		go func() { <-ctx.Done(); ln.Close() }()
+		s.listening(l)
 		return tl.ServeTLS(newTCPLimitListener(ln, s))
 	default: // "udp"
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -426,6 +447,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 			return err
 		}
 		go func() { <-ctx.Done(); conn.Close() }()
+		s.listening(l)
 		return tl.ServeUDP(conn)
 	}
 }
