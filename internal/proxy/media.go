@@ -166,11 +166,17 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, offerBody []byte) (*off
 // the public plane, side B in the private one.
 func (s *Server) allocateRTP(offer *sdp.Session) (*mediaSession, error) {
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
-		// Strict latching on both sides: the first packet must come from
-		// the address that was signalled, which is what stops an
-		// off-path attacker from stealing the stream. The port may differ
-		// — that is the NAT case symmetric RTP exists for.
-		Latch: [2]media.LatchMode{media.LatchStrict, media.LatchStrict},
+		// Loose latching on the PUBLIC leg (media.LatchLoose, the config
+		// name for "symmetric RTP"): a phone behind a hard NAT cannot be
+		// trusted to signal the source address its RTP actually comes from
+		// — some put an unroutable fake IP in c=/Via and send from the
+		// NATed one — so the first inbound packet from any source is
+		// accepted and fixes the send-destination to the real source. The
+		// SDP-seeded address still carries outbound audio until that first
+		// packet arrives (see latch.seed). The PRIVATE leg stays strict:
+		// FreeSWITCH's signalled address over wg0 is trustworthy, and
+		// strict mode already tolerates a NAT-rewritten port.
+		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
 	})
 	if err != nil {
 		return nil, err
@@ -333,7 +339,11 @@ func (s *Server) buildPublicOffer(offerBody []byte) (*offerResult, error) {
 		return nil, fmt.Errorf("%w: upstream offered %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
-		Latch: [2]media.LatchMode{media.LatchStrict, media.LatchStrict},
+		// Same policy as allocateRTP: the public leg (the answering phone)
+		// latches loosely so a hard-NAT phone's real RTP source — which
+		// may differ from the IP it signalled — is what fixes the
+		// send-destination; the private FreeSWITCH leg stays strict.
+		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
 	})
 	if err != nil {
 		return nil, err

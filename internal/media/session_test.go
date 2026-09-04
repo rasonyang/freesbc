@@ -53,6 +53,45 @@ func TestLatchNeverMoves(t *testing.T) {
 	}
 }
 
+// TestLatchSymmetricOverridesSDPSeedNAT is the regression test for a
+// one-way-audio bug: a phone behind a hard NAT puts an unroutable fake IP
+// (198.18.0.1:55135) in its SDP c= line but its RTP actually arrives from
+// the NATed source 183.241.147.126:50699. The loose ("symmetric") latch —
+// the proxy's public-leg policy — must accept that first packet and move
+// the send-destination to the real source; strict latching must keep
+// rejecting it, which is what starved the relay.
+func TestLatchSymmetricOverridesSDPSeedNAT(t *testing.T) {
+	sdpAddr := netip.MustParseAddrPort("198.18.0.1:55135")
+	natSrc := &net.UDPAddr{IP: net.IPv4(183, 241, 147, 126), Port: 50699}
+
+	// Symmetric: seed still provides a provisional destination before any
+	// packet arrives, then the first packet from ANY source latches and
+	// redirects outbound media to the real NATed address.
+	sym := &latch{mode: LatchLoose}
+	sym.seed(sdpAddr)
+	if got := sym.target(); got == nil || got.String() != sdpAddr.String() {
+		t.Fatalf("seed must provide a provisional destination before the first packet, got %v", got)
+	}
+	if !sym.accept(natSrc) {
+		t.Fatal("symmetric latch must accept the first packet even though its source IP differs from the SDP IP")
+	}
+	if got := sym.target(); got == nil || !got.IP.Equal(natSrc.IP) || got.Port != natSrc.Port {
+		t.Fatalf("send-destination must relatch to the real packet source, got %v", got)
+	}
+
+	// Strict: the same first packet is rejected — the source IP must equal
+	// the SDP IP (only the port may differ), so the seeded destination
+	// stands and the stream stays one-way.
+	strict := &latch{mode: LatchStrict}
+	strict.seed(sdpAddr)
+	if strict.accept(natSrc) {
+		t.Fatal("strict latch must reject a first packet whose source IP differs from the SDP IP")
+	}
+	if got := strict.target(); got == nil || got.String() != sdpAddr.String() {
+		t.Fatalf("strict latch must keep the seeded destination after rejecting, got %v", got)
+	}
+}
+
 func TestRelatchMovesToNewRemote(t *testing.T) {
 	l := &latch{mode: LatchStrict}
 	l.setExpected(netip.MustParseAddr("10.0.0.1"))
