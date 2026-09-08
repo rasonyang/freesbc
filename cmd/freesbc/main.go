@@ -129,7 +129,7 @@ func run(cfgPath string) error {
 		}()
 	}
 	if sipServer == nil && edge == nil {
-		return fmt.Errorf("nothing to run: configure trunk peers, sip.upstream.address, or both")
+		return fmt.Errorf("nothing to run: configure trunk peers, sip.upstream.address (or sip.upstreams.nodes), or both")
 	}
 
 	// The B2BUA bridge (M3.3) is wired into sipServer above (trunk.NewServer /

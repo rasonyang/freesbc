@@ -89,6 +89,13 @@ type harness struct {
 
 	fs *fakeSwitch
 
+	// upstreams holds the fake switches of a multi-switch sip.upstreams
+	// harness (startHarnessUpstreams), keyed by the node NAME the config and
+	// the cooldown table use. Nodes deliberately left unreachable (a
+	// documentation address, to force a transport error) have no entry.
+	// Stopped with the rest of the harness.
+	upstreams map[string]*fakeSwitch
+
 	// carrier is the PSTN gateway fake when the harness configured
 	// sip.pstn (startHarnessPSTN). It is stopped with the rest of the
 	// harness.
@@ -286,6 +293,134 @@ func startHarnessPSTNGateways(t *testing.T, attemptTimeout, routesYAML string, g
 	return h, switches
 }
 
+// startHarnessUpstreams is startHarness with a configured MULTI-switch
+// sip.upstreams pool. nodes maps the node NAME — the name the cooldown
+// table, the logs and the tests use — to its "host:port" address.
+//
+// The YAML template is a deliberate COPY of startHarnessCfg's rather than a
+// call into it: the existing single-upstream harness must stay
+// byte-for-byte unchanged (D9), and startHarnessCfg's shape — one
+// `upstream:` stanza — cannot express a pool anyway. The copy also has no
+// `fs:` field to fill, so h.fs stays nil and stop() guards it.
+//
+// A fake switch is started for every node on a LOOPBACK address. A node on
+// any other address (the documentation range, e.g. 192.0.2.1:5060)
+// deliberately gets none: the proxy's private socket binds loopback, and a
+// UDP socket bound to loopback cannot send to a documentation address at
+// all — the send fails immediately with EINVAL. That deterministic
+// transport error is exactly what the failover tests need; a closed socket
+// would instead swallow the datagram silently, and a silent node is
+// indistinguishable from a slow one (D5).
+func startHarnessUpstreams(t *testing.T, algorithm, cooldown string, nodes map[string]string) (*harness, map[string]*fakeSwitch) {
+	t.Helper()
+	if len(nodes) == 0 {
+		t.Fatal("startHarnessUpstreams needs at least one node")
+	}
+	pubUDP := freePort(t)
+	pubWS := freeTCPPort(t)
+	priv := freePort(t)
+	// Media ranges are per-harness so no two tests contend for a port.
+	mediaBase := nextMediaBase()
+
+	// Deterministic config: sort the names so neither the YAML nor the
+	// topology it produces ever depends on map iteration order.
+	names := make([]string, 0, len(nodes))
+	for name := range nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var opts, nodeLines strings.Builder
+	if algorithm != "" {
+		fmt.Fprintf(&opts, "    algorithm: %s\n", algorithm)
+	}
+	if cooldown != "" {
+		fmt.Fprintf(&opts, "    cooldown: %s\n", cooldown)
+	}
+	for _, name := range names {
+		fmt.Fprintf(&nodeLines, "      %s:\n        address: %s\n", name, nodes[name])
+	}
+
+	yaml := fmt.Sprintf(`
+network:
+  public:
+    bind_ip: 127.0.0.1
+    advertised_ip: 127.0.0.1
+  private:
+    bind_ip: 127.0.0.1
+    advertised_ip: 127.0.0.1
+sip:
+  public:
+    udp: {enabled: true, bind: "127.0.0.1:%d"}
+    ws:  {enabled: true, bind: "127.0.0.1:%d"}
+  private:
+    bind: "127.0.0.1:%d"
+  upstreams:
+%s    nodes:
+%s
+rtp:
+  public:  {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
+  private: {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
+webrtc:
+  enabled: false
+listen:
+  media:
+    rtp_timeout: 60s
+shield:
+  rate_limit: "5000/s per_ip"
+`, pubUDP, pubWS, priv, opts.String(), nodeLines.String(), mediaBase, mediaBase+199, mediaBase+200, mediaBase+399)
+
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("upstreams harness config: %v", err)
+	}
+	store := config.NewStore(cfg)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	srv, err := New(store, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := &harness{
+		t: t, srv: srv, store: store,
+		publicUDP:  fmt.Sprintf("127.0.0.1:%d", pubUDP),
+		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
+		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
+		upstreams:  map[string]*fakeSwitch{},
+		done:       make(chan struct{}),
+	}
+	switches := map[string]*fakeSwitch{}
+	for _, name := range names {
+		host, _, err := net.SplitHostPort(nodes[name])
+		if err != nil {
+			t.Fatalf("node %s address %q: %v", name, nodes[name], err)
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			continue // deliberately unreachable; see the doc comment
+		}
+		fs := startFakeSwitch(t, nodes[name])
+		h.upstreams[name] = fs
+		switches[name] = fs
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	go func() {
+		defer close(h.done)
+		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Errorf("proxy Run: %v", err)
+		}
+	}()
+	select {
+	case <-srv.Ready():
+	case <-h.done:
+		t.Fatal("proxy exited before it was ready")
+	case <-time.After(10 * time.Second):
+		t.Fatal("proxy never became ready")
+	}
+	t.Cleanup(h.stop)
+	return h, switches
+}
+
 func (h *harness) stop() {
 	h.cancel()
 	select {
@@ -293,7 +428,14 @@ func (h *harness) stop() {
 	case <-time.After(10 * time.Second):
 		h.t.Error("proxy did not shut down")
 	}
-	h.fs.stop()
+	// h.fs is nil in a pool harness (startHarnessUpstreams): there is no
+	// single upstream, and a nil fake must not panic the cleanup path.
+	if h.fs != nil {
+		h.fs.stop()
+	}
+	for _, up := range h.upstreams {
+		up.stop()
+	}
 	if h.carrier != nil {
 		h.carrier.stop()
 	}

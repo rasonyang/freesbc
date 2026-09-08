@@ -22,8 +22,9 @@ import (
 	"github.com/freesbc/freesbc/internal/shield"
 )
 
-// Server is the edge proxy: public SIP listeners, one upstream, a
-// registration binding table and the media plane that anchors every call.
+// Server is the edge proxy: public SIP listeners, one or more upstream
+// FreeSWITCHes, a registration binding table and the media plane that
+// anchors every call.
 type Server struct {
 	store *config.Store
 	log   *slog.Logger
@@ -38,9 +39,13 @@ type Server struct {
 	calls   *callTable
 	metrics *Metrics
 
-	// pstnHealth tracks the passive cooldowns of the PSTN carrier gateways
-	// (see pstnhealth.go). Always allocated; harmless when sip.pstn is off.
-	pstnHealth *pstnHealth
+	// pstnCooldown and upstreamCooldown are the passive health penalties of
+	// the PSTN carrier gateways and the upstream FreeSWITCHes (see
+	// cooldown.go). Two instances of one policy: the sets and the windows
+	// are configured separately, but the logic must not fork. Both are
+	// always allocated; harmless when the corresponding section is off.
+	pstnCooldown     *cooldownTable
+	upstreamCooldown *cooldownTable
 
 	ua     *sipgo.UserAgent
 	srv    *sipgo.Server
@@ -115,7 +120,7 @@ func raiseUDPSendLimit() {
 func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	cfg := store.Current()
 	if !cfg.ProxyEnabled() {
-		return nil, errors.New("proxy: sip.upstream.address is not configured")
+		return nil, errors.New("proxy: sip.upstream.address (or sip.upstreams.nodes) is not configured")
 	}
 	topo, err := buildTopology(cfg)
 	if err != nil {
@@ -124,19 +129,20 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	raiseUDPSendLimit()
 	pub, priv := media.NewProxyPools(store)
 	s := &Server{
-		store:         store,
-		log:           log.With("component", "proxy"),
-		topo:          topo,
-		pubPool:       pub,
-		privPool:      priv,
-		loc:           NewLocation(),
-		calls:         newCallTable(),
-		metrics:       NewMetrics(),
-		pstnHealth:    newPSTNHealth(),
-		pending:       map[string]*pendingInvite{},
-		privSources:   newPrivateSources(),
-		ready:         make(chan struct{}),
-		webrtcEnabled: cfg.WebRTC.Enabled,
+		store:            store,
+		log:              log.With("component", "proxy"),
+		topo:             topo,
+		pubPool:          pub,
+		privPool:         priv,
+		loc:              NewLocation(),
+		calls:            newCallTable(),
+		metrics:          NewMetrics(),
+		pstnCooldown:     newCooldownTable(),
+		upstreamCooldown: newCooldownTable(),
+		pending:          map[string]*pendingInvite{},
+		privSources:      newPrivateSources(),
+		ready:            make(chan struct{}),
+		webrtcEnabled:    cfg.WebRTC.Enabled,
 	}
 	if s.webrtcEnabled {
 		if cfg.WebRTC.DTLSCertFile != "" {
@@ -275,7 +281,11 @@ func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("edge proxy listening",
 		"public_listeners", len(s.topo.public),
 		"private", s.topo.private.laddr.String(),
-		"upstream", s.topo.upstreamHost,
+		// The alias renders as upstreams=1 upstream_nodes=default — one log
+		// shape for both config forms, so a deployment never has to know
+		// which one it is running to read the line.
+		"upstreams", len(s.topo.upstreamNames),
+		"upstream_nodes", strings.Join(s.topo.upstreamNames, ","),
 		"webrtc", s.webrtcEnabled)
 
 	// Ready fires only after every startup read of the topology above: the

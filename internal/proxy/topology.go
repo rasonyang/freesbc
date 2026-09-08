@@ -17,9 +17,11 @@
 package proxy
 
 import (
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,6 +116,14 @@ func (s side) via(branch string) *sip.ViaHeader {
 	return v
 }
 
+// upstreamEntry is one resolved FreeSWITCH upstream: its signaling address
+// (parsed) plus the host:port as configured, which is what the forwarder
+// puts in Destination and what the call table records as PrivateRemote.
+type upstreamEntry struct {
+	addr netip.AddrPort
+	host string
+}
+
 // pstnGateway is one resolved carrier gateway: its signaling address
 // (parsed) plus the host:port as configured, which is what the forwarder
 // puts in Destination.
@@ -183,10 +193,14 @@ type topology struct {
 	// private is the single FreeSWITCH-facing side.
 	private side
 
-	// upstream is FreeSWITCH's signaling address.
-	upstream netip.AddrPort
-	// upstreamHost is the address as configured, used for Destination.
-	upstreamHost string
+	// upstreams is the FreeSWITCH upstream set, keyed by the names the
+	// cooldown table and the logs use. The v1 alias (sip.upstream.address)
+	// synthesises node "default" at build time, so both config shapes are
+	// one runtime model and the request path never knows which produced it.
+	// upstreamNames is the same set's names, sorted once here: hashing and
+	// failover order must be deterministic, and Go map iteration is not.
+	upstreams     map[string]upstreamEntry
+	upstreamNames []string
 
 	// pstn is the PSTN trunk, when sip.pstn is configured; a nil gateways
 	// map leaves the trunk off. Resolved at startup like upstream — the
@@ -201,21 +215,61 @@ type topology struct {
 }
 
 // buildTopology resolves the config into the runtime model. It performs
-// no DNS: the upstream must be a literal address, so a poisoned resolver
-// can never redirect the private leg.
+// no DNS: every upstream node must be a literal address, so a poisoned
+// resolver can never redirect the private leg and failover never waits on
+// a lookup.
 func buildTopology(cfg *config.Config) (*topology, error) {
-	host, portStr, err := net.SplitHostPort(cfg.SIP.Upstream.Address)
-	if err != nil {
-		return nil, err
+	// The upstream pool converges the two config shapes here, exactly like
+	// sip.pstn below: the v1 alias is synthesised — in buildTopology, NOT in
+	// the config defaults — into the multi model as the single node
+	// "default", so a v1 config and an equivalent one-node pool behave
+	// identically by construction (and the hash degenerates trivially: one
+	// node is always index 0). The store keeps what the operator wrote.
+	upstreams := map[string]upstreamEntry{}
+	resolveUpstream := func(name, label, address string) error {
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return &configError{label + " must be a literal IP:port, got " + host}
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return err
+		}
+		upstreams[name] = upstreamEntry{
+			addr: netip.AddrPortFrom(ip, uint16(port)),
+			host: address,
+		}
+		return nil
 	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return nil, &configError{"sip.upstream.address must be a literal IP:port, got " + host}
+	if cfg.SIP.Upstream.Address != "" {
+		if err := resolveUpstream("default", "sip.upstream.address", cfg.SIP.Upstream.Address); err != nil {
+			return nil, err
+		}
+	} else {
+		for name, n := range cfg.SIP.Upstreams.Nodes {
+			// A node entry missing its address cannot survive validation,
+			// but a nil map entry (an empty `fs-1:` block) would panic below
+			// — treat it as the address error it is.
+			if n == nil || n.Address == "" {
+				return nil, &configError{"sip.upstreams.nodes." + name + " must be a literal IP:port, got \"\""}
+			}
+			if err := resolveUpstream(name, "sip.upstreams.nodes."+name, n.Address); err != nil {
+				return nil, err
+			}
+		}
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, err
+	// Sorted once, here: the hash pool and the failover order are read from
+	// this slice on the request path, where map iteration order must never
+	// leak into routing decisions.
+	upstreamNames := make([]string, 0, len(upstreams))
+	for name := range upstreams {
+		upstreamNames = append(upstreamNames, name)
 	}
+	sort.Strings(upstreamNames)
 
 	// sip.pstn is optional; the resolution mirrors the upstream's: no DNS,
 	// literal address only, validated host:port. The match must already be
@@ -288,10 +342,10 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 
 	privIP := cfg.PrivateAdvertisedIP()
 	t := &topology{
-		public:       map[string]side{},
-		upstream:     netip.AddrPortFrom(ip, uint16(port)),
-		upstreamHost: cfg.SIP.Upstream.Address,
-		pstn:         pstn,
+		public:        map[string]side{},
+		upstreams:     upstreams,
+		upstreamNames: upstreamNames,
+		pstn:          pstn,
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",
@@ -417,12 +471,107 @@ func defaultPort(transport string) int {
 	}
 }
 
-// fromUpstream reports whether a request arrived from FreeSWITCH. The
-// transport source address is the only trustworthy signal — never a Via or
-// From host, which the sender controls.
+// fromUpstream reports whether a request arrived from a FreeSWITCH in the
+// upstream pool. The transport source address is the only trustworthy
+// signal — never a Via or From host, which the sender controls.
 //
-// Only the IP is compared, not the port: FreeSWITCH may source a request
-// from an ephemeral port while still listening on its configured one.
+// Membership is by IP across the WHOLE pool, not by a single address: with
+// several switches, any of them may source a request, and the trust
+// decision (readFilter, arrivedOnPrivate, the PSTN-bridge classification,
+// the shield exemption) must not depend on which one. Only the IP is
+// compared, not the port: FreeSWITCH may source a request from an
+// ephemeral port while still listening on its configured one. Two nodes
+// behind one IP are therefore indistinguishable for trust purposes — fine,
+// they are equally trusted; per-node precision lives in the dial order and
+// the call table's PrivateRemote, which are addr:port.
 func (t *topology) fromUpstream(src netip.Addr) bool {
-	return src.Unmap() == t.upstream.Addr()
+	src = src.Unmap()
+	for _, name := range t.upstreamNames {
+		if t.upstreams[name].addr.Addr().Unmap() == src {
+			return true
+		}
+	}
+	return false
+}
+
+// upstreamEntryFor returns the resolved entry for a node name. ok is false
+// only for a name the topology does not know, which a dial order cannot
+// produce.
+func (t *topology) upstreamEntryFor(name string) (upstreamEntry, bool) {
+	e, ok := t.upstreams[name]
+	return e, ok
+}
+
+// hashUpstreamUser maps a SIP user to a hash value: FNV-1a 64 over the
+// LOWER-CASED user part. Lower-casing is part of the contract, not a
+// nicety — SIP user parts are case-insensitive, and a phone that REGISTERs
+// as "Alice" and then calls as "alice" must reach the switch that holds its
+// binding. The function is pure (no map iteration, no randomness) so every
+// request a user causes, plus any later re-computation such as
+// directionFor's race-ACK fallback, agrees on the node with no shared
+// state.
+func hashUpstreamUser(user string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.ToLower(user)))
+	return h.Sum64()
+}
+
+// upstreamDialOrder is the failover order for a user: the hash-chosen node
+// first, then the rest of the pool in rotation from it, then any cooled
+// nodes.
+//
+// The hash pool EXCLUDES cooled nodes whenever at least one node is
+// available (D6): leaving a sick node in the pool would keep routing it its
+// share of the users, which is the opposite of what a passive penalty is
+// for. It falls back to the full sorted set when everything is cooling — a
+// cooldown must never make the proxy refuse to try anything at all.
+//
+// available reports whether a node may be used. In production it is the
+// cooldown table; tests pass a plain function.
+func (t *topology) upstreamDialOrder(user string, available func(string) bool) []string {
+	pool := make([]string, 0, len(t.upstreamNames))
+	var cooled []string
+	for _, name := range t.upstreamNames {
+		if available == nil || available(name) {
+			pool = append(pool, name)
+		} else {
+			cooled = append(cooled, name)
+		}
+	}
+	if len(pool) == 0 {
+		// Everything is cooling: dial the full set rather than nothing.
+		pool, cooled = t.upstreamNames, nil
+	}
+	if len(pool) == 0 {
+		return nil
+	}
+	idx := int(hashUpstreamUser(user) % uint64(len(pool)))
+	order := make([]string, 0, len(pool)+len(cooled))
+	order = append(order, pool[idx:]...)
+	order = append(order, pool[:idx]...)
+	order = append(order, cooled...)
+	return order
+}
+
+// selectUpstream picks the node a user's request should start on: the head
+// of its dial order. ok is false only for an empty pool, which validation
+// makes impossible on a running proxy.
+func (t *topology) selectUpstream(user string, available func(string) bool) (string, upstreamEntry, bool) {
+	order := t.upstreamDialOrder(user, available)
+	if len(order) == 0 {
+		return "", upstreamEntry{}, false
+	}
+	return order[0], t.upstreams[order[0]], true
+}
+
+// upstreamOrder is a user's failover order with the passive cooldown table
+// as the availability oracle: the production binding of upstreamDialOrder.
+func (s *Server) upstreamOrder(user string) []string {
+	return s.topo.upstreamDialOrder(user, s.upstreamCooldown.Available)
+}
+
+// selectUpstream is a user's hash-chosen node, cooldown-aware (see
+// topology.selectUpstream).
+func (s *Server) selectUpstream(user string) (string, upstreamEntry, bool) {
+	return s.topo.selectUpstream(user, s.upstreamCooldown.Available)
 }
