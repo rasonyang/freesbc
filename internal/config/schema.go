@@ -49,8 +49,9 @@ type Config struct {
 
 	// Network and WebRTC belong to the edge-proxy plane (see
 	// config/proxy.go): the public/private topology the SIP/RTP/WebRTC
-	// proxy straddles. They are inert unless sip.upstream.address is set
-	// (Config.ProxyEnabled) — the trunk B2BUA plane above is unaffected.
+	// proxy straddles. They are inert unless an upstream is set —
+	// sip.upstream.address or sip.upstreams.nodes (Config.ProxyEnabled) —
+	// the trunk B2BUA plane above is unaffected.
 	Network NetworkConfig `yaml:"network"`
 	WebRTC  WebRTCConfig  `yaml:"webrtc"`
 }
@@ -89,13 +90,16 @@ type SIPNetConfig struct {
 	AdvertisedIP   string `yaml:"advertised_ip"`
 	AdvertisedPort int    `yaml:"advertised_port"`
 
-	// Public/Private/Upstream are the edge-proxy plane's listeners and
-	// upstream target (see config/proxy.go). They nest under the same
-	// `sip:` key as the flat trunk fields above but are independent of
-	// them: a config may enable the trunk plane, the proxy plane, or both.
-	Public   ProxySIPConfig  `yaml:"public"`
-	Private  ProxyPrivateSIP `yaml:"private"`
-	Upstream UpstreamConfig  `yaml:"upstream"`
+	// Public/Private/Upstream/Upstreams are the edge-proxy plane's
+	// listeners and upstream target(s) (see config/proxy.go). They nest
+	// under the same `sip:` key as the flat trunk fields above but are
+	// independent of them: a config may enable the trunk plane, the proxy
+	// plane, or both. Upstream (the v1 alias) and Upstreams (the
+	// multi-switch pool) are mutually exclusive.
+	Public    ProxySIPConfig  `yaml:"public"`
+	Private   ProxyPrivateSIP `yaml:"private"`
+	Upstream  UpstreamConfig  `yaml:"upstream"`
+	Upstreams UpstreamsConfig `yaml:"upstreams"`
 	// Pstn is the optional peer-to-peer PSTN carrier gateway the proxy
 	// forwards FreeSWITCH-bridged outbound calls to (see config/proxy.go).
 	Pstn PstnConfig `yaml:"pstn"`

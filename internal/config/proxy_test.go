@@ -221,6 +221,165 @@ func TestPSTNGatewaysExplicitAndCatchalls(t *testing.T) {
 	}
 }
 
+// multiUpstreams is a valid multi-FreeSWITCH sip.upstreams pool for the
+// proxyYAML shape: two named nodes, the algorithm and cooldown left to their
+// defaults, per-node transport left to its default too.
+const multiUpstreams = `  upstreams:
+    nodes:
+      fs-a:
+        address: 10.77.0.10:5060
+      fs-b:
+        address: 10.77.0.11:5060
+`
+
+// withUpstreams swaps the v1 upstream alias stanza for a sip.upstreams pool.
+// The two shapes are mutually exclusive, so a config carries exactly one.
+func withUpstreams(base, upstreamsSection string) string {
+	return strings.Replace(base, "  upstream:\n    address: 10.77.0.10:5060\n    transport: udp\n", upstreamsSection, 1)
+}
+
+// The multi-switch pool parses and defaults like the alias: cooldown 30s
+// (the passive penalty applies to BOTH shapes — with the alias synthesised
+// as node "default", a zero window would disable it in production), the
+// algorithm to hash-user, and every node's transport to udp. The pool alone
+// enables the proxy plane: no alias required.
+func TestUpstreamsParses(t *testing.T) {
+	c := mustParseProxy(t, withUpstreams(proxyYAML, multiUpstreams))
+	ups := c.SIP.Upstreams
+	if c.SIP.Upstream.Address != "" {
+		t.Errorf("alias Address set in the pool shape: %q", c.SIP.Upstream.Address)
+	}
+	if !c.ProxyEnabled() {
+		t.Fatal("ProxyEnabled() = false with only sip.upstreams.nodes set")
+	}
+	if got := ups.Algorithm; got != "hash-user" {
+		t.Errorf("Algorithm = %q, want the hash-user default", got)
+	}
+	if got := ups.Cooldown.Std(); got != 30*time.Second {
+		t.Errorf("Cooldown = %s, want the 30s default", got)
+	}
+	if len(ups.Nodes) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(ups.Nodes))
+	}
+	for name, want := range map[string]string{"fs-a": "10.77.0.10:5060", "fs-b": "10.77.0.11:5060"} {
+		n := ups.Nodes[name]
+		if n == nil || n.Address != want || n.Transport != "udp" {
+			t.Errorf("node %s = %+v, want address %s transport udp", name, n, want)
+		}
+	}
+
+	// The alias shape gets the same cooldown default (D8): its synthesised
+	// node "default" is penalized exactly like a pool node.
+	alias := mustParseProxy(t, proxyYAML)
+	if got := alias.SIP.Upstreams.Cooldown.Std(); got != 30*time.Second {
+		t.Errorf("alias Cooldown = %s, want the 30s default", got)
+	}
+	if alias.SIP.Upstreams.Algorithm != "" || len(alias.SIP.Upstreams.Nodes) != 0 {
+		t.Errorf("alias config grew pool fields: %+v", alias.SIP.Upstreams)
+	}
+	// And an alias-only config keeps a fully zero pool, so "is the pool
+	// configured" stays decidable.
+	if got := alias.SIP.Upstreams.Algorithm; got != "" {
+		t.Errorf("alias config grew an algorithm: %q", got)
+	}
+	if len(alias.SIP.Upstreams.Nodes) != 0 {
+		t.Errorf("alias config grew nodes: %+v", alias.SIP.Upstreams.Nodes)
+	}
+}
+
+func TestUpstreamsValidationErrors(t *testing.T) {
+	// replaceUps rewrites multiUpstreams then swaps it into the proxy YAML.
+	replaceUps := func(edit func(string) string) string {
+		return withUpstreams(proxyYAML, edit(multiUpstreams))
+	}
+	tests := []struct {
+		name string
+		edit func(string) string
+		want string
+	}{
+		{
+			"alias and pool together",
+			func(s string) string {
+				return strings.Replace(s, "  upstreams:\n", "  upstream:\n    address: 10.77.0.10:5060\n  upstreams:\n", 1)
+			},
+			"sip.upstreams: sip.upstream.address and sip.upstreams.nodes are mutually exclusive",
+		},
+		{
+			"unsupported algorithm",
+			func(s string) string {
+				return strings.Replace(s, "  upstreams:\n", "  upstreams:\n    algorithm: round-robin\n", 1)
+			},
+			`sip.upstreams.algorithm: only "hash-user" is supported, got "round-robin"`,
+		},
+		{
+			"node missing address",
+			func(s string) string {
+				return strings.Replace(s, "      fs-a:\n        address: 10.77.0.10:5060\n", "      fs-a:\n        transport: udp\n", 1)
+			},
+			"sip.upstreams.nodes.fs-a.address: required",
+		},
+		{
+			"node address not host:port",
+			func(s string) string { return strings.Replace(s, "10.77.0.10:5060", "10.77.0.10", 1) },
+			`sip.upstreams.nodes.fs-a.address: "10.77.0.10" is not "host:port"`,
+		},
+		{
+			"node address bad port",
+			func(s string) string { return strings.Replace(s, "10.77.0.10:5060", "10.77.0.10:99999", 1) },
+			"sip.upstreams.nodes.fs-a.address: bad port",
+		},
+		{
+			"node transport tcp",
+			func(s string) string {
+				return strings.Replace(s, "      fs-b:\n        address: 10.77.0.11:5060\n", "      fs-b:\n        address: 10.77.0.11:5060\n        transport: tcp\n", 1)
+			},
+			`sip.upstreams.nodes.fs-b.transport: only "udp" is supported, got "tcp"`,
+		},
+		{
+			"negative cooldown",
+			func(s string) string {
+				return strings.Replace(s, "  upstreams:\n", "  upstreams:\n    cooldown: -1m\n", 1)
+			},
+			"sip.upstreams.cooldown: must not be negative, got -1m0s",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(replaceUps(tt.edit)))
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+// A sip.pstn match must not name ANY upstream node, not just the alias: the
+// classification keys on the match address, so naming a pool node would
+// shadow the traffic that node carries for everything else.
+func TestPSTNMatchRejectsPoolNode(t *testing.T) {
+	// The pstn stanza goes after the pool block (the alias stanza withPSTN
+	// keys on is not there any more).
+	poolYAML := strings.Replace(withUpstreams(proxyYAML, multiUpstreams),
+		"      fs-b:\n        address: 10.77.0.11:5060\n",
+		"      fs-b:\n        address: 10.77.0.11:5060\n"+pstnTrunk, 1)
+	yaml := strings.Replace(poolYAML, "match: 203.0.113.7:16060", "match: 10.77.0.11:5060", 1)
+	if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), "sip.pstn.match: must not name the upstream") {
+		t.Fatalf("want the must-not-name-the-upstream error, got %v", err)
+	}
+	// A match naming nothing upstream is fine in the pool shape.
+	if _, err := Parse([]byte(poolYAML)); err != nil {
+		t.Fatalf("valid pool + pstn config rejected: %v", err)
+	}
+	// The alias collision keeps the same message (and the same check).
+	aliasYAML := strings.Replace(withPSTN(proxyYAML, pstnTrunk), "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+	if _, err := Parse([]byte(aliasYAML)); err == nil || !strings.Contains(err.Error(), "sip.pstn.match: must not name the upstream") {
+		t.Fatalf("alias: want the must-not-name-the-upstream error, got %v", err)
+	}
+}
+
 func TestPSTNMultiValidationErrors(t *testing.T) {
 	// replacePSTN rewrites multiPSTN then swaps it into the proxy YAML.
 	replacePSTN := func(edit func(string) string) string {
@@ -374,7 +533,7 @@ func TestProxyValidationErrors(t *testing.T) {
 		{
 			"no upstream but listeners configured",
 			func(s string) string { return strings.Replace(s, "    address: 10.77.0.10:5060\n", "", 1) },
-			"sip.upstream.address: required",
+			"sip.upstream: required to enable the edge proxy",
 		},
 		{
 			"upstream transport tcp",

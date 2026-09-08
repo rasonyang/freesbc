@@ -13,8 +13,8 @@ import (
 // edge proxy (the "proxy plane"). It is deliberately additive: the trunk
 // B2BUA plane keeps its own flat `sip:`/`rtp:` bind/advertised fields and
 // its `listen.sip` listener list, and a config may enable either plane or
-// both. The proxy plane is active exactly when sip.upstream.address is set
-// (see Config.ProxyEnabled).
+// both. The proxy plane is active exactly when an upstream is set —
+// sip.upstream.address or sip.upstreams.nodes (see Config.ProxyEnabled).
 //
 // Naming follows the topology, not the transport: "public" is the side
 // facing phones and browsers (SIP/UDP, SIP/WS(S), RTP, WebRTC), "private"
@@ -111,6 +111,39 @@ type ProxyPrivateSIP struct {
 type UpstreamConfig struct {
 	Address   string `yaml:"address"`   // host:port
 	Transport string `yaml:"transport"` // udp (the only supported value today)
+}
+
+// UpstreamsConfig is the multi-FreeSWITCH upstream pool: a named set of
+// switches the edge proxy load-balances across. It and the v1 `upstream`
+// alias are mutually exclusive (validation rejects writing both); the
+// alias converges on this same model at topology build time as the single
+// node "default" (see proxy/topology.go), so the runtime never knows which
+// shape produced it.
+//
+// Selection is per-user hashing (algorithm hash-user, the only value
+// today): every request a user causes — its REGISTER, its INVITEs and the
+// in-dialog requests of the dialogs those establish — starts on the same
+// switch, which is what keeps one dialog on one FreeSWITCH. The switches
+// must share a registration database (sofia `db=shared`) for a binding
+// made through one to be callable through another.
+//
+// Cooldown is the passive health penalty: a switch that produced no
+// response at all across a whole attempt is skipped in favour of its
+// alternatives for this long, and skipped entirely as a hash target while
+// it cools — leaving a sick node in the pool would keep sending it a share
+// of the users. There is no active probing (see cooldown.go).
+type UpstreamsConfig struct {
+	// Algorithm is the selection algorithm; "hash-user" (the default when
+	// nodes are configured) is the only supported value. The field exists
+	// so a future algorithm is a value, not a config-shape change.
+	Algorithm string `yaml:"algorithm"`
+	// Cooldown is how long a switch that answered nothing is skipped.
+	// Defaults to 30s when either shape is configured (the alias needs it
+	// too: Penalize with a zero window would be a no-op).
+	Cooldown Duration `yaml:"cooldown"`
+	// Nodes is the named upstream set, keyed by the names the logs and the
+	// cooldown table use. transport defaults to udp per node.
+	Nodes map[string]*UpstreamConfig `yaml:"nodes"`
 }
 
 // PstnConfig routes FreeSWITCH-bridged outbound calls to peer-to-peer PSTN
@@ -226,8 +259,11 @@ func (w WebRTCConfig) RTCPMuxEnabled() bool { return w.RTCPMux == nil || *w.RTCP
 
 // ProxyEnabled reports whether the SIP/RTP/WebRTC edge proxy plane is
 // configured. It is the single switch main.go and validation branch on:
-// without an upstream there is nothing to proxy to.
-func (c *Config) ProxyEnabled() bool { return c.SIP.Upstream.Address != "" }
+// without an upstream — the v1 alias or the multi-switch pool — there is
+// nothing to proxy to.
+func (c *Config) ProxyEnabled() bool {
+	return c.SIP.Upstream.Address != "" || len(c.SIP.Upstreams.Nodes) > 0
+}
 
 // PublicSIPListeners returns the enabled public listeners as
 // (transport, bind) pairs, in a stable order.
@@ -310,6 +346,28 @@ func (c *Config) PrivateSIPAdvertisedPort() int {
 func proxyWithDefaults(c *Config) {
 	if c.SIP.Upstream.Address != "" && c.SIP.Upstream.Transport == "" {
 		c.SIP.Upstream.Transport = "udp"
+	}
+	// The upstream pool's defaults apply when EITHER shape was written. The
+	// cooldown is the reason the alias is included: the alias synthesises
+	// node "default" and the passive penalty is per node, so a zero window
+	// would silently disable the penalty in the one deployment shape that
+	// is already in production. Algorithm and per-node transport only
+	// exist in the pool shape.
+	ups := &c.SIP.Upstreams
+	if c.SIP.Upstream.Address != "" || len(ups.Nodes) > 0 {
+		if ups.Cooldown == 0 {
+			ups.Cooldown = Duration(30 * time.Second)
+		}
+		for _, n := range ups.Nodes {
+			// A nil entry (an empty `fs-1:` block) is a config error
+			// validation names; do not panic on the way there.
+			if n != nil && n.Transport == "" {
+				n.Transport = "udp"
+			}
+		}
+	}
+	if len(ups.Nodes) > 0 && ups.Algorithm == "" {
+		ups.Algorithm = "hash-user"
 	}
 	if c.SIP.Pstn.Address != "" && c.SIP.Pstn.Transport == "" {
 		c.SIP.Pstn.Transport = "udp"

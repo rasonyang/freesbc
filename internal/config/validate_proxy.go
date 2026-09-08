@@ -23,11 +23,13 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 	pstnSet := pstn.Address != "" || !pstn.Match.IsZero() ||
 		len(pstn.Gateways) > 0 || len(pstn.Routes) > 0 ||
 		pstn.AttemptTimeout != 0 || pstn.Cooldown != 0
+	ups := c.SIP.Upstreams
+	upsSet := len(ups.Nodes) > 0 || ups.Algorithm != "" || ups.Cooldown != 0
 	partial := len(listeners) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
-		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || pstnSet
+		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || pstnSet || upsSet
 	if !enabled {
 		if partial {
-			fail("sip.upstream.address: required to enable the edge proxy — sip.public/sip.private/sip.pstn/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
+			fail("sip.upstream: required to enable the edge proxy — set sip.upstream.address or sip.upstreams.nodes; sip.public/sip.private/sip.pstn/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
 		}
 		return
 	}
@@ -43,22 +45,70 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 	}
 
 	// ---- upstream ----
-	if host, port, err := net.SplitHostPort(c.SIP.Upstream.Address); err != nil {
-		fail("sip.upstream.address: %q is not \"host:port\"", c.SIP.Upstream.Address)
-	} else {
-		if host == "" {
-			fail("sip.upstream.address: host required")
+	// Two mutually exclusive shapes, exactly like sip.pstn: the v1 alias
+	// (sip.upstream.address) and the multi-switch pool (sip.upstreams.nodes).
+	// The alias converges on the pool at topology build time as node
+	// "default", so the runtime never knows which shape produced it — but
+	// writing both is a mistake worth naming, not a merge to guess at.
+	if c.SIP.Upstream.Address != "" && len(ups.Nodes) > 0 {
+		fail("sip.upstreams: sip.upstream.address and sip.upstreams.nodes are mutually exclusive — use the single-upstream alias or the multi-switch pool, not both")
+	}
+	if c.SIP.Upstream.Address != "" {
+		if host, port, err := net.SplitHostPort(c.SIP.Upstream.Address); err != nil {
+			fail("sip.upstream.address: %q is not \"host:port\"", c.SIP.Upstream.Address)
+		} else {
+			if host == "" {
+				fail("sip.upstream.address: host required")
+			}
+			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+				fail("sip.upstream.address: bad port in %q", c.SIP.Upstream.Address)
+			}
 		}
-		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-			fail("sip.upstream.address: bad port in %q", c.SIP.Upstream.Address)
+		if c.SIP.Upstream.Transport != "udp" {
+			// Deliberately narrow: §2 of the spec scopes the private/upstream
+			// transport to UDP for this phase. Reject anything else loudly
+			// rather than binding a transport the forwarding path can't route
+			// responses back through.
+			fail("sip.upstream.transport: only \"udp\" is supported, got %q", c.SIP.Upstream.Transport)
 		}
 	}
-	if c.SIP.Upstream.Transport != "udp" {
-		// Deliberately narrow: §2 of the spec scopes the private/upstream
-		// transport to UDP for this phase. Reject anything else loudly
-		// rather than binding a transport the forwarding path can't route
-		// responses back through.
-		fail("sip.upstream.transport: only \"udp\" is supported, got %q", c.SIP.Upstream.Transport)
+	if len(ups.Nodes) > 0 {
+		// The algorithm field is a forward-compatibility seam: exactly one
+		// value is implemented, so anything else is a config error rather
+		// than a silent fallback to hashing. Each node is checked like the
+		// alias and like a pstn gateway — literal host:port, UDP only.
+		if ups.Algorithm != "hash-user" {
+			fail("sip.upstreams.algorithm: only \"hash-user\" is supported, got %q", ups.Algorithm)
+		}
+		for name, n := range ups.Nodes {
+			label := "sip.upstreams.nodes." + name
+			if n == nil || n.Address == "" {
+				fail("%s.address: required", label)
+				continue
+			}
+			if host, port, err := net.SplitHostPort(n.Address); err != nil {
+				fail("%s.address: %q is not \"host:port\"", label, n.Address)
+			} else {
+				if host == "" {
+					fail("%s.address: host required", label)
+				}
+				if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+					fail("%s.address: bad port in %q", label, n.Address)
+				}
+			}
+			if n.Transport != "udp" {
+				// Same reasoning as the alias transport: the private leg is
+				// UDP in this phase, and the forwarding path has no way to
+				// route a TCP/TLS response back to the right transaction.
+				fail("%s.transport: only \"udp\" is supported, got %q", label, n.Transport)
+			}
+		}
+	}
+	if ups.Cooldown < 0 {
+		// Like the pstn budgets: zero means "use the default", so a
+		// negative value is an operator mistake to name, not to default
+		// away.
+		fail("sip.upstreams.cooldown: must not be negative, got %v", ups.Cooldown.Std())
 	}
 
 	// ---- pstn carrier gateway ----
@@ -317,7 +367,9 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 // legitimately uses for other traffic would shadow it: every such call
 // would be routed to the carrier instead of its real destination. The
 // private SIP socket and the upstream are exactly the two addresses
-// FreeSWITCH talks to for everything else.
+// FreeSWITCH talks to for everything else — and in the pool shape "the
+// upstream" is every node, not just the one the operator happened to be
+// thinking of, so the alias and all nodes are checked alike.
 func (c *Config) validatePSTNMatch(pstn PstnConfig, fail func(string, ...any)) {
 	if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
 		fail("sip.pstn.match: must not name the SBC's private SIP address")
@@ -325,8 +377,19 @@ func (c *Config) validatePSTNMatch(pstn PstnConfig, fail func(string, ...any)) {
 	if pstn.Match.Host == c.PrivateAdvertisedIP().String() && pstn.Match.Port == c.PrivateSIPAdvertisedPort() {
 		fail("sip.pstn.match: must not name the SBC's private SIP address")
 	}
-	if uh, up, err := net.SplitHostPort(c.SIP.Upstream.Address); err == nil {
-		if p, err := strconv.Atoi(up); err == nil && pstn.Match.Host == uh && pstn.Match.Port == p {
+	collidesUpstream := func(address string) bool {
+		uh, up, err := net.SplitHostPort(address)
+		if err != nil {
+			return false
+		}
+		p, err := strconv.Atoi(up)
+		return err == nil && pstn.Match.Host == uh && pstn.Match.Port == p
+	}
+	if c.SIP.Upstream.Address != "" && collidesUpstream(c.SIP.Upstream.Address) {
+		fail("sip.pstn.match: must not name the upstream")
+	}
+	for _, n := range c.SIP.Upstreams.Nodes {
+		if n != nil && n.Address != "" && collidesUpstream(n.Address) {
 			fail("sip.pstn.match: must not name the upstream")
 		}
 	}
