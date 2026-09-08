@@ -151,17 +151,26 @@ shield:                            # sensible defaults; the whole section is opt
 #
 #   # Optional peer-to-peer PSTN trunk: outbound calls from FreeSWITCH's
 #   # dialplan, bridged to sip:<number>@10.77.0.2:16060 (the MATCH address),
-#   # are forwarded to a carrier gateway that never registers — FreeSBC
-#   # never pings it, and inbound carrier calls need no special handling.
-#   # The bridge is recognised by its SOURCE (FreeSWITCH's own IP) plus its
+#   # are forwarded to carrier gateways that never register — FreeSBC never
+#   # pings them, and inbound carrier calls need no special handling. The
+#   # bridge is recognised by its SOURCE (FreeSWITCH's own IP) plus its
 #   # Request-URI naming the match, so a public phone dialling the same
 #   # address is not hijacked. The match must be a host:port FreeSWITCH
 #   # uses for nothing else: here it is the SBC's public UDP listener
 #   # (bound 0.0.0.0:16060) as FreeSWITCH reaches it from the private LAN.
+#   # Two shapes: the multi-gateway form (gateways + routes below) or the
+#   # single-gateway shorthand `address: <host:port>` — mutually exclusive.
 #   # pstn:
-#   #   address: 223.76.90.4:16060    # the carrier gateway — literal IP:port
-#   #   transport: udp
 #   #   match: 10.77.0.2:16060        # what the dialplan dials PSTN prefixes to
+#   #   # attempt_timeout: 32s        # per-gateway attempt budget (default 32s)
+#   #   # cooldown: 30s               # passive health penalty window (default 30s)
+#   #   gateways:
+#   #     gw-mobile: { address: 223.76.90.4:16060 }  # literal IP:port; transport: udp implied
+#   #     gw-fixed:   { address: 223.76.90.5:16060 }
+#   #   routes:                       # first match wins; multiple catch-alls legal
+#   #     - match: "^1[3-9]\d{9}$"    # Go regexp on the called number
+#   #       to: [gw-mobile]
+#   #     - to: [gw-fixed, gw-mobile]  # no match = catch-all; to: order = failover order
 #
 # rtp:
 #   public:                          # media toward phones/browsers

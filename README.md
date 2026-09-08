@@ -101,14 +101,42 @@ FreeSWITCH the phones register to:
 FreeSWITCH ──bridge──▶ FreeSBC public UDP ──▶ PSTN carrier gateway
 ```
 
-Configure `sip.pstn` (`address` = the gateway, `match` = an address
-FreeSWITCH's dialplan dials PSTN prefixes to). A bridged call is
+Configure `sip.pstn`: either the single-gateway shorthand (`address` =
+the gateway) or the multi-gateway form (`gateways` = named carriers,
+`routes` = called-number prefixes selecting which gateways a call fails
+over across, in `to:` order). `match` is the address FreeSWITCH's
+dialplan dials PSTN prefixes to in both forms. A bridged call is
 classified by its source (FreeSWITCH itself) **and** its Request-URI
 naming the match, then forwarded exactly like a call to a registered
 client: media anchored on both legs, each side offered only the SBC's own
 port, and in-dialog requests routed by Record-Route in both directions.
 A phone dialling the match address from the public side is unaffected —
 the source check fails and the call is proxied upstream as usual.
+
+```yaml
+sip:
+  pstn:
+    match: 10.77.0.1:16060
+    # attempt_timeout: 32s     # per-gateway attempt budget (default 32s)
+    # cooldown: 30s            # passive health penalty window (default 30s)
+    gateways:
+      gw-mobile: { address: 223.76.90.4:16060 }   # transport: udp implied
+      gw-fixed:   { address: 223.76.90.5:16060 }
+    routes:                  # first match wins; multiple catch-alls legal
+      - match: "^1[3-9]\d{9}$"   # Go regexp on the called number
+        to: [gw-mobile]
+      - to: [gw-fixed, gw-mobile]  # no match = catch-all
+```
+
+Failover: a call retries the next gateway on a transport error, a silent
+gateway (attempt budget expiry — the current attempt is CANCELled first),
+a 5xx/408, or an unanchorable answer; a 4xx like 486 or an auth challenge
+is relayed to FreeSWITCH immediately, never retried. When every gateway
+fails, FreeSWITCH sees the last genuine carrier code, else 408, else 503.
+Health is passive cooldown: a gateway that answered nothing before its
+budget expired is penalized for `cooldown` and dialed only when no
+healthy alternative remains (never a hard block); a successful call
+recovers it.
 
 On the FreeSWITCH side (no gateway definition needed — this is a plain
 peer-to-peer bridge):

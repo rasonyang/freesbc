@@ -65,19 +65,30 @@ sip:
     transport: udp
 
   # Optional: a peer-to-peer PSTN trunk. Uncomment to let FreeSWITCH bridge
-  # outbound PSTN calls through the SBC to a carrier gateway that never
-  # registers (FreeSBC never pings it). A bridged call is one whose source
+  # outbound PSTN calls through the SBC to carrier gateways that never
+  # register (FreeSBC never pings them). A bridged call is one whose source
   # is FreeSWITCH AND whose Request-URI names the match address — the SBC
-  # forwards it to the gateway with media anchored on both legs, exactly
-  # like a call to a registered client. The match is what the FreeSWITCH
-  # dialplan dials PSTN prefixes to, so it must be an address FreeSWITCH
-  # uses for nothing else (validation refuses the SBC's own sockets and the
-  # upstream). Here FreeSWITCH reaches the public UDP listener, bound
-  # 0.0.0.0:16060, at the SBC's private address 10.77.0.2:16060.
+  # forwards it with media anchored on both legs, exactly like a call to a
+  # registered client. The match is what the FreeSWITCH dialplan dials PSTN
+  # prefixes to, so it must be an address FreeSWITCH uses for nothing else
+  # (validation refuses the SBC's own sockets and the upstream). Here
+  # FreeSWITCH reaches the public UDP listener, bound 0.0.0.0:16060, at the
+  # SBC's private address 10.77.0.2:16060.
+  #
+  # Two shapes: the multi-gateway form below (named carriers, routes by
+  # called-number prefix, failover in to: order), or the single-gateway
+  # shorthand `address: <host:port>` — the two are mutually exclusive.
   # pstn:
-  #   address: 223.76.90.4:16060  # the carrier gateway — a literal IP:port
-  #   transport: udp              # the only supported value today
   #   match: 10.77.0.2:16060      # FreeSWITCH dials sip:<number>@THIS address
+  #   # attempt_timeout: 32s      # per-gateway attempt budget (default 32s)
+  #   # cooldown: 30s             # passive health penalty window (default 30s)
+  #   gateways:
+  #     gw-mobile: { address: 223.76.90.4:16060 }  # literal IP:port; transport: udp implied
+  #     gw-fixed:   { address: 223.76.90.5:16060 }
+  #   routes:                     # first match wins; multiple catch-alls legal
+  #     - match: "^1[3-9]\d{9}$"  # Go regexp on the called number
+  #       to: [gw-mobile]
+  #     - to: [gw-fixed, gw-mobile]  # no match = catch-all; to: order = failover order
 
 rtp:
   public:
