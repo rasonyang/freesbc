@@ -12,8 +12,9 @@ It runs two independent planes, either or both of which may be enabled:
 - **Edge proxy** — a stateful SIP and media edge proxy that provides SIP
   registration proxying, UDP/WebSocket transport interworking, RTP anchoring,
   WebRTC-to-RTP media relay, and peer-to-peer PSTN trunking for FreeSWITCH.
-  Configured with `network:`, `sip.public/private/upstream`, an optional
-  `sip.pstn`, `rtp.public/private` and `webrtc:`.
+  Configured with `network:`, `sip.public/private`, `sip.upstream` (or
+  `sip.upstreams` for a pool), an optional `sip.pstn`, `rtp.public/private`
+  and `webrtc:`.
 
 ## Why
 
@@ -153,6 +154,57 @@ upstream unchanged. Note that they are also subject to the same
 chatty carrier can be throttled like an attacker; raise its budget if
 needed.
 
+### Multiple FreeSWITCHes (`sip.upstreams`)
+
+The single-upstream shorthand (`sip.upstream.address`) is also available as
+a pool: `sip.upstreams.nodes` names two or more switches and the proxy
+picks one per user. This is the OpenSIPS dispatcher's `hash-user`
+algorithm (alg 10) — the same placement rule, applied at the edge.
+
+```yaml
+sip:
+  # upstream: { address: 10.77.0.10:5060 }   # the v1 shorthand; XOR with nodes
+  upstreams:
+    algorithm: hash-user     # the only value; the field is reserved for others
+    cooldown: 30s            # passive health penalty window (default 30s)
+    nodes:
+      fs-1: { address: 10.77.0.10:5060 }   # literal IP:port; transport: udp implied
+      fs-2: { address: 10.77.0.11:5060 }
+```
+
+Selection is FNV-1a 64 over the **lower-cased** SIP user part, modulo the
+pool size. A user's REGISTER, its refresh, and the calls it places all
+start on the same node, and the other nodes see none of that traffic. The
+hash is a pure function of the user and the sorted node set: every request
+the same caller causes recomputes the same answer, with no shared state.
+
+Once a call is up, **the dialog record beats the hash**. A call that fs-2
+placed to a phone (the phone's user may hash to fs-1) is carried by fs-2,
+and the phone's ACK and BYE return to fs-2 because that is what the dialog
+record says — a dialog never migrates between switches mid-call. A record
+that is missing (an ACK racing the 2xx commit, or an evicted dialog) falls
+back to re-hashing the caller's identity, which lands on the same node the
+INVITE went to; it never answers 481 for lack of a record.
+
+What the pool requires of FreeSWITCH: a **shared registration database**
+(same `odbc-db`/`sofia` profile view on every node). Registration digests
+are forwarded verbatim, so after a failover the new node re-challenges and
+the phone's answer is valid there too — one extra round trip, not a broken
+registration. The switches must also be interchangeable for calls: the
+proxy hashes to a switch, it does not choose a dialplan.
+
+Failover is passive and transport-driven. A node that fails to accept the
+datagram (an unreachable route, a closed port that resets) is penalized for
+`cooldown` and retried only when no healthy alternative remains — never
+hard-blocked. On UDP a silent node is indistinguishable from a slow one, so
+a whole REGISTER attempt with zero responses is also penalized; the phone's
+own retry then skips that node. Any final response — including a 401
+challenge — is a real judgement and ends the attempt series; it is relayed,
+never retried on another node. Because the nodes are named and the pool is
+modulo-hashed, a change in the node set reshuffles users between nodes
+(follow-up: consistent hashing); with a shared database that is a
+re-registration, not an outage.
+
 ### Known limitations
 
 - **An inbound call to a browser is offered plain RTP**, which a browser will
@@ -164,8 +216,10 @@ needed.
 - **Offerless INVITE is refused (488)** in both directions.
 - **One media session per Call-ID.** An upstream that forked one Call-ID into
   two dialogs would need two sessions — a B2BUA's problem, not a proxy's.
-- **Upstream is a single UDP FreeSWITCH** at a literal address. No SRV, no
-  failover, no TCP/TLS upstream.
+- **Upstreams are UDP FreeSWITCHes at literal addresses.** One or a pool
+  (`sip.upstreams`), with per-user hashing and passive failover between
+  pool members — but no SRV, no TCP/TLS upstream, and no failover to a
+  switch outside the pool.
 - **IPv6 is untested** on the proxy plane, though the code paths are
   address-family agnostic.
 - **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
