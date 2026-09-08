@@ -58,6 +58,17 @@ func mustParseProxy(t *testing.T, yaml string) *Config {
 	return c
 }
 
+// pstnTrunk is a valid sip.pstn section for the proxyYAML shape: a carrier
+// gateway on the public side whose match address nothing else uses (it is
+// not the private socket and not the upstream).
+const pstnTrunk = "  pstn:\n    address: 223.76.90.4:16060\n    match: 203.0.113.7:16060\n"
+
+// withPSTN tucks a sip.pstn section into a proxyYAML-shaped config, right
+// after the upstream stanza it belongs beside — both are keys of sip:.
+func withPSTN(base, pstnSection string) string {
+	return strings.Replace(base, "    transport: udp\n", "    transport: udp\n"+pstnSection, 1)
+}
+
 func TestProxyOnlyConfigIsValid(t *testing.T) {
 	c := mustParseProxy(t, proxyYAML)
 	if !c.ProxyEnabled() {
@@ -82,6 +93,28 @@ func TestProxyOnlyConfigIsValid(t *testing.T) {
 	}
 	if got := c.PrivateSIPAdvertisedPort(); got != 16060 {
 		t.Errorf("PrivateSIPAdvertisedPort = %d", got)
+	}
+}
+
+// The optional sip.pstn trunk section parses, and its transport defaults to
+// udp — the only transport the carrier leg can ride (validation rejects the
+// rest). A config without the section must keep the zero PstnConfig, or the
+// proxy would believe a trunk was configured where none was.
+func TestPSTNTrunkParses(t *testing.T) {
+	c := mustParseProxy(t, withPSTN(proxyYAML, pstnTrunk))
+	if got := c.SIP.Pstn.Address; got != "223.76.90.4:16060" {
+		t.Errorf("Pstn.Address = %q", got)
+	}
+	if got := c.SIP.Pstn.Match.Host; got != "203.0.113.7" || c.SIP.Pstn.Match.Port != 16060 {
+		t.Errorf("Pstn.Match = %s, want 203.0.113.7:16060", c.SIP.Pstn.Match)
+	}
+	if got := c.SIP.Pstn.Transport; got != "udp" {
+		t.Errorf("Pstn.Transport = %q, want the udp default", got)
+	}
+	// And absent stays absent: no phantom trunk.
+	plain := mustParseProxy(t, proxyYAML)
+	if plain.SIP.Pstn.Address != "" || !plain.SIP.Pstn.Match.IsZero() || plain.SIP.Pstn.Transport != "" {
+		t.Errorf("SIP.Pstn not zero when the section is absent: %+v", plain.SIP.Pstn)
 	}
 }
 
@@ -158,6 +191,74 @@ func TestProxyValidationErrors(t *testing.T) {
 			"bad upstream address",
 			func(s string) string { return strings.Replace(s, "address: 10.77.0.10:5060", "address: 10.77.0.10", 1) },
 			"is not \"host:port\"",
+		},
+		{
+			"pstn transport tcp",
+			func(s string) string { return withPSTN(s, pstnTrunk+"    transport: tcp\n") },
+			`sip.pstn.transport: only "udp" is supported`,
+		},
+		{
+			"pstn address not host:port",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "223.76.90.4:16060", "223.76.90.4", 1)
+			},
+			`is not "host:port"`,
+		},
+		{
+			"pstn address bad port",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "223.76.90.4:16060", "223.76.90.4:99999", 1)
+			},
+			"sip.pstn.address: bad port",
+		},
+		{
+			"pstn match names the private socket",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:16060", 1)
+			},
+			"sip.pstn.match: must not name the SBC's private SIP address",
+		},
+		{
+			"pstn match names the upstream",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+			},
+			"sip.pstn.match: must not name the upstream",
+		},
+		{
+			"pstn without upstream",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "    address: 10.77.0.10:5060\n", "", 1)
+			},
+			"required to enable the edge proxy",
+		},
+		{
+			"pstn without public udp",
+			func(s string) string {
+				s = withPSTN(s, pstnTrunk)
+				return strings.Replace(s, "enabled: true\n      bind: 0.0.0.0:16060",
+					"enabled: false\n      bind: 0.0.0.0:16060", 1)
+			},
+			"sip.pstn: requires sip.public.udp.enabled",
+		},
+		{
+			"pstn match without address",
+			func(s string) string {
+				return withPSTN(s, "  pstn:\n    match: 203.0.113.7:16060\n")
+			},
+			"sip.pstn.match: requires sip.pstn.address",
+		},
+		{
+			"pstn address without match",
+			func(s string) string {
+				return withPSTN(s, "  pstn:\n    address: 223.76.90.4:16060\n")
+			},
+			"sip.pstn.match: required with sip.pstn.address",
 		},
 	}
 	for _, tt := range tests {

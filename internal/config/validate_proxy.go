@@ -7,21 +7,23 @@ import (
 )
 
 // validateProxy checks the edge-proxy plane (network/sip.public/
-// sip.private/sip.upstream/rtp.public/rtp.private/webrtc). It is a no-op
-// for a trunk-only config apart from rejecting half-written sections: a
-// public listener or a media plane configured WITHOUT an upstream is a
-// mistake worth naming, not a silent no-op.
+// sip.private/sip.upstream/sip.pstn/rtp.public/rtp.private/webrtc). It is
+// a no-op for a trunk-only config apart from rejecting half-written
+// sections: a public listener, a media plane or a PSTN trunk configured
+// WITHOUT an upstream is a mistake worth naming, not a silent no-op.
 //
 // fail is validate's error collector, so every problem in the file is
 // reported in one pass.
 func (c *Config) validateProxy(fail func(string, ...any)) {
 	enabled := c.ProxyEnabled()
 	listeners := c.PublicSIPListeners()
+	pstn := c.SIP.Pstn
+	pstnSet := pstn.Address != "" || !pstn.Match.IsZero()
 	partial := len(listeners) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
-		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero()
+		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || pstnSet
 	if !enabled {
 		if partial {
-			fail("sip.upstream.address: required to enable the edge proxy — sip.public/sip.private/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
+			fail("sip.upstream.address: required to enable the edge proxy — sip.public/sip.private/sip.pstn/rtp.public/rtp.private/webrtc are configured but there is no upstream to proxy to")
 		}
 		return
 	}
@@ -53,6 +55,58 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		// rather than binding a transport the forwarding path can't route
 		// responses back through.
 		fail("sip.upstream.transport: only \"udp\" is supported, got %q", c.SIP.Upstream.Transport)
+	}
+
+	// ---- pstn carrier gateway ----
+	// sip.pstn is optional: an outbound PSTN trunk riding the public UDP
+	// plane. It is a strict pair — address AND match, or nothing — and its
+	// match must not collide with an address FreeSWITCH already uses for
+	// other traffic, or the classification in the proxy's onInvite would
+	// misroute calls that are not PSTN bridges at all.
+	if pstnSet {
+		if pstn.Address == "" {
+			fail("sip.pstn.match: requires sip.pstn.address")
+		} else if host, port, err := net.SplitHostPort(pstn.Address); err != nil {
+			fail("sip.pstn.address: %q is not \"host:port\"", pstn.Address)
+		} else {
+			if host == "" {
+				fail("sip.pstn.address: host required")
+			}
+			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+				fail("sip.pstn.address: bad port in %q", pstn.Address)
+			}
+		}
+		if pstn.Transport != "udp" {
+			// The carrier leg rides the public UDP plane, which is the only
+			// public transport the forwarding path can send a peer-to-peer
+			// call over without a registration to bind it to.
+			fail("sip.pstn.transport: only \"udp\" is supported, got %q", pstn.Transport)
+		}
+		if !c.SIP.Public.UDP.Enabled {
+			fail("sip.pstn: requires sip.public.udp.enabled — the carrier leg rides the public UDP side")
+		}
+		if pstn.Match.IsZero() {
+			fail("sip.pstn.match: required with sip.pstn.address")
+		} else {
+			// The classification keys on the match host:port alone (the
+			// called number varies per call), so a match that names an
+			// address FreeSWITCH legitimately uses for other traffic would
+			// shadow it: every such call would be routed to the carrier
+			// instead of its real destination. The private SIP socket and
+			// the upstream are exactly the two addresses FreeSWITCH talks
+			// to for everything else.
+			if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
+				fail("sip.pstn.match: must not name the SBC's private SIP address")
+			}
+			if pstn.Match.Host == c.PrivateAdvertisedIP().String() && pstn.Match.Port == c.PrivateSIPAdvertisedPort() {
+				fail("sip.pstn.match: must not name the SBC's private SIP address")
+			}
+			if uh, up, err := net.SplitHostPort(c.SIP.Upstream.Address); err == nil {
+				if p, err := strconv.Atoi(up); err == nil && pstn.Match.Host == uh && pstn.Match.Port == p {
+					fail("sip.pstn.match: must not name the upstream")
+				}
+			}
+		}
 	}
 
 	// ---- network planes ----

@@ -113,6 +113,21 @@ func (s side) via(branch string) *sip.ViaHeader {
 	return v
 }
 
+// pstnTopo is the resolved PSTN gateway model. gateway/gatewayHost are the
+// carrier's signaling address (parsed and as-configured); match is the
+// host:port FreeSWITCH bridges PSTN calls to — the trigger of the
+// classification in onInvite.
+type pstnTopo struct {
+	gateway     netip.AddrPort
+	gatewayHost string
+	match       config.HostPort
+}
+
+// pstnEnabled reports whether a PSTN carrier gateway is configured. The
+// zero pstnTopo (an invalid gateway AddrPort) is what a config without
+// sip.pstn leaves behind.
+func (t *topology) pstnEnabled() bool { return t.pstn.gateway.IsValid() }
+
 // topology is the resolved network model the proxy runs with, built once
 // at startup from the config. Listener addresses cannot be changed under a
 // running socket, so this is deliberately a snapshot rather than something
@@ -140,6 +155,11 @@ type topology struct {
 	// upstreamHost is the address as configured, used for Destination.
 	upstreamHost string
 
+	// pstn is the PSTN carrier gateway, when sip.pstn is configured; its
+	// zero value leaves the trunk off. Resolved at startup like upstream —
+	// the topology is a snapshot, not something re-read per request.
+	pstn pstnTopo
+
 	// media advertised addresses.
 	publicMediaIP  netip.Addr
 	privateMediaIP netip.Addr
@@ -162,11 +182,41 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 		return nil, err
 	}
 
+	// sip.pstn is optional; the resolution mirrors the upstream's: no DNS,
+	// literal address only, validated host:port. The match must already be
+	// a literal too — it is compared byte-for-byte against Request-URIs,
+	// and a name would silently never match (or, worse, match the wrong
+	// thing once a resolver changed).
+	var pstn pstnTopo
+	if cfg.SIP.Pstn.Address != "" {
+		gwHost, gwPortStr, err := net.SplitHostPort(cfg.SIP.Pstn.Address)
+		if err != nil {
+			return nil, err
+		}
+		gwIP, err := netip.ParseAddr(gwHost)
+		if err != nil {
+			return nil, &configError{"sip.pstn.address must be a literal IP:port, got " + gwHost}
+		}
+		gwPort, err := strconv.Atoi(gwPortStr)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := netip.ParseAddr(cfg.SIP.Pstn.Match.Host); err != nil {
+			return nil, &configError{"sip.pstn.match must be a literal IP, got " + cfg.SIP.Pstn.Match.Host}
+		}
+		pstn = pstnTopo{
+			gateway:     netip.AddrPortFrom(gwIP, uint16(gwPort)),
+			gatewayHost: cfg.SIP.Pstn.Address,
+			match:       cfg.SIP.Pstn.Match,
+		}
+	}
+
 	privIP := cfg.PrivateAdvertisedIP()
 	t := &topology{
 		public:       map[string]side{},
 		upstream:     netip.AddrPortFrom(ip, uint16(port)),
 		upstreamHost: cfg.SIP.Upstream.Address,
+		pstn:         pstn,
 		private: side{
 			plane:     planePrivate,
 			transport: "udp",

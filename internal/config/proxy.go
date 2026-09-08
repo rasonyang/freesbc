@@ -111,6 +111,16 @@ type UpstreamConfig struct {
 	Transport string `yaml:"transport"` // udp (the only supported value today)
 }
 
+// PstnConfig points at a peer-to-peer PSTN carrier gateway the edge proxy
+// forwards FreeSWITCH-bridged outbound calls to. The gateway never
+// registers and FreeSBC never sends it keepalives; the only traffic it
+// receives is what it is answering. Its zero value disables the trunk.
+type PstnConfig struct {
+	Address   string   `yaml:"address"`   // host:port; literal IP enforced at topology build
+	Transport string   `yaml:"transport"` // udp (default; the only supported value)
+	Match     HostPort `yaml:"match"`     // host:port FreeSWITCH bridges PSTN calls to
+}
+
 // RTPPlaneConfig is one media plane's bind/advertised address plus its own
 // port pool. The two planes MUST use disjoint port ranges when they bind
 // the same address family on the same interface, so validation rejects an
@@ -241,6 +251,9 @@ func (c *Config) PrivateSIPAdvertisedPort() int {
 func proxyWithDefaults(c *Config) {
 	if c.SIP.Upstream.Address != "" && c.SIP.Upstream.Transport == "" {
 		c.SIP.Upstream.Transport = "udp"
+	}
+	if c.SIP.Pstn.Address != "" && c.SIP.Pstn.Transport == "" {
+		c.SIP.Pstn.Transport = "udp"
 	}
 	// A public listener written without an explicit bind gets the public
 	// plane's bind address and the transport's conventional port, so the

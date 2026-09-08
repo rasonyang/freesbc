@@ -148,6 +148,86 @@ func TestBuildTopologyRejectsHostname(t *testing.T) {
 	}
 }
 
+// pstnTopoBlock is a valid sip.pstn section for the topoYAML shape. The
+// match address must not collide with anything FreeSWITCH already talks to
+// for other traffic: the private socket is 10.77.0.2:16060 and the upstream
+// is 10.77.0.10:5060, so 10.77.0.2:16061 is free.
+const pstnTopoBlock = "  pstn:\n    address: 223.76.90.4:16060\n    match: 10.77.0.2:16061\n"
+
+func testPSTNTopology(t *testing.T) *topology {
+	t.Helper()
+	cfg, err := config.Parse([]byte(strings.Replace(topoYAML,
+		"    address: 10.77.0.10:5060\n", "    address: 10.77.0.10:5060\n"+pstnTopoBlock, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topo, err := buildTopology(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return topo
+}
+
+func TestTopologyPSTN(t *testing.T) {
+	topo := testPSTNTopology(t)
+	if !topo.pstnEnabled() {
+		t.Fatal("pstnEnabled() = false with sip.pstn configured")
+	}
+	if got := topo.pstn.gateway.String(); got != "223.76.90.4:16060" {
+		t.Errorf("pstn gateway = %s", got)
+	}
+	if got := topo.pstn.gatewayHost; got != "223.76.90.4:16060" {
+		t.Errorf("pstn gatewayHost = %q", got)
+	}
+	if topo.pstn.match.Host != "10.77.0.2" || topo.pstn.match.Port != 16061 {
+		t.Errorf("pstn match = %v, want 10.77.0.2:16061", topo.pstn.match)
+	}
+	// A topology without sip.pstn must report the trunk off — the zero
+	// gateway is what the classification tests rely on.
+	plain := testTopology(t)
+	if plain.pstnEnabled() {
+		t.Error("pstnEnabled() = true without sip.pstn configured")
+	}
+	if plain.pstn.match.Host != "" {
+		t.Errorf("plain topology has a pstn match: %v", plain.pstn.match)
+	}
+}
+
+// The PSTN gateway is resolved like the upstream: no DNS. A hostname here
+// would make the carrier leg resolve per forward — or, if the name is
+// gone, silently fail every bridged call.
+func TestBuildTopologyRejectsPSTNHostnames(t *testing.T) {
+	tests := []struct {
+		name string
+		// from/to break one field of an otherwise valid pstn section.
+		from, to, want string
+	}{
+		{
+			"address",
+			"address: 223.76.90.4:16060", "address: gw.example.com:16060",
+			"sip.pstn.address must be a literal IP:port, got gw.example.com",
+		},
+		{
+			"match",
+			"match: 10.77.0.2:16061", "match: pstn.example.com:16061",
+			"sip.pstn.match must be a literal IP, got pstn.example.com",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			yaml := strings.Replace(topoYAML, "    address: 10.77.0.10:5060\n",
+				"    address: 10.77.0.10:5060\n"+pstnTopoBlock, 1)
+			cfg, err := config.Parse([]byte(strings.Replace(yaml, tt.from, tt.to, 1)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := buildTopology(cfg); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("want error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
 func TestSameAddr(t *testing.T) {
 	cases := []struct {
 		a, b string
