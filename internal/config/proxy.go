@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
+	"time"
 )
 
 // This file adds the public/private network model of the SIP/RTP/WebRTC
@@ -111,15 +113,72 @@ type UpstreamConfig struct {
 	Transport string `yaml:"transport"` // udp (the only supported value today)
 }
 
-// PstnConfig points at a peer-to-peer PSTN carrier gateway the edge proxy
-// forwards FreeSWITCH-bridged outbound calls to. The gateway never
-// registers and FreeSBC never sends it keepalives; the only traffic it
-// receives is what it is answering. Its zero value disables the trunk.
+// PstnConfig routes FreeSWITCH-bridged outbound calls to peer-to-peer PSTN
+// carrier gateways. A gateway never registers and FreeSBC never sends it
+// keepalives; the only traffic it receives is what it is answering. Its
+// zero value disables the trunk.
+//
+// There are two shapes, and they are mutually exclusive (validation
+// rejects writing both):
+//
+//   - the v1 ALIAS: `address` + `transport` + `match`, a single gateway.
+//     The topology builder synthesises it into gateways["default"] plus
+//     one catch-all route, so the runtime treats both shapes identically
+//     (see proxy/topology.go).
+//   - the MULTI shape: `gateways` (named carrier gateways) + `routes`
+//     (prefix selection over them, in order, first hit wins) + `match`.
+//     The `to` list of a route is its failover order.
+//
+// attempt_timeout is the per-gateway attempt budget before FreeSBC cancels
+// and fails over; cooldown is how long a gateway that produced no response
+// at all is skipped in favour of alternatives. Both are re-read from the
+// store on every call, so a reload changes the budget for the NEXT call;
+// gateways/routes/match are a startup snapshot (like the rest of the
+// topology).
 type PstnConfig struct {
-	Address   string   `yaml:"address"`   // host:port; literal IP enforced at topology build
-	Transport string   `yaml:"transport"` // udp (default; the only supported value)
+	Address   string   `yaml:"address"`   // v1 alias: host:port; literal IP enforced at topology build
+	Transport string   `yaml:"transport"` // v1 alias transport: udp (default; the only supported value)
 	Match     HostPort `yaml:"match"`     // host:port FreeSWITCH bridges PSTN calls to
+
+	// AttemptTimeout is how long one gateway may take to answer before the
+	// attempt is cancelled and the next gateway in the route is dialed.
+	// Defaults to 32s when the section is configured.
+	AttemptTimeout Duration `yaml:"attempt_timeout"`
+	// Cooldown is how long a gateway that answered nothing is skipped after
+	// a failed attempt (a passive penalty; there is no active health
+	// probing). Defaults to 30s when the section is configured.
+	Cooldown Duration `yaml:"cooldown"`
+
+	// Gateways is the multi-shape gateway set, keyed by the names the
+	// routes reference.
+	Gateways map[string]*PstnGateway `yaml:"gateways"`
+	// Routes selects the failover list per called number, evaluated in
+	// order; the first route whose match hits wins, and a route without a
+	// match is a catch-all (several catch-alls are legal — only the first
+	// ever fires).
+	Routes []*PstnRoute `yaml:"routes"`
 }
+
+// PstnGateway is one named carrier gateway in the multi shape.
+type PstnGateway struct {
+	Address   string `yaml:"address"`   // host:port; literal IP enforced at topology build
+	Transport string `yaml:"transport"` // udp (default; the only supported value)
+}
+
+// PstnRoute is one routing rule of the multi shape: which gateways a
+// called number fails over across, in order.
+type PstnRoute struct {
+	// Match is a Go regexp matched against the called number (the
+	// Request-URI user part). Empty means the route matches every number.
+	Match string   `yaml:"match"`
+	To    []string `yaml:"to"` // gateway names, in failover order
+
+	matchTo *regexp.Regexp // compiled by Validate
+}
+
+// CompiledMatch returns the compiled Match regex, or nil for a catch-all.
+// Only valid after Validate has run.
+func (r *PstnRoute) CompiledMatch() *regexp.Regexp { return r.matchTo }
 
 // RTPPlaneConfig is one media plane's bind/advertised address plus its own
 // port pool. The two planes MUST use disjoint port ranges when they bind
@@ -254,6 +313,25 @@ func proxyWithDefaults(c *Config) {
 	}
 	if c.SIP.Pstn.Address != "" && c.SIP.Pstn.Transport == "" {
 		c.SIP.Pstn.Transport = "udp"
+	}
+	// The pstn failure-budget defaults mirror peer_cooldown's (schema.go):
+	// they only apply when the section was actually written — a config
+	// without sip.pstn keeps a fully zero PstnConfig so "is the trunk
+	// configured" stays decidable — and zero still means "operator did not
+	// say", which is why validation only has to reject negatives.
+	pstn := &c.SIP.Pstn
+	if pstn.Address != "" || !pstn.Match.IsZero() || len(pstn.Gateways) > 0 || len(pstn.Routes) > 0 {
+		if pstn.AttemptTimeout == 0 {
+			pstn.AttemptTimeout = Duration(32 * time.Second)
+		}
+		if pstn.Cooldown == 0 {
+			pstn.Cooldown = Duration(30 * time.Second)
+		}
+		for _, g := range pstn.Gateways {
+			if g.Transport == "" {
+				g.Transport = "udp"
+			}
+		}
 	}
 	// A public listener written without an explicit bind gets the public
 	// plane's bind address and the transport's conventional port, so the

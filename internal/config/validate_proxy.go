@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
 )
 
@@ -18,7 +20,9 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 	enabled := c.ProxyEnabled()
 	listeners := c.PublicSIPListeners()
 	pstn := c.SIP.Pstn
-	pstnSet := pstn.Address != "" || !pstn.Match.IsZero()
+	pstnSet := pstn.Address != "" || !pstn.Match.IsZero() ||
+		len(pstn.Gateways) > 0 || len(pstn.Routes) > 0 ||
+		pstn.AttemptTimeout != 0 || pstn.Cooldown != 0
 	partial := len(listeners) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
 		c.WebRTC.Enabled || !c.SIP.Private.Bind.IsZero() || pstnSet
 	if !enabled {
@@ -59,24 +63,120 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 
 	// ---- pstn carrier gateway ----
 	// sip.pstn is optional: an outbound PSTN trunk riding the public UDP
-	// plane. It is a strict pair — address AND match, or nothing — and its
-	// match must not collide with an address FreeSWITCH already uses for
-	// other traffic, or the classification in the proxy's onInvite would
-	// misroute calls that are not PSTN bridges at all.
+	// plane, in one of two mutually exclusive shapes — the v1 single-
+	// gateway alias (address + match) or the multi form (gateways + routes
+	// + match). Either way its match must not collide with an address
+	// FreeSWITCH already uses for other traffic, or the classification in
+	// the proxy's onInvite would misroute calls that are not PSTN bridges
+	// at all.
 	if pstnSet {
-		if pstn.Address == "" {
-			fail("sip.pstn.match: requires sip.pstn.address")
-		} else if host, port, err := net.SplitHostPort(pstn.Address); err != nil {
-			fail("sip.pstn.address: %q is not \"host:port\"", pstn.Address)
-		} else {
-			if host == "" {
-				fail("sip.pstn.address: host required")
+		// Both budgets are optional but signed: zero means "use the
+		// default", so a negative value is an operator mistake to name
+		// here, not a value to default away.
+		if pstn.AttemptTimeout < 0 {
+			fail("sip.pstn.attempt_timeout: must not be negative, got %v", pstn.AttemptTimeout.Std())
+		}
+		if pstn.Cooldown < 0 {
+			fail("sip.pstn.cooldown: must not be negative, got %v", pstn.Cooldown.Std())
+		}
+
+		alias := pstn.Address != ""
+		gws := len(pstn.Gateways) > 0
+		routes := len(pstn.Routes) > 0
+		switch {
+		case alias && (gws || routes):
+			fail("sip.pstn: address and gateways are mutually exclusive — use the single-gateway alias (address) or the multi-gateway form (gateways + routes), not both")
+		case alias:
+			// ---- v1 alias: a strict address AND match pair, byte-for-byte
+			// the checks the deployed shape has always had.
+			if host, port, err := net.SplitHostPort(pstn.Address); err != nil {
+				fail("sip.pstn.address: %q is not \"host:port\"", pstn.Address)
+			} else {
+				if host == "" {
+					fail("sip.pstn.address: host required")
+				}
+				if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+					fail("sip.pstn.address: bad port in %q", pstn.Address)
+				}
 			}
-			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-				fail("sip.pstn.address: bad port in %q", pstn.Address)
+			if pstn.Match.IsZero() {
+				fail("sip.pstn.match: required with sip.pstn.address")
+			} else {
+				c.validatePSTNMatch(pstn, fail)
+			}
+		case gws:
+			// ---- multi shape: named gateways plus the routes that select
+			// and order them. Both halves are required — a gateway that no
+			// route names is dead config, and a route with nothing to name
+			// cannot exist.
+			if !routes {
+				fail("sip.pstn.routes: at least one route required when gateways are configured — the route is what selects which gateways a called number fails over across")
+			}
+			for name, g := range pstn.Gateways {
+				label := "sip.pstn.gateways." + name
+				if g == nil || g.Address == "" {
+					fail("%s.address: required", label)
+					continue
+				}
+				if host, port, err := net.SplitHostPort(g.Address); err != nil {
+					fail("%s.address: %q is not \"host:port\"", label, g.Address)
+				} else {
+					if host == "" {
+						fail("%s.address: host required", label)
+					}
+					if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+						fail("%s.address: bad port in %q", label, g.Address)
+					}
+				}
+				if g.Transport != "udp" {
+					// Same reasoning as the alias transport: the carrier leg
+					// rides the public UDP plane, the only public transport
+					// the forwarding path can use without a registration.
+					fail("%s.transport: only \"udp\" is supported, got %q", label, g.Transport)
+				}
+			}
+			for i, r := range pstn.Routes {
+				label := fmt.Sprintf("sip.pstn.routes[%d]", i)
+				if len(r.To) == 0 {
+					fail("%s: to: at least one gateway required", label)
+				}
+				for _, t := range r.To {
+					if _, ok := pstn.Gateways[t]; !ok {
+						fail("%s: to: unknown gateway %q", label, t)
+					}
+				}
+				r.matchTo = nil
+				if r.Match != "" {
+					// Compiled once at validate time, exactly like the trunk
+					// routes (validate.go): a bad pattern is a config error,
+					// not a discovery on the first matching call.
+					re, err := regexp.Compile(r.Match)
+					if err != nil {
+						fail("%s: match: %v", label, err)
+					} else {
+						r.matchTo = re
+					}
+				}
+			}
+			if pstn.Match.IsZero() {
+				fail("sip.pstn.match: required with sip.pstn.gateways")
+			} else {
+				c.validatePSTNMatch(pstn, fail)
+			}
+		default:
+			// The section exists but names no gateway in either form:
+			// match/routes/timers alone are configuration with nothing to
+			// route to.
+			if !pstn.Match.IsZero() {
+				fail("sip.pstn.match: requires sip.pstn.address")
+			} else if routes {
+				fail("sip.pstn.routes: require sip.pstn.gateways — a route can only name configured gateways")
+			} else {
+				fail("sip.pstn: address or gateways required — match/attempt_timeout/cooldown alone configure nothing")
 			}
 		}
-		if pstn.Transport != "udp" {
+
+		if pstn.Transport != "" && pstn.Transport != "udp" {
 			// The carrier leg rides the public UDP plane, which is the only
 			// public transport the forwarding path can send a peer-to-peer
 			// call over without a registration to bind it to.
@@ -84,28 +184,6 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		}
 		if !c.SIP.Public.UDP.Enabled {
 			fail("sip.pstn: requires sip.public.udp.enabled — the carrier leg rides the public UDP side")
-		}
-		if pstn.Match.IsZero() {
-			fail("sip.pstn.match: required with sip.pstn.address")
-		} else {
-			// The classification keys on the match host:port alone (the
-			// called number varies per call), so a match that names an
-			// address FreeSWITCH legitimately uses for other traffic would
-			// shadow it: every such call would be routed to the carrier
-			// instead of its real destination. The private SIP socket and
-			// the upstream are exactly the two addresses FreeSWITCH talks
-			// to for everything else.
-			if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
-				fail("sip.pstn.match: must not name the SBC's private SIP address")
-			}
-			if pstn.Match.Host == c.PrivateAdvertisedIP().String() && pstn.Match.Port == c.PrivateSIPAdvertisedPort() {
-				fail("sip.pstn.match: must not name the SBC's private SIP address")
-			}
-			if uh, up, err := net.SplitHostPort(c.SIP.Upstream.Address); err == nil {
-				if p, err := strconv.Atoi(up); err == nil && pstn.Match.Host == uh && pstn.Match.Port == p {
-					fail("sip.pstn.match: must not name the upstream")
-				}
-			}
 		}
 	}
 
@@ -229,6 +307,27 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		wsEnabled := c.SIP.Public.WS.Enabled || c.SIP.Public.WSS.Enabled
 		if !wsEnabled {
 			fail("webrtc.enabled: requires sip.public.ws or sip.public.wss — a browser has no other way to signal")
+		}
+	}
+}
+
+// validatePSTNMatch runs the match-collision checks shared by both pstn
+// shapes. The classification keys on the match host:port alone (the called
+// number varies per call), so a match that names an address FreeSWITCH
+// legitimately uses for other traffic would shadow it: every such call
+// would be routed to the carrier instead of its real destination. The
+// private SIP socket and the upstream are exactly the two addresses
+// FreeSWITCH talks to for everything else.
+func (c *Config) validatePSTNMatch(pstn PstnConfig, fail func(string, ...any)) {
+	if pstn.Match.Host == c.SIP.Private.Bind.Host && pstn.Match.Port == c.SIP.Private.Bind.Port {
+		fail("sip.pstn.match: must not name the SBC's private SIP address")
+	}
+	if pstn.Match.Host == c.PrivateAdvertisedIP().String() && pstn.Match.Port == c.PrivateSIPAdvertisedPort() {
+		fail("sip.pstn.match: must not name the SBC's private SIP address")
+	}
+	if uh, up, err := net.SplitHostPort(c.SIP.Upstream.Address); err == nil {
+		if p, err := strconv.Atoi(up); err == nil && pstn.Match.Host == uh && pstn.Match.Port == p {
+			fail("sip.pstn.match: must not name the upstream")
 		}
 	}
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // proxyYAML is a complete, minimal edge-proxy config: no trunk peers, no
@@ -111,10 +112,246 @@ func TestPSTNTrunkParses(t *testing.T) {
 	if got := c.SIP.Pstn.Transport; got != "udp" {
 		t.Errorf("Pstn.Transport = %q, want the udp default", got)
 	}
-	// And absent stays absent: no phantom trunk.
+	// The failure budgets default exactly like the trunk plane's
+	// peer_cooldown: zero in the file means "the default", never "zero".
+	if got := c.SIP.Pstn.AttemptTimeout.Std(); got != 32*time.Second {
+		t.Errorf("AttemptTimeout = %s, want the 32s default", got)
+	}
+	if got := c.SIP.Pstn.Cooldown.Std(); got != 30*time.Second {
+		t.Errorf("Cooldown = %s, want the 30s default", got)
+	}
+	// And absent stays absent: no phantom trunk, no phantom budgets.
 	plain := mustParseProxy(t, proxyYAML)
-	if plain.SIP.Pstn.Address != "" || !plain.SIP.Pstn.Match.IsZero() || plain.SIP.Pstn.Transport != "" {
+	if plain.SIP.Pstn.Address != "" || !plain.SIP.Pstn.Match.IsZero() || plain.SIP.Pstn.Transport != "" ||
+		plain.SIP.Pstn.AttemptTimeout != 0 || plain.SIP.Pstn.Cooldown != 0 ||
+		len(plain.SIP.Pstn.Gateways) > 0 || len(plain.SIP.Pstn.Routes) > 0 {
 		t.Errorf("SIP.Pstn not zero when the section is absent: %+v", plain.SIP.Pstn)
+	}
+}
+
+// multiPSTN is a valid multi-gateway sip.pstn section for the proxyYAML
+// shape: two named gateways and two routes (a mobile-number prefix rule and
+// a catch-all whose to list doubles as the failover order). The route
+// regexp is single-quoted YAML on purpose: a double-quoted "\d" is not a
+// YAML escape and would not parse.
+const multiPSTN = `  pstn:
+    match: 203.0.113.7:16060
+    gateways:
+      gw-mobile:
+        address: 223.76.90.4:16060
+      gw-fixed:
+        address: 223.76.90.5:16060
+    routes:
+      - match: '^1[3-9]\d{9}$'
+        to: [gw-mobile]
+      - to: [gw-fixed, gw-mobile]
+`
+
+// The multi-gateway shape parses: named gateways, per-number routes whose
+// match compiles at validate time, and per-gateway transport defaulting to
+// udp. Unwritten budgets get the same defaults as the alias shape.
+func TestPSTNGatewaysParses(t *testing.T) {
+	c := mustParseProxy(t, withPSTN(proxyYAML, multiPSTN))
+	pstn := c.SIP.Pstn
+	if pstn.Address != "" {
+		t.Errorf("alias Address set in the multi shape: %q", pstn.Address)
+	}
+	if got := pstn.Match.String(); got != "203.0.113.7:16060" {
+		t.Errorf("Match = %s", got)
+	}
+	if got := pstn.AttemptTimeout.Std(); got != 32*time.Second {
+		t.Errorf("AttemptTimeout = %s, want the 32s default", got)
+	}
+	if got := pstn.Cooldown.Std(); got != 30*time.Second {
+		t.Errorf("Cooldown = %s, want the 30s default", got)
+	}
+	if mobile := pstn.Gateways["gw-mobile"]; mobile == nil || mobile.Address != "223.76.90.4:16060" {
+		t.Fatalf("gateway gw-mobile = %+v", pstn.Gateways["gw-mobile"])
+	} else if got := mobile.Transport; got != "udp" {
+		t.Errorf("gw-mobile transport = %q, want the udp default", got)
+	}
+	if fixed := pstn.Gateways["gw-fixed"]; fixed == nil || fixed.Address != "223.76.90.5:16060" || fixed.Transport != "udp" {
+		t.Errorf("gateway gw-fixed = %+v", fixed)
+	}
+	if len(pstn.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(pstn.Routes))
+	}
+	// The mobile route compiles; the catch-all stays nil so the topology
+	// builder can match it against every number.
+	if re := pstn.Routes[0].CompiledMatch(); re == nil || !re.MatchString("13800138000") || re.MatchString("0281234567") {
+		t.Errorf("route[0] regexp miscompiled from %q", pstn.Routes[0].Match)
+	}
+	if re := pstn.Routes[1].CompiledMatch(); re != nil {
+		t.Errorf("catch-all route[1] compiled to %v, want nil", re)
+	}
+	if to := pstn.Routes[1].To; len(to) != 2 || to[0] != "gw-fixed" || to[1] != "gw-mobile" {
+		t.Errorf("route[1] to = %v, want [gw-fixed gw-mobile]", to)
+	}
+}
+
+// The multi shape also parses with an explicit attempt_timeout and with
+// several catch-all routes — only the first one ever fires, but writing
+// several is not a config error. The inline { address: ... } gateway form
+// is exercised too, as that is the shape the examples document.
+func TestPSTNGatewaysExplicitAndCatchalls(t *testing.T) {
+	explicit := `  pstn:
+    match: 203.0.113.7:16060
+    attempt_timeout: 45s
+    cooldown: 90s
+    gateways:
+      gw-a: { address: 223.76.90.4:16060 }
+      gw-b: { address: 223.76.90.5:16060, transport: udp }
+    routes:
+      - to: [gw-a]
+      - to: [gw-b, gw-a]
+`
+	c := mustParseProxy(t, withPSTN(proxyYAML, explicit))
+	pstn := c.SIP.Pstn
+	if got := pstn.AttemptTimeout.Std(); got != 45*time.Second {
+		t.Errorf("AttemptTimeout = %s, want 45s", got)
+	}
+	if got := pstn.Cooldown.Std(); got != 90*time.Second {
+		t.Errorf("Cooldown = %s, want 90s", got)
+	}
+	if len(pstn.Routes) != 2 || pstn.Routes[0].CompiledMatch() != nil || pstn.Routes[1].CompiledMatch() != nil {
+		t.Fatalf("catch-all routes = %+v", pstn.Routes)
+	}
+	if g := pstn.Gateways["gw-b"]; g == nil || g.Address != "223.76.90.5:16060" || g.Transport != "udp" {
+		t.Errorf("flow-style gateway gw-b = %+v", g)
+	}
+}
+
+func TestPSTNMultiValidationErrors(t *testing.T) {
+	// replacePSTN rewrites multiPSTN then swaps it into the proxy YAML.
+	replacePSTN := func(edit func(string) string) string {
+		return withPSTN(proxyYAML, edit(multiPSTN))
+	}
+	tests := []struct {
+		name string
+		edit func(string) string
+		want string
+	}{
+		{
+			"address alias combined with gateways",
+			func(s string) string {
+				return strings.Replace(s, "  pstn:\n    match:", "  pstn:\n    address: 223.76.90.9:16060\n    match:", 1)
+			},
+			"address and gateways are mutually exclusive",
+		},
+		{
+			"gateways without routes",
+			func(s string) string {
+				s = strings.Replace(s, "    routes:\n", "", 1)
+				return strings.Replace(s, "      - match: '^1[3-9]\\d{9}$'\n        to: [gw-mobile]\n      - to: [gw-fixed, gw-mobile]\n", "", 1)
+			},
+			"sip.pstn.routes: at least one route required",
+		},
+		{
+			"gateways without match",
+			func(s string) string { return strings.Replace(s, "    match: 203.0.113.7:16060\n", "", 1) },
+			"sip.pstn.match: required with sip.pstn.gateways",
+		},
+		{
+			"gateway missing address",
+			func(s string) string {
+				return strings.Replace(s, "      gw-mobile:\n        address: 223.76.90.4:16060\n", "      gw-mobile:\n        transport: udp\n", 1)
+			},
+			"sip.pstn.gateways.gw-mobile.address: required",
+		},
+		{
+			"gateway address not host:port",
+			func(s string) string {
+				return strings.Replace(s, "223.76.90.4:16060", "223.76.90.4", 1)
+			},
+			`sip.pstn.gateways.gw-mobile.address: "223.76.90.4" is not "host:port"`,
+		},
+		{
+			"gateway address bad port",
+			func(s string) string {
+				return strings.Replace(s, "223.76.90.4:16060", "223.76.90.4:99999", 1)
+			},
+			"sip.pstn.gateways.gw-mobile.address: bad port",
+		},
+		{
+			"gateway transport tcp",
+			func(s string) string {
+				return strings.Replace(s, "      gw-mobile:\n        address: 223.76.90.4:16060\n", "      gw-mobile:\n        address: 223.76.90.4:16060\n        transport: tcp\n", 1)
+			},
+			`sip.pstn.gateways.gw-mobile.transport: only "udp" is supported`,
+		},
+		{
+			"route with empty to",
+			func(s string) string { return strings.Replace(s, "to: [gw-mobile]\n", "to: []\n", 1) },
+			"sip.pstn.routes[0]: to: at least one gateway required",
+		},
+		{
+			"route naming an unknown gateway",
+			func(s string) string {
+				return strings.Replace(s, "to: [gw-fixed, gw-mobile]", "to: [gw-fixed, gw-ghost]", 1)
+			},
+			`sip.pstn.routes[1]: to: unknown gateway "gw-ghost"`,
+		},
+		{
+			"route with a bad regexp",
+			func(s string) string { return strings.Replace(s, "'^1[3-9]\\d{9}$'", "'['", 1) },
+			"sip.pstn.routes[0]: match: error parsing regexp",
+		},
+		{
+			"negative attempt_timeout",
+			func(s string) string {
+				return strings.Replace(s, "  pstn:\n    match:", "  pstn:\n    attempt_timeout: -5s\n    match:", 1)
+			},
+			"sip.pstn.attempt_timeout: must not be negative, got -5s",
+		},
+		{
+			"negative cooldown",
+			func(s string) string {
+				return strings.Replace(s, "  pstn:\n    match:", "  pstn:\n    cooldown: -1m\n    match:", 1)
+			},
+			"sip.pstn.cooldown: must not be negative, got -1m0s",
+		},
+		{
+			"routes without gateways",
+			func(s string) string { return "  pstn:\n    routes:\n      - to: [gw-mobile]\n" },
+			"sip.pstn.routes: require sip.pstn.gateways",
+		},
+		{
+			"budget without either shape",
+			func(s string) string { return "  pstn:\n    attempt_timeout: 5s\n" },
+			"sip.pstn: address or gateways required",
+		},
+		{
+			"match names the private socket in the multi shape",
+			func(s string) string {
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:16060", 1)
+			},
+			"sip.pstn.match: must not name the SBC's private SIP address",
+		},
+		{
+			"match names the upstream in the multi shape",
+			func(s string) string {
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.10:5060", 1)
+			},
+			"sip.pstn.match: must not name the upstream",
+		},
+		{
+			"top-level transport tcp in the multi shape",
+			func(s string) string {
+				return strings.Replace(s, "  pstn:\n    match:", "  pstn:\n    transport: tcp\n    match:", 1)
+			},
+			`sip.pstn.transport: only "udp" is supported`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(replacePSTN(tt.edit)))
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tt.want)
+			}
+		})
 	}
 }
 
