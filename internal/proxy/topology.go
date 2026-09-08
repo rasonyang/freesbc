@@ -19,6 +19,7 @@ package proxy
 import (
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,20 +114,52 @@ func (s side) via(branch string) *sip.ViaHeader {
 	return v
 }
 
-// pstnTopo is the resolved PSTN gateway model. gateway/gatewayHost are the
-// carrier's signaling address (parsed and as-configured); match is the
-// host:port FreeSWITCH bridges PSTN calls to — the trigger of the
-// classification in onInvite.
-type pstnTopo struct {
-	gateway     netip.AddrPort
-	gatewayHost string
-	match       config.HostPort
+// pstnGateway is one resolved carrier gateway: its signaling address
+// (parsed) plus the host:port as configured, which is what the forwarder
+// puts in Destination.
+type pstnGateway struct {
+	addr netip.AddrPort
+	host string
 }
 
-// pstnEnabled reports whether a PSTN carrier gateway is configured. The
-// zero pstnTopo (an invalid gateway AddrPort) is what a config without
-// sip.pstn leaves behind.
-func (t *topology) pstnEnabled() bool { return t.pstn.gateway.IsValid() }
+// pstnRoute is one resolved routing rule: which gateways a called number
+// fails over across, in order. A nil re matches every number — that is the
+// catch-all a number with no more specific prefix rule falls back to.
+type pstnRoute struct {
+	re      *regexp.Regexp
+	targets []string // gateway names, in failover order
+}
+
+// pstnTopo is the resolved PSTN gateway model. match is the host:port
+// FreeSWITCH bridges PSTN calls to — the trigger of the classification in
+// onInvite; gateways is keyed by the names routes reference; routes is the
+// per-number failover plan, in evaluation order. The v1 alias shape
+// (config address + match) converges on this same model at build time as
+// gateway "default" with one catch-all route, so the request path never
+// knows which config shape produced it.
+type pstnTopo struct {
+	match    config.HostPort
+	gateways map[string]pstnGateway
+	routes   []pstnRoute
+}
+
+// pstnEnabled reports whether a PSTN trunk is configured. A config without
+// sip.pstn leaves the gateways map nil; validation guarantees a configured
+// trunk always has at least one gateway.
+func (t *topology) pstnEnabled() bool { return len(t.pstn.gateways) > 0 }
+
+// resolvePSTNRoute picks the failover list for a called number: the first
+// route whose regexp matches the number wins, a nil regexp matches every
+// number, and no match means the call is not a PSTN call at all. Pure and
+// stateless, mirroring the trunk plane's route resolution.
+func resolvePSTNRoute(routes []pstnRoute, user string) ([]string, bool) {
+	for _, r := range routes {
+		if r.re == nil || r.re.MatchString(user) {
+			return r.targets, true
+		}
+	}
+	return nil, false
+}
 
 // topology is the resolved network model the proxy runs with, built once
 // at startup from the config. Listener addresses cannot be changed under a
@@ -155,9 +188,11 @@ type topology struct {
 	// upstreamHost is the address as configured, used for Destination.
 	upstreamHost string
 
-	// pstn is the PSTN carrier gateway, when sip.pstn is configured; its
-	// zero value leaves the trunk off. Resolved at startup like upstream —
-	// the topology is a snapshot, not something re-read per request.
+	// pstn is the PSTN trunk, when sip.pstn is configured; a nil gateways
+	// map leaves the trunk off. Resolved at startup like upstream — the
+	// topology is a snapshot, not something re-read per request (the
+	// failure budgets ARE re-read per call from the store, but they are not
+	// topology).
 	pstn pstnTopo
 
 	// media advertised addresses.
@@ -187,27 +222,67 @@ func buildTopology(cfg *config.Config) (*topology, error) {
 	// a literal too — it is compared byte-for-byte against Request-URIs,
 	// and a name would silently never match (or, worse, match the wrong
 	// thing once a resolver changed).
-	var pstn pstnTopo
-	if cfg.SIP.Pstn.Address != "" {
-		gwHost, gwPortStr, err := net.SplitHostPort(cfg.SIP.Pstn.Address)
-		if err != nil {
-			return nil, err
-		}
-		gwIP, err := netip.ParseAddr(gwHost)
-		if err != nil {
-			return nil, &configError{"sip.pstn.address must be a literal IP:port, got " + gwHost}
-		}
-		gwPort, err := strconv.Atoi(gwPortStr)
-		if err != nil {
-			return nil, err
-		}
+	//
+	// The two config shapes converge here. The v1 alias (a single
+	// `address`) is synthesised — in buildTopology, NOT in the config
+	// defaults — into the multi model: one gateway named "default" plus a
+	// catch-all route naming it. The store keeps what the operator wrote;
+	// this function is the one place both shapes become one runtime model,
+	// so a v1 config and an equivalent multi config behave identically by
+	// construction.
+	pstn := pstnTopo{gateways: map[string]pstnGateway{}}
+	if cfg.SIP.Pstn.Address != "" || len(cfg.SIP.Pstn.Gateways) > 0 {
 		if _, err := netip.ParseAddr(cfg.SIP.Pstn.Match.Host); err != nil {
 			return nil, &configError{"sip.pstn.match must be a literal IP, got " + cfg.SIP.Pstn.Match.Host}
 		}
-		pstn = pstnTopo{
-			gateway:     netip.AddrPortFrom(gwIP, uint16(gwPort)),
-			gatewayHost: cfg.SIP.Pstn.Address,
-			match:       cfg.SIP.Pstn.Match,
+		pstn.match = cfg.SIP.Pstn.Match
+
+		// Parse one gateway address into the runtime model. A name that
+		// must be resolved would make failover depend on DNS at call time —
+		// the opposite of the startup snapshot the rest of the topology is.
+		resolve := func(name, label, address string) error {
+			gwHost, gwPortStr, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			gwIP, err := netip.ParseAddr(gwHost)
+			if err != nil {
+				return &configError{label + " must be a literal IP:port, got " + gwHost}
+			}
+			gwPort, err := strconv.Atoi(gwPortStr)
+			if err != nil {
+				return err
+			}
+			pstn.gateways[name] = pstnGateway{
+				addr: netip.AddrPortFrom(gwIP, uint16(gwPort)),
+				host: address,
+			}
+			return nil
+		}
+
+		if cfg.SIP.Pstn.Address != "" {
+			// v1 alias: the single gateway the config has always meant.
+			if err := resolve("default", "sip.pstn.address", cfg.SIP.Pstn.Address); err != nil {
+				return nil, err
+			}
+			pstn.routes = []pstnRoute{{targets: []string{"default"}}}
+		} else {
+			for name, g := range cfg.SIP.Pstn.Gateways {
+				// A gateway entry missing its address cannot survive
+				// validation, but a nil map entry (an empty `gw:` block)
+				// would panic below — treat it as the address error it is.
+				if g == nil || g.Address == "" {
+					return nil, &configError{"sip.pstn.gateways." + name + ".address must be a literal IP:port, got \"\""}
+				}
+				if err := resolve(name, "sip.pstn.gateways."+name, g.Address); err != nil {
+					return nil, err
+				}
+			}
+			for _, r := range cfg.SIP.Pstn.Routes {
+				// The match was compiled by validation (PstnRoute.matchTo);
+				// CompiledMatch() is nil for a catch-all.
+				pstn.routes = append(pstn.routes, pstnRoute{re: r.CompiledMatch(), targets: r.To})
+			}
 		}
 	}
 

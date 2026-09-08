@@ -406,6 +406,58 @@ func (s *Server) applyPublicAnswer(res *offerResult, answerBody []byte) ([]byte,
 	}.MarshalDeclining(res.offer)
 }
 
+// applyPSTNAnswer processes a PSTN carrier's answer (to the offer FreeSBC
+// sent on behalf of a FreeSWITCH-bridged call) and produces the body
+// FreeSWITCH will see.
+//
+// It deliberately does NOT Start the relay: a call may fail over across
+// several gateways, each of which may answer once, and the pump guards the
+// single Start with a sync.Once shared by every attempt. It also never
+// touches the private leg's latch (Side B, FreeSWITCH-facing) — that
+// address cannot change mid-call, and a re-latch there would race the
+// packets FreeSWITCH is already sending.
+//
+// rePoint is the failover re-latch: when an earlier attempt already latched
+// Side A to a gateway that failed, the latch would decline this attempt's
+// answer as a hijack (SetRemote's seed is refused once latched). Relatch
+// first re-arms the latch to the answering gateway's IP, so its media is
+// accepted and its address becomes the new send target.
+func (s *Server) applyPSTNAnswer(res *offerResult, answerBody []byte, rePoint bool) ([]byte, error) {
+	answer, err := sdp.Parse(answerBody)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: carrier answer: %w", err)
+	}
+	// Every attempt negotiates against the ORIGINAL offer FreeSWITCH made,
+	// never the session's live codec list: the list is shrunk to each
+	// previous attempt's agreement (below), and a failed gateway's narrow
+	// taste must not cost the next gateway its codecs. The session list
+	// stays in step afterwards so later relays describe what is agreed.
+	base := sdp.Filter(res.offer.Audio.Codecs)
+	agreed, err := sdp.Intersect(base, answer.Audio.Codecs)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNoUsableCodec, err)
+	}
+	if o, a, yes := sdp.NeedsRenumber(base, answer.Audio.Codecs); yes {
+		return nil, fmt.Errorf("%w: offered %s, answered %s", errRenumbered, o, a)
+	}
+	res.sess.codecs = agreed
+	if rePoint {
+		res.sess.rtp.Relatch(media.SideA, answer.Audio.Address)
+	}
+	res.sess.rtp.SetRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port)))
+	if answer.Audio.RTCPPort > 0 {
+		res.sess.rtp.SetRTCPRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort)))
+	}
+	return sdp.Build{
+		Address:        s.topo.privateMediaIP,
+		Port:           res.sess.privatePort,
+		Codecs:         agreed,
+		Direction:      answer.Audio.Direction,
+		SessionID:      res.sess.sessionID,
+		SessionVersion: res.sess.nextVersion(),
+	}.MarshalDeclining(res.offer)
+}
+
 // newSessionID returns a fresh SDP o= session identifier. RFC 4566 wants
 // it to be "globally unique"; a nanosecond clock reading is what every
 // implementation actually uses.

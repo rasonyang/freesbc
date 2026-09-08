@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +93,12 @@ type harness struct {
 	// sip.pstn (startHarnessPSTN). It is stopped with the rest of the
 	// harness.
 	carrier *fakeSwitch
+
+	// pstnGateways holds every gateway fake of a multi-gateway sip.pstn
+	// harness (startHarnessPSTNGateways), keyed by the gateway NAME the
+	// config and the cooldown health table are keyed by. Stopped with the
+	// rest of the harness.
+	pstnGateways map[string]*fakeSwitch
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -228,6 +235,57 @@ func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 	return h, carrier
 }
 
+// startHarnessPSTNGateways is startHarness with a configured MULTI-gateway
+// sip.pstn block. gwAddrs names every gateway — map key is the gateway's
+// config name, map value the "host:port" it lives on (fixed up front by the
+// caller, exactly as startHarnessPSTN fixes the carrier's, because the
+// address must be in the config before the switch can be started) — and the
+// harness writes one {address, transport: udp} gateway per name into the
+// config, starts a fake carrier switch on each address, and returns the
+// switches keyed by gateway NAME: the name a route's `to:` list refers to,
+// and the name a cooldown penalizes.
+//
+// routesYAML is spliced verbatim under the config's `routes:` key — the
+// caller's lines must carry the six-space indent the examples in pstn_test
+// use — so the failover ORDER and the match prefixes are the caller's to
+// choose. attemptTimeout, when non-empty, is spliced under `attempt_timeout:`
+// (the tests that need a fast-failing gateway pass "300ms"); the match is
+// always the harness's own public UDP socket, and cooldown rides the
+// 30-second default unless the caller wants otherwise.
+func startHarnessPSTNGateways(t *testing.T, attemptTimeout, routesYAML string, gwAddrs map[string]string) (*harness, map[string]*fakeSwitch) {
+	t.Helper()
+	if len(gwAddrs) == 0 {
+		t.Fatal("startHarnessPSTNGateways needs at least one gateway")
+	}
+	// Deterministic config: sort the names so the YAML — and with it the
+	// topology the proxy builds — never depends on map iteration order.
+	names := make([]string, 0, len(gwAddrs))
+	for name := range gwAddrs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var gateways strings.Builder
+	for _, name := range names {
+		fmt.Fprintf(&gateways, "      %s:\n        address: %s\n", name, gwAddrs[name])
+	}
+	budget := ""
+	if attemptTimeout != "" {
+		budget = "    attempt_timeout: " + attemptTimeout + "\n"
+	}
+	h := startHarnessCfg(t, false, "127.0.0.1", "127.0.0.2", func(pubUDP int) string {
+		return fmt.Sprintf("  pstn:\n    match: 127.0.0.1:%d\n%s    gateways:\n%s    routes:\n%s",
+			pubUDP, budget, gateways.String(), routesYAML)
+	})
+	switches := make(map[string]*fakeSwitch, len(names))
+	h.pstnGateways = make(map[string]*fakeSwitch, len(names))
+	for _, name := range names {
+		gw := startFakeSwitch(t, gwAddrs[name])
+		h.pstnGateways[name] = gw
+		switches[name] = gw
+	}
+	return h, switches
+}
+
 func (h *harness) stop() {
 	h.cancel()
 	select {
@@ -238,6 +296,9 @@ func (h *harness) stop() {
 	h.fs.stop()
 	if h.carrier != nil {
 		h.carrier.stop()
+	}
+	for _, gw := range h.pstnGateways {
+		gw.stop()
 	}
 }
 
@@ -350,6 +411,79 @@ func (f *fakeSwitch) setInviteHook(hook func(req *sip.Request, tx sip.ServerTran
 	f.mu.Lock()
 	f.inviteHook = hook
 	f.mu.Unlock()
+}
+
+// answerHook returns an INVITE override that answers EVERY INVITE with the
+// same final status: 2xx carries the switch's own SDP plus a fresh To tag
+// and a Contact (a 2xx needs all three for the dialog machinery that
+// follows it — the To tag names the dialog, and in-dialog requests are
+// routed by the Contact); any other code is a bodyless final. Failover
+// tests dial one gateway across several calls, so the hook is stateless by
+// design.
+func (f *fakeSwitch) answerHook(code int, withBody bool) func(req *sip.Request, tx sip.ServerTransaction) bool {
+	return func(req *sip.Request, tx sip.ServerTransaction) bool {
+		var body []byte
+		if withBody {
+			body = []byte(f.answerSDP(req))
+		}
+		res := sip.NewResponseFromRequest(req, code, pstnReasonFor(code), body)
+		if withBody {
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		}
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "gw", Host: "127.0.0.1", Port: portOf(f.addr)}})
+		if code/100 == 2 {
+			res.To().Params.Add("tag", sip.GenerateTagN(12))
+		}
+		_ = tx.Respond(res)
+		return true
+	}
+}
+
+// silentHook returns an INVITE override that swallows the request the way a
+// carrier that accepted the call and never answers does: no provisional, no
+// final — the "black hole" an attempt budget exists for.
+//
+// sipgo destroys a server transaction the moment its handler returns
+// without a final response, and a destroyed transaction could never match
+// the attempt's CANCEL or send the 487 the budget-expiry path drains for.
+// A real gateway holds the transaction while it rings, so this hook holds
+// it too: it parks until the CANCEL arrives, then lets sipgo answer the
+// CANCEL with 200 and 487 the INVITE. The CANCEL itself is recorded here —
+// a matched CANCEL is consumed by the transaction layer and never reaches
+// the switch's OnCancel handler.
+func (f *fakeSwitch) silentHook() func(req *sip.Request, tx sip.ServerTransaction) bool {
+	return func(req *sip.Request, tx sip.ServerTransaction) bool {
+		cancelled := make(chan struct{})
+		armed := tx.OnCancel(func(cancelReq *sip.Request) {
+			f.record(cancelReq)
+			close(cancelled)
+		})
+		if !armed {
+			// The CANCEL beat the hook to it; nothing is left to answer.
+			return true
+		}
+		select {
+		case <-cancelled:
+		case <-time.After(10 * time.Second):
+		}
+		return true
+	}
+}
+
+// pstnReasonFor is the reason phrase for the statuses answerHook uses; the
+// wire format wants one, and the last-real-code synthesis relays it.
+func pstnReasonFor(code int) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 486:
+		return "Busy Here"
+	case 500:
+		return "Server Internal Error"
+	case 503:
+		return "Service Unavailable"
+	}
+	return "Call Failure"
 }
 
 func (f *fakeSwitch) record(req *sip.Request) {

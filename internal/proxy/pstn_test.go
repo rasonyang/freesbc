@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,4 +317,674 @@ func TestPSTNNoCommonCodecRejected(t *testing.T) {
 		t.Errorf("the carrier saw %d BYEs, want 1", len(byes))
 	}
 	waitForRelease(t, h)
+}
+
+// ---------------------------------------------------------------------
+// The multi-gateway trunk (sip.pstn.gateways + sip.pstn.routes): a number
+// is routed by prefix onto a list of gateways, tried in order until one
+// connects the call. The single-gateway v1 shape above is an alias of this
+// one (one gateway, one catch-all route — see buildTopology), so these
+// tests exercise the same runtime machinery the v1 tests exercise.
+// ---------------------------------------------------------------------
+
+// bridgePSTNCall is placePSTNCall without its happy-path assertions: one
+// dialplan bridge to the trunk. When a gateway answers, the call is
+// committed and ACKed; the final response — whatever it is — comes back to
+// the caller, who decides what the code proves.
+func bridgePSTNCall(t *testing.T, h *harness, number string) *sip.Response {
+	t.Helper()
+	ruri := sip.Uri{User: number, Host: "127.0.0.1", Port: portOf(h.publicUDP)}
+	res := h.fs.call(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+	if res.StatusCode == 200 {
+		waitForCommitted(t, h)
+		h.fs.sendAckTo2xx(t, res)
+	}
+	return res
+}
+
+// hangupPSTN ends a committed bridged call from the FreeSWITCH side and
+// waits for the media and the call record to drain.
+func hangupPSTN(t *testing.T, h *harness, res *sip.Response) {
+	t.Helper()
+	if byeRes := h.fs.uacBye(t, res); byeRes.StatusCode != 200 {
+		t.Fatalf("BYE from FreeSWITCH: got %d, want 200", byeRes.StatusCode)
+	}
+	waitForRelease(t, h)
+}
+
+// branchOf returns the top Via branch of a request — what RFC 3261 §9.1
+// matches a CANCEL to its INVITE by.
+func branchOf(m sip.Message) string {
+	v := m.Via()
+	if v == nil {
+		return ""
+	}
+	b, _ := v.Params.Get("branch")
+	return b
+}
+
+// callAsync is call() without the wait: it places FreeSWITCH's bridged
+// INVITE and returns immediately — the request object, and the channel its
+// final response will arrive on (nil if the transaction never finalises).
+// Tests that must act while the trunk is still ringing — feeding a gateway
+// early media, or giving up mid-ring — use it instead of call().
+//
+// The transaction sends a CLONE: sipgo mutates the request it is sending,
+// so the caller's copy is a pristine snapshot that later requests (a
+// CANCEL built from it) can read without racing the send.
+func (f *fakeSwitch) callAsync(t *testing.T, ruri sip.Uri, dest, body string) (*sip.Request, chan *sip.Response) {
+	t.Helper()
+	req := sip.NewRequest(sip.INVITE, ruri)
+	from := &sip.FromHeader{Address: sip.Uri{User: "3003", Host: "example.com"}, Params: sip.NewParams()}
+	from.Params.Add("tag", sip.GenerateTagN(12))
+	req.AppendHeader(from)
+	req.AppendHeader(&sip.ToHeader{Address: ruri, Params: sip.NewParams()})
+	callID := sip.CallIDHeader(fmt.Sprintf("fs-call-%d", time.Now().UnixNano()))
+	req.AppendHeader(&callID)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	req.PrependHeader(via)
+	req.SetBody([]byte(body))
+	req.SetTransport("UDP")
+	req.SetDestination(dest)
+	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
+
+	txReq := req.Clone()
+	final := make(chan *sip.Response, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		tx, err := f.cli.TransactionRequest(ctx, txReq)
+		if err != nil {
+			final <- nil
+			return
+		}
+		defer tx.Terminate()
+		for {
+			select {
+			case res, ok := <-tx.Responses():
+				if !ok {
+					final <- nil
+					return
+				}
+				if res.StatusCode >= 200 {
+					final <- res
+					return
+				}
+			case <-tx.Done():
+				final <- nil
+				return
+			case <-ctx.Done():
+				final <- nil
+				return
+			}
+		}
+	}()
+	return req, final
+}
+
+// cancelCall sends the CANCEL for a callAsync INVITE, the way FreeSWITCH's
+// dialplan gives up on a ringing bridge: RFC 3261 §9.1 — same Request-URI,
+// top Via branch, Call-ID, From and To, CSeq — toward the same destination,
+// from the switch's own socket. The response is absorbed; the CANCEL is a
+// separate transaction the switch does not wait on here.
+func (f *fakeSwitch) cancelCall(t *testing.T, invite *sip.Request, dest string) {
+	t.Helper()
+	cn := sip.NewRequest(sip.CANCEL, invite.Recipient)
+	cn.AppendHeader(sip.HeaderClone(invite.Via()))
+	sip.CopyHeaders("From", invite, cn)
+	sip.CopyHeaders("To", invite, cn)
+	sip.CopyHeaders("Call-ID", invite, cn)
+	cn.AppendHeader(&sip.CSeqHeader{SeqNo: invite.CSeq().SeqNo, MethodName: sip.CANCEL})
+	mf := sip.MaxForwardsHeader(70)
+	cn.AppendHeader(&mf)
+	cn.SetTransport("UDP")
+	cn.SetDestination(dest)
+	cn.Laddr = invite.Laddr
+	if err := f.cli.WriteRequest(cn); err != nil {
+		t.Fatalf("fake switch CANCEL: %v", err)
+	}
+}
+
+// A prefix route steers each number to the gateway that owns its range, and
+// numbers no prefix owns fall to the catch-all: the route table, not the
+// dialed number, chooses the carrier.
+func TestPSTNRoutePicksGatewayByNumberPrefix(t *testing.T) {
+	const (
+		mobile = "gw-mobile"
+		fixed  = "gw-fixed"
+	)
+	routes := "      - match: '^13\\d{9}$'\n        to: [" + mobile + "]\n      - to: [" + fixed + "]\n"
+	h, gws := startHarnessPSTNGateways(t, "", routes, map[string]string{
+		mobile: fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		fixed:  fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwMobile, gwFixed := gws[mobile], gws[fixed]
+	gwMobile.setInviteHook(gwMobile.answerHook(200, true))
+	gwFixed.setInviteHook(gwFixed.answerHook(200, true))
+
+	// A 13-prefixed mobile number lands on the mobile gateway, addressed as
+	// the called number AT the gateway itself — and nothing is dialed
+	// anywhere else.
+	res := bridgePSTNCall(t, h, "13800138000")
+	if res.StatusCode != 200 {
+		t.Fatalf("mobile call: got %d, want 200", res.StatusCode)
+	}
+	inv := gwMobile.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(inv) != 1 {
+		t.Fatalf("gw-mobile saw %d INVITEs, want 1", len(inv))
+	}
+	if inv[0].Recipient.User != "13800138000" {
+		t.Errorf("gw-mobile Request-URI user = %q, want the called number", inv[0].Recipient.User)
+	}
+	if got := fmt.Sprintf("%s:%d", inv[0].Recipient.Host, inv[0].Recipient.Port); got != gwMobile.addr {
+		t.Errorf("gw-mobile Request-URI = %s, want the gateway %s", got, gwMobile.addr)
+	}
+	if got := gwFixed.received(sip.INVITE); len(got) != 0 {
+		t.Errorf("gw-fixed saw %d INVITEs for a mobile number", len(got))
+	}
+	hangupPSTN(t, h, res)
+
+	// Any other number falls through the prefix route to the catch-all.
+	res = bridgePSTNCall(t, h, "88001234")
+	if res.StatusCode != 200 {
+		t.Fatalf("fixed-line call: got %d, want 200", res.StatusCode)
+	}
+	inv = gwFixed.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(inv) != 1 {
+		t.Fatalf("gw-fixed saw %d INVITEs, want 1", len(inv))
+	}
+	if inv[0].Recipient.User != "88001234" {
+		t.Errorf("gw-fixed Request-URI user = %q, want the called number", inv[0].Recipient.User)
+	}
+	if got := fmt.Sprintf("%s:%d", inv[0].Recipient.Host, inv[0].Recipient.Port); got != gwFixed.addr {
+		t.Errorf("gw-fixed Request-URI = %s, want the gateway %s", got, gwFixed.addr)
+	}
+	if got := gwMobile.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-mobile saw %d INVITEs, want still 1", len(got))
+	}
+	hangupPSTN(t, h, res)
+}
+
+// A rejecting gateway is skipped, not fatal: the first gateway's 503 is
+// HELD — FreeSWITCH never sees it — and the series dials the second, whose
+// 200 is relayed and committed. The dialog then rides the WINNER: the
+// switch's ACK and BYE both reach gw-b, never the failed gw-a.
+func TestPSTNFailoverAfterGatewayFailure(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.answerHook(503, false))
+	gwB.setInviteHook(gwB.answerHook(200, true))
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("bridged call: got %d, want 200 (the held 503 must never surface)", res.StatusCode)
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want 1", len(got))
+	}
+	if got := gwB.waitFor(sip.INVITE, 1, 3*time.Second); len(got) != 1 {
+		t.Errorf("gw-b saw %d INVITEs, want 1", len(got))
+	}
+	if acks := gwB.waitFor(sip.ACK, 1, 3*time.Second); len(acks) != 1 {
+		t.Errorf("gw-b saw %d ACKs, want 1", len(acks))
+	}
+	if got := gwA.received(sip.ACK); len(got) != 0 {
+		t.Errorf("gw-a saw %d ACKs, want 0", len(got))
+	}
+	hangupPSTN(t, h, res)
+	if byes := gwB.waitFor(sip.BYE, 1, 3*time.Second); len(byes) != 1 {
+		t.Errorf("gw-b saw %d BYEs, want 1", len(byes))
+	}
+}
+
+// A gateway that swallows the INVITE (no provisional, no final) is given
+// attempt_timeout, then cancelled — the CANCEL echoes the INVITE's own Via
+// branch, RFC 3261 §9.1 — and the series dials the next gateway carrying
+// the SAME dialog: FreeSWITCH's Call-ID and CSeq ride both attempts, while
+// each attempt has a Via branch of its own.
+func TestPSTNSilentGatewayTimesOutAndFailsOver(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "300ms", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.silentHook())
+	gwB.setInviteHook(gwB.answerHook(200, true))
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("bridged call: got %d, want 200", res.StatusCode)
+	}
+	invA := gwA.waitFor(sip.INVITE, 1, 3*time.Second)
+	invB := gwB.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(invA) != 1 || len(invB) != 1 {
+		t.Fatalf("gateways saw %d/%d INVITEs, want 1 each", len(invA), len(invB))
+	}
+	if a, b := callIDOf(invA[0]), callIDOf(invB[0]); a != b {
+		t.Errorf("Call-ID changed across the failover: %q → %q", a, b)
+	}
+	if a, b := invA[0].CSeq().SeqNo, invB[0].CSeq().SeqNo; a != b {
+		t.Errorf("CSeq changed across the failover: %d → %d", a, b)
+	}
+	if branchOf(invA[0]) == branchOf(invB[0]) {
+		t.Error("both attempts carried the same Via branch")
+	}
+	// gw-a must have been cancelled, by a CANCEL echoing its INVITE branch.
+	if cans := gwA.waitFor(sip.CANCEL, 1, 3*time.Second); len(cans) != 1 {
+		t.Fatalf("gw-a saw %d CANCELs, want 1", len(cans))
+	} else if branchOf(cans[0]) != branchOf(invA[0]) {
+		t.Errorf("CANCEL branch %q does not echo the INVITE's %q", branchOf(cans[0]), branchOf(invA[0]))
+	}
+	// The failover INVITE is re-pointed at the winning gateway.
+	if got := fmt.Sprintf("%s:%d", invB[0].Recipient.Host, invB[0].Recipient.Port); got != gwB.addr {
+		t.Errorf("gw-b Request-URI = %s, want the gateway %s", got, gwB.addr)
+	}
+	hangupPSTN(t, h, res)
+}
+
+// A number no route matches is refused 503 before any gateway is dialed: it
+// is not this trunk's call, and FreeSWITCH's bridge is expected to fail
+// over around it.
+func TestPSTNUnroutedNumberRefusedBeforeDialing(t *testing.T) {
+	// Only a 13-prefixed route; a plain number has nowhere to go. gw-b
+	// exists to prove the series never dials anything for an unrouted
+	// number — not even its first choice.
+	routes := "      - match: '^13\\d{9}$'\n        to: [gw-a]\n"
+	h, gws := startHarnessPSTNGateways(t, "", routes, map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+
+	res := bridgePSTNCall(t, h, "88001234")
+	if res.StatusCode != 503 {
+		t.Errorf("got %d, want 503 Service Unavailable", res.StatusCode)
+	}
+	if got := gws["gw-a"].received(sip.INVITE); len(got) != 0 {
+		t.Errorf("gw-a saw %d INVITEs for an unrouted number", len(got))
+	}
+	if got := gws["gw-b"].received(sip.INVITE); len(got) != 0 {
+		t.Errorf("gw-b saw %d INVITEs for an unrouted number", len(got))
+	}
+	waitForRelease(t, h)
+}
+
+// When every gateway fails with a real final, FreeSWITCH hears the LAST
+// one: the first attempt's 503 is held, the second's 500 is synthesised as
+// the series' one verdict.
+func TestPSTNExhaustionSynthesisesLastRealCode(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.answerHook(503, false))
+	gwB.setInviteHook(gwB.answerHook(500, false))
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 500 {
+		t.Errorf("got %d, want the last real code 500", res.StatusCode)
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want 1", len(got))
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-b saw %d INVITEs, want 1", len(got))
+	}
+	waitForRelease(t, h)
+}
+
+// A 4xx other than 408 is the far end's verdict on THIS call — a busy
+// number will be busy on every gateway — so it is relayed to FreeSWITCH
+// as-is and the series stops: no CANCEL, no second gateway.
+func TestPSTNRelayedFinalStopsTheSeries(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.answerHook(486, false))
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 486 {
+		t.Errorf("got %d, want 486 Busy Here", res.StatusCode)
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want 1", len(got))
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 0 {
+		t.Errorf("gw-b saw %d INVITEs, want 0 — the series must stop at a relayed final", len(got))
+	}
+	if got := gwA.received(sip.CANCEL); len(got) != 0 {
+		t.Errorf("gw-a saw %d CANCELs, want 0 — it answered the call", len(got))
+	}
+	waitForRelease(t, h)
+}
+
+// Cooldown, observed from the outside: a gateway whose whole attempt
+// produced nothing is penalised, and the NEXT call skips it in favour of
+// its healthy alternative (skip-if-alternatives) — but when every gateway
+// is cooling the trunk dials the route's order anyway, because a cooldown
+// is a suspicion, not a verdict (all-cooled-dial-anyway).
+func TestPSTNCooldownSkipsSickGateway(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "300ms", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.silentHook())
+	gwB.setInviteHook(gwB.answerHook(200, true))
+
+	// Call 1: gw-a rings into its 300ms budget, is cancelled, and earns
+	// the 30s cooldown the expiry gives it; gw-b connects the call.
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("call 1: got %d, want 200", res.StatusCode)
+	}
+	if cans := gwA.waitFor(sip.CANCEL, 1, 5*time.Second); len(cans) != 1 {
+		t.Fatalf("gw-a saw %d CANCELs, want 1", len(cans))
+	}
+	hangupPSTN(t, h, res)
+
+	// Call 2: gw-a is still cooling, so the route's first position goes to
+	// gw-b and gw-a is not dialed at all.
+	res = bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("call 2: got %d, want 200", res.StatusCode)
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("call 2 dialed the cooling gw-a: %d INVITEs, want still 1", len(got))
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 2 {
+		t.Errorf("gw-b saw %d INVITEs, want 2", len(got))
+	}
+	hangupPSTN(t, h, res)
+
+	// Call 3: now gw-b is sick too — its silent attempt earns it its own
+	// cooldown — and with every candidate cooling there is no healthy
+	// alternative to prefer. Nothing connected, so FreeSWITCH hears 408.
+	gwB.setInviteHook(gwB.silentHook())
+	res = bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 408 {
+		t.Fatalf("call 3: got %d, want 408 Request Timeout", res.StatusCode)
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 3 {
+		t.Errorf("gw-b saw %d INVITEs, want 3", len(got))
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want still 1 (still cooling)", len(got))
+	}
+	waitForRelease(t, h)
+
+	// Call 4: BOTH gateways are cooling now, so the trunk must dial anyway
+	// — in route order: gw-a first (its attempt burns its budget again),
+	// then gw-b, which is answering again and connects the call.
+	gwB.setInviteHook(gwB.answerHook(200, true))
+	res = bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("call 4: got %d, want 200 — all-cooled calls must still be attempted", res.StatusCode)
+	}
+	if got := gwA.received(sip.INVITE); len(got) != 2 {
+		t.Errorf("gw-a saw %d INVITEs, want 2 (dialed despite its cooldown)", len(got))
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 4 {
+		t.Errorf("gw-b saw %d INVITEs, want 4", len(got))
+	}
+	hangupPSTN(t, h, res)
+}
+
+// Early media across a failover: the first gateway answers 180 with an SDP
+// and streams audio — FreeSWITCH hears it — then falls silent and burns its
+// attempt budget. The winner's 200 re-latches the media anchor: the public
+// latch, hardened by the failed gateway's own packets, is re-armed to the
+// winner (a hijack would refuse it), and the answer FreeSWITCH finally gets
+// carries the WINNER's codec set — PCMA, which the failed gateway never
+// offered.
+func TestPSTNFailoverRelatchesMedia(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "300ms", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gw1, gw2 := gws["gw-a"], gws["gw-b"]
+
+	// The endpoints' media sockets, bound before the call on the ports
+	// their SDP will advertise.
+	gw1RTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: gw1.rtpPort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw1RTP.Close()
+	gw2RTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: gw2.rtpPort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw2RTP.Close()
+	fsRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: h.fs.rtpPort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsRTP.Close()
+
+	// gw-a: early media — a body-bearing 180 offering only PCMU (so the
+	// winner's PCMA is distinguishable in the final answer), then a short
+	// audio stream from its advertised RTP port. The stream is what makes
+	// the test mean anything: the public latch hardens only on real
+	// inbound packets, so without it the winner's answer would seed a
+	// never-latched relay and the failover re-latch would go unexercised.
+	gw1.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		body := fmt.Sprintf("v=0\r\no=gw-a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
+			"m=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n", gw1.rtpPort)
+		res := sip.NewResponseFromRequest(req, 180, "Ringing", []byte(body))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		_ = tx.Respond(res)
+		// The offer is parsed here, synchronously: the hook's request may
+		// be touched by the stack once it returns, and the goroutine only
+		// needs the SBC's public media port.
+		offer, err := sdp.Parse(req.Body())
+		if err != nil {
+			return true
+		}
+		sbcPublic := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: offer.Audio.Port}
+		// 40 × 10ms = 400ms of audio: longer than the 300ms attempt budget
+		// plus its 300ms drain, so the stream has ENDED before the winner
+		// answers — a stream still running could re-latch the anchor away
+		// from the winner mid-call.
+		go func() {
+			pkt := rtpPacket(0, 300, 160)
+			for i := 0; i < 40; i++ {
+				if _, err := gw1RTP.WriteToUDP(pkt, sbcPublic); err != nil {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		return true
+	})
+	// gw-b: the winner, answering 200 with PCMU+PCMA+DTMF — a codec set
+	// only it offers.
+	gw2.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		body := fmt.Sprintf("v=0\r\no=gw-b 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
+			"m=audio %d RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n"+
+			"a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n", gw2.rtpPort)
+		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(body))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "gw", Host: "127.0.0.1", Port: portOf(gw2.addr)}})
+		res.To().Params.Add("tag", sip.GenerateTagN(12))
+		_ = tx.Respond(res)
+		return true
+	})
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("bridged call: got %d, want 200", res.StatusCode)
+	}
+
+	// gw-a's attempt burned its budget: it must have been cancelled, and
+	// the winner is gw-b.
+	if cans := gw1.waitFor(sip.CANCEL, 1, 5*time.Second); len(cans) != 1 {
+		t.Errorf("gw-a saw %d CANCELs, want 1", len(cans))
+	}
+	if got := gw1.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want 1", len(got))
+	}
+	if got := gw2.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-b saw %d INVITEs, want 1", len(got))
+	}
+
+	// FreeSWITCH heard gw-a's early media: its socket holds packets from
+	// the failed gateway's stream. (The stream ended well before gw-b
+	// answered, so everything in the socket is gw-a's.)
+	early := 0
+	_ = fsRTP.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	buf := make([]byte, 2000)
+	for {
+		n, _, err := fsRTP.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+		if n > 0 {
+			early++
+		}
+	}
+	if early == 0 {
+		t.Error("FreeSWITCH never heard gw-a's early media")
+	}
+	_ = fsRTP.SetReadDeadline(time.Time{})
+
+	// The answer FreeSWITCH got is the WINNER's negotiation: PCMA, which
+	// only gw-b offered.
+	answer, err := sdp.Parse(res.Body())
+	if err != nil {
+		t.Fatalf("answer to FreeSWITCH unparseable: %v\n%s", err, res.Body())
+	}
+	if got := sdp.Describe(answer.Audio.Codecs); !strings.Contains(got, "8 PCMA/8000") {
+		t.Errorf("answer codecs = %s, want the winner's PCMA", got)
+	}
+
+	// Media now flows both ways with the WINNING gateway: the anchor
+	// followed the call across the failover. (On loopback both gateways
+	// share an IP, so exclusivity cannot be asserted — only that the
+	// winner's media flows, which a stuck latch would break.)
+	inv := gw2.waitFor(sip.INVITE, 1, 3*time.Second)
+	offer, err := sdp.Parse(inv[0].Body())
+	if err != nil {
+		t.Fatalf("offer to gw-b unparseable: %v", err)
+	}
+	sbcPublic := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: offer.Audio.Port}
+	sbcPrivate := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: answer.Audio.Port}
+	if !relayReaches(t, gw2RTP, sbcPublic, fsRTP, rtpPacket(0, 400, 160)) {
+		t.Fatal("gw-b → FreeSWITCH audio never arrived (latch not re-pointed)")
+	}
+	if !relayReaches(t, fsRTP, sbcPrivate, gw2RTP, rtpPacket(0, 500, 160)) {
+		t.Fatal("FreeSWITCH → gw-b audio never arrived")
+	}
+
+	// The dialog rides the winner to the end: the switch's ACK and hangup
+	// both reach gw-b.
+	if acks := gw2.waitFor(sip.ACK, 1, 3*time.Second); len(acks) != 1 {
+		t.Errorf("gw-b saw %d ACKs, want 1", len(acks))
+	}
+	hangupPSTN(t, h, res)
+	if byes := gw2.waitFor(sip.BYE, 1, 3*time.Second); len(byes) != 1 {
+		t.Errorf("gw-b saw %d BYEs, want 1", len(byes))
+	}
+}
+
+// A FreeSWITCH CANCEL lands while the first attempt is ringing: the stack
+// answers the CANCEL and finalises the INVITE, the proxy's CANCEL bridge
+// fires wholeCancel — the attempt in flight gets its own CANCEL — and the
+// series stops: the next gateway is never dialed.
+func TestPSTNCancelDuringAttemptStopsTheSeries(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	gwA.setInviteHook(gwA.silentHook())
+	gwB.setInviteHook(gwB.answerHook(200, true))
+
+	ruri := sip.Uri{User: "12345", Host: "127.0.0.1", Port: portOf(h.publicUDP)}
+	invite, final := h.fs.callAsync(t, ruri, h.publicUDP, phoneOfferSDP(h.fs.rtpPort))
+
+	// Let the first attempt reach its gateway, then give up the way a
+	// dialplan's answer timeout does.
+	if invs := gwA.waitFor(sip.INVITE, 1, 5*time.Second); len(invs) != 1 {
+		t.Fatalf("gw-a saw %d INVITEs, want 1", len(invs))
+	}
+	h.fs.cancelCall(t, invite, h.publicUDP)
+
+	// The in-flight attempt is cancelled toward its own gateway...
+	if cans := gwA.waitFor(sip.CANCEL, 1, 5*time.Second); len(cans) != 1 {
+		t.Errorf("gw-a saw %d CANCELs, want 1", len(cans))
+	}
+	// ...and FreeSWITCH's INVITE finalises (the exact code is the stack's
+	// to choose; RFC 3261 §9.2 expects 487).
+	select {
+	case res := <-final:
+		if res == nil {
+			t.Fatal("the INVITE transaction never finalised after CANCEL")
+		}
+		if res.StatusCode != 487 {
+			t.Logf("FreeSWITCH saw final response %d (487 expected)", res.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the INVITE transaction never finalised after CANCEL")
+	}
+	// ...and the series stops: gw-b is never dialed.
+	if got := gwB.waitFor(sip.INVITE, 1, 300*time.Millisecond); len(got) != 0 {
+		t.Errorf("gw-b saw %d INVITEs, want 0 — the series must stop on cancel", len(got))
+	}
+	waitForRelease(t, h)
+}
+
+// An answer whose media cannot be anchored does not end the call: the
+// gateway that sent it is ACKed and BYEd — it believes it has a live dialog
+// and would sit retransmitting its 200 — and the series dials the next
+// gateway, whose answer reaches FreeSWITCH.
+func TestPSTNUnanchorableAnswerFailsOver(t *testing.T) {
+	h, gws := startHarnessPSTNGateways(t, "", "      - to: [gw-a, gw-b]\n", map[string]string{
+		"gw-a": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+		"gw-b": fmt.Sprintf("127.0.0.1:%d", freePort(t)),
+	})
+	gwA, gwB := gws["gw-a"], gws["gw-b"]
+	// gw-a answers 200 with a codec FreeSWITCH never offered (opus): the
+	// media cannot be anchored.
+	gwA.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		body := "v=0\r\no=gw-a 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n" +
+			"m=audio 9998 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\na=sendrecv\r\n"
+		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(body))
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		_ = tx.Respond(res)
+		return true
+	})
+	gwB.setInviteHook(gwB.answerHook(200, true))
+
+	res := bridgePSTNCall(t, h, "12345")
+	if res.StatusCode != 200 {
+		t.Fatalf("bridged call: got %d, want 200 from gw-b", res.StatusCode)
+	}
+	// gw-a's unanchorable 2xx was completed and torn down...
+	if acks := gwA.waitFor(sip.ACK, 1, 3*time.Second); len(acks) != 1 {
+		t.Errorf("gw-a saw %d ACKs, want 1", len(acks))
+	}
+	if byes := gwA.waitFor(sip.BYE, 1, 3*time.Second); len(byes) != 1 {
+		t.Errorf("gw-a saw %d BYEs, want 1", len(byes))
+	}
+	// ...and the call went on to the next gateway, once each.
+	if got := gwA.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-a saw %d INVITEs, want 1", len(got))
+	}
+	if got := gwB.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("gw-b saw %d INVITEs, want 1", len(got))
+	}
+	hangupPSTN(t, h, res)
 }

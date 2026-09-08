@@ -38,6 +38,10 @@ type Server struct {
 	calls   *callTable
 	metrics *Metrics
 
+	// pstnHealth tracks the passive cooldowns of the PSTN carrier gateways
+	// (see pstnhealth.go). Always allocated; harmless when sip.pstn is off.
+	pstnHealth *pstnHealth
+
 	ua     *sipgo.UserAgent
 	srv    *sipgo.Server
 	client *sipgo.Client
@@ -128,6 +132,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		loc:           NewLocation(),
 		calls:         newCallTable(),
 		metrics:       NewMetrics(),
+		pstnHealth:    newPSTNHealth(),
 		pending:       map[string]*pendingInvite{},
 		privSources:   newPrivateSources(),
 		ready:         make(chan struct{}),
