@@ -26,7 +26,9 @@
 #
 # There are no `peers:` or `routes:` here: those configure the separate
 # trunk B2BUA plane, which this deployment does not use. Add them alongside
-# these sections to run both planes in one process.
+# these sections to run both planes in one process. (Outbound PSTN calls
+# are a different feature — the commented `sip.pstn` section below — and
+# ride THIS plane, not the trunk plane.)
 #
 #   freesbc check -c edge.example.yaml
 #   freesbc run   -c edge.example.yaml
@@ -61,6 +63,21 @@ sip:
   upstream:
     address: 10.77.0.10:5060    # FreeSWITCH — a literal IP:port
     transport: udp
+
+  # Optional: a peer-to-peer PSTN trunk. Uncomment to let FreeSWITCH bridge
+  # outbound PSTN calls through the SBC to a carrier gateway that never
+  # registers (FreeSBC never pings it). A bridged call is one whose source
+  # is FreeSWITCH AND whose Request-URI names the match address — the SBC
+  # forwards it to the gateway with media anchored on both legs, exactly
+  # like a call to a registered client. The match is what the FreeSWITCH
+  # dialplan dials PSTN prefixes to, so it must be an address FreeSWITCH
+  # uses for nothing else (validation refuses the SBC's own sockets and the
+  # upstream). Here FreeSWITCH reaches the public UDP listener, bound
+  # 0.0.0.0:16060, at the SBC's private address 10.77.0.2:16060.
+  # pstn:
+  #   address: 223.76.90.4:16060  # the carrier gateway — a literal IP:port
+  #   transport: udp              # the only supported value today
+  #   match: 10.77.0.2:16060      # FreeSWITCH dials sip:<number>@THIS address
 
 rtp:
   public:

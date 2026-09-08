@@ -11,9 +11,9 @@ It runs two independent planes, either or both of which may be enabled:
   `routes:`.
 - **Edge proxy** — a stateful SIP and media edge proxy that provides SIP
   registration proxying, UDP/WebSocket transport interworking, RTP anchoring,
-  and WebRTC-to-RTP media relay for FreeSWITCH. Configured with
-  `network:`, `sip.public/private/upstream`, `rtp.public/private` and
-  `webrtc:`.
+  WebRTC-to-RTP media relay, and peer-to-peer PSTN trunking for FreeSWITCH.
+  Configured with `network:`, `sip.public/private/upstream`, an optional
+  `sip.pstn`, `rtp.public/private` and `webrtc:`.
 
 ## Why
 
@@ -89,6 +89,41 @@ configuration, and the "Edge proxy plane" section of
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role so media is never interrupted. |
 | Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored is ACKed and BYEd rather than left as a zombie dialog. |
+
+### PSTN trunk
+
+An optional peer-to-peer outbound trunk: a carrier gateway that never
+registers (and is never pinged) can be reached by FreeSWITCH bridging
+calls to it through the proxy, so PSTN numbers dial from the same
+FreeSWITCH the phones register to:
+
+```text
+FreeSWITCH ──bridge──▶ FreeSBC public UDP ──▶ PSTN carrier gateway
+```
+
+Configure `sip.pstn` (`address` = the gateway, `match` = an address
+FreeSWITCH's dialplan dials PSTN prefixes to). A bridged call is
+classified by its source (FreeSWITCH itself) **and** its Request-URI
+naming the match, then forwarded exactly like a call to a registered
+client: media anchored on both legs, each side offered only the SBC's own
+port, and in-dialog requests routed by Record-Route in both directions.
+A phone dialling the match address from the public side is unaffected —
+the source check fails and the call is proxied upstream as usual.
+
+On the FreeSWITCH side (no gateway definition needed — this is a plain
+peer-to-peer bridge):
+
+```xml
+<action application="bridge"
+        data="sofia/internal/sip:${destination_number}@10.77.0.2:16060"/>
+```
+
+Inbound carrier→FreeSWITCH calls need no trunk configuration: they arrive
+on the public side like any other unregistered caller and are proxied
+upstream unchanged. Note that they are also subject to the same
+[`shield`](#configuration) rate limiting as any unregistered source — a
+chatty carrier can be throttled like an attacker; raise its budget if
+needed.
 
 ### Known limitations
 

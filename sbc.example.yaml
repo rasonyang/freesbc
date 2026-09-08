@@ -149,6 +149,20 @@ shield:                            # sensible defaults; the whole section is opt
 #                                    #   the private leg never resolves DNS
 #     transport: udp                 # the only supported value today
 #
+#   # Optional peer-to-peer PSTN trunk: outbound calls from FreeSWITCH's
+#   # dialplan, bridged to sip:<number>@10.77.0.2:16060 (the MATCH address),
+#   # are forwarded to a carrier gateway that never registers — FreeSBC
+#   # never pings it, and inbound carrier calls need no special handling.
+#   # The bridge is recognised by its SOURCE (FreeSWITCH's own IP) plus its
+#   # Request-URI naming the match, so a public phone dialling the same
+#   # address is not hijacked. The match must be a host:port FreeSWITCH
+#   # uses for nothing else: here it is the SBC's public UDP listener
+#   # (bound 0.0.0.0:16060) as FreeSWITCH reaches it from the private LAN.
+#   # pstn:
+#   #   address: 223.76.90.4:16060    # the carrier gateway — literal IP:port
+#   #   transport: udp
+#   #   match: 10.77.0.2:16060        # what the dialplan dials PSTN prefixes to
+#
 # rtp:
 #   public:                          # media toward phones/browsers
 #     bind_ip: 0.0.0.0
@@ -175,3 +189,16 @@ shield:                            # sensible defaults; the whole section is opt
 # let FreeSBC proxy REGISTER through. FreeSBC rewrites the Contact so
 # FreeSWITCH stores an address that routes back through the SBC, and
 # rewrites it back on the way to the client.
+#
+# For outbound PSTN calls (with the pstn block above), bridge the dialplan
+# to the match address — a plain profile bridge; no gateway definition is
+# needed on FreeSWITCH, this trunk is peer-to-peer:
+#
+#   <action application="bridge"
+#           data="sofia/internal/sip:${destination_number}@10.77.0.2:16060"/>
+#
+# The bridge reaches FreeSBC on its public UDP socket; FreeSBC anchors the
+# media and forwards the call to the carrier gateway, exactly like a call
+# to a registered phone. Inbound carrier→FreeSWITCH calls need no extra
+# configuration: they arrive on the public side like any other unregistered
+# caller and are proxied upstream unchanged.
