@@ -179,49 +179,5 @@ func TestInboundCallAndHangupOnWildcardBind(t *testing.T) {
 // set from the response IN REVERSE (RFC 3261 §12.1.2), From/To copied from
 // the final response so both tags match the dialog.
 func fsUacBye(t *testing.T, f *fakeSwitch, res *sip.Response) *sip.Response {
-	t.Helper()
-	req := sip.NewRequest(sip.BYE, res.To().Address)
-	sip.CopyHeaders("From", res, req)
-	sip.CopyHeaders("To", res, req)
-	sip.CopyHeaders("Call-ID", res, req)
-	seq := uint32(1)
-	if c := res.CSeq(); c != nil {
-		seq = c.SeqNo
-	}
-	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq + 1, MethodName: sip.BYE})
-	mf := sip.MaxForwardsHeader(70)
-	req.AppendHeader(&mf)
-	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: "127.0.0.1", Port: portOf(f.addr)}})
-	copyRouteFromRecordRoute(res, req)
-	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
-	via.Params.Add("branch", sip.GenerateBranchN(16))
-	req.PrependHeader(via)
-
-	req.SetTransport("UDP")
-	req.SetDestination(f.topRouteDest(t, req))
-	req.Laddr = sip.Addr{IP: net.ParseIP("127.0.0.1"), Port: portOf(f.addr)}
-
-	ctx, cancel := timeoutCtx(10 * time.Second)
-	defer cancel()
-	tx, err := f.cli.TransactionRequest(ctx, req)
-	if err != nil {
-		t.Fatalf("fake switch BYE: %v", err)
-	}
-	defer tx.Terminate()
-	for {
-		select {
-		case r, ok := <-tx.Responses():
-			if !ok {
-				t.Fatal("fake switch BYE: no final response")
-			}
-			if r.StatusCode >= 200 {
-				return r
-			}
-		case <-tx.Done():
-			t.Fatalf("fake switch BYE: %v", tx.Err())
-		case <-ctx.Done():
-			t.Fatal("fake switch BYE timed out")
-		}
-	}
+	return f.uacBye(t, res)
 }

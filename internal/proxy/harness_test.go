@@ -88,6 +88,11 @@ type harness struct {
 
 	fs *fakeSwitch
 
+	// carrier is the PSTN gateway fake when the harness configured
+	// sip.pstn (startHarnessPSTN). It is stopped with the rest of the
+	// harness.
+	carrier *fakeSwitch
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -103,6 +108,14 @@ func startHarness(t *testing.T, webrtc bool) *harness {
 // address — a shape some transport-pool behaviour only distinguishes by
 // the socket's local address, so the suite needs both forms.
 func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
+	return startHarnessCfg(t, webrtc, pubBindIP, "127.0.0.1", nil)
+}
+
+// startHarnessCfg is startHarness with the upstream's IP and an optional
+// sip.pstn block chosen by the caller. pstn, when non-nil, is called with
+// the public UDP port once it is allocated and must return the YAML for
+// the sip.pstn section ("" disables the trunk).
+func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, pstn func(pubUDP int) string) *harness {
 	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
@@ -111,6 +124,10 @@ func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
 	// Media ranges are per-harness so no two tests contend for a port.
 	mediaBase := nextMediaBase()
 
+	pstnBlock := ""
+	if pstn != nil {
+		pstnBlock = pstn(pubUDP)
+	}
 	yaml := fmt.Sprintf(`
 network:
   public:
@@ -126,7 +143,8 @@ sip:
   private:
     bind: "127.0.0.1:%d"
   upstream:
-    address: 127.0.0.1:%d
+    address: %s:%d
+%s
 rtp:
   public:  {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
   private: {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
@@ -140,7 +158,7 @@ shield:
   # 20/s per_ip would throttle the harness itself rather than the code
   # under test. The rate limiter has its own tests in package shield.
   rate_limit: "5000/s per_ip"
-`, pubBindIP, pubUDP, pubWS, priv, up, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+`, pubBindIP, pubUDP, pubWS, priv, upstreamIP, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -158,7 +176,7 @@ shield:
 		publicUDP:  fmt.Sprintf("127.0.0.1:%d", pubUDP),
 		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
 		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
-		upstream:   fmt.Sprintf("127.0.0.1:%d", up),
+		upstream:   fmt.Sprintf("%s:%d", upstreamIP, up),
 		done:       make(chan struct{}),
 	}
 	h.fs = startFakeSwitch(t, h.upstream)
@@ -182,6 +200,34 @@ shield:
 	return h
 }
 
+// startHarnessPSTN is startHarness with a configured sip.pstn trunk: the
+// same proxy, plus a fake PSTN carrier gateway on the public side that
+// FreeSWITCH-bridged calls get forwarded to. It returns the carrier switch
+// so a test can install its answer hooks and assert on what it receives.
+//
+// The upstream FreeSWITCH is placed on 127.0.0.2 rather than loopback's
+// 127.0.0.1: the proxy classifies a PSTN bridge by the request's SOURCE
+// being the upstream, and the classification's other half is a Request-URI
+// a phone could just as well dial — all on one loopback address, the
+// source gate could never be exercised, because the upstream and every
+// client would be the same IP. Splitting them makes "the upstream bridged
+// it" and "a phone dialed it" distinguishable, which is exactly the
+// distinction the feature depends on.
+func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
+	t.Helper()
+	// The carrier gateway address must be in the config, so its port is
+	// fixed up front; the switch itself is only started once the harness
+	// is up, since the proxy never pings a peer-to-peer gateway (there is
+	// nothing to ping: no registration, no keepalives).
+	carrierAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	h := startHarnessCfg(t, false, "127.0.0.1", "127.0.0.2", func(pubUDP int) string {
+		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, pubUDP)
+	})
+	carrier := startFakeSwitch(t, carrierAddr)
+	h.carrier = carrier
+	return h, carrier
+}
+
 func (h *harness) stop() {
 	h.cancel()
 	select {
@@ -190,6 +236,9 @@ func (h *harness) stop() {
 		h.t.Error("proxy did not shut down")
 	}
 	h.fs.stop()
+	if h.carrier != nil {
+		h.carrier.stop()
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -416,6 +465,15 @@ func portOf(addr string) int {
 	return n
 }
 
+// hostOf returns the host half of a "host:port" address.
+func hostOf(addr string) string {
+	h, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return h
+}
+
 // call places an INVITE from the fake switch toward the proxy's private
 // socket, the way FreeSWITCH calls a registered contact, and returns the
 // final response.
@@ -441,8 +499,10 @@ func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string) *sip.Re
 	req.SetTransport("UDP")
 	req.SetDestination(dest)
 	// Send from the switch's own listening socket, so the proxy sees the
-	// configured upstream address as the source.
-	req.Laddr = sip.Addr{IP: net.ParseIP("127.0.0.1"), Port: portOf(f.addr)}
+	// configured upstream address as the source. A switch that lives on
+	// another loopback address (startHarnessPSTN's 127.0.0.2) must source
+	// from there too — the proxy's private plane trusts exactly that IP.
+	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -512,7 +572,7 @@ func (f *fakeSwitch) inDialog(t *testing.T, method sip.RequestMethod, invite *si
 	dest := f.topRouteDest(t, req)
 	req.SetTransport("UDP")
 	req.SetDestination(dest)
-	req.Laddr = sip.Addr{IP: net.ParseIP("127.0.0.1"), Port: portOf(f.addr)}
+	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -549,4 +609,110 @@ func (f *fakeSwitch) topRouteDest(t *testing.T, req *sip.Request) string {
 		port = 5060
 	}
 	return fmt.Sprintf("%s:%d", r.Address.Host, port)
+}
+
+// inDialogDest picks where the switch sends an in-dialog request: the top
+// Route when the dialog has a route set, else the remote target — the
+// Contact of the 2xx that established the dialog. (The second branch is
+// the RFC 3261 §12.1.2 fallback; every dialog in this suite carries
+// Record-Routes, so it is defence rather than a live path.)
+func (f *fakeSwitch) inDialogDest(t *testing.T, req *sip.Request, res *sip.Response) string {
+	t.Helper()
+	if req.Route() != nil {
+		return f.topRouteDest(t, req)
+	}
+	u, ok := contactURI(res)
+	if !ok {
+		t.Fatal("no Route and no Contact to route the in-dialog request to")
+	}
+	port := u.Port
+	if port == 0 {
+		port = 5060
+	}
+	return fmt.Sprintf("%s:%d", u.Host, port)
+}
+
+// sendAckTo2xx sends the ACK for a 2xx the switch received as the UAC of a
+// call IT placed (the role f.call leaves it in). The ACK for a 2xx is a
+// separate end-to-end transaction (RFC 3261 §17.1.1.3), so it is written
+// statelessly — never through a client transaction. Request-URI, From/To
+// and Call-ID come from the response, and the route set is the response's
+// Record-Route set in reverse, exactly as a UAC builds it.
+func (f *fakeSwitch) sendAckTo2xx(t *testing.T, res *sip.Response) {
+	t.Helper()
+	req := sip.NewRequest(sip.ACK, res.To().Address)
+	sip.CopyHeaders("From", res, req)
+	sip.CopyHeaders("To", res, req)
+	sip.CopyHeaders("Call-ID", res, req)
+	seq := uint32(1)
+	if c := res.CSeq(); c != nil {
+		seq = c.SeqNo
+	}
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: sip.ACK})
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	copyRouteFromRecordRoute(res, req)
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	req.PrependHeader(via)
+	req.SetTransport("UDP")
+	req.SetDestination(f.inDialogDest(t, req, res))
+	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
+	if err := f.cli.WriteRequest(req); err != nil {
+		t.Fatalf("fake switch ACK: %v", err)
+	}
+}
+
+// uacBye sends an in-dialog BYE from the fake switch as the UAC of a call
+// IT placed, and waits for the final response. Same shape as fsUacBye —
+// Request-URI and headers copied from the final response, Route = the
+// Record-Route set in reverse (RFC 3261 §12.1.2) — as a method so a switch
+// on any loopback address sources the request from its own socket.
+func (f *fakeSwitch) uacBye(t *testing.T, res *sip.Response) *sip.Response {
+	t.Helper()
+	req := sip.NewRequest(sip.BYE, res.To().Address)
+	sip.CopyHeaders("From", res, req)
+	sip.CopyHeaders("To", res, req)
+	sip.CopyHeaders("Call-ID", res, req)
+	seq := uint32(1)
+	if c := res.CSeq(); c != nil {
+		seq = c.SeqNo
+	}
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq + 1, MethodName: sip.BYE})
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: hostOf(f.addr), Port: portOf(f.addr)}})
+	copyRouteFromRecordRoute(res, req)
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	req.PrependHeader(via)
+
+	req.SetTransport("UDP")
+	req.SetDestination(f.inDialogDest(t, req, res))
+	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
+
+	ctx, cancel := timeoutCtx(10 * time.Second)
+	defer cancel()
+	tx, err := f.cli.TransactionRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("fake switch BYE: %v", err)
+	}
+	defer tx.Terminate()
+	for {
+		select {
+		case r, ok := <-tx.Responses():
+			if !ok {
+				t.Fatal("fake switch BYE: no final response")
+			}
+			if r.StatusCode >= 200 {
+				return r
+			}
+		case <-tx.Done():
+			t.Fatalf("fake switch BYE: %v", tx.Err())
+		case <-ctx.Done():
+			t.Fatal("fake switch BYE timed out")
+		}
+	}
 }

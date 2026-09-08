@@ -40,11 +40,50 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		s.onReInvite(req, tx)
 		return
 	}
+	// FreeSWITCH bridging an outbound PSTN call arrives on the PUBLIC
+	// socket (it targets the public listener port over the private link),
+	// so the plane dispatch below would misread it as a public phone's
+	// call. Classify it first: upstream source + the configured match
+	// Request-URI. Ordering against arrivedOnPrivate does not matter for
+	// correctness — such a request can never be in privSources — but this
+	// keeps "most specific first".
+	if s.isPSTNBridgeInvite(req, src) {
+		s.inviteToPSTN(req, tx)
+		return
+	}
 	if s.arrivedOnPrivate(req) {
 		s.inviteToClient(req, tx)
 		return
 	}
 	s.inviteToUpstream(req, tx, src)
+}
+
+// isPSTNBridgeInvite reports whether an INVITE is FreeSWITCH bridging an
+// outbound call to the PSTN carrier: it arrived from the configured
+// upstream AND its Request-URI names sip.pstn.match — the address the
+// dialplan sends PSTN prefixes to. Both halves are needed. A public phone
+// cannot trip this, because the source check fails for anything that did
+// not come from the upstream host; and a request from the upstream for any
+// other purpose fails the match check, because the match host:port is one
+// FreeSWITCH uses for nothing else (validation enforces it does not name
+// the SBC's private socket or the upstream itself).
+func (s *Server) isPSTNBridgeInvite(req *sip.Request, src netip.AddrPort) bool {
+	if !s.topo.pstnEnabled() {
+		return false
+	}
+	if !s.topo.fromUpstream(src.Addr()) {
+		return false
+	}
+	if req.Recipient.Host != s.topo.pstn.match.Host {
+		return false
+	}
+	// A URI without a port means the transport default, as everywhere else
+	// in the proxy (isSelf, Via checks).
+	port := req.Recipient.Port
+	if port == 0 {
+		port = 5060
+	}
+	return port == s.topo.pstn.match.Port
 }
 
 // inviteToUpstream handles a call placed BY a public client.
@@ -149,13 +188,51 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 404, "Not Found")
 		return
 	}
-	to, ok := s.topo.publicSide(binding.Transport)
+	s.forwardInboundInvite(req, tx, inboundInviteTarget{
+		dest:        binding.Source.String(),
+		recipient:   clientRequestURI(binding),
+		transport:   binding.Transport,
+		user:        binding.AOR,
+		label:       "client",
+		unavailable: 480,
+	})
+}
+
+// inboundInviteTarget is where an INVITE from FreeSWITCH is headed: a
+// registered client, or — when the proxy has a configured PSTN trunk — the
+// carrier gateway. The two forwardings are the same shape (media anchored
+// on both legs, the SBC's private identity advertised back to FreeSWITCH,
+// the far side's own identity in the Request-URI and Contact it sees), so
+// the differences are data rather than a second copy of the machinery.
+type inboundInviteTarget struct {
+	dest      string  // transport destination ("host:port") of the far side
+	recipient sip.Uri // Request-URI the far side must see, addressed to itself
+	transport string  // public transport to send over ("udp", "ws", "wss")
+	user      string  // far-side user for the log: the client's AoR, or the called number
+	label     string  // log label: "client" or "pstn"
+	// unavailable is the status to answer when the forward cannot even be
+	// attempted. A registered client that cannot be reached is 480 (the
+	// endpoint is gone); an unreachable PSTN carrier is 503 (it is
+	// infrastructure FreeSWITCH should fail over around, not an endpoint
+	// that went away).
+	unavailable int
+}
+
+// forwardInboundInvite carries an INVITE from FreeSWITCH to the far side
+// an inboundInviteTarget names, anchoring the call's media between the
+// two planes. It is inviteToClient's original body, parameterised — see
+// inviteToClient and inviteToPSTN for which target each direction builds.
+func (s *Server) forwardInboundInvite(req *sip.Request, tx sip.ServerTransaction, target inboundInviteTarget) {
+	to, ok := s.topo.publicSide(target.transport)
 	if !ok {
-		s.reject(req, tx, 480, "Temporarily Unavailable")
+		s.reject(req, tx, target.unavailable, unavailableReason(target.unavailable))
 		return
 	}
 	body := req.Body()
 	if len(body) == 0 {
+		// An offerless INVITE would make FreeSBC the offerer toward the
+		// far side and then require a second negotiation against the ACK.
+		// Not supported in this phase; refusing is honest.
 		s.reject(req, tx, 488, "Not Acceptable Here")
 		return
 	}
@@ -175,35 +252,41 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		}
 	}()
 
-	dest := binding.Source.String()
-	out, err := s.prepareForward(req, s.topo.private, to, dest, true)
+	out, err := s.prepareForward(req, s.topo.private, to, target.dest, true)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
-	// The Request-URI FreeSWITCH used names FreeSBC's own contact; the
-	// client must see one addressed to itself.
-	out.Recipient = clientRequestURI(binding)
+	// The Request-URI FreeSWITCH used names FreeSBC's own contact (or the
+	// match address); the far side must see one addressed to itself.
+	out.Recipient = target.recipient
 	setContact(out, to.uri())
 	setSDP(out, offer.sdp)
 
-	s.log.Info("proxying INVITE to client",
+	s.log.Info("proxying INVITE to "+target.label,
 		"sip_call_id", callIDOf(req), "direction", "private->public",
-		"transport", binding.Transport, "aor", binding.AOR,
-		"public_remote", dest,
+		"transport", target.transport, "aor", target.user,
+		"public_remote", target.dest,
 		"rtp_public_port", offer.sess.publicPort,
 		"rtp_private_port", offer.sess.privatePort,
 		"codec", codecNames(offer.sess.codecs))
 
 	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
 	if err != nil {
-		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)
-		s.reject(req, tx, 480, "Temporarily Unavailable")
+		s.log.Warn("forward INVITE to "+target.label, "err", err, "aor", target.user)
+		s.reject(req, tx, target.unavailable, unavailableReason(target.unavailable))
 		return
 	}
 	defer clTx.Terminate()
-	s.trackPending(req, &pendingInvite{req: out, dest: dest, side: to, cancel: cancel})
+	s.trackPending(req, &pendingInvite{req: out, dest: target.dest, side: to, cancel: cancel})
 	defer s.untrackPending(req)
+
+	// A CANCEL from FreeSWITCH terminates this server transaction; when it
+	// does, the INVITE we sent must be cancelled too or the far side would
+	// keep ringing. A false return means the transaction is ALREADY
+	// terminated — the CANCEL beat this registration — in which case the
+	// hook will never fire and the far-side leg must be cancelled right
+	// here instead.
 	if !tx.OnCancel(func(*sip.Request) { s.cancelPending(req) }) {
 		s.cancelPending(req)
 	}
@@ -214,11 +297,11 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		c := &call{
 			CallID: callIDOf(req), FromTag: fromTagOf(req),
 			ToTag: toTagOf(final), Inbound: true,
-			PublicRemote: dest, PrivateRemote: req.Source(),
-			Transport: binding.Transport,
+			PublicRemote: target.dest, PrivateRemote: req.Source(),
+			Transport: target.transport,
 		}
 		// FreeSWITCH is the caller here, so the roles are reversed: its
-		// Contact came on the INVITE and the client's on the 200.
+		// Contact came on the INVITE and the far side's on the 200.
 		if u, ok := contactURI(req); ok {
 			c.PrivateContact = u
 		}
@@ -227,6 +310,61 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		}
 		s.commitCall(req, final, offer, c)
 	}
+}
+
+// unavailableReason is the reason phrase for the status an
+// inboundInviteTarget chose for a forward that cannot start. Only two
+// statuses are used, so the mapping is a switch rather than a phrase
+// carried through the target: code 503 means "Service Unavailable"
+// (carrier), anything else means 480 "Temporarily Unavailable" (client).
+func unavailableReason(code int) string {
+	if code == 503 {
+		return "Service Unavailable"
+	}
+	return "Temporarily Unavailable"
+}
+
+// inviteToPSTN handles a call FreeSWITCH is bridging to the PSTN carrier
+// gateway. The gateway is peer-to-peer: it never registers and FreeSBC
+// never pings it. The call shape is exactly FS→client — media anchored on
+// both legs, the private identity advertised back to FreeSWITCH — so the
+// forwarding machinery is shared with inviteToClient.
+//
+// Precondition (established by onInvite's classification): the request
+// arrived from the configured upstream and its Request-URI names
+// sip.pstn.match.
+func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
+	// Unlike a client (480), an unreachable carrier is a temporary
+	// service failure (503): it is infrastructure FreeSWITCH expects to
+	// fail over around, not an endpoint that has gone away.
+	s.forwardInboundInvite(req, tx, inboundInviteTarget{
+		dest:        s.topo.pstn.gatewayHost,
+		recipient:   pstnRequestURI(req.Recipient, s.topo.pstn.gateway),
+		transport:   "udp",
+		user:        req.Recipient.User,
+		label:       "pstn",
+		unavailable: 503,
+	})
+}
+
+// pstnRequestURI re-points a bridged call's Request-URI at the carrier
+// gateway: FreeSWITCH dialed FreeSBC's own match address, and the carrier
+// must be addressed by its own host:port. Everything else about the URI
+// survives — the user part IS the called number, and header-style
+// parameters like user=phone ride along — so only the host, the port and
+// any transport parameter (which would try to steer the carrier to a
+// different transport on a non-default port) change.
+func pstnRequestURI(u sip.Uri, gw netip.AddrPort) sip.Uri {
+	// Clone first: the clone deep-copies the params, and the request's own
+	// URI must not be mutated — it is what the response path matches
+	// against.
+	u = *u.Clone()
+	u.Host = gw.Addr().String()
+	u.Port = int(gw.Port())
+	if u.UriParams != nil {
+		u.UriParams.Remove("transport")
+	}
+	return u
 }
 
 // pumpInvite relays every response of a forwarded INVITE, rewriting the
