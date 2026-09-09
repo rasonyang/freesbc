@@ -784,9 +784,14 @@ func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
 				// FreeSWITCH cancelled while this response was in flight:
 				// nothing may be relayed (its transaction is already
 				// terminated). A 2xx that raced the CANCEL still believes
-				// it has a live dialog — complete and tear it down.
+				// it has a live dialog — complete and tear it down. A
+				// provisional leaves the gateway's 487 still to come, so
+				// drain for it.
 				if res.StatusCode/100 == 2 {
 					go s.ackThenBye(res, to)
+				}
+				if res.StatusCode < 200 {
+					s.drainCancelledInvite(clTx, to)
 				}
 				return attemptResult{retryable: true, kind: failDial, code: 503,
 					reason: "Service Unavailable"}
@@ -882,7 +887,11 @@ func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
 		case <-wholeCtx.Done():
 			// FreeSWITCH cancelled (or the 5-minute backstop fired): the
 			// attempt ends, and the series with it. No penalize: the caller
-			// gave up; the gateway was not given its chance to fail.
+			// gave up; the gateway was not given its chance to fail. The
+			// CANCEL is already on the wire (the OnCancel hook sent it before
+			// cancelling this context), but its 487 is not necessarily here
+			// yet — drain for it.
+			s.drainCancelledInvite(clTx, to)
 			return attemptResult{retryable: true, kind: failDial, code: 503,
 				reason: "Service Unavailable"}
 		case <-timer.C:
@@ -958,6 +967,54 @@ func (s *Server) expirePSTNAttempt(wholeCtx context.Context, req, out *sip.Reque
 			// more may be relayed either way.
 			return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
 				penalize: !responded && wholeCtx.Err() == nil}
+		}
+	}
+}
+
+// drainCancelledInvite reads whatever the far end still has to say after the
+// call has been cancelled, briefly and without relaying any of it.
+//
+// The CANCEL for the forwarded INVITE is already on the wire (cancelPending
+// sent it before cancelling the caller's context), but the final it provokes
+// — the 487, or a 2xx that raced the CANCEL — may still be in flight. The
+// caller returns as soon as this function does and then Terminate()s the
+// client transaction, and a final response that matches no transaction is
+// never ACKed (RFC 3261 §17.1.1.3): the far end retransmits it until Timer H
+// and the log fills with "ACK missed". Keeping the transaction alive to
+// match the final is what makes sipgo's transaction layer send that ACK.
+//
+// Nothing read here may be relayed — the caller's server transaction is
+// already terminated. A 2xx is the one response with work left in it: the
+// far end believes it has a live dialog, so it is completed and torn down.
+// from is the side that teardown must go out on, as in ackThenBye.
+func (s *Server) drainCancelledInvite(clTx sip.ClientTransaction, from side) {
+	drain := time.NewTimer(pstnDrain)
+	defer drain.Stop()
+	for {
+		select {
+		case res, ok := <-clTx.Responses():
+			if !ok {
+				return
+			}
+			if !forwardable(res) {
+				continue // a 100 Trying carries nothing to match
+			}
+			if res.StatusCode/100 == 2 {
+				go s.ackThenBye(res, from)
+			}
+			if res.StatusCode >= 200 {
+				// The final: a non-2xx was ACKed by the transaction layer on
+				// its way in, a 2xx is being torn down. Nothing left to wait
+				// for.
+				return
+			}
+		case <-clTx.Done():
+			// The transaction died under us (a transport error, or a
+			// Terminate from another path): no response can be matched any
+			// more, so there is nothing left to drain for.
+			return
+		case <-drain.C:
+			return
 		}
 	}
 }
@@ -1070,6 +1127,13 @@ func (s *Server) pumpInvite(ctx context.Context, req *sip.Request, tx sip.Server
 			}
 			return nil, responded
 		case <-ctx.Done():
+			// The caller is gone: FreeSWITCH cancelled, or the backstop
+			// fired. The CANCEL is on the wire, but the far end's 487 may
+			// still be in flight — drain for it so the transaction layer can
+			// match it and send the ACK the far end expects, instead of the
+			// caller terminating the transaction first and leaving the 487
+			// unACKed.
+			s.drainCancelledInvite(clTx, near)
 			return nil, responded
 		}
 	}

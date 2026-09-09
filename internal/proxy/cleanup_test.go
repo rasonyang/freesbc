@@ -284,6 +284,109 @@ func TestCancelPropagatesUpstream(t *testing.T) {
 	waitForRelease(t, h)
 }
 
+// TestCancelACKsUpstream487 is the upstream leg's half of the PSTN cancel
+// bug: the caller gives up mid-ring, FreeSBC relays the CANCEL, and
+// FreeSWITCH's 487 — sent after the CANCEL already ended the call — must
+// still be ACKed (RFC 3261 §17.1.1.3), or FreeSWITCH retransmits it until
+// Timer H and logs "ACK missed".
+//
+// The switch's INVITE transaction is deliberately gone by the time the
+// CANCEL arrives (the hook returns without a final and sipgo destroys it),
+// so nothing auto-487s on the CANCEL and the test owns the timing: the 487
+// goes out a beat later, after FreeSBC's own cancel handling has run.
+func TestCancelACKsUpstream487(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+
+	// Build the 487 while the INVITE still carries the source it came from,
+	// then send it later — a real UAS answers the CANCEL first and the INVITE
+	// after, and the SBC's transaction must still be alive to match it.
+	late487 := make(chan *sip.Response, 1)
+	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 180, "Ringing", nil))
+		select {
+		case late487 <- sip.NewResponseFromRequest(req, 487, "Request Terminated", nil):
+		default: // a retransmitted INVITE must not wedge the switch
+		}
+		return true
+	})
+
+	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(30099))
+	invite.SetTransport("UDP")
+	invite.SetDestination(h.publicUDP)
+	cancelReq := buildCancelFor(phone, invite)
+
+	done := make(chan int, 1)
+	go func() {
+		ctx, cancel := timeoutCtx(15 * time.Second)
+		defer cancel()
+		tx, err := phone.cli.TransactionRequest(ctx, invite)
+		if err != nil {
+			done <- 0
+			return
+		}
+		defer tx.Terminate()
+		for {
+			select {
+			case res, ok := <-tx.Responses():
+				if !ok {
+					done <- 0
+					return
+				}
+				if res.StatusCode >= 200 {
+					done <- res.StatusCode
+					return
+				}
+			case <-tx.Done():
+				done <- 0
+				return
+			case <-ctx.Done():
+				done <- 0
+				return
+			}
+		}
+	}()
+
+	var res487 *sip.Response
+	select {
+	case res487 = <-late487:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FreeSWITCH never received the INVITE")
+	}
+
+	if res := phone.do(t, cancelReq, h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("CANCEL: got %d", res.StatusCode)
+	}
+	if got := h.fs.waitFor(sip.CANCEL, 1, 5*time.Second); len(got) != 1 {
+		t.Fatalf("FreeSWITCH saw %d CANCELs, want 1", len(got))
+	}
+
+	// The 487 goes out a beat after the CANCEL — after FreeSBC's own cancel
+	// handling has run — the way a switch that answered the CANCEL first
+	// sends it.
+	time.Sleep(100 * time.Millisecond)
+	h.fs.sendResponse(t, res487)
+
+	// Only the transaction layer's ACK counts, and it is the one that echoes
+	// the INVITE's own branch. The caller ACKs the 487 FreeSBC itself sent
+	// it, in a transaction of its own, and FreeSBC relays that ACK upstream
+	// with a fresh branch — so a check that just counts ACKs would see the
+	// relayed one and pass with the bug still in place.
+	branch, _ := res487.Via().Params.Get("branch")
+	if acks := h.fs.waitForAckBranch(branch, 3*time.Second); len(acks) != 1 {
+		t.Errorf("FreeSWITCH saw %d ACKs carrying its INVITE's branch, want 1 — it would retransmit its 487 until Timer H", len(acks))
+	}
+	select {
+	case code := <-done:
+		if code != 487 {
+			t.Logf("caller saw final response %d (487 expected, but the exact code is the UAS's to choose)", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the INVITE transaction never finalised after CANCEL")
+	}
+	waitForRelease(t, h)
+}
+
 func buildCancelFor(c *client, invite *sip.Request) *sip.Request {
 	cn := sip.NewRequest(sip.CANCEL, invite.Recipient)
 	// RFC 3261 §9.1: the CANCEL carries the INVITE's own top Via branch.
