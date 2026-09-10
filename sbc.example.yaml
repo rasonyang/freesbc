@@ -48,7 +48,7 @@ srv_cache_ttl: 300s  # cache DNS SRV/A resolutions this long (Go's resolver expo
 
 peers:
   carrier-a:
-    address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA (M4.4, not yet implemented)
+    address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
     # Pinned realm (T-19): just add it to the auth line — auth: { username: ..., password: ..., realm: carrier-a-realm }

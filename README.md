@@ -20,15 +20,16 @@ It runs two independent planes, either or both of which may be enabled:
 
 Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible, as in LibreSBC) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
 
-## Planned feature set (MVP)
+## Features
 
-- **SIP trunk interconnect** — UDP/TCP/TLS, IP-authenticated and registration-based trunks (outbound REGISTER with digest auth)
-- **B2BUA with topology hiding** — full SDP rewrite, two independent call legs
-- **Routing engine** — regex matching, number transformation, ordered failover, DNS SRV
-- **RTP relay + SRTP (SDES)** — media anchoring, NAT traversal via hardened first-packet latching; **no transcoding** (left to the softswitch behind)
-- **Built-in security** — per-IP rate limiting, scanner fingerprinting, auto-ban, optional nftables integration (not a hard dependency)
-- **Embedded WebUI + REST API** — an editor for the same YAML file, with hot reload
-- Carrier-grade interop baseline: OPTIONS answering, session timers (RFC 4028), 100rel/PRACK passthrough
+- **SIP trunk interconnect** — UDP, TCP and TLS transports (real certificate or a self-signed fallback, optional mTLS), IP-authenticated peers, and registration-based trunks via outbound REGISTER with digest auth
+- **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and full SDP rewrite
+- **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution (RFC 3263 priority/weight ordering, cached)
+- **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy, SRTP↔RTP interworking in both directions, NAT traversal via hardened first-packet latching; **no transcoding** (left to the softswitch behind)
+- **Edge proxy plane** — registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
+- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures, auto-ban, optional nftables integration (auto-detected, degrades to in-memory bans, never a hard dependency)
+- **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
+- Carrier interop baseline: OPTIONS answering and session timers (RFC 4028), including the 422/Min-SE negotiation on both legs
 
 Explicit non-goals: transcoding, CDR, clustering, and being a registrar in
 its own right — the edge proxy PROXIES registrations to FreeSWITCH rather
@@ -317,26 +318,21 @@ The two sections are mutually independent: SIP can advertise one public address 
 
 ## Roadmap
 
-| Milestone | Scope | Status |
-|---|---|---|
-| M1 | Config foundation: schema, validation, atomic hot reload, `run`/`check` CLI | ✅ done |
-| M2 | Media plane: RTP port pool, relay engine, latching hardening | ✅ done |
-| M3 | Signaling core: SIP server, B2BUA, SDP rewrite, routing — first end-to-end call | ✅ done |
-| ├ M3.1 | SIP front door: listeners, OPTIONS, source-IP identification | ✅ done |
-| ├ M3.2 | Routing engine: match / transform / failover | ✅ done |
-| └ M3.3 | B2BUA bridge: leg pairing, SDP rewrite, media wiring, Relatch | ✅ done |
-| M4 | Trunk interop: From/CLI, outbound REGISTER, session timers, PRACK, DNS SRV | ✅ done |
-| ├ M4.1 | Outbound-INVITE realism: From/CLI, ring cap, response codes | ✅ done |
-| ├ M4.2 | Outbound REGISTER | ✅ done |
-| ├ M4.3 | Session timers (RFC 4028) + 100rel/PRACK | ✅ done |
-| └ M4.4 | DNS SRV + peer health/cooldown | ✅ done |
-| M5 | SRTP (SDES): a=crypto negotiation, SRTP↔RTP interworking, per-peer policy | ✅ done |
-| M6 | Shield: per-IP rate limiting, scanner fingerprinting, auto-ban (optional nftables) | ✅ done |
-| M7 | Operability: admin API, metrics, embedded WebUI | ✅ done |
-| ├ M7.1 | Admin API + Prometheus metrics (read-only, bcrypt Basic Auth) | ✅ done |
-| ├ M7.2 | Config write-back (`PUT /api/config`, atomic, `${ENV}`-preserving) | ✅ done |
-| └ M7.3 | Embedded WebUI (dashboard + config editor) | ✅ done |
-| M8 | Edge proxy: public/private topology, REGISTER proxy, WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite/DTLS-SRTP) | ✅ done |
+Items not yet implemented. The milestones that produced the feature list above are
+finished and are no longer tracked here; see also the edge proxy's [known
+limitations](#known-limitations), which are structural rather than scheduled.
+
+- **100rel/PRACK** — an INVITE carrying `Require: 100rel` is answered `420 Bad Extension` today, and the trunk plane neither advertises 100rel nor handles PRACK
+- **Mid-call re-INVITE on the trunk plane** — hold/resume and codec renegotiation are answered `501`; only session-timer refresh re-INVITEs are handled (the edge proxy does re-anchor re-INVITEs)
+- **Inbound digest challenge** — the SBC answers challenges but never issues one; trunk peers are authenticated by source IP, plus TLS/mTLS where configured
+- **Active peer qualification** — outbound OPTIONS keepalives; peer liveness is passive cooldown today
+- **`listen.media.public_ip: auto`** — STUN-detected public address; a literal address is required for now
+- **Ring timeout against a silent target** — failover from a blackholing peer waits for the transaction timer (~32 s) instead of `ring_timeout`
+- **Scanner heuristics beyond User-Agent** — method and traffic-shape fingerprinting
+- **SUBSCRIBE/NOTIFY through the edge proxy** — needed before MWI and BLF reach phones
+- **Consistent hashing for `sip.upstreams`** — the pool is modulo-hashed, so changing the node set reshuffles users between switches
+- **Configurable TCP/TLS listener limits and TLS certificate hot rotation** — the connection cap and idle timeout are compiled in, and certificate changes need a restart
+- **Security hardening backlog** — the remaining items in [`docs/tasks.md`](docs/tasks.md)
 
 ## Admin & WebUI
 
@@ -385,3 +381,7 @@ go test ./... -race
 ```
 
 Design and implementation plans live in [`freesbc-allinone-design.md`](freesbc-allinone-design.md) and [`docs/superpowers/plans/`](docs/superpowers/plans/).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
