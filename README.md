@@ -32,7 +32,7 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 
 Explicit non-goals: transcoding, CDR, clustering, and being a registrar in
 its own right — the edge proxy PROXIES registrations to FreeSWITCH rather
-than owning users or credentials. See the [design doc](freesbc-allinone-design.md) (Chinese).
+than owning users or credentials. See the [design doc](freesbc-allinone-design.md).
 
 ## Edge proxy (SIP / RTP / WebRTC)
 
