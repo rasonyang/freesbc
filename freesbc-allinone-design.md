@@ -1,146 +1,146 @@
-# FreeSBC — All-in-One 开源 SBC 设计文档
+# FreeSBC — All-in-One Open Source SBC Design
 
-背景：借鉴 LibreSBC，解决其部署复杂、入门门槛高的核心痛点。
+Background: modeled on LibreSBC, aimed squarely at its core pain points — complex deployment and a high barrier to entry.
 
-## 1. 背景与动机
+## 1. Background and Motivation
 
-### LibreSBC 架构分析
+### LibreSBC Architecture Analysis
 
-| 组件 | 技术 | 职责 |
+| Component | Technology | Responsibility |
 |------|------|------|
-| FreeSWITCH | C | 信令 B2BUA + 媒体处理（RTP、转码） |
-| callng | Lua（嵌入 FreeSWITCH） | 呼叫路由逻辑、CDR 事件、安全事件 |
-| liberator | Python (FastAPI) | 管理 API、配置生成（Jinja2→XML）、CDR、nftables 管理 |
-| Redis | — | 配置/状态存储 |
-| webui | 静态 JS | 管理界面 |
-| ansible + docker | — | 部署编排 |
+| FreeSWITCH | C | Signaling B2BUA + media processing (RTP, transcoding) |
+| callng | Lua (embedded in FreeSWITCH) | Call routing logic, CDR events, security events |
+| liberator | Python (FastAPI) | Management API, config generation (Jinja2 → XML), CDR, nftables management |
+| Redis | — | Configuration and state storage |
+| webui | Static JS | Management interface |
+| ansible + docker | — | Deployment orchestration |
 
-**优点**：继承 FreeSWITCH 的电信级互操作性与转码能力；控制面/媒体面分层清晰；安全能力完整（nftables shield、topology hiding）；MIT 协议。
+**Strengths**: inherits FreeSWITCH's carrier-grade interoperability and transcoding; clean separation of control plane and media plane; a complete security feature set (nftables shield, topology hiding); MIT licensed.
 
-**缺点（本项目要解决的）**：部署组件多（FreeSWITCH + Redis + Python + Lua + nftables + ansible），任一环节版本不匹配即故障；四种语言维护成本高；配置链路长（API → Redis → Jinja2 → XML → reload），排错跨 4 层；无单二进制交付；FreeSWITCH 本身安装门槛高。
+**Weaknesses (what this project sets out to fix)**: too many deployment components (FreeSWITCH + Redis + Python + Lua + nftables + ansible), where a version mismatch anywhere breaks the system; four languages to maintain; a long configuration path (API → Redis → Jinja2 → XML → reload) that forces troubleshooting across four layers; no single-binary delivery; FreeSWITCH itself is hard to install.
 
-### 产品命题
+### Product Thesis
 
-对标 Caddy 的体验：**下载一个二进制、一个配置文件、`./FreeSBC run` 即可运行的开源 SBC**。
+Match the Caddy experience: **an open source SBC that runs from one downloaded binary, one configuration file, and `./FreeSBC run`.**
 
-## 2. 范围决策（已确认）
+## 2. Scope Decisions (Confirmed)
 
-- **媒体深度**：仅 RTP 中继 + SRTP 加解密，**不做转码**。转码留给后端软交换。覆盖 topology hiding、媒体安全、NAT 穿越等主流 SBC 场景。SRTP 密钥协商**仅支持 SDES**（SDP `a=crypto`，信令走 TLS）；DTLS-SRTP 随 WebRTC 范围一并排除。
-- **定位**：中小企业/ITSP 单节点优先，单机数百~数千并发。HA 用主备/VRRP 后置。
-- **MVP 包含**：SIP trunk 对接（含**出向 trunk 注册**：向运营商发 REGISTER + digest 认证，覆盖注册型 trunk）、路由引擎、topology hiding（B2BUA + SDP 重写）、RTP 中继 + SRTP(SDES)、内置安全防护、内嵌 WebUI。
-- **MVP 不含**（后续版本）：注册代理/Registrar（即**服务**话机/终端注册——与上述出向注册是两回事）、CDR、转码、集群。
-- **配置模型**：声明式 YAML 配置文件为唯一真相源，支持热重载；WebUI/API 是配置文件的编辑器。
+- **Media depth**: RTP relay plus SRTP encryption/decryption only — **no transcoding**. Transcoding is left to the softswitch behind the SBC. This covers the mainstream SBC scenarios: topology hiding, media security, NAT traversal. SRTP key negotiation is **SDES only** (SDP `a=crypto`, signaling over TLS); DTLS-SRTP is excluded along with the WebRTC scope.
+- **Positioning**: single node first, for SMBs and ITSPs, at hundreds to a few thousand concurrent calls per host. HA via active/standby or VRRP comes later.
+- **In the MVP**: SIP trunk interop (including **outbound trunk registration**: sending REGISTER with digest authentication to the carrier, covering registration-based trunks), routing engine, topology hiding (B2BUA + SDP rewrite), RTP relay + SRTP (SDES), built-in security protection, embedded WebUI.
+- **Not in the MVP** (later releases): registration proxy / registrar (that is, **serving** phone and endpoint registrations — a different thing from the outbound registration above), CDR, transcoding, clustering.
+- **Configuration model**: a declarative YAML file is the single source of truth, with hot reload; the WebUI and API are editors for that file.
 
-### 技术路线选型
+### Technology Selection
 
-- **方案 A（选定）：纯 Go 从零构建** — sipgo（SIP 栈）+ pion（SRTP/SDP）+ go:embed WebUI。真正单二进制、零依赖、交叉编译。代价：SIP 互操作性需自行踩坑（以 MVP 聚焦 trunk 对接收敛风险——对端为运营商/PBX，行为比话机规范）。
-- 方案 B（否决）：Go 控制面 + 内嵌 FreeSWITCH 单容器。互操作性免费但非真单体，FreeSWITCH 复杂度只是被隐藏，产品差异化弱。
-- 方案 C（否决）：Go 信令 + rtpengine。性能最强但需内核模块，部署门槛与目标矛盾。
+- **Option A (selected): pure Go, built from scratch** — sipgo (SIP stack) + pion (SRTP/SDP) + go:embed WebUI. A true single binary, zero dependencies, cross-compilable. The cost: SIP interoperability has to be learned the hard way (focusing the MVP on trunk interop bounds that risk — the far end is a carrier or PBX, whose behavior is better specified than a phone's).
+- Option B (rejected): Go control plane with FreeSWITCH embedded in a single container. Interoperability comes free, but it is not a true single binary — FreeSWITCH's complexity is merely hidden, and the product differentiation is weak.
+- Option C (rejected): Go signaling + rtpengine. The strongest performance, but it requires a kernel module, and that deployment barrier contradicts the goal.
 
-## 3. 整体架构
+## 3. Overall Architecture
 
-单进程四平面：
+Four planes in a single process:
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   FreeSBC (单进程)                  │
-│  ┌───────────┐   ┌────────────────────────────┐ │
-│  │ 管理平面    │   │ 信令平面 (sipgo)             │ │
-│  │ HTTP API  │──▶│ SIP B2BUA                  │ │
-│  │ WebUI     │   │ UDP/TCP/TLS :5060/:5061    │ │
-│  │ (embed)   │   └──────────┬─────────────────┘ │
-│  └───────────┘              │                   │
-│  ┌───────────┐   ┌──────────▼─────────────────┐ │
-│  │ 安全平面    │   │ 媒体平面                     │ │
-│  │ 限速/封禁   │──▶│ RTP Relay + SRTP (pion)    │ │
-│  │ 扫描识别    │   │ UDP 端口池 16384-32768      │ │
-│  └───────────┘   └────────────────────────────┘ │
-│  配置真相源: sbc.yaml (fsnotify 热重载)            │
-│  运行时状态: 纯内存 (呼叫状态表)                     │
+│              FreeSBC (single process)           │
+│  ┌─────────────┐   ┌──────────────────────────┐ │
+│  │ Mgmt Plane  │   │ Signaling Plane (sipgo)  │ │
+│  │ HTTP API    │──▶│ SIP B2BUA                │ │
+│  │ WebUI       │   │ UDP/TCP/TLS :5060/:5061  │ │
+│  │ (embed)     │   └──────────┬───────────────┘ │
+│  └─────────────┘              │                 │
+│  ┌─────────────┐   ┌──────────▼───────────────┐ │
+│  │ Shield Plane│   │ Media Plane              │ │
+│  │ Rate/Ban    │──▶│ RTP Relay + SRTP (pion)  │ │
+│  │ Scan Detect │   │ UDP port pool 16384-32768│ │
+│  └─────────────┘   └──────────────────────────┘ │
+│  Truth source: sbc.yaml (fsnotify hot reload)   │
+│  Runtime state: in-memory (call state table)    │
 └─────────────────────────────────────────────────┘
 ```
 
-### 关键设计决定
+### Key Design Decisions
 
-1. **B2BUA 而非 proxy**：入呼/出呼各一条 leg，SDP 完全重写指向自身媒体端口，实现 topology hiding 与媒体安全。sipgo 提供事务/对话层，B2BUA 逻辑自研（参考 diago）。
-2. **运行时状态纯内存**：单节点定位下呼叫状态不落盘，进程重启丢在途呼叫（与 Kamailio 默认一致）。配置文件是唯一持久化。
-3. **配置热重载语义**：变更 → 校验 → 原子替换（`atomic.Pointer[Config]`）→ 新呼叫用新配置，在途呼叫不受影响。校验失败保持旧配置，进程永不因坏配置崩溃。
-4. **安全平面应用层实现**：每 IP 限速、扫描器 UA 指纹、失败阈值自动封禁，内存封禁表，可选联动 nftables（`auto/on/off`），nftables 非硬依赖（与 libresbc 相反）。
-5. **媒体面安全（latching 加固）**：首包 latching 仅在媒体流建立前生效，默认要求首包源 IP 与 SDP 信令 IP 一致（每 peer 可配 `strict/loose` 应对强 NAT），媒体建立后**不再重新 latch**，防 RTP 劫持。**arming 语义（2026-07-15 已确认）**：初始媒体采用严格 per-side arming——strict 模式下某侧在信令面用 SDP 源 IP arm 之前**丢弃一切包**（防早期媒体窗口被抢注，劫持+DoS）；后续媒体地址变更（re-INVITE/hold-resume）仅能由 SIP/SDP 状态机显式调用授权 re-latch（`Relatch`），本地端口跨 re-INVITE 保持不变。
+1. **B2BUA, not proxy**: one inbound leg and one outbound leg, with the SDP fully rewritten to point at our own media ports, which delivers topology hiding and media security. sipgo provides the transaction and dialog layers; the B2BUA logic is our own (referencing diago).
+2. **Runtime state in memory only**: for a single-node product, call state is never written to disk, and a process restart drops in-flight calls (the same as Kamailio's default). The configuration file is the only persistent state.
+3. **Hot-reload semantics**: change → validate → atomic swap (`atomic.Pointer[Config]`) → new calls use the new configuration while in-flight calls are unaffected. A failed validation keeps the old configuration; the process never dies from a bad config.
+4. **Shield plane implemented in the application**: per-IP rate limiting, scanner UA fingerprints, automatic ban on a failure threshold, an in-memory ban table, and optional nftables integration (`auto/on/off`). nftables is not a hard dependency (unlike libresbc).
+5. **Media plane security (hardened latching)**: first-packet latching applies only before the media stream is established, and by default the first packet's source IP must match the signaling IP from the SDP (each peer can select `strict` or `loose` for hostile NAT). Once media is established there is **no re-latching**, which blocks RTP hijacking. **Arming semantics (confirmed 2026-07-15)**: initial media uses strict per-side arming — in strict mode a side **drops every packet** until the signaling plane arms it with the SDP source IP (preventing an attacker from claiming the early-media window, which would be hijacking plus DoS). Later media address changes (re-INVITE, hold/resume) can only be authorized by an explicit re-latch call (`Relatch`) from the SIP/SDP state machine, and the local port stays unchanged across re-INVITEs.
 
-### 信令互操作基线（MVP 必备）
+### Signaling Interop Baseline (MVP Mandatory)
 
-对接真实运营商/PBX 的最低要求，全部纳入 MVP：
+The minimum required to interoperate with real carriers and PBXs; all of it is in the MVP:
 
-- **应答入站 OPTIONS**：运营商用 OPTIONS 做 trunk 健康检查，不应答会被判死。
-- **Session Timers（RFC 4028）**：支持 `Session-Expires`/`Min-SE` 协商与定时刷新，许多运营商强制要求。
-- **100rel/PRACK 透传**：两 leg 间正确透传可靠临时响应（运营商 183 早期媒体场景）。
-- **Digest 认证客户端**：应答出向 INVITE/REGISTER 的 401/407 挑战（peer 配置的 `auth` 凭据）。
-- **出向 REGISTER**：peer 配 `register: true` 时向运营商周期注册（到期前刷新、失败退避重试），注册失败该 peer 标记不可用并计入 metrics。
-- **DNS SRV**：peer 地址支持 SRV 解析，priority/weight 结果并入 failover 列表；无 SRV 记录回退 A/AAAA。
+- **Answer inbound OPTIONS**: carriers use OPTIONS as a trunk health check and will mark a silent trunk dead.
+- **Session timers (RFC 4028)**: support `Session-Expires`/`Min-SE` negotiation and periodic refresh; many carriers require it.
+- **100rel/PRACK pass-through**: correctly relay reliable provisional responses between the two legs (the carrier 183 early-media case).
+- **Digest authentication client**: answer 401/407 challenges on outbound INVITE and REGISTER (using the peer's configured `auth` credentials).
+- **Outbound REGISTER**: when a peer sets `register: true`, register with the carrier periodically (refresh before expiry, back off and retry on failure); a peer whose registration fails is marked unavailable and counted in metrics.
+- **DNS SRV**: peer addresses support SRV resolution, with priority/weight results folded into the failover list; fall back to A/AAAA when there is no SRV record.
 
-## 4. 模块划分
+## 4. Module Layout
 
 ```
 FreeSBC/
-├── main.go                  # 入口：flag 解析、启动编排
+├── main.go                  # Entry point: flag parsing, startup orchestration
 ├── config/
-│   ├── schema.go            # YAML 结构体 + 校验规则
-│   └── reload.go            # fsnotify 监听、原子热重载
-├── sig/                     # 信令平面
-│   ├── server.go            # sipgo 装配 (UDP/TCP/TLS)、入站 OPTIONS 应答
-│   ├── b2bua.go             # leg 配对、状态机、re-INVITE/BYE 转发、PRACK 透传、session timers
-│   ├── routing.go           # 路由匹配 → 选网关 → failover（含 DNS SRV 解析）
-│   ├── auth.go              # digest 认证客户端（401/407，INVITE/REGISTER 共用）
-│   ├── register.go          # 出向 trunk 注册状态机（定时刷新、失败退避）
-│   ├── sdp.go               # SDP 解析/重写
-│   └── normalize.go         # 号码变换（正则替换）
+│   ├── schema.go            # YAML structs + validation rules
+│   └── reload.go            # fsnotify watch, atomic hot reload
+├── sig/                     # Signaling plane
+│   ├── server.go            # sipgo assembly (UDP/TCP/TLS), inbound OPTIONS replies
+│   ├── b2bua.go             # Leg pairing, state machine, re-INVITE/BYE forwarding, PRACK pass-through, session timers
+│   ├── routing.go           # Route match → gateway selection → failover (incl. DNS SRV resolution)
+│   ├── auth.go              # Digest authentication client (401/407, shared by INVITE and REGISTER)
+│   ├── register.go          # Outbound trunk registration state machine (periodic refresh, failure backoff)
+│   ├── sdp.go               # SDP parsing and rewriting
+│   └── normalize.go         # Number transformation (regex replacement)
 ├── media/
-│   ├── portpool.go          # RTP 端口池分配/回收
-│   ├── relay.go             # UDP 转发引擎（每呼叫 goroutine 对）
+│   ├── portpool.go          # RTP port pool allocation and release
+│   ├── relay.go             # UDP forwarding engine (one goroutine pair per call)
 │   └── srtp.go              # SRTP↔RTP (pion/srtp)
 ├── shield/
-│   ├── ratelimit.go         # 每 IP 令牌桶
-│   ├── scanner.go           # 扫描器 UA 指纹库
-│   ├── banlist.go           # 内存封禁表 + 可选 nftables 联动
-│   └── acl.go               # IP 白/黑名单
+│   ├── ratelimit.go         # Per-IP token bucket
+│   ├── scanner.go           # Scanner UA fingerprint database
+│   ├── banlist.go           # In-memory ban table + optional nftables integration
+│   └── acl.go               # IP allowlist/blocklist
 ├── admin/
-│   ├── api.go               # REST API (net/http 无框架)
-│   ├── webui/               # 前端静态文件 (go:embed)
+│   ├── api.go               # REST API (net/http, no framework)
+│   ├── webui/               # Frontend static files (go:embed)
 │   └── metrics.go           # Prometheus /metrics
-└── callstate/               # 内存呼叫状态表（API 查询/踢呼叫）
+└── callstate/               # In-memory call state table (API query / call teardown)
 ```
 
-### 模块间接口
+### Inter-Module Interfaces
 
-1. **sig → media**：`media.Allocate(ctx) (Session, error)` — INVITE 时申请媒体会话（两对端口），地址写入重写 SDP；结束 `Session.Close()` 回收。media 不懂 SIP，sig 不碰媒体包。
-2. **sig → shield**：sipgo middleware 挂 `shield.Check(srcIP, msg) Verdict` — 每个入站请求先过安全平面，返回拒绝/静默丢弃/放行。
-3. **全部模块 → config**：只读 `config.Current()` 取快照（atomic 解引用无锁），单呼叫内用同一快照，保证配置一致性。
+1. **sig → media**: `media.Allocate(ctx) (Session, error)` — request a media session (two port pairs) on INVITE, and write the addresses into the rewritten SDP; `Session.Close()` releases them at the end. media knows nothing about SIP, and sig never touches media packets.
+2. **sig → shield**: a sipgo middleware calls `shield.Check(srcIP, msg) Verdict` — every inbound request passes the shield plane first, which returns reject, silent drop, or allow.
+3. **All modules → config**: read-only `config.Current()` returns a snapshot (a lock-free atomic dereference); a single call uses one snapshot throughout, which guarantees configuration consistency.
 
-### 依赖清单
+### Dependency List
 
-`emiago/sipgo`（SIP 栈）、`pion/srtp` + `pion/rtp`（SRTP）、`pion/sdp`（SDP）、`fsnotify`（热重载）、`goccy/go-yaml`（配置，保留注释）、`prometheus/client_golang`（指标）。无数据库、无 Redis、无 Web 框架。
+`emiago/sipgo` (SIP stack), `pion/srtp` + `pion/rtp` (SRTP), `pion/sdp` (SDP), `fsnotify` (hot reload), `goccy/go-yaml` (configuration, preserves comments), `prometheus/client_golang` (metrics). No database, no Redis, no web framework.
 
-## 5. 配置文件形态与路由模型
+## 5. Configuration File Shape and Routing Model
 
-设计目标：新手照 20 行示例跑通第一通呼叫。libresbc 的五层引用模型（interconnection / media class / capacity class / translation class / routing table）压扁为三个顶层概念：**listen / peers / routes**。
+Design goal: a newcomer gets their first call working from a 20-line example. libresbc's five-layer reference model (interconnection / media class / capacity class / translation class / routing table) is flattened into three top-level concepts: **listen / peers / routes**.
 
 ```yaml
 listen:
   sip:
     - udp://0.0.0.0:5060
-    - tls://0.0.0.0:5061          # 证书不配则自签
+    - tls://0.0.0.0:5061          # self-signed if no certificate is configured
   media:
     port_range: 16384-32768
-    public_ip: auto                # auto = STUN 探测，或写死
+    public_ip: auto                # auto = STUN discovery, or hard-code it
 
 peers:
   carrier-a:
-    address: sip.carrier-a.com:5060  # 支持 DNS SRV，无记录回退 A/AAAA
+    address: sip.carrier-a.com:5060  # DNS SRV supported, falls back to A/AAAA
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
-    register: true                 # 注册型 trunk：周期 REGISTER + digest 认证
-    allowed_ips: [203.0.113.0/24]  # 入呼按源 IP 识别 peer
+    register: true                 # registration-based trunk: periodic REGISTER + digest auth
+    allowed_ips: [203.0.113.0/24]  # inbound calls identify the peer by source IP
   internal-pbx:
     address: 10.0.0.10:5060
     allowed_ips: [10.0.0.0/8]
@@ -150,12 +150,12 @@ routes:
     from: internal-pbx
     match: { to: "^9(\\d+)$" }
     transform: { to: "$1" }
-    to: [carrier-a]                # 顺序即 failover 顺序
+    to: [carrier-a]                # list order is the failover order
   - name: inbound
     from: carrier-a
     to: [internal-pbx]
 
-shield:                            # 有合理默认值，整段可省略
+shield:                            # sensible defaults; the whole block may be omitted
   rate_limit: 20/s per_ip
   auto_ban: { failures: 5, window: 60s, duration: 1h }
   nftables: auto
@@ -165,62 +165,62 @@ admin:
   auth: { username: admin, password_hash: "..." }
 ```
 
-### 路由语义
+### Routing Semantics
 
-- **入呼识别**：源 IP 匹配 peer 的 `allowed_ips` → 确定 `from`；无匹配交给 shield（默认静默丢弃）。
-- **匹配**：按 `routes` 顺序，`from` + `match` 正则首条命中即用，无优先级数字。
-- **failover**：`to` 列表依序尝试，5xx/超时切下一个；peer 带被动健康检查（连续失败冷却）+ 可选 OPTIONS 探测。
-- **变换**：`transform` 支持正则捕获组，内联于路由，无需单独定义再引用。
-- **codec 过滤**：按 peer 配置过滤 SDP codec 列表（纯 SDP 层操作，不涉及转码）。
+- **Inbound identification**: the source IP matches a peer's `allowed_ips` → that determines `from`; no match is handed to shield (silent drop by default).
+- **Matching**: `routes` are evaluated in order, and the first entry whose `from` and `match` regex both hit is used — no priority numbers.
+- **Failover**: the `to` list is tried in order, moving to the next entry on 5xx or timeout; peers carry passive health checking (cooldown after consecutive failures) plus optional OPTIONS probing.
+- **Transformation**: `transform` supports regex capture groups and is inline in the route, so nothing needs to be defined separately and then referenced.
+- **Codec filtering**: the SDP codec list is filtered per peer configuration (purely an SDP-layer operation, no transcoding involved).
 
-### WebUI 与配置文件
+### WebUI and the Configuration File
 
-WebUI 读写同一份 YAML（`GET/PUT /api/config`：校验 → 写文件 → 热重载）。手工改文件与 WebUI 双向可见。**配置回写策略**：WebUI 编辑以结构化 PATCH 作用于 YAML AST（goccy/go-yaml `ast` 包），只改动目标节点，不整体重序列化，以保留注释与排版；`${ENV_VAR}` 引用原样存取，**永不**把展开后的明文写回磁盘。
+The WebUI reads and writes the same YAML (`GET/PUT /api/config`: validate → write file → hot reload). Hand edits and WebUI edits are visible to each other. **Write-back strategy**: WebUI edits apply as structured PATCHes against the YAML AST (the `ast` package of goccy/go-yaml), touching only the target nodes instead of re-serializing the whole document, so comments and layout survive. `${ENV_VAR}` references are stored and returned verbatim; the expanded plaintext is **never** written back to disk.
 
-## 6. 呼叫数据流
+## 6. Call Data Flow
 
 ```
-1. INVITE 到达 (carrier-a → :5060)
-2. shield.Check(srcIP)          → 限速/封禁/ACL，不过则静默丢弃
-3. peer 识别                     → 源 IP ∈ carrier-a.allowed_ips
-4. config.Current()             → 取配置快照，绑定本呼叫
-5. routing.Match(from, to号码)   → 命中路由 → 目标 peer
-6. media.Allocate()             → 分配两对 RTP/RTCP 端口（A/B 侧）
-7. SDP 重写                      → A leg 应答 SDP 指向本机 A 侧端口
-8. 新建 B leg INVITE，SDP 指向本机 B 侧端口
-9. B leg 应答 → 状态机桥接（180/183/200 映射回 A leg）
-10. 双向媒体经 relay 转发；首包 latching：以对端首个 RTP 包实际源地址为准（NAT 穿越，加固规则见 §3 关键设计决定 5）
-11. 任一侧 BYE → 转发另一侧 → Session.Close() 回收端口 → 状态表清除
+1. INVITE arrives (carrier-a → :5060)
+2. shield.Check(srcIP)            → rate limit / ban / ACL; silent drop on failure
+3. Peer identification            → source IP ∈ carrier-a.allowed_ips
+4. config.Current()               → take a config snapshot, bound to this call
+5. routing.Match(from, to-number) → route hit → target peer
+6. media.Allocate()               → allocate two RTP/RTCP port pairs (A and B sides)
+7. SDP rewrite                    → the A leg answer SDP points at our A-side port
+8. Build the B leg INVITE, SDP pointing at our B-side port
+9. B leg answers → state machine bridges the legs (180/183/200 mapped back to the A leg)
+10. Media flows both ways through the relay; first-packet latching: the actual source address of the far end's first RTP packet wins (NAT traversal; hardening rules in §3 key design decision 5)
+11. BYE from either side → forwarded to the other → Session.Close() releases the ports → state table entry removed
 ```
 
-re-INVITE（hold/恢复/改 codec）透传并同步重写 SDP。relay 对 payload 不感知。
+re-INVITEs (hold, resume, codec change) are passed through with the SDP rewritten to match. The relay is payload-agnostic.
 
-## 7. 错误处理
+## 7. Error Handling
 
-| 场景 | 行为 |
+| Scenario | Behavior |
 |------|------|
-| 坏配置（启动时） | 报错退出，指出行号与原因 |
-| 坏配置（热重载） | 保持旧配置运行，日志 + metrics 报警标志 |
-| B leg 全部 failover 失败 | A leg 返回最后错误码（或可配置统一码） |
-| 媒体端口耗尽 | INVITE 拒 503，metrics 计数 |
-| 单呼叫内部 panic | per-call goroutine recover，杀该呼叫并释放资源，进程不死 |
-| 半死呼叫（BYE 丢失） | RTP 静默超时（默认 5 分钟）自动拆线 |
-| 出向 REGISTER 失败 | 指数退避重试，该 peer 标记不可用（路由跳过），metrics 报警 |
+| Bad config (at startup) | Report the error and exit, naming the line number and cause |
+| Bad config (hot reload) | Keep running on the old configuration, log it, raise a metrics alarm flag |
+| All B leg failover targets failed | Return the last error code to the A leg (or a configurable fixed code) |
+| Media ports exhausted | Reject the INVITE with 503, increment a metric |
+| Panic inside a single call | Per-call goroutine recover: kill that call and release its resources; the process survives |
+| Half-dead call (BYE lost) | RTP silence timeout (5 minutes by default) tears the call down automatically |
+| Outbound REGISTER failure | Exponential backoff retry; the peer is marked unavailable (skipped by routing) and a metrics alarm is raised |
 
-## 8. 测试策略
+## 8. Test Strategy
 
-- **单元测试**：routing 匹配/变换、SDP 重写、shield 判定（多为纯函数）。
-- **SIP 集成测试**：sipgo 在测试内模拟 UAC/UAS，真实 UDP 回环，覆盖建立/failover/re-INVITE/BYE 全状态机。
-- **互操作验收**：sipp 场景脚本 + docker-compose 里的真实 FreeSWITCH/Asterisk 对端，CI 运行。
-- **媒体验证**：relay 双向收发 + SRTP 端到端包级断言。
-- **性能基准**：**Linux 上**单机 1000 并发呼叫 RTP 转发 CPU < 50%（`SO_REUSEPORT` + `sendmmsg`/`recvmmsg` batch syscall，Linux 专属优化），作为回归门槛。darwin/windows 构建走普通收发路径，功能完整但不做性能承诺。
+- **Unit tests**: routing match and transform, SDP rewriting, shield verdicts (mostly pure functions).
+- **SIP integration tests**: sipgo simulates a UAC and a UAS inside the test over real UDP loopback, covering the full state machine — setup, failover, re-INVITE, BYE.
+- **Interop acceptance**: sipp scenario scripts against real FreeSWITCH and Asterisk endpoints in docker-compose, run in CI.
+- **Media verification**: bidirectional relay send/receive plus packet-level SRTP end-to-end assertions.
+- **Performance baseline**: **on Linux**, 1000 concurrent calls of RTP forwarding on one host at under 50% CPU (`SO_REUSEPORT` + `sendmmsg`/`recvmmsg` batch syscalls, a Linux-only optimization), used as a regression gate. darwin and windows builds take the ordinary send/receive path: fully functional, but with no performance commitment.
 
-## 9. 非目标（明确排除）
+## 9. Non-Goals (Explicitly Excluded)
 
-- 音频转码（G.729/AMR/opus 互转）
-- 注册代理/Registrar——服务话机注册（MVP 后评估；出向 trunk 注册**在** MVP 内）
-- DTLS-SRTP 密钥协商（MVP 仅 SDES）
-- CDR（MVP 后评估）
-- 分布式集群/无缝 failover
+- Audio transcoding (G.729/AMR/opus conversion)
+- Registration proxy / registrar — serving phone registrations (to be evaluated after the MVP; outbound trunk registration **is** in the MVP)
+- DTLS-SRTP key negotiation (the MVP is SDES only)
+- CDR (to be evaluated after the MVP)
+- Distributed clustering / seamless failover
 - K8s Operator
-- 视频/WebRTC 网关
+- Video / WebRTC gateway

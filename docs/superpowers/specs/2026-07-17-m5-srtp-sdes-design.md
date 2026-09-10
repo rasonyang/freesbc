@@ -6,8 +6,9 @@ to its own media ports and relays every packet through its own sockets, so the
 SBC becomes the SRTP boundary — it terminates SRTP on a secure leg and
 re-originates (or passes plaintext) toward the other leg. This is the first
 milestone touching the media crypto path. Parent spec:
-`freesbc-allinone-design.md` (媒体深度: RTP 中继 + SRTP，不转码; SRTP 密钥协商仅
-SDES; DTLS-SRTP 随 WebRTC 排除). M1–M4 complete and merged.
+`freesbc-allinone-design.md` (media depth: RTP relay + SRTP, no transcoding;
+SRTP key negotiation via SDES only; DTLS-SRTP excluded along with WebRTC).
+M1–M4 complete and merged.
 
 ## 0. Reality baseline (existing code)
 

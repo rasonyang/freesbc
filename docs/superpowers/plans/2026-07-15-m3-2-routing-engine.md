@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go stdlib + the project's `config` package only. **No new dependencies** — routing does not even import sipgo (M3.3 adapts SIP messages into the string arguments). Config already compiles `match.to` regexes at parse time and exposes them via `(*config.Route).CompiledMatch()`.
 
-**Roadmap context:** Second of three M3 slices (M3.1 front door ✅ → **M3.2 routing** → M3.3 bridge). This slice ships a tested library with no runtime wiring — the bridge in M3.3 is its first caller, at which point the end-to-end call lights up. Intentionally deferred: failover *execution* (try next target on 5xx/timeout) and peer health/cooldown skipping — both stateful and owned by M3.3's B2BUA attempt loop; DNS SRV resolution of peer addresses (M4); per-peer SDP codec filtering (M3.3, an SDP-layer concern). No separate `sig/normalize.go`: the compressed config model puts number transformation inline in each route (`transform`), so a standalone normalization stage would be dead code (spec §5: "transform 内联于路由，无需单独定义再引用").
+**Roadmap context:** Second of three M3 slices (M3.1 front door ✅ → **M3.2 routing** → M3.3 bridge). This slice ships a tested library with no runtime wiring — the bridge in M3.3 is its first caller, at which point the end-to-end call lights up. Intentionally deferred: failover *execution* (try next target on 5xx/timeout) and peer health/cooldown skipping — both stateful and owned by M3.3's B2BUA attempt loop; DNS SRV resolution of peer addresses (M4); per-peer SDP codec filtering (M3.3, an SDP-layer concern). No separate `sig/normalize.go`: the compressed config model puts number transformation inline in each route (`transform`), so a standalone normalization stage would be dead code (spec §5: "transform is inlined in the route; no separate definition to reference").
 
 **Why the config fix (Task 1):** M1's env expansion walks every exported string field (including `route.Transform.To`) and rejects any `${...}` span that is not a valid `${VAR}` reference. A regexp replacement template like `${1}` is digit-led, so it can never be a valid env variable name — yet the current `malformedRef` check rejects it, so `transform: { to: "${1}" }` fails at parse with a baffling "malformed ${...} reference" error. Bare `$1` survives (it contains no `${`), but the braced form users need to place a group next to literal digits (`${1}000`) is broken. The fix: treat `${<digits>}` as a literal (a regexp group ref), never an env reference — safe because a digit-led name is never a valid env var, so no real env typo is masked.
 
@@ -20,7 +20,7 @@
 - Config lifecycle contract (M1): callers pass a `*config.Config` snapshot from `(*config.Store).Current()`; routing never mutates it. `match.to` regexes are already compiled and validated at parse time; a route's `Transform` is only non-empty when `match.to` compiled successfully (M1 validation enforces "transform.to requires match.to").
 - Routing semantics (spec §5): inbound peer identified upstream by source IP (M3.1); match by `routes` order, `from`+`match` regex, first hit wins, no priority numbers; `transform` uses regex capture groups inline; `to` list order is failover order.
 - The `toNumber` argument is the dialed number — M3.3 will supply the INVITE Request-URI user part. Routing treats it as an opaque string.
-- Deviation note: spec §6 names the entry `routing.Match(from, to号码)`. The as-built public entry is `Resolve(cfg, fromPeer, toNumber) (*Decision, bool)` — it returns the transformed number and resolved target peers in one struct, which is what the bridge needs; `matchRoute`/`transformNumber` are the package-private primitives.
+- Deviation note: spec §6 names the entry `routing.Match(from, to number)`. The as-built public entry is `Resolve(cfg, fromPeer, toNumber) (*Decision, bool)` — it returns the transformed number and resolved target peers in one struct, which is what the bridge needs; `matchRoute`/`transformNumber` are the package-private primitives.
 - Env-expansion invariant (do not weaken): well-formed `${VAR}` references are still expanded; genuinely malformed spans (`${VAR:-default}`, `${FOO BAR}`) are still rejected; a reference to an unset well-formed variable is still reported as "missing". Only digit-led `${<digits>}` spans change behavior (now treated as literals).
 
 ---
@@ -516,12 +516,12 @@ gofmt -l . && git add sig/routing.go sig/routing_test.go README.md && git commit
 
 | Spec requirement | Task |
 |---|---|
-| §4 `sig/routing.go` — 路由匹配 → 选网关 | 2, 4 |
-| §5 匹配：routes 顺序，from+match 正则首条命中即用，无优先级 | 2 |
-| §5 变换：transform 正则捕获组，内联于路由 | 1 (parsing), 3 (logic) |
-| §5 failover：to 列表依序（顺序即 failover 顺序） | 4 (ordered Targets) |
-| §6 step 5 — routing.Match(from, to号码) → 目标 peer | 4 (`Resolve`) |
-| §5 无 normalize 单独层（transform 内联） | design decision (no `normalize.go`) |
+| §4 `sig/routing.go` — route matching → gateway selection | 2, 4 |
+| §5 matching: `routes` order, first hit on the from+match regex wins, no priorities | 2 |
+| §5 transformation: transform regex capture groups, inlined in the route | 1 (parsing), 3 (logic) |
+| §5 failover: `to` list in order (list order is failover order) | 4 (ordered Targets) |
+| §6 step 5 — routing.Match(from, to number) → target peer | 4 (`Resolve`) |
+| §5 no separate normalize layer (transform is inlined) | design decision (no `normalize.go`) |
 | M1 backlog — `${N}` regexp group refs vs env-syntax collision | 1 |
 
 Deferred (documented in header): failover *execution* + peer health/cooldown skipping (M3.3 B2BUA loop); DNS SRV peer-address resolution (M4); per-peer SDP codec filtering (M3.3). No runtime wiring in this slice — `Resolve` is a library consumed first by the M3.3 bridge.

@@ -51,8 +51,8 @@ peers:
     address: sip.carrier-a.com:5060   # DNS SRV honored, falls back to A/AAAA (M4.4, not yet implemented)
     transport: udp
     auth: { username: acct01, password: "${CARRIER_A_PASS}" }
-    # realm 固定（T-19）：加到 auth 行内即可——auth: { username: ..., password: ..., realm: carrier-a-realm }
-    # 设置后，realm 不匹配的 401/407 质询将不再被应答（防恶意/被攻陷服务器收割 digest 响应）
+    # Pinned realm (T-19): just add it to the auth line — auth: { username: ..., password: ..., realm: carrier-a-realm }
+    # Once set, 401/407 challenges whose realm does not match are no longer answered (stops malicious or compromised servers from harvesting digest responses)
     register: true                 # registration-based trunk: SBC periodically sends REGISTER, un-registers on shutdown
     allowed_ips: [203.0.113.0/24]  # inbound calls matched to this peer by source IP
     # media_latch: strict          # strict (default): first RTP packet must

@@ -1233,14 +1233,14 @@ gofmt -l . && git add main.go README.md && git commit -m "feat: wire media pool 
 
 | Spec requirement | Task |
 |---|---|
-| §4 `media/portpool.go` — RTP 端口池分配/回收 | 3 |
-| §4 `media/relay.go` — UDP 转发引擎（per-call goroutines） | 5 |
-| §3 decision 5 — latching 加固（pre-media only, source-IP check, never re-latch, strict/loose per peer） | 2 (config), 4 (logic), 5 (enforcement) |
-| §6 step 10 — 双向媒体转发 + 首包 latching | 5 |
-| §7 — 媒体端口耗尽 → caller error (503 mapping in M3) | 3 (`ErrPortsExhausted`) |
+| §4 `media/portpool.go` — RTP port pool allocation/release | 3 |
+| §4 `media/relay.go` — UDP forwarding engine (per-call goroutines) | 5 |
+| §3 decision 5 — latching hardening (pre-media only, source-IP check, never re-latch, strict/loose per peer) | 2 (config), 4 (logic), 5 (enforcement) |
+| §6 step 10 — bidirectional media forwarding + first-packet latching | 5 |
+| §7 — media port exhaustion → caller error (503 mapping in M3) | 3 (`ErrPortsExhausted`) |
 | §7 — per-call panic recover, call dies, process survives | 5 (`forward` recover) |
-| §7 — 半死呼叫 RTP 静默超时（默认 5 分钟）自动拆线 | 2 (config), 5 (watchdog) |
-| §3 — 模块接口 sig→media：Allocate/Session.Close | 4 (deviation from sketch documented in Global Constraints) |
+| §7 — half-dead calls torn down automatically on RTP silence timeout (default 5 minutes) | 2 (config), 5 (watchdog) |
+| §3 — module interface sig→media: Allocate/Session.Close | 4 (deviation from sketch documented in Global Constraints) |
 | M1 backlog — quoted scalars (Important), doubled error prefix | 1 |
 | M1 backlog — top-level `-h` exit code, watcher shutdown coordination | 6 |
 

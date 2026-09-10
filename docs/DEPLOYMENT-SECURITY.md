@@ -1,84 +1,84 @@
-# FreeSBC 部署安全基线（G-1 / G-2）
+# FreeSBC Deployment Security Baseline (G-1 / G-2)
 
-- 生成日期：2026-08-31 ｜ 对应任务卡：`docs/tasks.md` G-1（F-07 缓解）、G-2（F-14 缓解）
-- 定位：P0 部署闸门文档。**公网（或任何不可信网络）部署前，必须满足本文全部条款。**
-- 状态：文档闸门。G-2 在 T-26（admin 非 loopback 默认拒绝 + bcrypt cost ≥10 强制）落地后升级为代码闸门；G-1 的代码级修复（入向 digest 质询/mTLS）挂起待产品决策（见 `docs/tasks.md`「后期考虑」）。
-- 背景依据：`docs/SECURITY-AUDIT-20260826.md` F-07（SIP 身份=源 IP、无质询）与 F-14（admin 明文 Basic 暴露时的高危链条）。
-
----
-
-## G-1 公网暴露策略（信令面）
-
-### 信任模型（必须理解）
-
-FreeSBC 对入向 SIP 请求的 peer 识别**只凭传输层源 IP**（`peers.<name>.allowed_ips`，T-01 前置过滤与 shield 均以此为准）。对源 IP 的判定不经过任何质询：
-
-- **TCP/TLS**：盲伪造不可行（三次握手+序列号），源 IP 可信度接近路径信任。
-- **UDP**：单个数据报即可伪造任意源 IP。**伪造源 IP 落入某 peer 的 `allowed_ips` = 完整继承该 peer 的信任**，包括：
-  - 触发真实出局话务（盗打/toll fraud，经 `routes` 的 outbound 目标）；
-  - shield 全免（configured peer 豁免限速与 ban）。
-
-T-01 的入口前置过滤与 T-02 的「UDP 单包判定仅内存 ban」**不改变此边界**：前者把非 peer 字节挡在解析前，但伪造源落在 allowed_ips 内时就是「合法 peer」；后者只防止伪造包把第三方 IP 打进内核黑洞，业务面的信任照旧。
-
-### 允许的暴露方式（三选一，满足其一即可）
-
-1. **公网仅暴露 tcp/tls 监听**（推荐）。`listen.sip` 中不得有绑到公网可达地址的 `udp://` 条目；UDP 仅允许存在于内网/受控网段（如与 PBX 直连的链路）。
-   - 注意：入向 tls 目前为自签名证书（可配置真证书在 T-17），peer 侧校验收紧同样在 T-17 的配置面。
-2. **上游 ACL 白名单 + uRPF**：若业务强制要求公网 UDP，则必须在更上游（防火墙/路由器）做两道闸——① 只放行各 peer 实际源网段的入站 UDP（ACL 白名单）；② 开启严格模式 uRPF（RFC 3704），使伪造源（源地址不在入接口路由方向的包）在到达 SBC 前被丢弃。
-3. **入向 digest 质询**：代码级修复（非对称的信任建立），当前挂起——需产品决策（schema 与质询流程定义），见 `docs/tasks.md`「后期考虑」F-07 代码级。
-
-### 反例（禁止）
-
-- 将 `udp://0.0.0.0:5060` 暴露到公网且 `allowed_ips` 含宽网段：任何能向该网段伪造源 IP 的攻击者即可经出局路由盗打。
-- 用 `allowed_ips` 收窄代替上游防护：收窄**必须做**（也是 F-16/T-11 的校验项），但它只缩小伪造目标集，不消灭伪造能力本身。
-
-### 部署检查清单（G-1）
-
-- [ ] 公网可达的 `listen.sip` 仅含 `tcp://` / `tls://`
-- [ ] 若公网 UDP 不可避免：上游 ACL 白名单 + 严格 uRPF 均已配置并验证
-- [ ] 每个 peer 的 `allowed_ips` 收窄到其实际源网段（非 0.0.0.0/0）
-- [ ] 已向运维/安全负责人书面确认理解「UDP 下源 IP 伪造 = 完整 peer 信任」边界
+- Generated: 2026-08-31 | Task cards: `docs/tasks.md` G-1 (F-07 mitigation), G-2 (F-14 mitigation)
+- Scope: P0 deployment gate document. **Every clause below must be satisfied before deploying on the public internet (or any untrusted network).**
+- Status: documentation gate. G-2 is promoted to a code gate once T-26 lands (non-loopback admin denied by default + bcrypt cost ≥10 enforced); the code-level fix for G-1 (inbound digest challenge / mTLS) is on hold pending a product decision (see "Later consideration" in `docs/tasks.md`).
+- Background: `docs/SECURITY-AUDIT-20260826.md` F-07 (SIP identity = source IP, no challenge) and F-14 (the high-severity chain opened by an exposed plaintext admin Basic auth).
 
 ---
 
-## G-2 admin 部署基线（管理面）
+## G-1 Public Internet Exposure Policy (Signaling Plane)
 
-### 基线：仅绑 loopback
+### Trust Model (Required Reading)
 
-`admin.listen` **必须只绑 loopback**（`127.0.0.1:8080` 或 `[::1]:8080`，示例配置 `sbc.example.yaml` 的默认形态）。理由（F-14 High）：
+FreeSBC identifies the peer behind an inbound SIP request **solely by the transport-layer source IP** (`peers.<name>.allowed_ips`; both the T-01 pre-filter and shield use it). That source IP is never challenged:
 
-- admin 无 TLS，Basic Auth 凭据与响应明文传输，可被嗅探；
-- 登录后 `/api/config/raw` 可读全部 SIP 明文凭据（peer 密码）——一次嗅探 = 完整盗打链；
-- 认证面在 T-09 落地前无失败限速，且缺 Authorization 头的请求也跑满一次 bcrypt（与 SIP 同进程的 CPU 放大）。
+- **TCP/TLS**: blind spoofing is impractical (three-way handshake plus sequence numbers), so source-IP confidence approaches path trust.
+- **UDP**: a single datagram can carry any forged source IP. **A forged source IP that lands inside a peer's `allowed_ips` inherits that peer's trust in full**, including:
+  - placing real outbound calls (toll fraud, through the outbound targets in `routes`);
+  - complete shield exemption (configured peers bypass rate limits and bans).
 
-本地管理通过 SSH 隧道或本地浏览器访问：
+Neither T-01's ingress pre-filter nor T-02's "single-packet UDP verdicts produce in-memory bans only" **changes this boundary**: the former drops non-peer bytes before parsing, but a forged source inside `allowed_ips` is by definition a "legitimate peer"; the latter only prevents forged packets from pushing a third-party IP into the kernel blackhole, and trust on the service side is unchanged.
+
+### Permitted Exposure Modes (Any One of Three)
+
+1. **Expose only tcp/tls listeners to the internet** (recommended). `listen.sip` must contain no `udp://` entry bound to a publicly reachable address; UDP is permitted only on internal or otherwise controlled segments (for example a direct link to a PBX).
+   - Note: inbound tls currently uses a self-signed certificate (real certificates become configurable in T-17); tightening peer-side verification is likewise part of T-17's configuration surface.
+2. **Upstream ACL allowlist + uRPF**: if the deployment mandates public UDP, two gates further upstream (firewall or router) are required — (1) permit inbound UDP only from each peer's actual source prefixes (ACL allowlist); (2) enable strict-mode uRPF (RFC 3704) so spoofed sources (packets whose source address does not route back out the ingress interface) are dropped before they reach the SBC.
+3. **Inbound digest challenge**: a code-level fix (asymmetric trust establishment), currently on hold — it needs a product decision (schema and challenge flow definition); see "Later consideration", F-07 code-level, in `docs/tasks.md`.
+
+### Anti-Patterns (Prohibited)
+
+- Exposing `udp://0.0.0.0:5060` on the internet while `allowed_ips` covers a broad prefix: any attacker able to forge a source IP from that prefix can place fraudulent calls through the outbound routes.
+- Substituting narrow `allowed_ips` for upstream protection: narrowing them **is mandatory** (it is also checked by F-16/T-11), but it only shrinks the set of spoofing targets; it does not remove the ability to spoof.
+
+### Deployment Checklist (G-1)
+
+- [ ] Publicly reachable `listen.sip` entries are `tcp://` / `tls://` only
+- [ ] If public UDP is unavoidable: upstream ACL allowlist and strict uRPF are both configured and verified
+- [ ] Every peer's `allowed_ips` is narrowed to its actual source prefixes (not 0.0.0.0/0)
+- [ ] Operations and security owners have confirmed in writing that they understand the "source-IP spoofing over UDP = full peer trust" boundary
+
+---
+
+## G-2 Admin Deployment Baseline (Management Plane)
+
+### Baseline: Bind Loopback Only
+
+`admin.listen` **must bind loopback only** (`127.0.0.1:8080` or `[::1]:8080`, the default shape in the sample config `sbc.example.yaml`). Rationale (F-14, High):
+
+- admin has no TLS; Basic Auth credentials and responses travel in plaintext and can be sniffed;
+- once authenticated, `/api/config/raw` exposes every SIP credential in plaintext (peer passwords) — one capture yields a complete toll-fraud chain;
+- until T-09 lands, the auth path has no failure rate limit, and even a request without an Authorization header runs a full bcrypt (CPU amplification in the same process as SIP).
+
+Manage locally over an SSH tunnel or from a browser on the host:
 
 ```sh
 ssh -L 8080:127.0.0.1:8080 <sbc-host>
-# 浏览器打开 http://127.0.0.1:8080/
+# open http://127.0.0.1:8080/ in a browser
 ```
 
-### 非 loopback 部署（T-26 落地前的临时闸门）
+### Non-Loopback Deployment (Interim Gate Until T-26)
 
-确需从网络访问时（例如 LAN 内的运维网段），在 T-26 把「非 loopback 默认拒绝」变成代码强制之前，**必须全部满足**：
+When network access is genuinely required (an operations LAN segment, for example), **all of the following must hold** until T-26 turns "deny non-loopback by default" into a code-enforced rule:
 
-- [ ] 仅绑定运维/管理网段可达地址，**绝不公网可达**
-- [ ] 前置 TLS 反向代理（nginx/caddy 等）：终结 TLS 于代理，代理仅回源到 loopback；若直接绑定非 loopback 地址，用防火墙把源 IP 限到管理网段
-- [ ] 确认理解风险：明文 Basic 嗅探 → `/api/config/raw` 全部 SIP 明文凭据（完整盗打链）；T-09 前无失败限速（任何可达源可持续驱动 bcrypt 烧 CPU）
-- [ ] admin 口令使用强口令（bcrypt 哈希本身不代替口令强度；T-26 会强制 cost ≥10）
+- [ ] Bind only to an address reachable from the operations/management segment, **never publicly reachable**
+- [ ] Front it with a TLS reverse proxy (nginx, caddy, etc.): terminate TLS at the proxy and let the proxy connect back to loopback only; if you bind a non-loopback address directly, restrict source IPs to the management segment with a firewall
+- [ ] Acknowledge the risk: sniffed plaintext Basic auth → every SIP credential in plaintext via `/api/config/raw` (a complete toll-fraud chain); no failure rate limit before T-09 (any reachable source can keep bcrypt burning CPU)
+- [ ] Use a strong admin password (the bcrypt hash is no substitute for password strength; T-26 will enforce cost ≥10)
 
-T-26 落地后：非 loopback 默认启动失败，需显式 `admin.allow_remote` 放行——本清单届时由代码闸门取代（但代理/防火墙条款仍建议保留为纵深）。
+Once T-26 lands: a non-loopback bind fails startup unless `admin.allow_remote` explicitly permits it — the code gate then replaces this checklist (though the proxy and firewall clauses remain recommended as defense in depth).
 
 ---
 
-## 与代码修复的对应关系（进度锚点）
+## Mapping to Code Fixes (Progress Anchors)
 
-| 文档条款 | 对应代码修复 | 状态（2026-08-31） |
+| Document clause | Corresponding code fix | Status (2026-08-31) |
 |---|---|---|
-| G-1 公网仅 tcp/tls | T-05 TCP/TLS 连接上限+超时 | ✅ 已落地 |
-| G-1 上游 ACL+uRPF | （部署项，无代码） | 本文档 |
-| G-1 入向 digest 质询 | F-07 代码级 | 挂起，待产品决策 |
-| G-1 伪造边界内的资源保护 | T-01 前置过滤 / T-06 并发配额 / T-02 UDP 单包仅内存 ban | ✅ 已落地 |
-| G-2 仅 loopback | T-26（admin.allow_remote 显式放行 + bcrypt cost ≥10） | ⏳ P1 队列 |
-| G-2 失败限速 / 跳过无头 bcrypt | T-09 | ⏳ P1 队列 |
-| G-2 TLS 反代 | （部署项） | 本文档 |
+| G-1 tcp/tls only on the internet | T-05 TCP/TLS connection cap + timeouts | ✅ Landed |
+| G-1 upstream ACL + uRPF | (deployment item, no code) | This document |
+| G-1 inbound digest challenge | F-07 code-level | On hold, pending product decision |
+| G-1 resource protection inside the spoofing boundary | T-01 pre-filter / T-06 concurrency quota / T-02 in-memory-only UDP ban | ✅ Landed |
+| G-2 loopback only | T-26 (explicit `admin.allow_remote` + bcrypt cost ≥10) | ⏳ P1 queue |
+| G-2 failure rate limit / skip bcrypt for headerless requests | T-09 | ⏳ P1 queue |
+| G-2 TLS reverse proxy | (deployment item) | This document |

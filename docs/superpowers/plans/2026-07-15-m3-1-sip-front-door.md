@@ -698,11 +698,11 @@ gofmt -l . && git add main.go README.md && git commit -m "feat: start SIP front 
 
 | Spec requirement | Task |
 |---|---|
-| §4 `sig/server.go` — sipgo 装配 (UDP/TCP/TLS) | 3 |
-| §5 listen.sip 多传输；tls 证书不配则自签 | 2, 3 |
-| §6 step 2–3 — 源 IP 识别 peer；无匹配交给 shield（静默丢弃） | 1, 3 |
-| 互操作基线 — 应答入站 OPTIONS | 3 |
-| §3 — sig 读 config.Current() 快照（每请求一致） | 3 |
-| Caddy-like — 单进程内启动 SIP 服务 | 4 |
+| §4 `sig/server.go` — sipgo assembly (UDP/TCP/TLS) | 3 |
+| §5 listen.sip multiple transports; self-signed cert when tls certificate is not configured | 2, 3 |
+| §6 step 2–3 — identify peer by source IP; hand unmatched traffic to shield (silent drop) | 1, 3 |
+| Interop baseline — answer inbound OPTIONS | 3 |
+| §3 — sig reads a config.Current() snapshot (consistent per request) | 3 |
+| Caddy-like — start the SIP service inside a single process | 4 |
 
 Deferred to later M3 slices and milestones (documented in header): routing match/transform/failover (M3.2); B2BUA leg pairing, SDP rewrite, media `Allocate`/`SetExpectedRemote`/`Relatch` wiring, in-dialog ACK/BYE (M3.3); digest auth, outbound REGISTER, session timers, PRACK, DNS SRV (M4); real shield verdicts replacing `dropUnidentified` (M6); configurable TLS certificates and STUN `public_ip: auto` (later).

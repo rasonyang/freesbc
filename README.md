@@ -256,7 +256,7 @@ into FreeSWITCH's `echo` application and back.
 
 Requires Go ≥ 1.22.
 
-> **公网部署前必读** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md)（部署安全基线：公网暴露策略 + admin 监听基线）。
+> **Read before exposing to the public internet:** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (deployment security baseline: public exposure policy and admin listener baseline).
 
 ```sh
 go build -o freesbc ./cmd/freesbc

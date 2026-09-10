@@ -4,8 +4,9 @@ The security-hardening milestone: a front-door shield that rate-limits per sourc
 IP, fingerprints known SIP scanners by User-Agent, and auto-bans abusive sources
 via an in-memory ban table with optional nftables kernel-level enforcement. Every
 inbound SIP request passes the shield before anything else, and every denial is a
-silent drop. Parent spec: `freesbc-allinone-design.md` (§68: 每 IP 限速、扫描器 UA
-指纹、失败阈值自动封禁、内存封禁表、可选联动 nftables，nftables 非硬依赖; §117:
+silent drop. Parent spec: `freesbc-allinone-design.md` (§68: per-IP rate limiting,
+scanner User-Agent fingerprinting, auto-ban on a failure threshold, in-memory ban
+table, optional nftables integration with nftables not a hard dependency; §117:
 `shield.Check(srcIP, msg) Verdict` middleware). M1–M5 complete and merged.
 
 ## 0. Reality baseline (existing code)

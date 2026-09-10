@@ -3,8 +3,9 @@
 The final M7 slice (completes the operability milestone): a `go:embed`'d static
 web UI — a live dashboard + a raw-config editor — served by the admin server,
 consuming the M7.1/M7.2 JSON API. Parent spec: `freesbc-allinone-design.md`
-(§109 `admin/webui/` go:embed; §32 "WebUI/API 是配置文件的编辑器"; §15 静态 JS
-管理界面). M1–M6, M7.1, M7.2 complete and merged.
+(§109 `admin/webui/` go:embed; §32 "the WebUI/API is an editor for the config
+file"; §15 static JS management interface). M1–M6, M7.1, M7.2 complete and
+merged.
 
 ## 0. Reality baseline
 

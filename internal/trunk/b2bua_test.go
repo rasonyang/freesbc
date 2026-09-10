@@ -7261,9 +7261,9 @@ routes:
 
 // TestPeerCallCapReleasedOnFailure proves a FAILED initial INVITE (404:
 // dialed number matches no route) releases its quota slot — the card's
-// "呼叫结束（含失败路径）释放配额" requirement. With the cap at 1 and no
-// live call, a 404'd INVITE must not wedge the quota: the next valid INVITE
-// is admitted and bridges.
+// "call teardown (including failure paths) releases the quota"
+// requirement. With the cap at 1 and no live call, a 404'd INVITE must
+// not wedge the quota: the next valid INVITE is admitted and bridges.
 func TestPeerCallCapReleasedOnFailure(t *testing.T) {
 	uacRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
