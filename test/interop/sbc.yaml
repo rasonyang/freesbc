@@ -12,7 +12,7 @@
 # hot-reload; FreeSWITCH needs rtp_secure_media=optional on the internal profile.
 #
 # NOTE: this instance listens on UDP 5070, which collides with the fake UAC
-# ports used by the sig package integration tests (127.0.0.1:5070). Stop the
+# ports used by the trunk package integration tests (127.0.0.1:5070). Stop the
 # running instance before `go test ./... -race`.
 
 listen:
@@ -64,7 +64,8 @@ shield:
   nftables: off                    # no kernel ban table on this test host
 
 admin:
-  listen: 192.168.31.5:8080
+  listen: 192.168.31.5:8080       # LAN-reachable WebUI on the test host
+  allow_remote: true               # required for a non-loopback listener (plaintext; test LAN only)
   auth:
     username: admin
     password_hash: "$2a$10$GXryET6y6ypv5Suod3pvlebGERgjHUGNPbLsm0Lx3uTyBo4rqsBbW"
