@@ -1,7 +1,6 @@
 package trunk
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"strconv"
 	"strings"
@@ -15,26 +14,6 @@ type cryptoLine struct {
 	tag      int
 	suite    media.CryptoSuite
 	keyValue []byte
-}
-
-// suiteByName maps RFC 4568 suite names to our supported CryptoSuite. Only the
-// two AES_CM_128 suites are supported; anything else returns ok=false.
-func suiteByName(name string) (media.CryptoSuite, bool) {
-	switch name {
-	case "AES_CM_128_HMAC_SHA1_80":
-		return media.SuiteAES128CM80, true
-	case "AES_CM_128_HMAC_SHA1_32":
-		return media.SuiteAES128CM32, true
-	default:
-		return 0, false
-	}
-}
-
-func suiteName(s media.CryptoSuite) string {
-	if s == media.SuiteAES128CM32 {
-		return "AES_CM_128_HMAC_SHA1_32"
-	}
-	return "AES_CM_128_HMAC_SHA1_80"
 }
 
 // parseCryptoAttrs parses the VALUE part of each a=crypto line
@@ -53,7 +32,7 @@ func parseCryptoAttrs(values []string) []cryptoLine {
 		if err != nil {
 			continue
 		}
-		suite, ok := suiteByName(fields[1])
+		suite, ok := media.ParseCryptoSuite(fields[1])
 		if !ok {
 			continue
 		}
@@ -68,7 +47,7 @@ func parseCryptoAttrs(values []string) []cryptoLine {
 				b64 = b64[:i] // drop MKI / lifetime
 			}
 			decoded, err := base64.StdEncoding.DecodeString(b64)
-			if err != nil || len(decoded) != media.SrtpMasterKeyValueLen() {
+			if err != nil || len(decoded) != media.SDESKeyLen {
 				break // malformed → this line has no usable key
 			}
 			keyValue = decoded
@@ -82,26 +61,8 @@ func parseCryptoAttrs(values []string) []cryptoLine {
 	return out
 }
 
-// selectCrypto returns the first offered line whose suite we support, honoring
-// the offerer's preference order (RFC 4568 §5.1.2). ok=false if none.
-func selectCrypto(offered []cryptoLine) (cryptoLine, bool) {
-	if len(offered) == 0 {
-		return cryptoLine{}, false
-	}
-	return offered[0], true // parseCryptoAttrs already dropped unsupported suites
-}
-
-// newCryptoKeyValue generates a fresh 30-byte SDES inline value.
-func newCryptoKeyValue() ([]byte, error) {
-	k := make([]byte, media.SrtpMasterKeyValueLen())
-	if _, err := rand.Read(k); err != nil {
-		return nil, err
-	}
-	return k, nil
-}
-
 // cryptoAttrValue builds the VALUE of an a=crypto line advertising our key.
 func cryptoAttrValue(tag int, suite media.CryptoSuite, keyValue []byte) string {
-	return strconv.Itoa(tag) + " " + suiteName(suite) +
+	return strconv.Itoa(tag) + " " + suite.String() +
 		" inline:" + base64.StdEncoding.EncodeToString(keyValue)
 }

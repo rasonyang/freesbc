@@ -3,19 +3,30 @@ package media
 import (
 	"log/slog"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 )
 
 // Start launches the four forwarding loops (RTP and RTCP in both
-// directions) and the silence watchdog. Call at most once, after any
-// SetExpectedRemote calls for strict latching.
-func (s *Session) Start() {
+// directions) and the silence watchdog, after any SetExpectedRemote calls
+// for strict latching.
+//
+// It reports whether THIS call started the session. Calling it again — or
+// after Close — does nothing and returns false, so the "start exactly
+// once" rule is the session's own (one CompareAndSwap), not something
+// every caller has to re-establish with a sync.Once of its own. Callers
+// that only need the relay running can ignore the result.
+func (s *Session) Start() bool {
+	if !s.state.CompareAndSwap(sessAllocated, sessRunning) {
+		return false // already running, or already closed
+	}
 	s.lastRx.Store(time.Now().UnixNano())
 	s.forward(SideA, SideB, true)
 	s.forward(SideB, SideA, true)
 	s.forward(SideA, SideB, false)
 	s.forward(SideB, SideA, false)
-	go s.watchdog()
+	go watchdog(s.timeout, &s.lastRx, s.done, s.Close)
+	return true
 }
 
 // forward starts one read loop copying packets that arrive on the `from`
@@ -32,7 +43,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 		outSock, outLatch = s.pairs[to].RTP, s.rtp[to]
 	}
 	go func() {
-		defer s.recoverRelayPanic()
+		defer recoverRelayPanic(nil, s.Close)
 		buf := make([]byte, 1500)
 		for {
 			n, src, err := in.ReadFromUDP(buf)
@@ -85,10 +96,13 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 	}()
 }
 
-// watchdog tears the session down after `timeout` of RTP silence
-// (spec §7: half-dead calls are reclaimed automatically).
-func (s *Session) watchdog() {
-	interval := s.timeout / 4
+// watchdog closes a session after `timeout` of media silence, so a
+// half-dead call never keeps its ports reserved (spec §7: half-dead calls
+// are reclaimed automatically). Shared by Session and WebRTCSession: both
+// track the last genuine packet in an atomic nanosecond timestamp and are
+// torn down the same way.
+func watchdog(timeout time.Duration, lastRx *atomic.Int64, done <-chan struct{}, closeFn func() error) {
+	interval := timeout / 4
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
 	}
@@ -96,12 +110,11 @@ func (s *Session) watchdog() {
 	defer t.Stop()
 	for {
 		select {
-		case <-s.done:
+		case <-done:
 			return
 		case <-t.C:
-			last := time.Unix(0, s.lastRx.Load())
-			if time.Since(last) > s.timeout {
-				_ = s.Close()
+			if time.Since(time.Unix(0, lastRx.Load())) > timeout {
+				_ = closeFn()
 				return
 			}
 		}
@@ -110,12 +123,15 @@ func (s *Session) watchdog() {
 
 // recoverRelayPanic is deferred by every relay goroutine: a panic kills
 // only this session, never the process (spec §7), and leaves a forensic
-// trace instead of a silent call drop.
-func (s *Session) recoverRelayPanic() {
+// trace instead of a silent call drop. A nil log uses the default logger.
+func recoverRelayPanic(log *slog.Logger, closeFn func() error) {
 	if r := recover(); r != nil {
-		slog.Error("media relay panic; killing session",
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Error("media relay panic; killing session",
 			"panic", r,
 			"stack", string(debug.Stack()))
-		_ = s.Close()
+		_ = closeFn()
 	}
 }

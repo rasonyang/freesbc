@@ -42,7 +42,7 @@ type Config struct {
 	// unset, the legacy listen.sip + listen.media.public_ip resolution
 	// applies (see Server.sigIP). The rtp section likewise overrides just
 	// the media plane: every RTP/RTCP socket binds to rtp.bind_ip (empty =
-	// every interface, see media.Pool), and SDP c=/o= advertises
+	// every interface, see trunk.NewMediaPool), and SDP c=/o= advertises
 	// rtp.advertised_ip (empty = legacy resolution, see Server.mediaIP).
 	SIP SIPNetConfig `yaml:"sip"`
 	RTP RTPNetConfig `yaml:"rtp"`

@@ -12,11 +12,10 @@ import (
 type endpointHealth struct {
 	mu    sync.Mutex
 	until map[string]time.Time // endpointKey → cooldown-until
-	now   func() time.Time
 }
 
 func newEndpointHealth() *endpointHealth {
-	return &endpointHealth{until: make(map[string]time.Time), now: time.Now}
+	return &endpointHealth{until: make(map[string]time.Time)}
 }
 
 // Available reports whether ep may be dialed now — true unless it is inside
@@ -25,14 +24,14 @@ func (h *endpointHealth) Available(ep Endpoint) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	t, ok := h.until[endpointKey(ep)]
-	return !ok || !h.now().Before(t) // now >= t ⇒ expired ⇒ available
+	return !ok || !time.Now().Before(t) // now >= t ⇒ expired ⇒ available
 }
 
 // Penalize starts (or extends) ep's cooldown window.
 func (h *endpointHealth) Penalize(ep Endpoint, cooldown time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.until[endpointKey(ep)] = h.now().Add(cooldown)
+	h.until[endpointKey(ep)] = time.Now().Add(cooldown)
 }
 
 // Recover clears any cooldown on ep, making it immediately available.

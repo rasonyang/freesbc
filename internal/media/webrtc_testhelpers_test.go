@@ -4,14 +4,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/hex"
 	"math/big"
-	"strings"
 	"time"
 )
 
@@ -39,13 +36,7 @@ func selfSignedForTest() (tls.Certificate, error) {
 
 // fingerprintOf renders a certificate the way SDP a=fingerprint does.
 func fingerprintOf(cert tls.Certificate) string {
-	sum := sha256.Sum256(cert.Certificate[0])
-	hexed := hex.EncodeToString(sum[:])
-	parts := make([]string, 0, len(sum))
-	for i := 0; i < len(hexed); i += 2 {
-		parts = append(parts, strings.ToUpper(hexed[i:i+2]))
-	}
-	return strings.Join(parts, ":")
+	return fingerprintHex(cert.Certificate[0])
 }
 
 // rtpPacket builds a minimal valid RTP packet with a payload of n zero

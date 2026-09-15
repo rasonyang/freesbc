@@ -17,10 +17,10 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 
-	"github.com/freesbc/freesbc/internal/call"
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
 	"github.com/freesbc/freesbc/internal/shield"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
 // Server is the SIP signaling front door. It binds the configured
@@ -28,21 +28,21 @@ import (
 // OPTIONS health checks, and (M3.3) hosts the B2BUA bridge for INVITE.
 type Server struct {
 	store *config.Store
-	pool  *media.Pool
+	pool  *media.PlanePool
 	log   *slog.Logger
 
-	registry *call.Registry
+	// callMu guards the one call store (calls.go): calls is every bridged
+	// call keyed by its A-leg Call-ID — the identity the admin API and
+	// KillCall use — and legs indexes the SAME *call under EACH leg's own
+	// Call-ID, which is how an in-dialog request is matched to the leg it
+	// actually arrived on. registerCall/endCall are the only writers, and
+	// they move a call through callState under this one lock.
+	callMu sync.Mutex
+	calls  map[string]*call
+	legs   map[string]*call
 
-	// sdps remembers each established call LEG's SDP pair (Task 6 fix
-	// wave), keyed by that leg's own Call-ID — see callSDPStore and
-	// callSDP. Kept separate from registry: package call must stay
-	// dependency-free of sig/SDP.
-	sdps *callSDPStore
-
-	client    *sipgo.Client
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
-	br        *bridge
 	registrar *Registrar
 
 	// shield is the front-door security plane (M6): consulted before
@@ -72,14 +72,6 @@ type Server struct {
 	// the log once per call.
 	warnAutoIPOnce sync.Once
 
-	// killMu guards killers: the admin kick-call mechanism (KillCall). Each
-	// live call's onInvite goroutine registers its own killCtx cancel func
-	// under the A-leg Call-ID right after adding itself to the registry, and
-	// unregisters it (via defer) when the call ends. Kept separate from
-	// registry: killers holds a context.CancelFunc, not call metadata.
-	killMu  sync.Mutex
-	killers map[string]context.CancelFunc // Call-ID → cancel its killCtx
-
 	// T-05 (F-02) TCP/TLS listener resource bounds — see listenerlimit.go.
 	// tcpConns counts live connections across every tcp/tls listener; a
 	// single shared counter makes the cap global (N listeners can't each
@@ -87,8 +79,7 @@ type Server struct {
 	// the per-connection idle read deadline; both are set by NewServer and
 	// only tests override them (via startServerConfigured's hook, which runs
 	// before the Run goroutine spawns — never a cross-goroutine write).
-	// The values may move into config later (REMEDIATION-PLAN T-05 defers
-	// that).
+	// The values may move into config later (deferred).
 	tcpConns       atomic.Int64
 	tcpMaxConns    int64
 	tcpIdleTimeout time.Duration
@@ -110,16 +101,15 @@ type Server struct {
 	onListening func(config.SIPListen)
 }
 
-func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server {
+func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Server {
 	return &Server{
 		store:    store,
 		pool:     pool,
 		log:      log,
-		registry: call.NewRegistry(),
-		sdps:     newCallSDPStore(),
+		calls:    make(map[string]*call),
+		legs:     make(map[string]*call),
 		resolver: newResolver(time.Now().UnixNano()),
 		health:   newEndpointHealth(),
-		killers:  make(map[string]context.CancelFunc),
 
 		// T-05 defaults (see listenerlimit.go): 1024 concurrent TCP/TLS
 		// connections and a 120s idle read deadline per connection.
@@ -128,55 +118,18 @@ func NewServer(store *config.Store, pool *media.Pool, log *slog.Logger) *Server 
 	}
 }
 
-// registerKiller records cancel as the way to kick the live call with the
-// given (A-leg) Call-ID — called once, right after the call is added to the
-// registry (see bridge.onInvite).
-func (s *Server) registerKiller(id string, cancel context.CancelFunc) {
-	s.killMu.Lock()
-	s.killers[id] = cancel
-	s.killMu.Unlock()
-}
-
-// unregisterKiller removes id's kill-cancel entry — called (via defer) when
-// the call ends, however it ends, so KillCall never targets a stale entry.
-func (s *Server) unregisterKiller(id string) {
-	s.killMu.Lock()
-	delete(s.killers, id)
-	s.killMu.Unlock()
-}
-
-// KillCall tears down the live call with the given A-leg Call-ID by
-// cancelling its kill context (the onInvite goroutine then BYEs both legs
-// via the normal teardown — see byeBoth). Returns false if no such active
-// call is tracked. Idempotent: cancelling an already-cancelled
-// context.CancelFunc is a safe no-op, and unregisterKiller removes the
-// entry once the call actually ends, so a second call for the same id (or
-// one racing a natural end) returns false rather than firing twice.
-func (s *Server) KillCall(id string) bool {
-	s.killMu.Lock()
-	cancel, ok := s.killers[id]
-	s.killMu.Unlock()
-	if ok {
-		cancel()
-	}
-	return ok
-}
-
-// callSDP returns callID's established SDP pair (see callSDP), or ok=false
-// if there is no established call leg on record for it.
-func (s *Server) callSDP(callID string) (callSDP, bool) {
-	return s.sdps.get(callID)
-}
-
-// ActiveCalls returns the number of calls currently tracked in the call
-// registry, for metrics.
-func (s *Server) ActiveCalls() int { return s.registry.Count() }
-
-// IsRegistered reports whether the peer is currently registered (nil-safe:
-// false before Run builds the registrar).
+// IsRegistered reports whether the peer is available to route to as far as
+// registration is concerned. It is the single gate behind both the admin
+// peer view and the B2BUA's target skip (expandTargets), so the two cannot
+// disagree about what "registered" means.
+//
+// Peers that don't register are always true (there is nothing to wait for)
+// — that is Registrar.IsRegistered's rule, and the same answer is given
+// before Run has built the registrar at all: no registrar means no
+// registration gating, not "every peer is down".
 func (s *Server) IsRegistered(name string) bool {
 	if s.registrar == nil {
-		return false
+		return true
 	}
 	return s.registrar.IsRegistered(name)
 }
@@ -201,9 +154,6 @@ func (s *Server) Unban(ip netip.Addr) bool {
 	}
 	return sh.Unban(ip)
 }
-
-// Calls returns a snapshot of the active-call registry (for the admin API).
-func (s *Server) Calls() []call.Record { return s.registry.Snapshot() }
 
 // Run builds the sipgo server, binds every listen.sip entry, and blocks
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
@@ -245,7 +195,6 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("sipgo client: %w", err)
 	}
 	defer client.Close()
-	s.client = client
 
 	cfg := s.store.Current()
 	listeners := cfg.Listeners()
@@ -269,7 +218,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.dialogSrv = sipgo.NewDialogServerCache(client, contact)
 	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
-	s.br = &bridge{s: s}
 
 	// s.shield is built here (not in NewServer) so unit tests that
 	// construct a *Server directly (without Run) exercise handlers with a
@@ -285,7 +233,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.shield.Store(sh)
 
 	srv.OnRequest(sip.OPTIONS, s.withShield(s.onOptions))
-	srv.OnInvite(s.withShield(s.br.onInvite))
+	srv.OnInvite(s.withShield(s.onInvite))
 	srv.OnAck(s.withShield(s.onAck))
 	srv.OnBye(s.withShield(s.onBye))
 	srv.OnNoRoute(s.withShield(s.onNoRoute))
@@ -423,7 +371,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 			}
 			tlsConf = conf
 		} else {
-			conf, err := selfSignedTLSConfig()
+			conf, err := fsip.SelfSignedTLS("FreeSBC self-signed", nil)
 			if err != nil {
 				return err
 			}
@@ -456,7 +404,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 // source address. sipgo sets req.Source() from the real remote socket on
 // receive, so this is the trust boundary — never the Via/From host.
 func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
-	addr, ok := sourceAddr(req)
+	addr, ok := fsip.ParseHostPortAddr(req.Source())
 	if !ok {
 		return "", nil, false
 	}
@@ -489,36 +437,12 @@ func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func
 			}
 		}()
 		sh := s.shield.Load()
-		src, ok := sourceAddr(req)
-		if sh != nil && ok && sh.Check(src, userAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
+		src, ok := fsip.ParseHostPortAddr(req.Source())
+		if sh != nil && ok && sh.Check(src, fsip.UserAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
 			return // silent
 		}
 		next(req, tx)
 	}
-}
-
-// sourceAddr parses the transport source of req into a netip.Addr. sipgo
-// sets req.Source() from the real remote socket on receive, so this is the
-// trust boundary — never the Via/From host.
-func sourceAddr(req *sip.Request) (netip.Addr, bool) {
-	host, _, err := net.SplitHostPort(req.Source())
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	return addr, true
-}
-
-// userAgent returns req's User-Agent header value, or "" if absent.
-func userAgent(req *sip.Request) string {
-	hs := req.GetHeaders("User-Agent")
-	if len(hs) == 0 {
-		return ""
-	}
-	return hs[0].Value()
 }
 
 // dropUnidentified is the shield seam (M6): a request from a source that
@@ -540,7 +464,7 @@ func (s *Server) dropUnidentified(req *sip.Request) {
 	// traffic from the same source eventually bans it (spec §3). Nil-guarded:
 	// unit tests build a *Server directly (without Run), where s.shield is nil.
 	if sh := s.shield.Load(); sh != nil {
-		if src, ok := sourceAddr(req); ok {
+		if src, ok := fsip.ParseHostPortAddr(req.Source()); ok {
 			sh.RecordUnidentified(src)
 		}
 	}
@@ -709,8 +633,10 @@ func noMatchingDialog(err error) bool {
 // ever calling identify(), which would let an unauthorized source detect
 // the SBC's existence — defeating the "silently drop unknown sources"
 // guarantee (spec §6 step 2). Every method must pass through identify()
-// first: unknown sources get silence, known peers get a normal 405 until
-// M3.3/M4 add dialog and REGISTER support for their respective methods.
+// first: unknown sources get silence, known peers get a normal 405 for any
+// method this plane doesn't implement. (The trunk plane never acts as a
+// registrar — its Registrar is the outbound REGISTER client — so inbound
+// REGISTER belongs here too.)
 func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction) {
 	name, _, ok := s.identify(req)
 	if !ok {

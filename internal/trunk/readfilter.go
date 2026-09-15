@@ -1,12 +1,8 @@
 package trunk
 
 import (
-	"net"
-	"net/netip"
-
 	"github.com/emiago/sipgo/sip"
-
-	"github.com/freesbc/freesbc/internal/config"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
 // preParseFilter returns the transport-layer read filter installed on the
@@ -19,48 +15,20 @@ import (
 // on UDP (transport_udp.go) and ahead of the stream parser on TCP
 // (transport_tcp.go); an empty return discards the read there.
 //
-// The filter deliberately never returns an error: sipgo treats a filter
-// error as fatal to the whole read loop (transport_udp.go logs it and
-// returns), which would let one bad datagram kill a listener. Anything with
-// an unparseable source is simply dropped.
+// The never-return-an-error rule that makes that safe lives in
+// fsip.ReadFilter; what is here is the trunk plane's own gate. No size cap
+// is applied (the 0): a trunk peer is an identified carrier, and its
+// message sizes are its own business.
 func (s *Server) preParseFilter() sip.TransportReadFilter {
-	return func(info sip.TransportReadProps, data []byte) ([]byte, error) {
-		addr, ok := remoteAddr(info.RemoteAddr)
+	return fsip.ReadFilter(0, func(info sip.TransportReadProps) bool {
+		addr, ok := fsip.ParseHostPortAddr(info.RemoteAddr.String())
 		if !ok {
-			return nil, nil
+			return false
 		}
-		if !anyPeerAllows(s.store.Current(), addr) {
-			return nil, nil
-		}
-		return data, nil
-	}
-}
-
-// remoteAddr extracts the IP from a transport remote address (UDP yields
-// *net.UDPAddr, TCP/TLS *net.TCPAddr).
-func remoteAddr(a net.Addr) (netip.Addr, bool) {
-	host, _, err := net.SplitHostPort(a.String())
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	return addr, true
-}
-
-// anyPeerAllows reports whether any configured peer allows addr. The filter
-// needs only this boolean — not IdentifyPeer's deterministic winner — so it
-// skips the name-sort identify() performs per handled request; the filter
-// runs once per datagram, including garbage that never becomes a request.
-// (IPv4-mapped IPv6 Unmap normalization is T-10's job; until then this
-// mirrors sourceAddr/IdentifyPeer exactly so the two gates agree.)
-func anyPeerAllows(cfg *config.Config, addr netip.Addr) bool {
-	for _, p := range cfg.Peers {
-		if p.AllowsIP(addr) {
-			return true
-		}
-	}
-	return false
+		// Same gate as the per-request one (identify → IdentifyPeer), by
+		// construction: one matcher, so the two cannot drift apart. The
+		// filter needs only the boolean, not the winning peer.
+		_, _, ok = IdentifyPeer(s.store.Current(), addr)
+		return ok
+	})
 }

@@ -243,7 +243,7 @@ rather than a fake one, because the questions that decide whether this works
 in production are questions about sofia's behaviour:
 
 ```sh
-FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./internal/proxy/ -run TestFreeSWITCH -v
+FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<password> go test ./internal/edge/ -run TestFreeSWITCH -v
 ```
 
 It confirms that sofia accepts a proxied REGISTER and **preserves the
@@ -257,7 +257,7 @@ into FreeSWITCH's `echo` application and back.
 
 Requires Go ≥ 1.22.
 
-> **Read before exposing to the public internet:** [`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (deployment security baseline: public exposure policy and admin listener baseline).
+> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (the deployment topology and security sections: public exposure policy and admin listener baseline).
 
 ```sh
 go build -o freesbc ./cmd/freesbc
@@ -327,12 +327,10 @@ limitations](#known-limitations), which are structural rather than scheduled.
 - **Inbound digest challenge** — the SBC answers challenges but never issues one; trunk peers are authenticated by source IP, plus TLS/mTLS where configured
 - **Active peer qualification** — outbound OPTIONS keepalives; peer liveness is passive cooldown today
 - **`listen.media.public_ip: auto`** — STUN-detected public address; a literal address is required for now
-- **Ring timeout against a silent target** — failover from a blackholing peer waits for the transaction timer (~32 s) instead of `ring_timeout`
 - **Scanner heuristics beyond User-Agent** — method and traffic-shape fingerprinting
 - **SUBSCRIBE/NOTIFY through the edge proxy** — needed before MWI and BLF reach phones
 - **Consistent hashing for `sip.upstreams`** — the pool is modulo-hashed, so changing the node set reshuffles users between switches
 - **Configurable TCP/TLS listener limits and TLS certificate hot rotation** — the connection cap and idle timeout are compiled in, and certificate changes need a restart
-- **Security hardening backlog** — the remaining items in [`docs/tasks.md`](docs/tasks.md)
 
 ## Admin & WebUI
 
@@ -349,29 +347,33 @@ Enable the optional `admin` block (a bcrypt `password_hash` — generate with
   http://<admin.listen>/api/calls/<call-id>` (204 killed, 404 already gone) —
   the `<call-id>` is the `id` from `GET /api/calls`.
 
-Bind the admin listener **private** (there is no TLS on it) — front it with a
-reverse proxy for remote/TLS access. Deployment baseline: loopback-only by
-policy; non-loopback requires the checklist in
-[`docs/DEPLOYMENT-SECURITY.md`](docs/DEPLOYMENT-SECURITY.md) (G-2).
+Bind the admin listener **private** — front it with a reverse proxy for remote
+access, or serve HTTPS directly with `admin.tls_cert` / `admin.tls_key`.
+Deployment baseline: loopback-only by policy; non-loopback requires the
+checklist in
+[`docs/design.md`](docs/design.md) (security model section).
 
 ## Layout
 
 ```text
-cmd/freesbc/          the binary
+cmd/freesbc/          argv parsing, signal handling, exit codes
 internal/
+  app/                construction and lifecycle: builds every component and runs it
   config/             sbc.yaml: parse, validate, hot reload
-  call/               active-call metadata table (no SIP/media deps)
+  sip/                SIP protocol primitives shared by both planes
+  sip/sdp/            SDP subsystem (parse, codec negotiation, construction)
   trunk/              trunk plane: B2BUA between carriers and a PBX
-  proxy/              edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
-  sdp/                SDP subsystem (parse, codec negotiation, construction)
+  edge/               edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
   media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
   shield/             per-IP rate limiting, scanner fingerprinting, auto-ban
   admin/              operator HTTP API, Prometheus metrics, embedded WebUI
 ```
 
-`trunk` and `proxy` are the two SIP planes and are named for the side each
-serves, not the protocol both speak. Everything is under `internal/`: the
-only consumer is `cmd/freesbc`, so no package here carries an API promise.
+`trunk` and `edge` are the two SIP planes and are named for the side each
+serves, not the protocol both speak. They share protocol primitives (`sip`,
+`sip/sdp`) and nothing else; dependencies run one way, and only `app` knows
+about every package. Everything is under `internal/`: the only consumer is
+`cmd/freesbc`, so no package here carries an API promise.
 
 ## Development
 
@@ -380,7 +382,7 @@ go vet ./...
 go test ./... -race
 ```
 
-Design and implementation plans live in [`freesbc-allinone-design.md`](freesbc-allinone-design.md) and [`docs/superpowers/plans/`](docs/superpowers/plans/).
+The design document is [`docs/design.md`](docs/design.md); [`freesbc-allinone-design.md`](freesbc-allinone-design.md) is the original all-in-one design note.
 
 ## License
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/freesbc/freesbc/internal/config"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -113,7 +114,7 @@ func (r *Resolver) Resolve(peer *config.Peer, cacheTTL time.Duration) []Endpoint
 	}
 	host, port, explicitPort, isIP := classifyAddress(peer.Address)
 	if !explicitPort {
-		port = defaultPort(transport)
+		port = fsip.DefaultPort(transport)
 	}
 	if isIP || explicitPort {
 		return []Endpoint{{Host: host, Port: port, Transport: transport}}
@@ -159,7 +160,7 @@ func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []
 			// bare host — but cached only briefly (srvFailCacheTTL) so a
 			// momentary resolver outage doesn't pin the fallback for the
 			// whole srv_cache_ttl (T-28/D8-1).
-			eps = []Endpoint{{Host: host, Port: defaultPort(transport), Transport: transport}}
+			eps = []Endpoint{{Host: host, Port: fsip.DefaultPort(transport), Transport: transport}}
 			ttl = min(cacheTTL, srvFailCacheTTL)
 		default:
 			eps = orderSRV(recs, transport, r.rand)
@@ -167,7 +168,7 @@ func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []
 				// Every record was filtered as unusable (T-29/D8-2: all
 				// Target "." / port 0) — treat like no SRV, and cache it
 				// short: the record set clearly changed recently.
-				eps = []Endpoint{{Host: host, Port: defaultPort(transport), Transport: transport}}
+				eps = []Endpoint{{Host: host, Port: fsip.DefaultPort(transport), Transport: transport}}
 				ttl = min(cacheTTL, srvFailCacheTTL)
 			}
 		}
@@ -175,15 +176,6 @@ func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []
 		return eps, nil
 	})
 	return epsAny.([]Endpoint)
-}
-
-// defaultPort returns the transport's default SIP port (T-30/D8-4):
-// RFC 3263 §4.1 — sips (tls) falls back to 5061, everything else 5060.
-func defaultPort(transport string) int {
-	if strings.ToLower(transport) == "tls" {
-		return 5061
-	}
-	return 5060
 }
 
 // classifyAddress splits a peer address into host/port and reports whether a

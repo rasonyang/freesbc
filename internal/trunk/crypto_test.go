@@ -63,33 +63,8 @@ func TestParseCryptoIgnoresMKIAndLifetime(t *testing.T) {
 	}
 }
 
-func TestSelectCryptoFirstSupportedInOrder(t *testing.T) {
-	offered := []cryptoLine{
-		{tag: 5, suite: media.SuiteAES128CM32, keyValue: make([]byte, 30)},
-		{tag: 6, suite: media.SuiteAES128CM80, keyValue: make([]byte, 30)},
-	}
-	got, ok := selectCrypto(offered)
-	if !ok || got.tag != 5 {
-		t.Fatalf("select must honor offered order (tag 5 first), got %+v ok=%v", got, ok)
-	}
-	if _, ok := selectCrypto(nil); ok {
-		t.Fatal("empty offered → ok=false")
-	}
-}
-
-func TestNewCryptoKeyValueLengthAndRandomness(t *testing.T) {
-	a, err := newCryptoKeyValue()
-	if err != nil || len(a) != 30 {
-		t.Fatalf("key value len=%d err=%v", len(a), err)
-	}
-	b, _ := newCryptoKeyValue()
-	if string(a) == string(b) {
-		t.Fatal("two generated keys are identical (not random)")
-	}
-}
-
 func TestCryptoAttrValueRoundTrip(t *testing.T) {
-	key, _ := newCryptoKeyValue()
+	key := media.NewSDESKey()
 	v := cryptoAttrValue(1, media.SuiteAES128CM80, key)
 	lines := parseCryptoAttrs([]string{v})
 	if len(lines) != 1 || lines[0].tag != 1 || lines[0].suite != media.SuiteAES128CM80 {
@@ -98,4 +73,15 @@ func TestCryptoAttrValueRoundTrip(t *testing.T) {
 	if string(lines[0].keyValue) != string(key) {
 		t.Fatal("round-tripped key value differs")
 	}
+}
+
+// firstCryptoLine is the test-side equivalent of what onInvite and
+// processAnswerSDP do inline: parseCryptoAttrs has already dropped every
+// unsupported suite, so the first surviving line is the selected one
+// (RFC 4568 §5.1.2).
+func firstCryptoLine(lines []cryptoLine) (cryptoLine, bool) {
+	if len(lines) == 0 {
+		return cryptoLine{}, false
+	}
+	return lines[0], true
 }

@@ -1,8 +1,7 @@
 // Package admin serves the read-only operator HTTP surface: a Prometheus
 // /metrics endpoint and a JSON status API, behind bcrypt HTTP Basic Auth.
-// It imports only config and the dependency-free call package; plane-side
-// data arrives via the Deps closures (main adapts trunk.Server and
-// proxy.Server).
+// It imports only config; plane-side data arrives via the Deps closures
+// over admin's own DTOs (internal/app adapts trunk.Server and edge.Server).
 package admin
 
 import (
@@ -18,10 +17,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/freesbc/freesbc/internal/call"
 	"github.com/freesbc/freesbc/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// Call is one active call as the admin surface sees it: plain metadata,
+// no SIP dialog or media session. app converts the planes' own records
+// into these.
+type Call struct {
+	ID            string // A-leg Call-ID
+	FromPeer      string
+	ToPeer        string
+	StartUnixNano int64
+}
 
 // PeerStatus is one peer's operator-visible status.
 type PeerStatus struct {
@@ -39,7 +47,7 @@ type ShieldStats struct {
 // Deps are the live-data closures the admin surface reads. All must be safe
 // for concurrent use (they read already-synchronized structures).
 type Deps struct {
-	Calls       func() []call.Record
+	Calls       func() []Call
 	Peers       func() []PeerStatus
 	Ports       func() (inUse, total int)
 	Shield      func() ShieldStats

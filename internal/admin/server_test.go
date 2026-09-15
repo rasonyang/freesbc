@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/freesbc/freesbc/internal/call"
 	"github.com/freesbc/freesbc/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -58,7 +57,7 @@ func mustCfg(t *testing.T) *config.Config {
 // override the fields they exercise.
 func emptyDeps() Deps {
 	return Deps{
-		Calls:       func() []call.Record { return nil },
+		Calls:       func() []Call { return nil },
 		Peers:       func() []PeerStatus { return nil },
 		Ports:       func() (int, int) { return 0, 0 },
 		Shield:      func() ShieldStats { return ShieldStats{DropsByReason: map[string]int64{}} },
@@ -82,10 +81,10 @@ func testServer(t *testing.T) *Server { return newTestServer(t, emptyDeps()) }
 
 // testServerWithCalls returns a test server whose Deps.Calls is overridden to
 // return the given calls, for exercising /api/calls.
-func testServerWithCalls(t *testing.T, calls []call.Record) *Server {
+func testServerWithCalls(t *testing.T, calls []Call) *Server {
 	t.Helper()
 	deps := emptyDeps()
-	deps.Calls = func() []call.Record { return calls }
+	deps.Calls = func() []Call { return calls }
 	return newTestServer(t, deps)
 }
 

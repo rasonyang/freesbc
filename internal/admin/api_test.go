@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/freesbc/freesbc/internal/call"
 )
 
 func TestAPIStatus(t *testing.T) {
@@ -25,7 +23,7 @@ func TestAPIStatus(t *testing.T) {
 
 func TestAPICalls(t *testing.T) {
 	// override the Calls dep to return one call, assert it's reflected.
-	s := testServerWithCalls(t, []call.Record{{ID: "abc", FromPeer: "a", ToPeer: "b", StartUnixNano: time.Now().UnixNano()}})
+	s := testServerWithCalls(t, []Call{{ID: "abc", FromPeer: "a", ToPeer: "b", StartUnixNano: time.Now().UnixNano()}})
 	body := authGET(t, s, "/api/calls")
 	var calls []map[string]any
 	if err := json.Unmarshal(body, &calls); err != nil {

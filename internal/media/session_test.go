@@ -111,7 +111,7 @@ func TestRelatchMovesToNewRemote(t *testing.T) {
 }
 
 func TestSessionRelatchBothKinds(t *testing.T) {
-	p := NewPool(testStore(40500, 40507))
+	p := testPool(40500, 40507)
 	s, err := p.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestSetLatchModeChangesAcceptBehavior(t *testing.T) {
 // TestSessionRelatchBothKinds: SetLatchMode on a Session must flip both the
 // RTP and RTCP latches of the given side, not just one of them.
 func TestSessionSetLatchModeChangesBothKinds(t *testing.T) {
-	p := NewPool(testStore(40510, 40517))
+	p := testPool(40510, 40517)
 	s, err := p.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestParseLatchMode(t *testing.T) {
 }
 
 func TestAllocateAndPorts(t *testing.T) {
-	p := NewPool(testStore(40300, 40315))
+	p := testPool(40300, 40315)
 	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
@@ -200,7 +200,7 @@ func TestAllocateAndPorts(t *testing.T) {
 }
 
 func TestAllocateDefaultsTimeoutFromConfig(t *testing.T) {
-	p := NewPool(testStore(40320, 40327))
+	p := testPool(40320, 40327)
 	s, err := p.Allocate(SessionConfig{}) // zero timeout
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +212,7 @@ func TestAllocateDefaultsTimeoutFromConfig(t *testing.T) {
 }
 
 func TestSessionCloseIdempotentAndReleases(t *testing.T) {
-	p := NewPool(testStore(40400, 40403)) // exactly 2 pairs = 1 session
+	p := testPool(40400, 40403) // exactly 2 pairs = 1 session
 	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)

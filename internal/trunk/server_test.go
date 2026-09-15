@@ -8,12 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/freesbc/freesbc/internal/config"
-	"github.com/freesbc/freesbc/internal/media"
 )
 
 // startServer boots a trunk.Server on the given UDP port with the given
@@ -57,7 +58,7 @@ func startServerAt(t *testing.T, port int, probeHost string, cfgYAML string, con
 		t.Fatalf("parse config: %v", err)
 	}
 	store := config.NewStore(cfg)
-	pool := media.NewPool(store)
+	pool := NewMediaPool(store)
 	srv := NewServer(store, pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	listeners := cfg.Listeners()
 	bound := make(chan config.SIPListen, len(listeners)+1)
@@ -206,9 +207,11 @@ func mustMinimalCfg(t *testing.T) *config.Config {
 // Run, which this test never calls).
 func TestServerAccessorsNilSafe(t *testing.T) {
 	s := NewServer(config.NewStore(mustMinimalCfg(t)), nil, discardLogger())
-	// registrar/shield are nil before Run — accessors must not panic.
-	if s.IsRegistered("nobody") {
-		t.Error("nil registrar → not registered")
+	// No registrar means no registration gating — the same answer
+	// Registrar.IsRegistered gives for a peer it isn't tracking, so the
+	// B2BUA's expandTargets gate and the admin view agree either way.
+	if !s.IsRegistered("nobody") {
+		t.Error("nil registrar → no gating, peer must read as available")
 	}
 	_ = s.ShieldStats() // must not panic; zero-value stats
 }
@@ -502,5 +505,32 @@ func TestServerByeNoDialogGets481(t *testing.T) {
 	}
 	if !strings.Contains(got.String(), "SIP/2.0 481") {
 		t.Fatalf("BYE with no dialog must get 481, got:\n%s", got.String())
+	}
+}
+
+// KillCall must not read call state outside the lock: endCall writes
+// c.state while an admin kick may be running. s.calls only ever holds
+// bridged entries, so the lookup alone is the whole check. Under -race
+// this fails on any unsynchronised read.
+func TestKillCallRacesNaturalEnd(t *testing.T) {
+	const n = 200
+	s := &Server{
+		calls: map[string]*call{},
+		legs:  map[string]*call{},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		id := "call-" + strconv.Itoa(i)
+		_, cancel := context.WithCancel(context.Background())
+		c := &call{id: id, cancel: cancel}
+		s.registerCall(c)
+
+		wg.Add(2)
+		go func() { defer wg.Done(); s.endCall(c) }()
+		go func() { defer wg.Done(); s.KillCall(id) }()
+	}
+	wg.Wait()
+	if got := s.ActiveCalls(); got != 0 {
+		t.Errorf("ActiveCalls = %d after every call ended, want 0", got)
 	}
 }

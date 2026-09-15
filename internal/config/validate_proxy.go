@@ -20,9 +20,7 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 	enabled := c.ProxyEnabled()
 	listeners := c.PublicSIPListeners()
 	pstn := c.SIP.Pstn
-	pstnSet := pstn.Address != "" || !pstn.Match.IsZero() ||
-		len(pstn.Gateways) > 0 || len(pstn.Routes) > 0 ||
-		pstn.AttemptTimeout != 0 || pstn.Cooldown != 0
+	pstnSet := pstn.configured()
 	ups := c.SIP.Upstreams
 	upsSet := len(ups.Nodes) > 0 || ups.Algorithm != "" || ups.Cooldown != 0
 	partial := len(listeners) > 0 || c.RTP.Public.configured() || c.RTP.Private.configured() ||
@@ -54,23 +52,12 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		fail("sip.upstreams: sip.upstream.address and sip.upstreams.nodes are mutually exclusive — use the single-upstream alias or the multi-switch pool, not both")
 	}
 	if c.SIP.Upstream.Address != "" {
-		if host, port, err := net.SplitHostPort(c.SIP.Upstream.Address); err != nil {
-			fail("sip.upstream.address: %q is not \"host:port\"", c.SIP.Upstream.Address)
-		} else {
-			if host == "" {
-				fail("sip.upstream.address: host required")
-			}
-			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-				fail("sip.upstream.address: bad port in %q", c.SIP.Upstream.Address)
-			}
-		}
-		if c.SIP.Upstream.Transport != "udp" {
-			// Deliberately narrow: §2 of the spec scopes the private/upstream
-			// transport to UDP for this phase. Reject anything else loudly
-			// rather than binding a transport the forwarding path can't route
-			// responses back through.
-			fail("sip.upstream.transport: only \"udp\" is supported, got %q", c.SIP.Upstream.Transport)
-		}
+		checkHostPort(fail, "sip.upstream.address", c.SIP.Upstream.Address)
+		// Deliberately narrow: §2 of the spec scopes the private/upstream
+		// transport to UDP for this phase. Reject anything else loudly rather
+		// than binding a transport the forwarding path can't route responses
+		// back through.
+		checkUDPOnly(fail, "sip.upstream.transport", c.SIP.Upstream.Transport)
 	}
 	if len(ups.Nodes) > 0 {
 		// The algorithm field is a forward-compatibility seam: exactly one
@@ -86,22 +73,11 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 				fail("%s.address: required", label)
 				continue
 			}
-			if host, port, err := net.SplitHostPort(n.Address); err != nil {
-				fail("%s.address: %q is not \"host:port\"", label, n.Address)
-			} else {
-				if host == "" {
-					fail("%s.address: host required", label)
-				}
-				if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-					fail("%s.address: bad port in %q", label, n.Address)
-				}
-			}
-			if n.Transport != "udp" {
-				// Same reasoning as the alias transport: the private leg is
-				// UDP in this phase, and the forwarding path has no way to
-				// route a TCP/TLS response back to the right transaction.
-				fail("%s.transport: only \"udp\" is supported, got %q", label, n.Transport)
-			}
+			checkHostPort(fail, label+".address", n.Address)
+			// Same reasoning as the alias transport: the private leg is UDP in
+			// this phase, and the forwarding path has no way to route a
+			// TCP/TLS response back to the right transaction.
+			checkUDPOnly(fail, label+".transport", n.Transport)
 		}
 	}
 	if ups.Cooldown < 0 {
@@ -139,16 +115,7 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		case alias:
 			// ---- v1 alias: a strict address AND match pair, byte-for-byte
 			// the checks the deployed shape has always had.
-			if host, port, err := net.SplitHostPort(pstn.Address); err != nil {
-				fail("sip.pstn.address: %q is not \"host:port\"", pstn.Address)
-			} else {
-				if host == "" {
-					fail("sip.pstn.address: host required")
-				}
-				if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-					fail("sip.pstn.address: bad port in %q", pstn.Address)
-				}
-			}
+			checkHostPort(fail, "sip.pstn.address", pstn.Address)
 			if pstn.Match.IsZero() {
 				fail("sip.pstn.match: required with sip.pstn.address")
 			} else {
@@ -168,22 +135,11 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 					fail("%s.address: required", label)
 					continue
 				}
-				if host, port, err := net.SplitHostPort(g.Address); err != nil {
-					fail("%s.address: %q is not \"host:port\"", label, g.Address)
-				} else {
-					if host == "" {
-						fail("%s.address: host required", label)
-					}
-					if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-						fail("%s.address: bad port in %q", label, g.Address)
-					}
-				}
-				if g.Transport != "udp" {
-					// Same reasoning as the alias transport: the carrier leg
-					// rides the public UDP plane, the only public transport
-					// the forwarding path can use without a registration.
-					fail("%s.transport: only \"udp\" is supported, got %q", label, g.Transport)
-				}
+				checkHostPort(fail, label+".address", g.Address)
+				// Same reasoning as the alias transport: the carrier leg rides
+				// the public UDP plane, the only public transport the
+				// forwarding path can use without a registration.
+				checkUDPOnly(fail, label+".transport", g.Transport)
 			}
 			for i, r := range pstn.Routes {
 				label := fmt.Sprintf("sip.pstn.routes[%d]", i)
@@ -226,11 +182,11 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 			}
 		}
 
-		if pstn.Transport != "" && pstn.Transport != "udp" {
+		if pstn.Transport != "" {
 			// The carrier leg rides the public UDP plane, which is the only
 			// public transport the forwarding path can send a peer-to-peer
 			// call over without a registration to bind it to.
-			fail("sip.pstn.transport: only \"udp\" is supported, got %q", pstn.Transport)
+			checkUDPOnly(fail, "sip.pstn.transport", pstn.Transport)
 		}
 		if !c.SIP.Public.UDP.Enabled {
 			fail("sip.pstn: requires sip.public.udp.enabled — the carrier leg rides the public UDP side")
@@ -265,9 +221,7 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		}
 		seen[key] = label
 		if l.Transport == "wss" {
-			if (l.CertFile == "") != (l.KeyFile == "") {
-				fail("sip.public.wss: cert_file and key_file must be set together")
-			}
+			checkFilePair(fail, "sip.public.wss", "cert_file", l.CertFile, "key_file", l.KeyFile)
 		}
 	}
 	if !c.PublicAdvertisedIP().IsValid() {
@@ -283,13 +237,7 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 	} else if _, err := netip.ParseAddr(c.SIP.Private.Bind.Host); err != nil {
 		fail("sip.private.bind: %q is not a valid IP", c.SIP.Private.Bind.Host)
 	}
-	if c.SIP.Private.AdvertisedIP != "" {
-		if ip, err := netip.ParseAddr(c.SIP.Private.AdvertisedIP); err != nil {
-			fail("sip.private.advertised_ip: %q is not a valid IP", c.SIP.Private.AdvertisedIP)
-		} else if ip.IsUnspecified() {
-			fail("sip.private.advertised_ip: %q is unspecified — FreeSWITCH could not route to it", c.SIP.Private.AdvertisedIP)
-		}
-	}
+	checkAdvertisedIP(fail, "sip.private.advertised_ip", c.SIP.Private.AdvertisedIP, "FreeSWITCH could not route to it")
 	if p := c.SIP.Private.AdvertisedPort; p != 0 && (p < 1 || p > 65535) {
 		fail("sip.private.advertised_port: must be 1-65535, got %d", p)
 	}
@@ -348,12 +296,10 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 		if c.WebRTC.ICEMode != "lite" {
 			fail("webrtc.ice_mode: only \"lite\" is supported, got %q", c.WebRTC.ICEMode)
 		}
-		if !c.WebRTC.RTCPMuxEnabled() {
+		if c.WebRTC.RTCPMux != nil && !*c.WebRTC.RTCPMux {
 			fail("webrtc.rtcp_mux: must be true — FreeSBC allocates one ICE component per session and cannot serve a non-muxed browser leg")
 		}
-		if (c.WebRTC.DTLSCertFile == "") != (c.WebRTC.DTLSKeyFile == "") {
-			fail("webrtc: dtls_cert_file and dtls_key_file must be set together")
-		}
+		checkFilePair(fail, "webrtc", "dtls_cert_file", c.WebRTC.DTLSCertFile, "dtls_key_file", c.WebRTC.DTLSKeyFile)
 		wsEnabled := c.SIP.Public.WS.Enabled || c.SIP.Public.WSS.Enabled
 		if !wsEnabled {
 			fail("webrtc.enabled: requires sip.public.ws or sip.public.wss — a browser has no other way to signal")
@@ -396,38 +342,16 @@ func (c *Config) validatePSTNMatch(pstn PstnConfig, fail func(string, ...any)) {
 }
 
 func (c *Config) validatePlane(label string, p NetworkPlane, fail func(string, ...any)) {
-	if p.BindIP != "" {
-		if _, err := netip.ParseAddr(p.BindIP); err != nil {
-			fail("%s.bind_ip: %q is not a valid IP", label, p.BindIP)
-		}
-	}
-	if p.AdvertisedIP != "" {
-		ip, err := netip.ParseAddr(p.AdvertisedIP)
-		if err != nil {
-			fail("%s.advertised_ip: %q is not a valid IP", label, p.AdvertisedIP)
-		} else if ip.IsUnspecified() {
-			fail("%s.advertised_ip: %q is unspecified — advertising it would blackhole signaling and media", label, p.AdvertisedIP)
-		}
-	}
+	checkIP(fail, label+".bind_ip", p.BindIP)
+	checkAdvertisedIP(fail, label+".advertised_ip", p.AdvertisedIP, "advertising it would blackhole signaling and media")
 }
 
 func (c *Config) validateRTPPlane(label string, p RTPPlaneConfig, fail func(string, ...any)) {
 	if !p.configured() {
 		return
 	}
-	if p.BindIP != "" {
-		if _, err := netip.ParseAddr(p.BindIP); err != nil {
-			fail("%s.bind_ip: %q is not a valid IP", label, p.BindIP)
-		}
-	}
-	if p.AdvertisedIP != "" {
-		ip, err := netip.ParseAddr(p.AdvertisedIP)
-		if err != nil {
-			fail("%s.advertised_ip: %q is not a valid IP", label, p.AdvertisedIP)
-		} else if ip.IsUnspecified() {
-			fail("%s.advertised_ip: %q is unspecified — SDP would blackhole media", label, p.AdvertisedIP)
-		}
-	}
+	checkIP(fail, label+".bind_ip", p.BindIP)
+	checkAdvertisedIP(fail, label+".advertised_ip", p.AdvertisedIP, "SDP would blackhole media")
 	if (p.PortMin == 0) != (p.PortMax == 0) {
 		fail("%s: port_min and port_max must be set together", label)
 		return
@@ -436,15 +360,31 @@ func (c *Config) validateRTPPlane(label string, p RTPPlaneConfig, fail func(stri
 		fail("%s: port_min/port_max required", label)
 		return
 	}
-	if p.PortMin < 1024 || p.PortMin > 65535 {
-		fail("%s.port_min: must be 1024-65535, got %d", label, p.PortMin)
+	checkPortRange(fail, label, label, "session", p.PortMin, p.PortMax)
+}
+
+// checkHostPort fails unless address is a literal "host:port" with a
+// non-empty host and a port in 1-65535. label is the full config key.
+func checkHostPort(fail func(string, ...any), label, address string) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		fail("%s: %q is not \"host:port\"", label, address)
+		return
 	}
-	if p.PortMax < 1024 || p.PortMax > 65535 {
-		fail("%s.port_max: must be 1024-65535, got %d", label, p.PortMax)
+	if host == "" {
+		fail("%s: host required", label)
 	}
-	if p.PortMin >= p.PortMax {
-		// A degenerate range can never hold an RTP+RTCP pair.
-		fail("%s: port_min must be less than port_max (each session needs an RTP+RTCP port pair), got %d-%d", label, p.PortMin, p.PortMax)
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		fail("%s: bad port in %q", label, address)
+	}
+}
+
+// checkUDPOnly rejects every transport but UDP. Both the private/upstream
+// leg and the carrier leg are UDP-only in this phase: the forwarding path
+// has no way to route a TCP/TLS response back to the right transaction.
+func checkUDPOnly(fail func(string, ...any), label, transport string) {
+	if transport != "udp" {
+		fail("%s: only \"udp\" is supported, got %q", label, transport)
 	}
 }
 

@@ -1,8 +1,6 @@
 package media
 
 import (
-	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -15,13 +13,11 @@ import (
 // packets share one socket, and RFC 7983 §7 defines how to tell them
 // apart by the first byte:
 //
-//	  0..3    STUN          (consumed by the ICE agent, never seen here)
-//	 16..19   ZRTP          (unsupported: dropped)
 //	 20..63   DTLS
-//	 64..79   TURN channel  (unsupported: dropped)
 //	128..191  RTP or RTCP   (SRTP/SRTCP once DTLS has keyed)
 //
-// Anything else is malformed and dropped. Dropping rather than erroring is
+// Everything else — STUN (already consumed by the ICE agent), ZRTP, TURN
+// channel data, and anything malformed — is dropped. Dropping rather than erroring is
 // deliberate: a single hostile datagram must not be able to tear down a
 // live call's media path.
 
@@ -133,16 +129,7 @@ func newMuxEndpoint(parent *demux, limit int) *muxEndpoint {
 	return &muxEndpoint{parent: parent, buf: b}
 }
 
-func (e *muxEndpoint) Read(p []byte) (int, error) {
-	n, err := e.buf.Read(p)
-	if err != nil && errors.Is(err, io.ErrShortBuffer) {
-		// A packet larger than the caller's buffer is malformed for this
-		// stream; surface it as a normal short read rather than killing
-		// the endpoint.
-		return 0, err
-	}
-	return n, err
-}
+func (e *muxEndpoint) Read(p []byte) (int, error) { return e.buf.Read(p) }
 
 func (e *muxEndpoint) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, err := e.Read(p)

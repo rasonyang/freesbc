@@ -8,11 +8,10 @@ type Target struct {
 	Peer *config.Peer
 }
 
-// Decision is the outcome of routing an inbound call: the matched route,
-// the dialed number after transform, and the ordered failover candidates
-// the B2BUA tries in turn.
+// Decision is the outcome of routing an inbound call: the dialed number
+// after transform, and the ordered failover candidates the B2BUA tries in
+// turn.
 type Decision struct {
-	Route     *config.Route
 	OutNumber string
 	Targets   []Target
 }
@@ -65,7 +64,6 @@ func Resolve(cfg *config.Config, fromPeer, toNumber string) (*Decision, bool) {
 		targets = append(targets, Target{Name: name, Peer: cfg.Peers[name]})
 	}
 	return &Decision{
-		Route:     route,
 		OutNumber: transformNumber(route, toNumber),
 		Targets:   targets,
 	}, true

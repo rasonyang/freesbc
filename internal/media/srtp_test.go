@@ -27,7 +27,7 @@ func testRTCPPacket() []byte {
 
 func mustKey(t *testing.T) []byte {
 	t.Helper()
-	k := make([]byte, srtpMasterKeyValueLen)
+	k := make([]byte, SDESKeyLen)
 	if _, err := rand.Read(k); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
@@ -189,4 +189,28 @@ func TestSRTPContextConcurrentRTPandRTCP(t *testing.T) {
 		go func() { defer wg.Done(); enc.protectRTCP(testRTCPPacket()) }()
 	}
 	wg.Wait() // -race is the assertion
+}
+
+func TestNewSDESKeyLengthAndRandomness(t *testing.T) {
+	a := NewSDESKey()
+	if len(a) != SDESKeyLen {
+		t.Fatalf("key value len=%d, want %d", len(a), SDESKeyLen)
+	}
+	if string(a) == string(NewSDESKey()) {
+		t.Fatal("two generated keys are identical (not random)")
+	}
+}
+
+func TestParseCryptoSuiteRoundTrip(t *testing.T) {
+	for _, want := range []CryptoSuite{SuiteAES128CM80, SuiteAES128CM32} {
+		got, ok := ParseCryptoSuite(want.String())
+		if !ok || got != want {
+			t.Errorf("ParseCryptoSuite(%q) = %v/%v, want %v/true", want.String(), got, ok, want)
+		}
+	}
+	for _, name := range []string{"AES_256_CM_HMAC_SHA1_80", "", "aes_cm_128_hmac_sha1_80"} {
+		if _, ok := ParseCryptoSuite(name); ok {
+			t.Errorf("ParseCryptoSuite(%q) accepted an unsupported suite", name)
+		}
+	}
 }

@@ -57,9 +57,7 @@ func (c *Config) validate() error {
 		fail("sip.bind_port: required when any sip.* field is configured")
 	}
 	if c.SIP.BindIP != "" {
-		if _, err := netip.ParseAddr(c.SIP.BindIP); err != nil {
-			fail("sip.bind_ip: %q is not a valid IP", c.SIP.BindIP)
-		}
+		checkIP(fail, "sip.bind_ip", c.SIP.BindIP)
 		if len(c.Listen.SIP) > 0 {
 			fail("sip.bind_ip and listen.sip are mutually exclusive: the sip section replaces the listen.sip listener list — configure one or the other")
 		}
@@ -72,30 +70,12 @@ func (c *Config) validate() error {
 	default:
 		fail("sip.transport: must be udp, tcp, or tls, got %q", c.SIP.Transport)
 	}
-	if c.SIP.AdvertisedIP != "" {
-		ip, err := netip.ParseAddr(c.SIP.AdvertisedIP)
-		if err != nil {
-			fail("sip.advertised_ip: %q is not a valid IP", c.SIP.AdvertisedIP)
-		} else if ip.IsUnspecified() {
-			fail("sip.advertised_ip: %q is unspecified — advertising it in Contact/From would be unroutable", c.SIP.AdvertisedIP)
-		}
-	}
+	checkAdvertisedIP(fail, "sip.advertised_ip", c.SIP.AdvertisedIP, "advertising it in Contact/From would be unroutable")
 	if c.SIP.AdvertisedPort != 0 && (c.SIP.AdvertisedPort < 1 || c.SIP.AdvertisedPort > 65535) {
 		fail("sip.advertised_port: must be 1-65535, got %d", c.SIP.AdvertisedPort)
 	}
-	if c.RTP.BindIP != "" {
-		if _, err := netip.ParseAddr(c.RTP.BindIP); err != nil {
-			fail("rtp.bind_ip: %q is not a valid IP", c.RTP.BindIP)
-		}
-	}
-	if c.RTP.AdvertisedIP != "" {
-		ip, err := netip.ParseAddr(c.RTP.AdvertisedIP)
-		if err != nil {
-			fail("rtp.advertised_ip: %q is not a valid IP", c.RTP.AdvertisedIP)
-		} else if ip.IsUnspecified() {
-			fail("rtp.advertised_ip: %q is unspecified — advertising it in SDP would blackhole media", c.RTP.AdvertisedIP)
-		}
-	}
+	checkIP(fail, "rtp.bind_ip", c.RTP.BindIP)
+	checkAdvertisedIP(fail, "rtp.advertised_ip", c.RTP.AdvertisedIP, "advertising it in SDP would blackhole media")
 	// Blackhole guard for the NAT/VPN topology: with sip.bind_ip configured
 	// there are no listen.sip hosts for the SDP media IP to fall back on
 	// (see Server.mediaIP), so without an explicit rtp.advertised_ip — and
@@ -117,18 +97,10 @@ func (c *Config) validate() error {
 		if c.Listen.Media.PortRange != (PortRange{}) {
 			fail("rtp.port_min/port_max and listen.media.port_range are mutually exclusive: the rtp section replaces the legacy range — configure one or the other")
 		}
-		if c.RTP.PortMin < 1024 || c.RTP.PortMin > 65535 {
-			fail("rtp.port_min: must be 1024-65535, got %d", c.RTP.PortMin)
-		}
-		if c.RTP.PortMax < 1024 || c.RTP.PortMax > 65535 {
-			fail("rtp.port_max: must be 1024-65535, got %d", c.RTP.PortMax)
-		}
-		if c.RTP.PortMin >= c.RTP.PortMax {
-			// A degenerate (min == max) range can never hold an RTP+RTCP
-			// pair — reject it up front rather than fail every call with
-			// "exhausted".
-			fail("rtp.port_min/port_max: port_min must be less than port_max (each call needs an RTP+RTCP port pair), got %d-%d", c.RTP.PortMin, c.RTP.PortMax)
-		}
+		// A degenerate (min == max) range can never hold an RTP+RTCP pair —
+		// checkPortRange rejects it up front rather than let every call fail
+		// with "exhausted".
+		checkPortRange(fail, "rtp", "rtp.port_min/port_max", "call", c.RTP.PortMin, c.RTP.PortMax)
 	}
 	if c.RingTimeout.Std() <= 0 {
 		fail("ring_timeout: must be > 0, got %v", c.RingTimeout.Std())
@@ -313,25 +285,19 @@ func (c *Config) validate() error {
 			// the hash travels in backups, logs, and the config itself.
 			fail("admin.auth.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
 		}
-		if (c.Admin.TLSCert == "") != (c.Admin.TLSKey == "") {
-			// T-26b: both-or-neither, so a half-configured pair can't leave
-			// the operator believing TLS is on while it silently isn't.
-			fail("admin: tls_cert and tls_key must be set together")
-		}
+		// T-26b: both-or-neither, so a half-configured pair can't leave the
+		// operator believing TLS is on while it silently isn't.
+		checkFilePair(fail, "admin", "tls_cert", c.Admin.TLSCert, "tls_key", c.Admin.TLSKey)
 	}
 
 	// T-17 (F-13): SIP-plane TLS pairs — same both-or-neither rationale as
 	// the admin pair above.
-	if (c.Listen.TLSCert == "") != (c.Listen.TLSKey == "") {
-		fail("listen: tls_cert and tls_key must be set together")
-	}
+	checkFilePair(fail, "listen", "tls_cert", c.Listen.TLSCert, "tls_key", c.Listen.TLSKey)
 	if c.Listen.TLSClientCA != "" && c.Listen.TLSCert == "" {
 		fail("listen.tls_client_ca requires listen.tls_cert and tls_key")
 	}
 	for name, p := range c.Peers {
-		if (p.TLSClientCert == "") != (p.TLSClientKey == "") {
-			fail("peers.%s: tls_client_cert and tls_client_key must be set together", name)
-		}
+		checkFilePair(fail, "peers."+name, "tls_client_cert", p.TLSClientCert, "tls_client_key", p.TLSClientKey)
 	}
 
 	c.validateProxy(fail)
@@ -410,6 +376,60 @@ func allDigits(s string) bool {
 		}
 	}
 	return len(s) > 0
+}
+
+// checkIP fails unless value is empty or a valid IP literal. label is the
+// full config key ("rtp.bind_ip"), so the message reads the same as a
+// hand-written one.
+func checkIP(fail func(string, ...any), label, value string) {
+	if value == "" {
+		return
+	}
+	if _, err := netip.ParseAddr(value); err != nil {
+		fail("%s: %q is not a valid IP", label, value)
+	}
+}
+
+// checkAdvertisedIP is checkIP plus the unspecified-address rejection every
+// advertised_ip key needs: 0.0.0.0/:: is a valid literal but putting it in
+// Contact/Via/SDP is never routable. why completes the sentence after the
+// em dash, which is the only part that differs between the keys.
+func checkAdvertisedIP(fail func(string, ...any), label, value, why string) {
+	if value == "" {
+		return
+	}
+	ip, err := netip.ParseAddr(value)
+	if err != nil {
+		fail("%s: %q is not a valid IP", label, value)
+	} else if ip.IsUnspecified() {
+		fail("%s: %q is unspecified — %s", label, value, why)
+	}
+}
+
+// checkFilePair enforces the both-or-neither rule shared by every
+// cert/key pair: half a pair would leave the operator believing TLS (or
+// DTLS) is configured while it silently isn't.
+func checkFilePair(fail func(string, ...any), prefix, aKey, aVal, bKey, bVal string) {
+	if (aVal == "") != (bVal == "") {
+		fail("%s: %s and %s must be set together", prefix, aKey, bKey)
+	}
+}
+
+// checkPortRange validates one RTP port pool: each end unprivileged and
+// within the UDP port space, and min strictly below max because every
+// session needs an RTP+RTCP port pair. boundsLabel prefixes the per-key
+// messages ("rtp" -> "rtp.port_min: ..."), rangeLabel the pair-wide one,
+// and unit names what a pair is allocated for on this plane.
+func checkPortRange(fail func(string, ...any), boundsLabel, rangeLabel, unit string, min, max int) {
+	if min < 1024 || min > 65535 {
+		fail("%s.port_min: must be 1024-65535, got %d", boundsLabel, min)
+	}
+	if max < 1024 || max > 65535 {
+		fail("%s.port_max: must be 1024-65535, got %d", boundsLabel, max)
+	}
+	if min >= max {
+		fail("%s: port_min must be less than port_max (each %s needs an RTP+RTCP port pair), got %d-%d", rangeLabel, unit, min, max)
+	}
 }
 
 // parsePrefixOrAddr accepts "10.0.0.0/8" or a bare "203.0.113.7"

@@ -10,74 +10,57 @@ import "sync/atomic"
 // operator needs to answer "is media flowing, and which way isn't it",
 // nothing more.
 type Stats struct {
-	PublicRTPPacketsRx  uint64
-	PublicRTPPacketsTx  uint64
-	PublicRTPBytesRx    uint64
-	PublicRTPBytesTx    uint64
-	PublicRTCPPacketsRx uint64
-	PublicRTCPPacketsTx uint64
+	PublicRTPPacketsRx uint64
+	PublicRTPPacketsTx uint64
+	PublicRTPBytesRx   uint64
+	PublicRTPBytesTx   uint64
 
-	PrivateRTPPacketsRx  uint64
-	PrivateRTPPacketsTx  uint64
-	PrivateRTPBytesRx    uint64
-	PrivateRTPBytesTx    uint64
-	PrivateRTCPPacketsRx uint64
-	PrivateRTCPPacketsTx uint64
-
-	// LastActivityUnixNano is when the session last accepted a packet that
-	// passed every check (latch, and SRTP authentication where it
-	// applies). Unauthenticated bytes never move it — see the note in
-	// relay.go.
-	LastActivityUnixNano int64
+	PrivateRTPPacketsRx uint64
+	PrivateRTPPacketsTx uint64
+	PrivateRTPBytesRx   uint64
+	PrivateRTPBytesTx   uint64
 }
 
 // counters is the atomic backing store for Stats. One instance per
 // session; every field is touched from the relay goroutines.
 type counters struct {
-	rtpPacketsRx  [2]atomic.Uint64
-	rtpPacketsTx  [2]atomic.Uint64
-	rtpBytesRx    [2]atomic.Uint64
-	rtpBytesTx    [2]atomic.Uint64
-	rtcpPacketsRx [2]atomic.Uint64
-	rtcpPacketsTx [2]atomic.Uint64
+	rtpPacketsRx [2]atomic.Uint64
+	rtpPacketsTx [2]atomic.Uint64
+	rtpBytesRx   [2]atomic.Uint64
+	rtpBytesTx   [2]atomic.Uint64
 }
 
+// recordRx and recordTx count RTP only; RTCP is relayed but not counted,
+// since nothing reads an RTCP counter.
 func (c *counters) recordRx(side Side, rtp bool, n int) {
-	if rtp {
-		c.rtpPacketsRx[side].Add(1)
-		c.rtpBytesRx[side].Add(uint64(n))
+	if !rtp {
 		return
 	}
-	c.rtcpPacketsRx[side].Add(1)
+	c.rtpPacketsRx[side].Add(1)
+	c.rtpBytesRx[side].Add(uint64(n))
 }
 
 func (c *counters) recordTx(side Side, rtp bool, n int) {
-	if rtp {
-		c.rtpPacketsTx[side].Add(1)
-		c.rtpBytesTx[side].Add(uint64(n))
+	if !rtp {
 		return
 	}
-	c.rtcpPacketsTx[side].Add(1)
+	c.rtpPacketsTx[side].Add(1)
+	c.rtpBytesTx[side].Add(uint64(n))
 }
 
 // snapshot renders the counters, mapping side A to "public" and side B to
 // "private" — the orientation both the edge proxy and the trunk B2BUA use
 // (A is the leg the call arrived on).
-func (c *counters) snapshot(lastRx int64) Stats {
+func (c *counters) snapshot() Stats {
 	return Stats{
-		PublicRTPPacketsRx:   c.rtpPacketsRx[SideA].Load(),
-		PublicRTPPacketsTx:   c.rtpPacketsTx[SideA].Load(),
-		PublicRTPBytesRx:     c.rtpBytesRx[SideA].Load(),
-		PublicRTPBytesTx:     c.rtpBytesTx[SideA].Load(),
-		PublicRTCPPacketsRx:  c.rtcpPacketsRx[SideA].Load(),
-		PublicRTCPPacketsTx:  c.rtcpPacketsTx[SideA].Load(),
-		PrivateRTPPacketsRx:  c.rtpPacketsRx[SideB].Load(),
-		PrivateRTPPacketsTx:  c.rtpPacketsTx[SideB].Load(),
-		PrivateRTPBytesRx:    c.rtpBytesRx[SideB].Load(),
-		PrivateRTPBytesTx:    c.rtpBytesTx[SideB].Load(),
-		PrivateRTCPPacketsRx: c.rtcpPacketsRx[SideB].Load(),
-		PrivateRTCPPacketsTx: c.rtcpPacketsTx[SideB].Load(),
-		LastActivityUnixNano: lastRx,
+		PublicRTPPacketsRx:  c.rtpPacketsRx[SideA].Load(),
+		PublicRTPPacketsTx:  c.rtpPacketsTx[SideA].Load(),
+		PublicRTPBytesRx:    c.rtpBytesRx[SideA].Load(),
+		PublicRTPBytesTx:    c.rtpBytesTx[SideA].Load(),
+		PrivateRTPPacketsRx: c.rtpPacketsRx[SideB].Load(),
+		PrivateRTPPacketsTx: c.rtpPacketsTx[SideB].Load(),
+		PrivateRTPBytesRx:   c.rtpBytesRx[SideB].Load(),
+		PrivateRTPBytesTx:   c.rtpBytesTx[SideB].Load(),
 	}
 }
 

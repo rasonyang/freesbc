@@ -88,7 +88,7 @@ shield:                            # sensible defaults; the whole section is opt
   nftables: auto
 
 # admin:                            # optional operator API + Prometheus /metrics (bcrypt HTTP Basic Auth)
-#   listen: 127.0.0.1:8080          # default must be loopback; see docs/DEPLOYMENT-SECURITY.md (G-2)
+#   listen: 127.0.0.1:8080          # default must be loopback; see docs/design.md (security model section)
 #   # allow_remote: true            # REQUIRED to bind a non-loopback (e.g. LAN) address — refused otherwise
 #   # tls_cert: /etc/freesbc/admin-cert.pem   # serve HTTPS (TLS >= 1.2) instead of plaintext —
 #   # tls_key:  /etc/freesbc/admin-key.pem    #   strongly recommended whenever allow_remote is on

@@ -154,7 +154,7 @@ type Session struct {
 	// AllocateAcross); the trunk B2BUA plane simply passes the same pool
 	// twice.
 	pools   [2]*PlanePool
-	pairs   [2]*PortPair
+	pairs   [2]*portPair
 	rtp     [2]*latch
 	rtcp    [2]*latch
 	timeout time.Duration
@@ -170,22 +170,35 @@ type Session struct {
 	srtpIn  [2]atomic.Pointer[SRTPContext] // decrypt packets received FROM this side (nil = plaintext)
 	srtpOut [2]atomic.Pointer[SRTPContext] // encrypt packets sent TO this side (nil = plaintext)
 
-	lastRx    atomic.Int64 // unix nanos of the last accepted packet
-	counters  counters
-	done      chan struct{}
-	closeOnce sync.Once
+	lastRx   atomic.Int64 // unix nanos of the last accepted packet
+	counters counters
+	done     chan struct{}
+
+	// state is the session's lifecycle, made explicit rather than inferred
+	// from a sync.Once plus "are the goroutines running": every transition
+	// is one atomic step, so Start and Close are each idempotent and can
+	// race each other without a half-started relay or a double release.
+	state atomic.Int32
 }
+
+// Session and WebRTCSession lifecycle states. Transitions only ever move
+// forward: allocated → running → closed, or allocated → closed.
+const (
+	sessAllocated int32 = iota
+	sessRunning
+	sessClosed
+)
 
 // Stats returns the session's packet counters (side A reported as
 // "public", side B as "private").
-func (s *Session) Stats() Stats { return s.counters.snapshot(s.lastRx.Load()) }
+func (s *Session) Stats() Stats { return s.counters.snapshot() }
 
 // Allocate binds two port pairs (side A and side B) for one call from
 // this single pool — the trunk B2BUA plane's shape. The caller must Close
 // the session — or rely on silence teardown — to return the ports.
 // Returns ErrPortsExhausted when the range is full.
-func (p *Pool) Allocate(cfg SessionConfig) (*Session, error) {
-	return AllocateAcross(p.PlanePool, p.PlanePool, cfg)
+func (p *PlanePool) Allocate(cfg SessionConfig) (*Session, error) {
+	return AllocateAcross(p, p, cfg)
 }
 
 // AllocateAcross binds side A from poolA and side B from poolB. This is
@@ -212,7 +225,7 @@ func AllocateAcross(poolA, poolB *PlanePool, cfg SessionConfig) (*Session, error
 	}
 	s := &Session{
 		pools:   [2]*PlanePool{poolA, poolB},
-		pairs:   [2]*PortPair{a, b},
+		pairs:   [2]*portPair{a, b},
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
 	}
@@ -240,11 +253,19 @@ func (s *Session) SetExpectedRemote(side Side, ip netip.Addr) {
 // destination (symmetric RTP) — see latch.seed.
 func (s *Session) SetRemote(side Side, addr netip.AddrPort) {
 	s.rtp[side].seed(addr)
-	// RTCP is conventionally RTP+1 (RFC 3550 §11); an explicit a=rtcp is
-	// handled by the caller passing the port it parsed.
-	if addr.Port() < 65535 {
-		s.rtcp[side].seed(netip.AddrPortFrom(addr.Addr(), addr.Port()+1))
+	if rtcp, ok := rtcpAddr(addr); ok {
+		s.rtcp[side].seed(rtcp)
 	}
+}
+
+// rtcpAddr is the conventional RTCP address for a media address: the RTP
+// port plus one (RFC 3550 §11). ok is false when that port does not exist.
+// An explicit a=rtcp is handled by the caller passing the port it parsed.
+func rtcpAddr(addr netip.AddrPort) (netip.AddrPort, bool) {
+	if addr.Port() < 65535 {
+		return netip.AddrPortFrom(addr.Addr(), addr.Port()+1), true
+	}
+	return netip.AddrPort{}, false
 }
 
 // SetRTCPRemote overrides just the RTCP send-to address of one side, for a
@@ -289,6 +310,9 @@ func ParseLatchMode(s string) LatchMode {
 // answer must be able to replace (or clear) the contexts an earlier target's
 // early media already installed, without racing the relay's forward loops.
 func (s *Session) SetSRTP(side Side, inbound, outbound *SRTPContext) {
+	if s.state.Load() == sessClosed {
+		return // the relay is gone; installing keys on it would be a lie
+	}
 	s.srtpIn[side].Store(inbound)
 	s.srtpOut[side].Store(outbound)
 }
@@ -299,13 +323,14 @@ func (s *Session) Done() <-chan struct{} { return s.done }
 // Close tears the session down and returns its ports to the pool.
 // Idempotent and safe to call from any goroutine.
 func (s *Session) Close() error {
-	s.closeOnce.Do(func() {
-		for _, pp := range s.pairs {
-			pp.Close()
-		}
-		s.pools[SideA].release(s.pairs[SideA].RTPPort())
-		s.pools[SideB].release(s.pairs[SideB].RTPPort())
-		close(s.done)
-	})
+	if s.state.Swap(sessClosed) == sessClosed {
+		return nil
+	}
+	for _, pp := range s.pairs {
+		pp.Close()
+	}
+	s.pools[SideA].release(s.pairs[SideA].RTPPort())
+	s.pools[SideB].release(s.pairs[SideB].RTPPort())
+	close(s.done)
 	return nil
 }

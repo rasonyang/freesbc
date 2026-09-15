@@ -137,9 +137,6 @@ func TestResolveOutboundWithFailoverOrder(t *testing.T) {
 	if !ok {
 		t.Fatal("9123 must resolve")
 	}
-	if d.Route.Name != "outbound" {
-		t.Errorf("route = %q, want outbound", d.Route.Name)
-	}
 	if d.OutNumber != "123" {
 		t.Errorf("OutNumber = %q, want \"123\"", d.OutNumber)
 	}
@@ -163,8 +160,8 @@ func TestResolveInboundPassthrough(t *testing.T) {
 	if !ok {
 		t.Fatal("inbound must resolve")
 	}
-	if d.Route.Name != "inbound" || d.OutNumber != "5551234" {
-		t.Errorf("route=%q out=%q; want inbound / 5551234", d.Route.Name, d.OutNumber)
+	if d.OutNumber != "5551234" {
+		t.Errorf("OutNumber = %q, want \"5551234\"", d.OutNumber)
 	}
 	if len(d.Targets) != 1 || d.Targets[0].Name != "internal-pbx" {
 		t.Errorf("targets = %+v; want [internal-pbx]", d.Targets)

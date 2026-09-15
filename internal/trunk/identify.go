@@ -3,7 +3,7 @@
 // identifies inbound requests by peer source IP, and hosts the bridge,
 // routing engine and SDP rewrite.
 //
-// It is one of FreeSBC's two SIP planes; the other is package proxy, the
+// It is one of FreeSBC's two SIP planes; the other is package edge, the
 // phone- and browser-facing edge proxy. They share no state and run
 // independently — hence the names, which say which side each serves
 // rather than which protocol both speak.
@@ -11,7 +11,6 @@ package trunk
 
 import (
 	"net/netip"
-	"sort"
 
 	"github.com/freesbc/freesbc/internal/config"
 )
@@ -20,17 +19,21 @@ import (
 // than one peer matches, the lexicographically-first name wins, so the
 // result is deterministic regardless of map iteration order. ok is false
 // when no peer matches (the caller hands such requests to the shield seam).
+//
+// It is the only peer gate: both the per-request path (Server.identify) and
+// the pre-parse read filter go through it, so the two cannot diverge. The
+// filter runs once per datagram — including garbage that never becomes a
+// request — so the deterministic winner is picked by a single allocation-free
+// pass that keeps the smallest matching name, not by sorting the peer names.
+// (IPv4-mapped IPv6 Unmap normalization is T-10's job.)
 func IdentifyPeer(cfg *config.Config, addr netip.Addr) (name string, peer *config.Peer, ok bool) {
-	names := make([]string, 0, len(cfg.Peers))
-	for n := range cfg.Peers {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		p := cfg.Peers[n]
-		if p.AllowsIP(addr) {
-			return n, p, true
+	for n, p := range cfg.Peers {
+		if !p.AllowsIP(addr) {
+			continue
+		}
+		if !ok || n < name {
+			name, peer, ok = n, p, true
 		}
 	}
-	return "", nil, false
+	return name, peer, ok
 }

@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -32,7 +30,7 @@ import (
 // harder to reason about for no reuse.
 type WebRTCSession struct {
 	leg      *WebRTCLeg
-	priv     *PortPair
+	priv     *portPair
 	privPool *PlanePool
 
 	// Private-side latches: the same hardened first-packet latching the
@@ -41,19 +39,17 @@ type WebRTCSession struct {
 	privRTP  *latch
 	privRTCP *latch
 
-	// privMux is set when FreeSWITCH agreed to rtcp-mux, in which case
-	// RTCP goes back over the RTP socket and the RTCP socket stays idle.
-	privMux bool
-
 	timeout  time.Duration
 	lastRx   atomic.Int64
 	counters counters
 
-	log *slog.Logger
+	log *slog.Logger // nil = the default logger
 
-	started   sync.Once
-	done      chan struct{}
-	closeOnce sync.Once
+	done chan struct{}
+	// state is the session's lifecycle (see session.go): allocated →
+	// running → closed. Start claims the allocated→running transition, so
+	// only the first caller runs the handshake wait and launches relays.
+	state atomic.Int32
 }
 
 // errWebRTCSessionClosed reports that a session ended before its media
@@ -64,9 +60,6 @@ var errWebRTCSessionClosed = errors.New("media: webrtc session closed before est
 type WebRTCSessionConfig struct {
 	// PrivateLatch is the latching mode for the FreeSWITCH side.
 	PrivateLatch LatchMode
-	// PrivateRTCPMux relays RTCP over the private RTP socket instead of
-	// the RTCP one.
-	PrivateRTCPMux bool
 	// Timeout tears the session down after this much media silence.
 	Timeout time.Duration
 	// Log receives relay-level errors; nil uses the default logger.
@@ -88,19 +81,14 @@ func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConf
 	if timeout <= 0 {
 		timeout = privPool.timeout()
 	}
-	log := cfg.Log
-	if log == nil {
-		log = slog.Default()
-	}
 	return &WebRTCSession{
 		leg:      leg,
 		priv:     priv,
 		privPool: privPool,
 		privRTP:  &latch{mode: cfg.PrivateLatch},
 		privRTCP: &latch{mode: cfg.PrivateLatch},
-		privMux:  cfg.PrivateRTCPMux,
 		timeout:  timeout,
-		log:      log,
+		log:      cfg.Log,
 		done:     make(chan struct{}),
 	}, nil
 }
@@ -123,8 +111,8 @@ func (s *WebRTCSession) Leg() *WebRTCLeg { return s.leg }
 // (symmetric RTP) — see latch.seed.
 func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
 	s.privRTP.seed(addr)
-	if addr.Port() < 65535 {
-		s.privRTCP.seed(netip.AddrPortFrom(addr.Addr(), addr.Port()+1))
+	if rtcp, ok := rtcpAddr(addr); ok {
+		s.privRTCP.seed(rtcp)
 	}
 }
 
@@ -132,17 +120,22 @@ func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
 func (s *WebRTCSession) Done() <-chan struct{} { return s.done }
 
 // Stats returns the session's packet counters.
-func (s *WebRTCSession) Stats() Stats { return s.counters.snapshot(s.lastRx.Load()) }
+func (s *WebRTCSession) Stats() Stats { return s.counters.snapshot() }
 
 // Start waits for the WebRTC leg to finish ICE and DTLS, then launches the
 // relay. It returns the leg's establishment error if the handshake failed,
 // in which case the session is already closed.
 //
-// Calling it more than once is a no-op after the first.
+// Calling it more than once is a no-op after the first; after Close it
+// reports errWebRTCSessionClosed.
 func (s *WebRTCSession) Start(ctx context.Context) error {
-	var err error
-	s.started.Do(func() { err = s.start(ctx) })
-	return err
+	if !s.state.CompareAndSwap(sessAllocated, sessRunning) {
+		if s.state.Load() == sessClosed {
+			return errWebRTCSessionClosed
+		}
+		return nil // already started
+	}
+	return s.start(ctx)
 }
 
 func (s *WebRTCSession) start(ctx context.Context) error {
@@ -175,10 +168,8 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 	s.lastRx.Store(time.Now().UnixNano())
 	go s.publicToPrivate(conn, in)
 	go s.privateToPublic(conn, out, true)
-	if !s.privMux {
-		go s.privateToPublic(conn, out, false)
-	}
-	go s.watchdog()
+	go s.privateToPublic(conn, out, false)
+	go watchdog(s.timeout, &s.lastRx, s.done, s.Close)
 	return nil
 }
 
@@ -190,7 +181,7 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 // media activity, so an attacker who can reach the socket cannot keep a
 // dead call alive with garbage.
 func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
-	defer s.recoverRelayPanic()
+	defer recoverRelayPanic(s.log, s.Close)
 	buf := make([]byte, maxPacketSize)
 	for {
 		n, err := conn.Read(buf)
@@ -201,9 +192,9 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 		rtcp := isRTCP(pkt)
 		var ok bool
 		if rtcp {
-			pkt, ok = in.UnprotectRTCP(pkt)
+			pkt, ok = in.unprotectRTCP(pkt)
 		} else {
-			pkt, ok = in.UnprotectRTP(pkt)
+			pkt, ok = in.unprotectRTP(pkt)
 		}
 		if !ok {
 			continue // bad auth tag or replay: fail closed, call stays up
@@ -212,7 +203,7 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 		s.counters.recordRx(SideA, !rtcp, len(pkt))
 
 		sock, lat := s.priv.RTP, s.privRTP
-		if rtcp && !s.privMux {
+		if rtcp {
 			sock, lat = s.priv.RTCP, s.privRTCP
 		}
 		dst := lat.target()
@@ -231,7 +222,7 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 // privateToPublic reads one of the private sockets, gates it through the
 // latch, encrypts, and writes to the browser.
 func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind bool) {
-	defer s.recoverRelayPanic()
+	defer recoverRelayPanic(s.log, s.Close)
 	sock, lat := s.priv.RTP, s.privRTP
 	if !rtpKind {
 		sock, lat = s.priv.RTCP, s.privRTCP
@@ -246,21 +237,15 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 			continue // pre-latch source mismatch, or post-latch hijack
 		}
 		pkt := buf[:n]
-		// On a muxed private socket the RTP socket also carries RTCP, so
-		// classify per packet rather than trusting which socket it came
-		// from.
 		rtcp := !rtpKind
-		if rtpKind && s.privMux {
-			rtcp = isRTCP(pkt)
-		}
 		s.lastRx.Store(time.Now().UnixNano())
 		s.counters.recordRx(SideB, !rtcp, n)
 
 		var ok bool
 		if rtcp {
-			pkt, ok = out.ProtectRTCP(pkt)
+			pkt, ok = out.protectRTCP(pkt)
 		} else {
-			pkt, ok = out.ProtectRTP(pkt)
+			pkt, ok = out.protectRTP(pkt)
 		}
 		if !ok {
 			continue
@@ -271,49 +256,17 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 	}
 }
 
-// watchdog tears the session down after `timeout` of media silence, so a
-// half-dead call never keeps a public port and a private pair reserved.
-func (s *WebRTCSession) watchdog() {
-	interval := s.timeout / 4
-	if interval < 10*time.Millisecond {
-		interval = 10 * time.Millisecond
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-t.C:
-			if time.Since(time.Unix(0, s.lastRx.Load())) > s.timeout {
-				_ = s.Close()
-				return
-			}
-		}
-	}
-}
-
 // Close tears the session down: both relay directions stop (their sockets
 // close), the WebRTC leg releases its public port and ICE agent, and the
 // private pair returns to its pool. Idempotent and safe from any
 // goroutine.
 func (s *WebRTCSession) Close() error {
-	s.closeOnce.Do(func() {
-		close(s.done)
-		s.priv.Close()
-		s.privPool.release(s.priv.RTPPort())
-		_ = s.leg.Close()
-	})
-	return nil
-}
-
-// recoverRelayPanic is deferred by every relay goroutine: a panic from a
-// malformed packet kills only this session, never the process, and leaves
-// a forensic trace instead of a silent call drop.
-func (s *WebRTCSession) recoverRelayPanic() {
-	if r := recover(); r != nil {
-		s.log.Error("webrtc relay panic; killing session",
-			"panic", r, "stack", string(debug.Stack()))
-		_ = s.Close()
+	if s.state.Swap(sessClosed) == sessClosed {
+		return nil
 	}
+	close(s.done)
+	s.priv.Close()
+	s.privPool.release(s.priv.RTPPort())
+	_ = s.leg.Close()
+	return nil
 }

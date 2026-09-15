@@ -8,24 +8,27 @@ import (
 
 func TestEndpointHealthPenalizeAndExpire(t *testing.T) {
 	h := newEndpointHealth()
-	fakeNow := time.Unix(2000, 0)
-	h.now = func() time.Time { return fakeNow }
 	ep := Endpoint{Host: "1.2.3.4", Port: 5060, Transport: "udp"}
 
 	if !h.Available(ep) {
 		t.Fatal("fresh endpoint must be available")
 	}
-	h.Penalize(ep, 30*time.Second)
+	// A long cooldown is still in force immediately after Penalize.
+	h.Penalize(ep, time.Hour)
 	if h.Available(ep) {
 		t.Fatal("penalized endpoint must be unavailable within the window")
 	}
-	fakeNow = fakeNow.Add(29 * time.Second)
+	// A short cooldown expires on its own (lazy, no sweeper).
+	h.Penalize(ep, 20*time.Millisecond)
 	if h.Available(ep) {
-		t.Fatal("still within cooldown at 29s")
+		t.Fatal("still within the 20ms cooldown")
 	}
-	fakeNow = fakeNow.Add(2 * time.Second) // now 31s > 30s window
-	if !h.Available(ep) {
-		t.Fatal("cooldown expired → available again")
+	deadline := time.Now().Add(2 * time.Second)
+	for !h.Available(ep) {
+		if time.Now().After(deadline) {
+			t.Fatal("cooldown never expired")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

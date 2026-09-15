@@ -14,8 +14,7 @@ import (
 // The bounds live on Server (tcpMaxConns/tcpIdleTimeout — see server.go) so
 // tests can lower them via startServerConfigured's hook before Run spawns
 // its goroutines (no cross-goroutine write to a package var); the defaults
-// are set in NewServer. The values may move into config later
-// (REMEDIATION-PLAN T-05 defers that).
+// are set in NewServer. The values may move into config later (deferred).
 
 // tcpLimitListener wraps a TCP/TLS net.Listener with the global connection
 // cap and the per-connection idle read deadline. The cap is enforced with a

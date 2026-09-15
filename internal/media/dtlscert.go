@@ -100,14 +100,6 @@ func identityFrom(cert tls.Certificate) (*DTLSIdentity, error) {
 	if len(cert.Certificate) == 0 {
 		return nil, fmt.Errorf("media: dtls identity has no certificate")
 	}
-	// RFC 8122 §5: the fingerprint is over the DER of the certificate,
-	// rendered as uppercase hex bytes joined by colons.
-	sum := sha256.Sum256(cert.Certificate[0])
-	hexed := hex.EncodeToString(sum[:])
-	parts := make([]string, 0, len(sum))
-	for i := 0; i < len(hexed); i += 2 {
-		parts = append(parts, strings.ToUpper(hexed[i:i+2]))
-	}
 	if cert.Leaf == nil {
 		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
 			cert.Leaf = leaf
@@ -116,6 +108,19 @@ func identityFrom(cert tls.Certificate) (*DTLSIdentity, error) {
 	return &DTLSIdentity{
 		Certificate:      cert,
 		FingerprintHash:  "sha-256",
-		FingerprintValue: strings.Join(parts, ":"),
+		FingerprintValue: fingerprintHex(cert.Certificate[0]),
 	}, nil
+}
+
+// fingerprintHex renders a certificate's SDP a=fingerprint value the way
+// RFC 8122 §5 requires: SHA-256 over the DER, uppercase hex bytes joined
+// by colons.
+func fingerprintHex(der []byte) string {
+	sum := sha256.Sum256(der)
+	hexed := hex.EncodeToString(sum[:])
+	parts := make([]string, 0, len(sum))
+	for i := 0; i < len(hexed); i += 2 {
+		parts = append(parts, strings.ToUpper(hexed[i:i+2]))
+	}
+	return strings.Join(parts, ":")
 }

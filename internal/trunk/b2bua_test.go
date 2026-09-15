@@ -1790,7 +1790,7 @@ routes:
 // short-circuit checks `abandoned` before touching aLeg/media state for the
 // select-randomness window where a just-arrived response could otherwise
 // still reach relay (a concurrent, unsynchronized WriteResponse against the
-// main flow's own — SECURITY-REVIEW-20260831 §S-02). The caller sees
+// main flow's own). The caller sees
 // exactly the synthesized 408 ring-timeout final, never a 183; and the
 // bridge must CANCEL the attempt once the late provisional proves the
 // carrier is alive. Timing-based over real UDP loopback: re-run once before
@@ -1919,103 +1919,43 @@ func TestBridgeRaced2xxAfterAbandonTearsDown(t *testing.T) {
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }
 
-// waiterPanicCfg is TestBridgeWaiterPanicContained's config: same shape as
-// raced2xxCfg, but the carrier answers immediately — the injected panic
-// kills the bridge's waiter goroutine, not the carrier's behavior.
-const waiterPanicCfg = `
-listen:
-  sip: [udp://127.0.0.1:45734]
-  media:
-    port_range: 46738-46741
-    public_ip: 127.0.0.1
-ring_timeout: 500ms
-peers:
-  local-uac:
-    address: 127.0.0.1:5070
-    allowed_ips: [127.0.0.1/32]
-  carrier:
-    address: 127.0.0.1:45735
-    allowed_ips: [203.0.113.0/24]
-routes:
-  - name: out
-    from: local-uac
-    to: [carrier]
-`
-
 // TestBridgeWaiterPanicContained (S-batch regression, S-01): a panic inside
-// the orphan B-leg waiter goroutine (injected via testHookBWaiterPanic) must
-// stay contained to that goroutine — the attempt fails with the ordinary
-// ring-timeout 408 and the server keeps serving: a second call on the same
-// server bridges normally. Pre-fix, the panic would unwind past the
-// goroutine into the Go runtime and kill the whole process, so this test
-// would die rather than fail. Timing-based over real UDP loopback: re-run
-// once before treating a flake as failure.
+// the orphan B-leg waiter goroutine must stay contained to that goroutine.
+// That goroutine outlives onInvite's own recoverCall umbrella, so an
+// unrecovered panic there kills the whole process, not one call.
+//
+// This exercises recoverBWaiter — the deferred recovery dialTarget's waiter
+// goroutine installs — directly, in a goroutine of its own, rather than
+// through a production-side injection hook: the hook existed only so a test
+// could make the real waiter panic, and the property under test is entirely
+// the recovery's, not the surrounding SIP flow's. What the earlier
+// hook-driven version additionally covered — that the abandoned attempt then
+// fails as an ordinary ring-timeout 408 and the server keeps serving — is
+// already covered without any panic by TestBridgeRingTimeoutFailsOver and
+// TestBridgeGraceWindowEdgeRaceClean.
 func TestBridgeWaiterPanicContained(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45735", testSDPBody(uacRTPStubPort(t)))
-	srv := startServer(t, 45734, waiterPanicCfg)
+	var logBuf bytes.Buffer
+	srv := &Server{log: slog.New(slog.NewTextHandler(&logBuf, nil))}
 
-	panicFn := func() { panic("injected waiter panic") }
-	testHookBWaiterPanic.Store(&panicFn)
-	t.Cleanup(func() { testHookBWaiterPanic.Store(nil) })
-
-	uacUA, err := sipgo.NewUA()
-	if err != nil {
-		t.Fatalf("uac ua: %v", err)
-	}
-	defer uacUA.Close()
-	uacClient, err := sipgo.NewClient(uacUA, sipgo.WithClientConnectionAddr("127.0.0.1:0"))
-	if err != nil {
-		t.Fatalf("uac client: %v", err)
-	}
-	defer uacClient.Close()
-	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
-
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45734}
-	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelInvite()
-
-	// Call 1: the waiter goroutine panics before WaitAnswer runs; the
-	// attempt must fail as an ordinary ring timeout — and the process must
-	// survive (this test keeps running).
-	sess1, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
-	if err != nil {
-		t.Fatalf("uac invite: %v", err)
-	}
-	defer sess1.Close()
-	if err := sess1.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err == nil {
-		t.Fatal("uac wait answer: expected the ring-timeout failure after the injected panic, got success")
-	}
-	if sess1.InviteResponse == nil || sess1.InviteResponse.StatusCode != 408 {
-		t.Fatalf("call 1 must get 408 Request Timeout, got %+v", sess1.InviteResponse)
-	}
-
-	testHookBWaiterPanic.Store(nil)
-
-	// Call 2: the same server must bridge normally — the panic stayed
-	// contained to call 1's waiter goroutine.
-	sess2, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
-	if err != nil {
-		t.Fatalf("uac invite (post-panic): %v", err)
-	}
-	defer sess2.Close()
-	if err := sess2.WaitAnswer(inviteCtx, sipgo.AnswerOptions{}); err != nil {
-		t.Fatalf("post-panic call must bridge normally, got: %v", err)
-	}
-	if sess2.InviteResponse.StatusCode != 200 {
-		t.Fatalf("post-panic call got %d, want 200", sess2.InviteResponse.StatusCode)
-	}
-	if err := sess2.Ack(context.Background()); err != nil {
-		t.Fatalf("uac ack: %v", err)
-	}
-	if err := sess2.Bye(context.Background()); err != nil {
-		t.Fatalf("uac bye: %v", err)
-	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer srv.recoverBWaiter("carrier")
+		panic("injected waiter panic")
+	}()
 	select {
-	case <-carrier.byeDone:
+	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("carrier dialog never ended after the post-panic call's BYE")
+		t.Fatal("waiter goroutine never returned after the panic")
 	}
-	waitForActiveCalls(t, srv, 0, 3*time.Second)
+	// Surviving to here is the assertion the process-kill regression needs:
+	// the panic did not unwind past the goroutine. The forensic trace must
+	// still be emitted.
+	if got := logBuf.String(); !strings.Contains(got, "b-leg waiter goroutine panic") ||
+		!strings.Contains(got, "injected waiter panic") ||
+		!strings.Contains(got, "carrier") {
+		t.Errorf("recovered panic must be logged with panic value, stack and target; got:\n%s", got)
+	}
 }
 
 // graceEdgeCfg is TestBridgeGraceWindowEdgeRaceClean's config: the carrier's
@@ -2818,7 +2758,7 @@ routes:
 // re-INVITE's own raw server transaction — never touching dialogSrv/aLeg —
 // answer it cleanly: the peer's ACK to that 200 is routed by onAck to
 // dialogSrv.ReadAck, which no-ops (a harmless, already-tolerated CSeq
-// mismatch — see the comment on b.s.sdps.set below) rather than mutating or
+// mismatch — see the comment where call.aSDP is filled) rather than mutating or
 // corrupting the established dialog's state, so the original call is
 // provably unharmed by the refresh: its real BYE still completes, the
 // carrier's dialog still ends, and the call registry/media pool still fully
@@ -2932,7 +2872,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	// assertion below for the wrong reason.)
 	entryDeadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, ok := srv.callSDP(realCallID); ok {
+		if _, ok := srv.lookupLeg(realCallID); ok {
 			break
 		}
 		if time.Now().After(entryDeadline) {
@@ -3102,8 +3042,8 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	// The per-call SDP store must also drain on teardown — otherwise a
 	// reused Call-ID (unlikely, but not impossible with a misbehaving UAC)
 	// could compare a later call's re-INVITE against a stale entry.
-	if _, ok := srv.callSDP(realCallID); ok {
-		t.Fatal("established SDP still on record after teardown; callSDPStore not cleared")
+	if _, ok := srv.lookupLeg(realCallID); ok {
+		t.Fatal("established SDP still on record after teardown; call store not cleared")
 	}
 }
 
@@ -3233,7 +3173,7 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 	// UAC side can observe).
 	entryDeadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, ok := srv.callSDP(realCallID); ok {
+		if _, ok := srv.lookupLeg(realCallID); ok {
 			break
 		}
 		if time.Now().After(entryDeadline) {
@@ -3315,8 +3255,8 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 		t.Fatal("carrier dialog never ended after BYE — the forged refresh perturbed the established call")
 	}
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
-	if _, ok := srv.callSDP(realCallID); ok {
-		t.Fatal("established SDP still on record after teardown; callSDPStore not cleared")
+	if _, ok := srv.lookupLeg(realCallID); ok {
+		t.Fatal("established SDP still on record after teardown; call store not cleared")
 	}
 }
 
@@ -5059,7 +4999,6 @@ func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
 	s := NewServer(config.NewStore(cfg), nil, discardLogger())
 	// expandTargets doesn't use the cfg's carrier peer here — we stub the
 	// resolver and pass our own multi-endpoint peer.
-	b := &bridge{s: s}
 
 	peerA := &config.Peer{Address: "multi.example", Transport: "udp"}
 	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
@@ -5069,7 +5008,7 @@ func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
 		}, nil
 	}
 	targets := []Target{{Name: "a", Peer: peerA}}
-	des := b.expandTargets(targets)
+	des := s.expandTargets(targets)
 	if len(des) != 2 {
 		t.Fatalf("want 2 dialEndpoints, got %d: %+v", len(des), des)
 	}
@@ -5092,7 +5031,6 @@ func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	s := NewServer(config.NewStore(cfg), nil, discardLogger())
-	b := &bridge{s: s}
 
 	s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
 		return "", []*net.SRV{
@@ -5104,14 +5042,14 @@ func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
 
 	// Cool down ep1: expandTargets returns only ep2.
 	s.health.Penalize(Endpoint{Host: "ep1.example", Port: 5060, Transport: "udp"}, time.Hour)
-	des := b.expandTargets(targets)
+	des := s.expandTargets(targets)
 	if len(des) != 1 || des[0].Endpoint.Host != "ep2.example" {
 		t.Fatalf("with ep1 cooled, want [ep2.example], got %+v", des)
 	}
 
 	// Cool down ep2 as well: everything is cooled → dial them ALL anyway.
 	s.health.Penalize(Endpoint{Host: "ep2.example", Port: 5061, Transport: "udp"}, time.Hour)
-	des = b.expandTargets(targets)
+	des = s.expandTargets(targets)
 	if len(des) != 2 {
 		t.Fatalf("all cooled → dial-anyway must return both, got %+v", des)
 	}
@@ -5627,10 +5565,7 @@ func TestBridgeSRTPInterworksSecureAToPlaintextB(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	aKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen a-leg key: %v", err)
-	}
+	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
 	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45510}
@@ -5654,7 +5589,7 @@ func TestBridgeSRTPInterworksSecureAToPlaintextB(t *testing.T) {
 	if !secure || len(lines) == 0 {
 		t.Fatalf("a-leg answer is not RTP/SAVP+a=crypto:\n%s", answerBody)
 	}
-	sel, ok := selectCrypto(lines)
+	sel, ok := firstCryptoLine(lines)
 	if !ok {
 		t.Fatalf("a-leg answer crypto line unusable:\n%s", answerBody)
 	}
@@ -5769,10 +5704,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	bAnswerKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen b-leg answer key: %v", err)
-	}
+	bAnswerKey := media.NewSDESKey()
 	carrier := startStubCarrier(t, "127.0.0.1:45517", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bAnswerKey))
 	startServer(t, 45515, srtpBothSecureCfg)
 
@@ -5788,10 +5720,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	aKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen a-leg key: %v", err)
-	}
+	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
 	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45515}
@@ -5815,7 +5744,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	if !aSecure || len(aAnswerLines) == 0 {
 		t.Fatalf("a-leg answer is not RTP/SAVP+a=crypto:\n%s", answerBody)
 	}
-	aAnswerSel, ok := selectCrypto(aAnswerLines)
+	aAnswerSel, ok := firstCryptoLine(aAnswerLines)
 	if !ok {
 		t.Fatalf("a-leg answer crypto line unusable:\n%s", answerBody)
 	}
@@ -5835,7 +5764,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	if !bSecure || len(bOfferLines) == 0 {
 		t.Fatalf("b-leg offer is not RTP/SAVP+a=crypto (carrier peer is srtp: required):\n%s", carrierOffer.Body())
 	}
-	bOfferSel, ok := selectCrypto(bOfferLines)
+	bOfferSel, ok := firstCryptoLine(bOfferLines)
 	if !ok {
 		t.Fatalf("b-leg offer crypto line unusable:\n%s", carrierOffer.Body())
 	}
@@ -6091,14 +6020,14 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 		t.Fatalf("answer is secure (RTP/SAVP or has a=crypto), want plain RTP/AVP for two srtp:disabled peers:\n%s", answerBody)
 	}
 
-	// Byte-for-byte identical to the pre-M5 rewriteSDP path.
+	// Byte-for-byte identical to the plaintext rewrite path.
 	sideAPort := sdpAudioPort(t, answerBody)
-	wantAnswer, err := rewriteSDP(carrierAnswer, netip.MustParseAddr("127.0.0.1"), sideAPort)
+	wantAnswer, err := rewriteSDPCrypto(carrierAnswer, netip.MustParseAddr("127.0.0.1"), sideAPort, nil)
 	if err != nil {
-		t.Fatalf("rewriteSDP reference (answer): %v", err)
+		t.Fatalf("rewriteSDPCrypto reference (answer): %v", err)
 	}
 	if string(answerBody) != string(wantAnswer) {
-		t.Errorf("answer body diverges from plain rewriteSDP output:\ngot:\n%s\nwant:\n%s", answerBody, wantAnswer)
+		t.Errorf("answer body diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", answerBody, wantAnswer)
 	}
 
 	if err := sess.Ack(context.Background()); err != nil {
@@ -6112,12 +6041,12 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 		t.Fatal("carrier never received the B-leg INVITE")
 	}
 	sideBPort := sdpAudioPort(t, carrierOffer.Body())
-	wantOffer, err := rewriteSDP(offer, netip.MustParseAddr("127.0.0.1"), sideBPort)
+	wantOffer, err := rewriteSDPCrypto(offer, netip.MustParseAddr("127.0.0.1"), sideBPort, nil)
 	if err != nil {
-		t.Fatalf("rewriteSDP reference (offer): %v", err)
+		t.Fatalf("rewriteSDPCrypto reference (offer): %v", err)
 	}
 	if string(carrierOffer.Body()) != string(wantOffer) {
-		t.Errorf("b-leg offer diverges from plain rewriteSDP output:\ngot:\n%s\nwant:\n%s", carrierOffer.Body(), wantOffer)
+		t.Errorf("b-leg offer diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", carrierOffer.Body(), wantOffer)
 	}
 
 	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
@@ -6202,10 +6131,7 @@ func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	bKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen carrier key: %v", err)
-	}
+	bKey := media.NewSDESKey()
 	carrier := startStubCarrier(t, "127.0.0.1:45542", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bKey))
 	startServer(t, 45540, srtpInterworkReversedCfg)
 
@@ -6377,10 +6303,7 @@ func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	aKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen a-leg key: %v", err)
-	}
+	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
 	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45550}
@@ -6454,7 +6377,7 @@ func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
 	if !aAnswerSecure || len(aAnswerLines) == 0 {
 		t.Fatalf("a-leg answer unexpectedly lost its crypto line:\n%s", answerBody)
 	}
-	aAnswerSel, ok := selectCrypto(aAnswerLines)
+	aAnswerSel, ok := firstCryptoLine(aAnswerLines)
 	if !ok {
 		t.Fatalf("a-leg answer crypto line unusable:\n%s", answerBody)
 	}
@@ -6521,7 +6444,7 @@ routes:
 // TestBridgeSRTPAnswerEchoesOfferedTag is Finding 2's regression guard:
 // RFC 4568 §5.1.3 requires the SBC, as answerer, to echo the a=crypto TAG of
 // whichever offered line it actually selected — not always tag 1. This
-// offer lists an UNSUPPORTED suite at tag 1 (so selectCrypto/parseCryptoAttrs
+// offer lists an UNSUPPORTED suite at tag 1 (so parseCryptoAttrs
 // must skip it) and a SUPPORTED AES_CM_128_HMAC_SHA1_80 at tag 2. A version
 // that hardcodes cryptoAttrValue(1, ...) would answer "a=crypto:1 ..." even
 // though it selected the OFFER's tag-2 line — a strict caller would then map
@@ -6542,10 +6465,7 @@ func TestBridgeSRTPAnswerEchoesOfferedTag(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	tag2Key, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen tag-2 key: %v", err)
-	}
+	tag2Key := media.NewSDESKey()
 	// tag 1's key value is irrelevant — AES_256_GCM isn't a suite we
 	// support, so parseCryptoAttrs must drop the line before a key is ever
 	// looked at.
@@ -6660,10 +6580,7 @@ routes:
 // warning shape the A-leg already uses, naming the B-leg's own transport and
 // peer.
 func TestBridgeSRTPBLegNonTLSWarn(t *testing.T) {
-	bKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen carrier key: %v", err)
-	}
+	bKey := media.NewSDESKey()
 	carrier := startStubCarrier(t, "127.0.0.1:45572", testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM80, bKey))
 
 	var logBuf syncLogBuf
@@ -6761,14 +6678,8 @@ routes:
 // only a plaintext-AVP answer bridges; a SAVP-but-unusable answer fails the
 // attempt over instead, exactly like "required" would.
 func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
-	aKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen a-leg key: %v", err)
-	}
-	wrongSuiteKey, err := newCryptoKeyValue()
-	if err != nil {
-		t.Fatalf("gen carrier key: %v", err)
-	}
+	aKey := media.NewSDESKey()
+	wrongSuiteKey := media.NewSDESKey()
 	carrier := startStubCarrier(t, "127.0.0.1:45582",
 		testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM32, wrongSuiteKey))
 	startServer(t, 45580, srtpOptionalBAnswersUnusableSAVPCfg)

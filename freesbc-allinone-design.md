@@ -82,34 +82,25 @@ The minimum required to interoperate with real carriers and PBXs; all of it is i
 ## 4. Module Layout
 
 ```
-FreeSBC/
-├── main.go                  # Entry point: flag parsing, startup orchestration
-├── config/
-│   ├── schema.go            # YAML structs + validation rules
-│   └── reload.go            # fsnotify watch, atomic hot reload
-├── sig/                     # Signaling plane
-│   ├── server.go            # sipgo assembly (UDP/TCP/TLS), inbound OPTIONS replies
-│   ├── b2bua.go             # Leg pairing, state machine, re-INVITE/BYE forwarding, PRACK pass-through, session timers
-│   ├── routing.go           # Route match → gateway selection → failover (incl. DNS SRV resolution)
-│   ├── auth.go              # Digest authentication client (401/407, shared by INVITE and REGISTER)
-│   ├── register.go          # Outbound trunk registration state machine (periodic refresh, failure backoff)
-│   ├── sdp.go               # SDP parsing and rewriting
-│   └── normalize.go         # Number transformation (regex replacement)
-├── media/
-│   ├── portpool.go          # RTP port pool allocation and release
-│   ├── relay.go             # UDP forwarding engine (one goroutine pair per call)
-│   └── srtp.go              # SRTP↔RTP (pion/srtp)
-├── shield/
-│   ├── ratelimit.go         # Per-IP token bucket
-│   ├── scanner.go           # Scanner UA fingerprint database
-│   ├── banlist.go           # In-memory ban table + optional nftables integration
-│   └── acl.go               # IP allowlist/blocklist
-├── admin/
-│   ├── api.go               # REST API (net/http, no framework)
-│   ├── webui/               # Frontend static files (go:embed)
-│   └── metrics.go           # Prometheus /metrics
-└── callstate/               # In-memory call state table (API query / call teardown)
+cmd/freesbc/          # Entry point: argv parsing, signal handling, exit codes
+internal/
+  app/                # Construction and lifecycle: builds every component, runs it, shuts it down
+  config/             # YAML schema, validation, fsnotify hot reload, snapshot store
+  sip/                # SIP protocol primitives shared by both planes (imports nothing internal)
+  sip/sdp/            # SDP parse, codec negotiation, construction
+  trunk/              # Trunk plane B2BUA: leg pairing, routing/failover, registration, session timers
+  edge/               # Edge plane proxy: dialogs, registrations, bindings, upstream routing, PSTN
+  media/              # RTP port pools, UDP relay, SRTP, WebRTC leg (ICE/DTLS)
+  shield/             # Per-IP rate limiting, scanner fingerprinting, ban table
+  admin/              # REST API, Prometheus /metrics, embedded WebUI
 ```
+
+Dependencies run one way. `sip`, `sip/sdp`, `config` and `media` import
+nothing else internal; `trunk` and `edge` sit on top of them and never on
+each other; `admin` sees only `config` plus its own DTOs; `app` is the only
+package that knows about all of them, and only `cmd/freesbc` imports `app`.
+Active-call metadata lives in the plane that owns the calls, not in a
+separate table.
 
 ### Inter-Module Interfaces
 

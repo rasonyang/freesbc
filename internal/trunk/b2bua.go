@@ -16,20 +16,21 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 
-	"github.com/freesbc/freesbc/internal/call"
+	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
-// legSRTP is the negotiated SRTP state for one leg. secure=false means the
-// leg is plaintext and inbound/outbound are nil. When secure, inbound
-// decrypts what we receive from the peer (built from the peer's advertised
-// key) and outbound encrypts what we send to the peer (built from
+// legSRTP is the negotiated SRTP state for one leg. A nil *legSRTP is the
+// one and only representation of "this leg is plaintext" — both legs use it,
+// and there is no second, redundant secure bool to keep in step with it.
+// inbound decrypts what we receive from the peer (built from the peer's
+// advertised key) and outbound encrypts what we send to the peer (built from
 // ourKeyValue, which we advertise to the peer in SDP). suite is the
 // negotiated suite. Keys are never copied between legs: each leg's inbound
 // context is built from THAT peer's own advertised key, and each leg's
 // outbound context is built from a key WE generated fresh for that leg.
 type legSRTP struct {
-	secure      bool
 	suite       media.CryptoSuite
 	inbound     *media.SRTPContext // nil until the peer's key is known
 	outbound    *media.SRTPContext
@@ -37,15 +38,15 @@ type legSRTP struct {
 
 	// tag is the a=crypto tag WE advertise this leg's key under. For the
 	// A-leg (the SBC as answerer), it must echo the tag of the offered line
-	// selectCrypto picked — RFC 4568 §5.1.3 — so it's copied from sel.tag in
+	// onInvite picked — RFC 4568 §5.1.3 — so it's copied from sel.tag in
 	// onInvite, not left at zero. For the B-leg (the SBC as offerer), the
 	// SBC always offers exactly one line, so its offer always uses tag 1
 	// directly rather than via this field.
 	tag int
 
 	// required is true only when this leg's peer policy is "srtp: required"
-	// (never for "optional", even when the leg ended up secure=true because
-	// the other leg happened to be secure). processAnswerSDP consults it to
+	// (never for "optional", even when the leg ended up secure because the
+	// other leg happened to be secure). processAnswerSDP consults it to
 	// decide how to treat an answer with no usable/matching crypto: required
 	// fails the attempt (→ failover); optional bridges as plaintext instead
 	// (RFC 3264-style graceful downgrade — "SRTP if the peer accepts, else
@@ -56,6 +57,16 @@ type legSRTP struct {
 	required bool
 }
 
+// srtpContexts returns the SRTP context pair to install on a side, reading
+// nil (plaintext) as the nil/nil pair — so every SetSRTP call site can pass
+// a leg's state straight through without its own nil check.
+func (l *legSRTP) srtpContexts() (inbound, outbound *media.SRTPContext) {
+	if l == nil {
+		return nil, nil
+	}
+	return l.inbound, l.outbound
+}
+
 // errSRTPRequiredMismatch marks a processAnswerSDP failure caused
 // specifically by a B-leg policy of required SRTP whose answer turned out
 // not to be secure. Unlike a malformed/unparseable answer (a genuine carrier
@@ -64,26 +75,6 @@ type legSRTP struct {
 // doesn't meet our policy, so placeCall should fail over to the next target
 // instead of giving up on the whole call.
 var errSRTPRequiredMismatch = errors.New("srtp required by policy but answer has no usable a=crypto")
-
-// testHookBWaiterPanic, set only by tests, is invoked at the top of the
-// orphan B-leg waiter goroutine in dialTarget so the S-01 recover path can
-// be exercised deterministically: a real panic there (see the S-01 defer in
-// that goroutine) would otherwise have to be provoked with a production
-// condition, and the regression test only needs to prove the panic stays
-// contained to that goroutine rather than killing the process. It is an
-// atomic pointer because the test clears it while waiter goroutines of an
-// earlier attempt may still read it — the test goroutine and the bridge's
-// waiter goroutines share no synchronization except network I/O, so a plain
-// package var would be a real data race under -race.
-var testHookBWaiterPanic atomic.Pointer[func()]
-
-// bridge is the B2BUA: it pairs an inbound A-leg with an outbound B-leg,
-// anchoring media and hiding topology. One bridge instance is shared; each
-// call runs in its own onInvite goroutine (sipgo dispatches OnInvite in a
-// fresh goroutine per request).
-type bridge struct {
-	s *Server
-}
 
 // callQuota counts in-flight initial INVITEs per peer and globally (T-06,
 // F-06/D6-8): a single peer source (forgable, given source-IP-only
@@ -133,12 +124,12 @@ func (q *callQuota) acquire(peer string, peerMax, globalMax int) (release func()
 // applying each target's outbound digest auth as it goes — Task 8),
 // anchor media, answer the A-leg, and hold the call open until either leg
 // ends the dialog or media goes silent.
-func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
-	defer b.recoverCall(req)
+func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
+	defer s.recoverCall(req)
 
-	name, fromPeer, ok := b.s.identify(req)
+	name, fromPeer, ok := s.identify(req)
 	if !ok {
-		b.s.dropUnidentified(req)
+		s.dropUnidentified(req)
 		return
 	}
 
@@ -147,7 +138,7 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// response at all — refuse it explicitly with 400 (RFC 3261 §8.1.1
 	// mandates all three on an INVITE).
 	if req.From() == nil || req.To() == nil || req.CallID() == nil {
-		b.reject(req, tx, 400, "Bad Request")
+		s.reject(req, tx, 400, "Bad Request")
 		return
 	}
 
@@ -176,11 +167,12 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// renegotiation support is deferred beyond M4.3.
 	//
 	// req.CallID() is looked up directly — not assumed to be the A-leg's —
-	// because b.s.sdps now holds an entry per LEG (see callSDPStore): a
-	// refresh from the CALLER carries the A-leg's Call-ID and is answered
-	// with aAnswer, while a refresh from the CARRIER carries the B-leg's
-	// own, distinct Call-ID and is answered with bOffer. Same code path,
-	// correct answer either way (Fix 2).
+	// because the call store indexes BOTH legs by their own Call-ID (see
+	// Server.lookupLeg): a refresh from the CALLER carries the A-leg's
+	// Call-ID and is answered with the A-leg's established answer, while a
+	// refresh from the CARRIER carries the B-leg's own, distinct Call-ID
+	// and is answered with the B-leg's. Same code path, correct answer
+	// either way (Fix 2).
 	//
 	// T-07 (F-08): the Call-ID naming a live leg is not enough — the
 	// request must also prove it IS on that leg's dialog before any
@@ -199,9 +191,9 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// reliable link; a retransmit loop is deferred (a hand-rolled one outside
 	// the dialog layer is the "fragile hack" the M4.3 spike avoided).
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
-		entry, known := b.s.callSDP(callID(req))
-		if known && (fromTagOf(req) != entry.fromTag || tag != entry.toTag) {
-			b.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		entry, known := s.lookupLeg(fsip.CallID(req))
+		if known && (fsip.FromTag(req) != entry.fromTag || tag != entry.toTag) {
+			s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 			return
 		}
 		if known && isRefreshReInvite(req, entry.compare) {
@@ -211,25 +203,25 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			// the same per-transport Contact the leg's original 200 used,
 			// from the current config and the re-INVITE's own transport
 			// (req.Transport(): whichever leg sent this refresh).
-			cfg := b.s.store.Current()
+			cfg := s.store.Current()
 			transport := sip.NetworkToLower(req.Transport())
-			contact := b.buildContact(b.s.sigIP(cfg), b.s.ourSigPort(cfg, transport), transport)
+			contact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, transport), transport)
 
 			res := sip.NewResponseFromRequest(req, 200, "OK", entry.answer)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 			res.AppendHeader(contact)
 			res.AppendHeader(sessionExpiresHeader(headerSeconds(req, "Session-Expires"), refresherOf(req)))
 			if err := tx.Respond(res); err != nil {
-				b.s.log.Error("respond session-timer refresh", "err", err, "call_id", callID(req))
-				b.reject(req, tx, 501, "Not Implemented")
+				s.log.Error("respond session-timer refresh", "err", err, "call_id", fsip.CallID(req))
+				s.reject(req, tx, 501, "Not Implemented")
 			}
 			return
 		}
-		b.reject(req, tx, 501, "Not Implemented")
+		s.reject(req, tx, 501, "Not Implemented")
 		return
 	}
 
-	cfg := b.s.store.Current()
+	cfg := s.store.Current()
 
 	// T-06 (F-06/D6-8) call-quota gate for initial INVITEs (the in-dialog
 	// re-INVITE branch above already returned — a refresh never consumes a
@@ -238,9 +230,9 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// §21.5.4) before routing, dialing, or a media port are spent on it.
 	// The slot is released by defer no matter how this onInvite ends, so
 	// failed calls can't leak quota.
-	release, admitted := b.s.quota.acquire(name, fromPeer.MaxConcurrentCalls, cfg.MaxConcurrentCalls)
+	release, admitted := s.quota.acquire(name, fromPeer.MaxConcurrentCalls, cfg.MaxConcurrentCalls)
 	if !admitted {
-		b.reject(req, tx, 503, "Call Quota Exceeded", sip.NewHeader("Retry-After", "30"))
+		s.reject(req, tx, 503, "Call Quota Exceeded", sip.NewHeader("Retry-After", "30"))
 		return
 	}
 	defer release()
@@ -258,7 +250,7 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
 		res.AppendHeader(sip.NewHeader("Unsupported", "100rel"))
 		_ = tx.Respond(res)
-		b.s.log.Info("declined Require: 100rel", "source", req.Source())
+		s.log.Info("declined Require: 100rel", "source", req.Source())
 		return
 	}
 	if se := headerSeconds(req, "Session-Expires"); se > 0 {
@@ -271,26 +263,26 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			res := sip.NewResponseFromRequest(req, 422, "Session Interval Too Small", nil)
 			res.AppendHeader(sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds()))))
 			_ = tx.Respond(res)
-			b.s.log.Info("rejected low Session-Expires", "requested", se, "min_se", minSE)
+			s.log.Info("rejected low Session-Expires", "requested", se, "min_se", minSE)
 			return
 		}
 	}
 
 	decision, ok := Resolve(cfg, name, req.Recipient.User)
 	if !ok || decision.OutNumber == "" || len(decision.Targets) == 0 {
-		b.reject(req, tx, 404, "Not Found")
+		s.reject(req, tx, 404, "Not Found")
 		return
 	}
 
-	aLeg, err := b.s.dialogSrv.ReadInvite(req, tx)
+	aLeg, err := s.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
 		// ReadInvite's failures are all request-shape problems (most
 		// commonly sipgo.ErrDialogInviteNoContact: no Contact header —
 		// see DialogUA.ReadInvite's own minimal validation) — the far
 		// end's fault, not an SBC-side failure, so 400 Bad Request
 		// rather than a 5xx that would misattribute the problem to us.
-		b.s.log.Info("malformed invite", "err", err, "source", req.Source())
-		b.reject(req, tx, 400, "Bad Request")
+		s.log.Info("malformed invite", "err", err, "source", req.Source())
+		s.reject(req, tx, 400, "Bad Request")
 		return
 	}
 	defer aLeg.Close()
@@ -311,43 +303,55 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// whatever the caller offered; "disabled" (including any unrecognized
 	// value) is always plaintext, byte-identical to pre-M5 behavior.
 	aSecureOffer, aLines := offeredCrypto(req.Body())
-	var aSRTP legSRTP
+	secureA := false
 	switch fromPeer.SRTP {
 	case "required":
 		if !aSecureOffer || len(aLines) == 0 {
 			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 			return
 		}
-		aSRTP.secure = true
+		secureA = true
 	case "optional":
-		aSRTP.secure = aSecureOffer && len(aLines) > 0
+		secureA = aSecureOffer && len(aLines) > 0
 	default: // "disabled" (config's normalized default) or anything unrecognized
-		aSRTP.secure = false
+		secureA = false
 	}
-	if aSRTP.secure {
-		sel, ok := selectCrypto(aLines)
-		ourKey, keyErr := newCryptoKeyValue()
+	// aSRTP stays nil for a plaintext A-leg — the single representation of
+	// "this leg is not secure" everywhere below (see legSRTP).
+	var aSRTP *legSRTP
+	if secureA {
+		// parseCryptoAttrs already dropped every unsupported suite, so the
+		// first surviving line is the offerer's most-preferred one we can
+		// use (RFC 4568 §5.1.2).
+		var sel cryptoLine
+		ok := len(aLines) > 0
+		if ok {
+			sel = aLines[0]
+		}
+		ourKey := media.NewSDESKey()
 		var inbound, outbound *media.SRTPContext
 		var ctxErr error
-		if ok && keyErr == nil {
+		if ok {
 			inbound, ctxErr = media.NewSRTPContext(sel.suite, sel.keyValue)
 		}
-		if ok && keyErr == nil && ctxErr == nil {
+		if ok && ctxErr == nil {
 			outbound, ctxErr = media.NewSRTPContext(sel.suite, ourKey)
 		}
-		if !ok || keyErr != nil || ctxErr != nil {
-			// Unusable crypto (no supported suite selected, key generation
-			// failed, or a malformed key rejected by NewSRTPContext) under a
-			// policy that requires SRTP: treat exactly like "not secure" —
-			// 488, never a silent plaintext fallback.
+		if !ok || ctxErr != nil {
+			// Unusable crypto (no supported suite selected, or a malformed
+			// key rejected by NewSRTPContext) under a policy that requires
+			// SRTP: treat exactly like "not secure" — 488, never a silent
+			// plaintext fallback.
 			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 			return
 		}
-		aSRTP.suite = sel.suite
-		aSRTP.ourKeyValue = ourKey
-		aSRTP.inbound = inbound
-		aSRTP.outbound = outbound
-		aSRTP.tag = sel.tag
+		aSRTP = &legSRTP{
+			suite:       sel.suite,
+			inbound:     inbound,
+			outbound:    outbound,
+			ourKeyValue: ourKey,
+			tag:         sel.tag,
+		}
 
 		// Non-TLS warn: SDES carries the master key in the clear inside the
 		// SDP body, so negotiating it over a non-TLS signaling transport
@@ -355,7 +359,7 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		// (the operator's policy said secure media is wanted; downgrading
 		// behind their back would be worse), but log once per secure leg.
 		if aTransport := sip.NetworkToLower(req.Transport()); aTransport != "tls" {
-			b.s.log.Warn("SDES key negotiated over non-TLS signaling transport",
+			s.log.Warn("SDES key negotiated over non-TLS signaling transport",
 				"transport", aTransport, "peer", name)
 		}
 	}
@@ -366,7 +370,7 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// each target's own media_latch before dialing it, so the mode actually
 	// in effect always matches whichever target ends up winning failover —
 	// see placeCall/dialTarget for the loop.
-	sess, err := b.s.pool.Allocate(media.SessionConfig{
+	sess, err := s.pool.Allocate(media.SessionConfig{
 		Latch: [2]media.LatchMode{
 			media.ParseLatchMode(fromPeer.MediaLatch),
 			media.ParseLatchMode(decision.Targets[0].Peer.MediaLatch),
@@ -383,48 +387,41 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// and Start is only ever reached later, once the B-leg answers (see
 	// processAnswerSDP), so doing this right after Allocate is always early
 	// enough.
-	sess.SetSRTP(media.SideA, aSRTP.inbound, aSRTP.outbound)
+	aIn, aOut := aSRTP.srtpContexts()
+	sess.SetSRTP(media.SideA, aIn, aOut)
 
-	mediaIP := b.s.mediaIP(cfg)
+	mediaIP := s.mediaIP(cfg)
 
-	bLeg, target, aAnswer, bOffer, ok := b.placeCall(aLeg, decision.Targets, decision.OutNumber, req.Body(), mediaIP, sess, aSRTP)
+	// c is this call's one state record from here on (see calls.go): the
+	// bridge's own locals stop being the source of truth the moment
+	// placeCall succeeds.
+	c := &call{
+		id:       fsip.CallID(req),
+		fromPeer: name,
+		aLeg:     aLeg,
+		sess:     sess,
+		aSRTP:    aSRTP,
+		state:    callDialing,
+	}
+
+	bLeg, target, aAnswer, bOffer, ok := s.placeCall(c, decision.Targets, decision.OutNumber, req.Body(), mediaIP)
 	if !ok {
 		return // placeCall already sent the A-leg's final response.
 	}
 	defer bLeg.Close()
 
-	call := call.Record{
-		ID:            callID(req),
-		FromPeer:      name,
-		ToPeer:        target.Name,
-		StartUnixNano: startNano(),
-	}
+	c.bLeg = bLeg
+	c.bID = fsip.CallID(bLeg.InviteRequest)
+	c.target = target
+	c.toPeer = target.Name
+	c.start = time.Now()
 
-	// killCtx is this call's admin kick-call hook (Task 1): registered
-	// BEFORE the call joins the registry (KillCall looks calls up by the
-	// same A-leg Call-ID /api/calls lists), so there is never a window
-	// where a call is listed by /api/calls but KillCall would return false
-	// for it. An orphan killer entry for a not-yet-listed call is harmless.
-	// Torn down via defer no matter how this call ends — LIFO order runs
-	// killCancel first and unregisterKiller second, but the order between
-	// those two doesn't matter (killCancel firing on an already-unregistered
-	// id, or unregistering before cancelling, are both safe) — so a kick
-	// that races a natural end always finds either a live entry (fires
-	// once) or none at all (KillCall returns false), never a stale one.
-	killCtx, killCancel := context.WithCancel(context.Background())
-	b.s.registerKiller(call.ID, killCancel)
-	defer b.s.unregisterKiller(call.ID)
-	defer killCancel()
-
-	b.s.registry.Add(call)
-	defer b.s.registry.Remove(call.ID)
-
-	// Remember BOTH legs' established SDP pairs (Task 6 fix wave), keyed by
-	// each leg's OWN Call-ID, so a later session-timer refresh re-INVITE on
+	// Both legs' established SDP pairs, each keyed (in registerCall) by that
+	// leg's OWN Call-ID, so a later session-timer refresh re-INVITE on
 	// EITHER leg is recognized (isRefreshReInvite, compared against
-	// .compare) and answered with the SBC's own established answer for
-	// THAT leg (.answer) — never the peer's offer, and never the other
-	// leg's SDP. See callSDP's doc and the in-dialog branch above.
+	// .compare) and answered with the SBC's own established answer for THAT
+	// leg (.answer) — never the peer's offer, and never the other leg's SDP.
+	// See legSDP's doc and the in-dialog branch above.
 	//
 	// A-leg: the caller offered req.Body(); we answered aAnswer.
 	// B-leg: we offered bOffer; the carrier answered bLeg.InviteResponse.Body().
@@ -444,40 +441,49 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// read both kinds of message and return "" on a missing header, which
 	// simply never matches a stored tag (stored tags are never empty on an
 	// established leg).
-	bCallID := callID(bLeg.InviteRequest)
-	b.s.sdps.set(call.ID, callSDP{
+	c.aSDP = legSDP{
 		compare: req.Body(),
 		answer:  aAnswer,
-		fromTag: fromTagOf(req),
-		toTag:   toTagOf(aLeg.InviteRequest),
-	})
-	b.s.sdps.set(bCallID, callSDP{
+		fromTag: fsip.FromTag(req),
+		toTag:   fsip.ToTag(aLeg.InviteRequest),
+	}
+	c.bSDP = legSDP{
 		compare: bLeg.InviteResponse.Body(),
 		answer:  bOffer,
-		fromTag: toTagOf(bLeg.InviteResponse),
-		toTag:   fromTagOf(bLeg.InviteRequest),
-	})
-	defer b.s.sdps.delete(call.ID)
-	defer b.s.sdps.delete(bCallID)
+		fromTag: fsip.ToTag(bLeg.InviteResponse),
+		toTag:   fsip.FromTag(bLeg.InviteRequest),
+	}
+
+	// One registration, one teardown (calls.go): registerCall publishes the
+	// call — admin listing, KillCall and both legs' in-dialog lookups all at
+	// once, under one lock — and the deferred endCall reverses exactly that,
+	// however the call ends. killCtx is the kick hook registerCall publishes;
+	// the explicit defer keeps the context released even on the paths endCall
+	// has already cancelled (cancelling twice is a no-op).
+	killCtx, killCancel := context.WithCancel(context.Background())
+	defer killCancel()
+	c.cancel = killCancel
+	s.registerCall(c)
+	defer s.endCall(c)
 
 	// Hold the call open until either leg ends the dialog or media goes
 	// silent, tearing down whatever is left.
 	select {
-	case <-aLeg.Context().Done():
+	case <-c.aLeg.Context().Done():
 		byeCtx, cancel := byeContext()
-		_ = bLeg.Bye(byeCtx)
+		_ = c.bLeg.Bye(byeCtx)
 		cancel()
-	case <-bLeg.Context().Done():
+	case <-c.bLeg.Context().Done():
 		byeCtx, cancel := byeContext()
-		_ = aLeg.Bye(byeCtx)
+		_ = c.aLeg.Bye(byeCtx)
 		cancel()
-	case <-sess.Done():
-		b.byeBoth(aLeg, bLeg)
+	case <-c.sess.Done():
+		s.byeBoth(c)
 	case <-killCtx.Done():
 		// Admin kick-call (Task 1): neither leg initiated, so BYE both —
 		// same teardown as a media-silence timeout (byeBoth), never a
 		// separate path.
-		b.byeBoth(aLeg, bLeg)
+		s.byeBoth(c)
 	}
 }
 
@@ -486,12 +492,12 @@ func (b *bridge) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 // leg's budget). Shared by both onInvite's natural media-silence teardown
 // (sess.Done) and the admin kick-call teardown (killCtx.Done) — the same
 // path, not a new one.
-func (b *bridge) byeBoth(aLeg *sipgo.DialogServerSession, bLeg *sipgo.DialogClientSession) {
+func (s *Server) byeBoth(c *call) {
 	aByeCtx, aCancel := byeContext()
-	_ = aLeg.Bye(aByeCtx)
+	_ = c.aLeg.Bye(aByeCtx)
 	aCancel()
 	bByeCtx, bCancel := byeContext()
-	_ = bLeg.Bye(bByeCtx)
+	_ = c.bLeg.Bye(bByeCtx)
 	bCancel()
 }
 
@@ -505,35 +511,31 @@ func byeContext() (context.Context, context.CancelFunc) {
 
 // failKind classifies a non-2xx dialTarget outcome so placeCall can decide
 // what code the caller ultimately sees. Only failReal carries a genuine
-// carrier status; failDial and failUnusable are our own synthesized codes
-// and must never be allowed to clobber an earlier failReal in placeCall's
-// final pick (see attemptResult and placeCall's precedence loop below).
-//
-// failRing (ring-timeout, our own 408) is Task 4's addition — it slots in
-// here as another synthetic kind alongside failDial/failUnusable, with no
-// changes needed to placeCall's failReal-precedence logic itself.
+// carrier status (realCode/realReason); failDial and failRing are our own
+// synthesized outcomes, which placeCall itself turns into a 503 or a 408 and
+// which must never clobber an earlier failReal in its final pick (see
+// attemptResult and placeCall's precedence loop below).
 type failKind int
 
 const (
-	failDial     failKind = iota // couldn't reach the target / no usable final response → 503
-	failReal                     // a genuine SIP final failure from the target → its own code
-	failUnusable                 // 2xx received but unusable on our side (bad/missing SDP, ACK failure, ...) → 502
-	failRing                     // this attempt's ring timer expired before the target answered → 408
+	failDial failKind = iota // no usable final response from the target → the caller's 503 fallback
+	failReal                 // a genuine SIP final failure from the target → its own code
+	failRing                 // this attempt's ring timer expired before the target answered → 408
 )
 
 // attemptResult is dialTarget's outcome for one target. ok is the only
 // field that matters on success (a live bridge) — along with aAnswer, the
 // SBC's own established A-side answer SDP for this call (Task 6 fix wave:
 // placeCall/onInvite need it verbatim to answer a later A-leg session-timer
-// refresh with, rather than the caller's own offer — see callSDP). On
+// refresh with, rather than the caller's own offer — see legSDP). On
 // failure, retryable tells placeCall whether there is anything left to do:
 // true means the B-leg never got past the answer (nothing committed, safe
 // to try the next candidate); false means dialTarget already finished the
 // call itself (bridged and responded, or answered-then-failed and already
 // responded/torn down) — placeCall must stop, not send anything further.
-// kind/code/reason are only meaningful when retryable is true; placeCall
-// uses them solely to remember the last failReal code, for the case where
-// every target is exhausted.
+// kind is only meaningful when retryable is true, and realCode/realReason
+// only when kind is failReal; placeCall uses them solely to remember the
+// last genuine carrier code, for the case where every target is exhausted.
 //
 // penalize marks a result as a genuine connect failure (no response from a
 // reachable endpoint / caller still present) that should cool the endpoint
@@ -548,14 +550,14 @@ const (
 // built fresh per attempt in dialTarget; placeCall reads it off the winning
 // attemptResult instead of building it once itself.
 type attemptResult struct {
-	ok        bool
-	aAnswer   []byte
-	bOffer    []byte
-	retryable bool
-	kind      failKind
-	code      int
-	reason    string
-	penalize  bool
+	ok         bool
+	aAnswer    []byte
+	bOffer     []byte
+	retryable  bool
+	kind       failKind
+	realCode   int
+	realReason string
+	penalize   bool
 }
 
 // dialEndpoint pairs a resolved dial destination with the Target (peer) it
@@ -571,23 +573,20 @@ type dialEndpoint struct {
 // weight-ordered endpoints, or a single endpoint for an IP/host:port), and a
 // register:true peer we have not registered with is skipped entirely (the
 // far end has no idea who we are). Task 5: endpoints currently in cooldown
-// (b.s.health, populated by placeCall's Penalize on a failDial) are skipped
+// (s.health, populated by placeCall's Penalize on a failDial) are skipped
 // in favor of healthy ones — but only when at least one healthy endpoint
 // exists; see the dial-anyway fallback below.
-func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
-	cfg := b.s.store.Current()
+func (s *Server) expandTargets(targets []Target) []dialEndpoint {
+	cfg := s.store.Current()
 	var available, cooled []dialEndpoint
 	for _, t := range targets {
-		// b.s.registrar is nil only in tests that build a bridge without
-		// Server.Run; treat that as "no gating" rather than skipping every
-		// target (mirrors the pre-M4.4 inline gate this replaces).
-		if t.Peer.Register && b.s.registrar != nil && !b.s.registrar.IsRegistered(t.Name) {
-			b.s.log.Debug("skipping unregistered target", "peer", t.Name)
+		if t.Peer.Register && !s.IsRegistered(t.Name) {
+			s.log.Debug("skipping unregistered target", "peer", t.Name)
 			continue
 		}
-		for _, ep := range b.s.resolver.Resolve(t.Peer, cfg.SRVCacheTTL.Std()) {
+		for _, ep := range s.resolver.Resolve(t.Peer, cfg.SRVCacheTTL.Std()) {
 			de := dialEndpoint{Target: t, Endpoint: ep}
-			if b.s.health.Available(ep) {
+			if s.health.Available(ep) {
 				available = append(available, de)
 			} else {
 				cooled = append(cooled, de)
@@ -635,8 +634,8 @@ func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 // code, since a real (if late) carrier response is always more informative
 // than our own synthesized timeout. This is the only path here that sends
 // a final response itself, since it's the only one not already covered by
-// rewriteSDP's own failure (488, target-independent — same offer, same
-// failure, on every attempt) or dialTarget's post-answer paths.
+// the offer-validation failure above (488, target-independent — same offer,
+// same failure, on every attempt) or dialTarget's post-answer paths.
 //
 // After each retryable failure, placeCall also checks whether the A-leg is
 // still there (aLeg.Context().Err()) before starting the next candidate: a
@@ -647,34 +646,29 @@ func (b *bridge) expandTargets(targets []Target) []dialEndpoint {
 // winning target) — like aAnswer (see attemptResult), the caller needs it
 // verbatim to answer a later B-LEG session-timer refresh with (Task 6 fix
 // wave), rather than the carrier's own answer.
-func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, outNumber string, offerBody []byte, mediaIP netip.Addr, sess *media.Session, aSRTP legSRTP) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
+func (s *Server) placeCall(c *call, targets []Target, outNumber string, offerBody []byte, mediaIP netip.Addr) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
+	aLeg := c.aLeg
 	// Pre-loop validation only (the actual per-target offer, including any
 	// SRTP crypto, is built fresh inside dialTarget — see its doc comment):
 	// a parse/no-audio failure in offerBody is target-independent, so 488
 	// here before any target is dialed rather than discovering the same
-	// failure on every attempt.
-	if _, err := rewriteSDP(offerBody, mediaIP, sess.RTPPort(media.SideB)); err != nil {
+	// failure (inside rewriteSDPCrypto) on every attempt.
+	if err := validAudioSDP(offerBody); err != nil {
 		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
 		return nil, Target{}, nil, nil, false
 	}
 
-	cfg := b.s.store.Current()
+	cfg := s.store.Current()
 
-	// startOnce is created here — not per attempt — and threaded through
-	// every dialTarget call so the media session Starts exactly once for
-	// the whole call: if an earlier, ultimately-failed target already sent
-	// early media, its 18x may have Started the session; a later target's
-	// answer still only Relatches (processAnswerSDP), never re-Starts.
-	var startOnce sync.Once
 	haveReal := false
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
-	for _, de := range b.expandTargets(targets) {
-		dialedLeg, res := b.dialTarget(aLeg, de.Target, de.Endpoint, outNumber, offerBody, sess, mediaIP, &startOnce, aSRTP)
+	for _, de := range s.expandTargets(targets) {
+		dialedLeg, res := s.dialTarget(c, cfg, de.Target, de.Endpoint, outNumber, offerBody, mediaIP)
 		if res.ok {
 			// A bridged call proves this endpoint is reachable — clear any
 			// prior cooldown so it is usable immediately on the next call.
-			b.s.health.Recover(de.Endpoint)
+			s.health.Recover(de.Endpoint)
 			return dialedLeg, de.Target, res.aAnswer, res.bOffer, true
 		}
 		if !res.retryable {
@@ -686,11 +680,11 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 		// all cases where the endpoint was demonstrably reachable, so kind
 		// alone is not a safe signal here (see attemptResult's doc).
 		if res.penalize {
-			b.s.health.Penalize(de.Endpoint, cfg.PeerCooldown.Std())
+			s.health.Penalize(de.Endpoint, cfg.PeerCooldown.Std())
 		}
 		if res.kind == failReal {
 			haveReal = true
-			lastRealCode, lastRealReason = res.code, res.reason
+			lastRealCode, lastRealReason = res.realCode, res.realReason
 		}
 		if res.kind == failRing {
 			haveRing = true
@@ -766,9 +760,11 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 //     false.
 //
 // Early media: for every 18x the B-leg sends, relayProvisional (via
-// WaitAnswer's OnResponse) may reach processAnswerSDP/startOnce.Do(Start)
-// before dialTarget's own post-answer processing does; both share the same
-// startOnce so Start runs at most once regardless of which path wins.
+// WaitAnswer's OnResponse) may reach processAnswerSDP/sess.Start before
+// dialTarget's own post-answer processing does; Session.Start is a single
+// CompareAndSwap, so the relay starts at most once regardless of which
+// path wins — and the same holds across failover attempts, which share the
+// one session.
 //
 // B-leg SRTP offer (M5 Task 6): bSecure is decided from THIS target's own
 // peer policy — required always secure, disabled always plaintext, optional
@@ -780,9 +776,10 @@ func (b *bridge) placeCall(aLeg *sipgo.DialogServerSession, targets []Target, ou
 // which suite the answerer picked across two independent keys — offering
 // suite 80 only is a documented, interop-negligible simplification (every
 // SDES peer supports it). The A-leg ANSWER side has no such restriction:
-// selectCrypto/parseCryptoAttrs already accept whichever supported suite the
+// parseCryptoAttrs already accepts whichever supported suite the
 // caller offered.
-func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep Endpoint, outNumber string, offerBody []byte, sess *media.Session, mediaIP netip.Addr, startOnce *sync.Once, aSRTP legSRTP) (bLeg *sipgo.DialogClientSession, res attemptResult) {
+func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpoint, outNumber string, offerBody []byte, mediaIP netip.Addr) (bLeg *sipgo.DialogClientSession, res attemptResult) {
+	aLeg, sess, aSRTP := c.aLeg, c.sess, c.aSRTP
 	// Align SideB's latch policy with THIS target before dialing it — not
 	// just whichever target happened to be Targets[0] at Allocate time — so
 	// early media (relayProvisional) and the eventual answer both apply the
@@ -792,18 +789,25 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// governing the session.
 	sess.SetLatchMode(media.SideB, media.ParseLatchMode(target.Peer.MediaLatch))
 
-	var bSRTP legSRTP
+	// bSRTP is nil for a plaintext B-leg — the same single representation
+	// the A-leg uses (see legSRTP): relayProvisional and processAnswerSDP
+	// both read nil as "nothing to negotiate". It is recorded on the call
+	// as the B-side state of the attempt in flight; a later failover attempt
+	// replaces it, so the winning attempt's is what the bridged call keeps.
+	var bSRTP *legSRTP
 	switch target.Peer.SRTP {
 	case "required":
-		bSRTP.secure = true
-		bSRTP.required = true
+		bSRTP = &legSRTP{required: true}
 	case "optional":
-		bSRTP.secure = aSRTP.secure
+		if aSRTP != nil {
+			bSRTP = &legSRTP{}
+		}
 	default: // "disabled" (config's normalized default) or anything unrecognized
-		bSRTP.secure = false
+		bSRTP = nil
 	}
+	c.bSRTP = bSRTP
 	var bOffer []byte
-	if bSRTP.secure {
+	if bSRTP != nil {
 		// Non-TLS warn (spec §4.5: one WARN per secure leg over non-TLS
 		// signaling) — mirrors the A-leg's identical warn in onInvite. The
 		// SBC is the one dialing this leg, so the transport is what WE chose
@@ -811,59 +815,46 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// config.Parse when unset), not something read off an inbound
 		// request.
 		if bTransport := target.Peer.Transport; bTransport != "tls" {
-			b.s.log.Warn("SDES key negotiated over non-TLS signaling transport",
+			s.log.Warn("SDES key negotiated over non-TLS signaling transport",
 				"transport", bTransport, "peer", target.Name)
 		}
-		bKey, err := newCryptoKeyValue()
-		var outbound *media.SRTPContext
-		if err == nil {
-			outbound, err = media.NewSRTPContext(media.SuiteAES128CM80, bKey)
-		}
+		bKey := media.NewSDESKey()
+		outbound, err := media.NewSRTPContext(media.SuiteAES128CM80, bKey)
 		if err != nil {
-			// Fresh-key generation or context construction failed (e.g. the
-			// CSPRNG is unavailable) — a transient, this-attempt-only
+			// Context construction failed — a transient, this-attempt-only
 			// problem, not the caller's or this carrier's fault: classify
 			// like any other pre-dial failure so placeCall tries the next
 			// candidate rather than failing the whole call.
-			b.s.log.Error("build b-leg srtp context", "err", err, "target", target.Name)
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			s.log.Error("build b-leg srtp context", "err", err, "target", target.Name)
+			return nil, attemptResult{retryable: true, kind: failDial}
 		}
 		bSRTP.suite = media.SuiteAES128CM80
 		bSRTP.ourKeyValue = bKey
 		bSRTP.outbound = outbound
 		rewritten, err := rewriteSDPCrypto(offerBody, mediaIP, sess.RTPPort(media.SideB), &sdpCrypto{suite: bSRTP.suite, keyValue: bKey, tag: 1})
 		if err != nil {
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			return nil, attemptResult{retryable: true, kind: failDial}
 		}
 		bOffer = rewritten
 	} else {
-		// Plaintext: rewriteSDPCrypto with a nil *sdpCrypto, NOT the plain
-		// rewriteSDP — offerBody is the CALLER's raw offer, which may itself
-		// be RTP/SAVP+a=crypto when the A-leg is secure (e.g. optional/
-		// required on fromPeer while THIS target's peer is disabled).
-		// rewriteSDP only rewrites port/connection info and leaves proto and
-		// attributes (including any a=crypto) untouched — using it here
-		// would leak the caller's own SRTP proto/key straight through to a
-		// peer whose policy says plaintext. rewriteSDPCrypto(..., nil)
-		// forces RTP/AVP and strips every a=crypto line, and produces
-		// byte-identical output to rewriteSDP when offerBody was already
-		// plaintext (see TestBridgePlaintextUnchanged), so this is safe for
-		// both cases. placeCall's pre-loop check already proved offerBody
-		// parses, so this is not expected to fail here.
+		// Plaintext: rewriteSDPCrypto with a nil *sdpCrypto, never a
+		// port/connection-only rewrite — offerBody is the CALLER's raw
+		// offer, which may itself be RTP/SAVP+a=crypto when the A-leg is
+		// secure (e.g. optional/required on fromPeer while THIS target's
+		// peer is disabled). Rewriting only port/connection info would leave
+		// proto and attributes (including any a=crypto) untouched and leak
+		// the caller's own SRTP proto/key straight through to a peer whose
+		// policy says plaintext. rewriteSDPCrypto(..., nil) forces RTP/AVP
+		// and strips every a=crypto line, and leaves an already-plaintext
+		// offerBody unchanged (see TestBridgePlaintextUnchanged), so it is
+		// safe for both cases. placeCall's pre-loop check already proved
+		// offerBody parses, so this is not expected to fail here.
 		rewritten, err := rewriteSDPCrypto(offerBody, mediaIP, sess.RTPPort(media.SideB), nil)
 		if err != nil {
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+			return nil, attemptResult{retryable: true, kind: failDial}
 		}
 		bOffer = rewritten
 	}
-	// bsrtpArg is nil for a plaintext B-leg — both relayProvisional and
-	// processAnswerSDP treat a nil *legSRTP as "nothing to negotiate",
-	// exactly the pre-M5 behavior.
-	var bsrtpArg *legSRTP
-	if bSRTP.secure {
-		bsrtpArg = &bSRTP
-	}
-
 	// peerURI builds only the trunk endpoint (host/port/transport); the
 	// dialed number (post-transform) is the Request-URI user part, so it
 	// must be set here — without it the carrier receives an INVITE with
@@ -871,10 +862,9 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	bTarget := peerURI(ep)
 	bTarget.User = outNumber
 
-	cfg := b.s.store.Current()
-	sigPort := b.s.ourSigPort(cfg, target.Peer.Transport)
-	from := b.buildFrom(aLeg.InviteRequest, b.s.sigIP(cfg), sigPort)
-	contact := b.buildContact(b.s.sigIP(cfg), sigPort, target.Peer.Transport)
+	sigPort := s.ourSigPort(cfg, target.Peer.Transport)
+	from := s.buildFrom(aLeg.InviteRequest, s.sigIP(cfg), sigPort)
+	contact := buildContact(s.sigIP(cfg), sigPort, target.Peer.Transport)
 
 	// bHeaders carries From/Contact plus the Task 4 session-timer headers,
 	// all as one slice so it can be passed as Invite's variadic headers on
@@ -898,9 +888,9 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 
 	for {
 		var err error
-		bLeg, err = b.s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
+		bLeg, err = s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
 		if err != nil {
-			b.s.log.Error("invite b-leg", "err", err, "target", target.Name)
+			s.log.Error("invite b-leg", "err", err, "target", target.Name)
 			// Invite() itself failed (dial/DNS/transport error before any
 			// request even went out, or went out and was synchronously
 			// rejected): the endpoint never had a chance to respond — normally
@@ -914,7 +904,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// below already uses, so only a genuine unreachable-host dial
 			// error (caller still present) cools the endpoint down; a
 			// caller-cancellation-induced Invite failure does not.
-			return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable", penalize: aLeg.Context().Err() == nil}
+			return nil, attemptResult{retryable: true, kind: failDial, penalize: aLeg.Context().Err() == nil}
 		}
 
 		// attemptCtx caps how long THIS target is allowed to ring before we give
@@ -955,7 +945,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		var responded atomic.Bool
 		var abandoned atomic.Bool
 		waited := make(chan error, 1)
-		relay := b.relayProvisional(aLeg, sess, mediaIP, startOnce, aSRTP, bsrtpArg)
+		relay := s.relayProvisional(aLeg, sess, mediaIP, aSRTP, bSRTP)
 		// bLeg and attemptCtx are passed as ARGUMENTS, not captured: the
 		// compiler may share the captured bLeg cell with dialTarget's return
 		// slot (bLeg escapes both ways), and the deadline path's return below
@@ -974,15 +964,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// path then simply runs out its ring budget and grace and
 			// classifies the attempt as a timeout, which is the same outcome
 			// an in-band error would have produced.
-			defer func() {
-				if r := recover(); r != nil {
-					b.s.log.Error("b-leg waiter goroutine panic",
-						"panic", r, "stack", string(debug.Stack()), "target", target.Name)
-				}
-			}()
-			if hook := testHookBWaiterPanic.Load(); hook != nil {
-				(*hook)()
-			}
+			defer s.recoverBWaiter(target.Name)
 			err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
 				OnResponse: func(res *sip.Response) error {
 					// S-02: once the main path has abandoned this attempt
@@ -992,7 +974,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 					// responding the A-leg or dialing the next target, so a
 					// late relay racing an abandoned attempt is an
 					// unsynchronized WriteResponse (a data race, not just a
-					// mis-aimed response — SECURITY-REVIEW-20260831 §S-02).
+					// mis-aimed response).
 					// responded also stays unset for late responses, so the
 					// penalize read on the deadline path reflects only what
 					// arrived in time. (A post-abandon OnResponse is rare —
@@ -1030,8 +1012,8 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// tear that phantom call down here, because the main loop below
 			// has already moved on and must never read InviteResponse again
 			// for this attempt.
-			if abandoned.Load() && bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
-				b.ackThenBye(bLeg, target)
+			if abandoned.Load() && carrierAnswered(bLeg) {
+				s.ackThenBye(bLeg, target)
 			}
 			waited <- err
 		}(bLeg, attemptCtx)
@@ -1067,7 +1049,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			case <-grace.C:
 				abandoned.Store(true)
 				cancel()
-				b.s.log.Info("b-leg not answered", "err", attemptCtx.Err(), "target", target.Name)
+				s.log.Info("b-leg not answered", "err", attemptCtx.Err(), "target", target.Name)
 				if attemptCtx.Err() == context.DeadlineExceeded {
 					// Caller still present (else attemptCtx would carry
 					// Canceled, not DeadlineExceeded — it derives from
@@ -1075,8 +1057,6 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 					return nil, attemptResult{
 						retryable: true,
 						kind:      failRing,
-						code:      408,
-						reason:    "Request Timeout",
 						penalize:  !responded.Load(),
 					}
 				}
@@ -1085,14 +1065,14 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 				// kind/code — nothing reaches a caller that no longer
 				// exists) and never penalize: this wasn't the endpoint's
 				// fault.
-				return nil, attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+				return nil, attemptResult{retryable: true, kind: failDial}
 			}
 		}
 		if waitErr == nil {
 			cancel()
 			break
 		}
-		b.s.log.Info("b-leg not answered", "err", waitErr, "target", target.Name)
+		s.log.Info("b-leg not answered", "err", waitErr, "target", target.Name)
 		// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
 		// it sees, including 1xx provisionals — not just the final one. If
 		// the transaction dies mid-ring (e.g. a transport error after a
@@ -1132,7 +1112,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// classified below, but first (Fix 1) it must be torn down with a
 		// real ACK+BYE rather than silently abandoned to ring up ~32s of
 		// carrier billing for a call nobody is using.
-		res := attemptResult{retryable: true, kind: failDial, code: 503, reason: "Service Unavailable"}
+		res := attemptResult{retryable: true, kind: failDial}
 		// The endpoint sent NOTHING at all (no provisional, no final — not
 		// even a stale one left over from a dead transaction) and the caller
 		// is still present: this is our own ring-timeout or a transport
@@ -1161,8 +1141,8 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// effort, independent of the A-leg's fate (which may already be
 		// cancelled — the caller-CANCEL case above): ackThenBye bounds both
 		// its own ACK and BYE via byeContext's 5s (S-04).
-		if bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess() {
-			b.ackThenBye(bLeg, target)
+		if carrierAnswered(bLeg) {
+			s.ackThenBye(bLeg, target)
 		}
 		switch {
 		case aLeg.Context().Err() != nil:
@@ -1174,7 +1154,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// — the important thing is NOT to misclassify this as failRing,
 			// which would be a lie (nothing "timed out"; the caller left).
 
-		case bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess():
+		case carrierAnswered(bLeg):
 			// Raced 2xx (see the comment above the switch — teardown already
 			// ran there, unconditionally). This 2xx must never be relayed to
 			// the caller as a success (dialTarget already returned
@@ -1185,8 +1165,6 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// expired, failDial/503 otherwise.
 			if attemptCtx.Err() == context.DeadlineExceeded {
 				res.kind = failRing
-				res.code = 408
-				res.reason = "Request Timeout"
 			}
 
 		case attemptCtx.Err() == context.DeadlineExceeded:
@@ -1195,8 +1173,6 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// WaitAnswer already sent it a CANCEL (see attemptCtx's comment
 			// above) — placeCall fails over to the next target.
 			res.kind = failRing
-			res.code = 408
-			res.reason = "Request Timeout"
 
 		case bLeg.InviteResponse != nil &&
 			bLeg.InviteResponse.StatusCode >= 300 &&
@@ -1209,8 +1185,8 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// — 422 >= 300 and isn't 401/407 — and is reported as failReal
 			// with its own code, same as any other genuine carrier decline.
 			res.kind = failReal
-			res.code = bLeg.InviteResponse.StatusCode
-			res.reason = bLeg.InviteResponse.Reason
+			res.realCode = bLeg.InviteResponse.StatusCode
+			res.realReason = bLeg.InviteResponse.Reason
 
 		case bLeg.InviteResponse != nil &&
 			(bLeg.InviteResponse.StatusCode == sip.StatusUnauthorized || bLeg.InviteResponse.StatusCode == sip.StatusProxyAuthRequired):
@@ -1220,9 +1196,9 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// IP-auth trunk that unexpectedly challenges, or a retry whose
 			// credentials the target still rejects, ends up here. A 401/407
 			// is a negotiation with THIS target, not something the caller
-			// can use, so it stays failDial's default 503 rather than
+			// can use, so it stays failDial — placeCall's 503 — rather than
 			// leaking the challenge upstream as a bogus 401/407.
-			b.s.log.Debug("b-leg auth challenge unsatisfied", "code", bLeg.InviteResponse.StatusCode, "target", target.Name)
+			s.log.Debug("b-leg auth challenge unsatisfied", "code", bLeg.InviteResponse.StatusCode, "target", target.Name)
 		}
 		cancel()
 		_ = bLeg.Close()
@@ -1234,14 +1210,14 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// Both failures below are POST-answer: the carrier already sent a 2xx,
 	// so the offer we sent it was fine — it's the carrier's ANSWER SDP that
 	// is missing/unparseable (processAnswerSDP) or that failed to rewrite
-	// (rewriteSDP). 488 would wrongly tell the caller ITS OWN offer was
+	// (rewriteSDPCrypto). 488 would wrongly tell the caller ITS OWN offer was
 	// unacceptable; 502 Bad Gateway correctly attributes the failure to the
 	// upstream leg (spec §6). This is distinct from placeCall's PRE-answer
-	// 488 (rewriteSDP of the caller's own offer, before any target is even
+	// 488 (validAudioSDP of the caller's own offer, before any target is even
 	// dialed), which stays 488 — that one really is about the caller's
 	// offer.
 	answer := bLeg.InviteResponse.Body()
-	if err := processAnswerSDP(sess, answer, media.SideB, startOnce, bsrtpArg); err != nil {
+	if err := processAnswerSDP(sess, answer, media.SideB, bSRTP); err != nil {
 		if errors.Is(err, errSRTPRequiredMismatch) {
 			// The carrier answered for real (2xx, billable) but its answer
 			// doesn't meet our required-SRTP policy for this target: unlike
@@ -1251,17 +1227,17 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 			// tear this attempt down and let placeCall try the next
 			// candidate rather than finalizing the call with 502. "required"
 			// never silently downgrades to plaintext.
-			b.s.log.Info("b-leg srtp required by policy but answer not secure", "target", target.Name)
-			b.ackThenBye(bLeg, target)
-			return nil, attemptResult{retryable: true, kind: failUnusable, code: 502, reason: "Bad Gateway"}
+			s.log.Info("b-leg srtp required by policy but answer not secure", "target", target.Name)
+			s.ackThenBye(bLeg, target)
+			return nil, attemptResult{retryable: true, kind: failDial}
 		}
 		// Respond the A-leg before tearing the B-leg down: ackThenBye is a
 		// network round trip bounded by its own 5s contexts (S-04), and
 		// there's no reason to hold the caller's final response hostage
 		// behind it.
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		b.ackThenBye(bLeg, target)
-		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
+		s.ackThenBye(bLeg, target)
+		return nil, attemptResult{}
 	}
 
 	// A-leg answer crypto (M5 Task 6): when the A-leg is secure, advertise
@@ -1272,38 +1248,37 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// (aSRTP.outbound). The caller's own key is never echoed back.
 	var aAnswer []byte
 	var err error
-	if aSRTP.secure {
+	if aSRTP != nil {
 		aAnswer, err = rewriteSDPCrypto(answer, mediaIP, sess.RTPPort(media.SideA), &sdpCrypto{suite: aSRTP.suite, keyValue: aSRTP.ourKeyValue, tag: aSRTP.tag})
 	} else {
-		// Plaintext A-leg: rewriteSDPCrypto with a nil *sdpCrypto, NOT the
-		// plain rewriteSDP — answer is the B-LEG's (carrier's) raw answer,
-		// which may itself be RTP/SAVP+a=crypto when the B-leg is secure
-		// (e.g. this target's peer is srtp: required/optional while the
-		// A-leg is disabled). rewriteSDP only rewrites port/connection info
-		// and leaves proto and attributes (including any a=crypto) untouched
-		// — using it here would leak the CARRIER's own SRTP master key, and
+		// Plaintext A-leg: rewriteSDPCrypto with a nil *sdpCrypto, never a
+		// port/connection-only rewrite — answer is the B-LEG's (carrier's)
+		// raw answer, which may itself be RTP/SAVP+a=crypto when the B-leg
+		// is secure (e.g. this target's peer is srtp: required/optional
+		// while the A-leg is disabled). Rewriting only port/connection info
+		// would leave proto and attributes (including any a=crypto)
+		// untouched and leak the CARRIER's own SRTP master key, and
 		// advertise RTP/SAVP, straight through to a plaintext caller (a
 		// critical key leak; see TestBridgeSRTPInterworksPlaintextAToSecureB).
 		// rewriteSDPCrypto(..., nil) forces RTP/AVP and strips every
-		// a=crypto line, and produces byte-identical output to rewriteSDP
-		// when answer was already plaintext (see TestBridgePlaintextUnchanged),
-		// so this is safe for both cases.
+		// a=crypto line, and leaves an already-plaintext answer unchanged
+		// (see TestBridgePlaintextUnchanged), so it is safe for both cases.
 		aAnswer, err = rewriteSDPCrypto(answer, mediaIP, sess.RTPPort(media.SideA), nil)
 	}
 	if err != nil {
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		b.ackThenBye(bLeg, target)
-		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
+		s.ackThenBye(bLeg, target)
+		return nil, attemptResult{}
 	}
 
 	if err := bLeg.Ack(aLeg.Context()); err != nil {
 		// ACK could not be sent: the dialog never reaches Confirmed, so
 		// Bye would refuse it too — nothing left to do but Close and tell
 		// the A-leg the call failed.
-		b.s.log.Error("ack b-leg", "err", err, "target", target.Name)
+		s.log.Error("ack b-leg", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		_ = aLeg.Respond(502, "Bad Gateway", nil)
-		return nil, attemptResult{kind: failUnusable, code: 502, reason: "Bad Gateway"}
+		return nil, attemptResult{}
 	}
 	// The establishing 2xx carries a Contact built for the A-leg's actual
 	// inbound transport (spec §5), not necessarily the dialog cache's
@@ -1324,7 +1299,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
-	aContact := b.buildContact(b.s.sigIP(cfg), b.s.ourSigPort(cfg, aTransport), aTransport)
+	aContact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, aTransport), aTransport)
 	negotiatedSE := negotiateSE(
 		headerSeconds(aLeg.InviteRequest, "Session-Expires"),
 		headerSeconds(aLeg.InviteRequest, "Min-SE"),
@@ -1337,14 +1312,25 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 		// call; the A-leg answer attempt itself failed (typically the
 		// caller CANCELed), so there is no A-leg response to send — only
 		// tear the carrier call down.
-		b.s.log.Error("respond a-leg", "err", err)
+		s.log.Error("respond a-leg", "err", err)
 		byeCtx, cancel := byeContext()
 		_ = bLeg.Bye(byeCtx)
 		cancel()
-		return nil, attemptResult{kind: failUnusable}
+		return nil, attemptResult{}
 	}
 
 	return bLeg, attemptResult{ok: true, aAnswer: aAnswer, bOffer: bOffer}
+}
+
+// carrierAnswered reports whether the B-leg holds a genuine 2xx from the
+// carrier — i.e. a live, billable call the carrier believes is up, whether
+// or not WaitAnswer returned it as a success. dialTarget asks this in three
+// places (the abandoned-attempt teardown in the waiter goroutine, the
+// unconditional raced-2xx teardown, and the classification switch), and
+// they must agree: a 2xx that one of them sees and another doesn't would
+// leave a phantom carrier call standing.
+func carrierAnswered(bLeg *sipgo.DialogClientSession) bool {
+	return bLeg.InviteResponse != nil && bLeg.InviteResponse.IsSuccess()
 }
 
 // buildFrom clones the caller's identity onto a B-leg From: the caller's
@@ -1353,7 +1339,7 @@ func (b *bridge) dialTarget(aLeg *sipgo.DialogServerSession, target Target, ep E
 // our own host (topology hiding — the caller's address is never exposed to
 // the target) and a fresh local tag, since this From establishes a brand
 // new dialog to the target rather than reusing the A-leg's.
-func (b *bridge) buildFrom(req *sip.Request, sigIP netip.Addr, port int) *sip.FromHeader {
+func (s *Server) buildFrom(req *sip.Request, sigIP netip.Addr, port int) *sip.FromHeader {
 	caller := req.From()
 	params := sip.NewParams()
 	params.Add("tag", freshTag())
@@ -1369,12 +1355,14 @@ func (b *bridge) buildFrom(req *sip.Request, sigIP netip.Addr, port int) *sip.Fr
 	}
 }
 
-// buildContact advertises our address for the given transport so in-dialog
-// requests (re-INVITE, BYE, ...) from the target reach us on the right leg.
-// UDP is SIP's default transport per RFC 3261 §19.1.2, so the transport
-// param is omitted for udp; only tcp and tls carry an explicit transport=
-// to ensure the target dials us back on the same non-default transport.
-func (b *bridge) buildContact(sigIP netip.Addr, port int, transport string) *sip.ContactHeader {
+// buildContact advertises our address for the given transport so requests
+// from the far side reach us on the right leg: in-dialog requests
+// (re-INVITE, BYE, ...) on a bridged call, and inbound INVITEs against a
+// REGISTER binding (see Registrar.paramsFor). UDP is SIP's default transport
+// per RFC 3261 §19.1.2, so the transport param is omitted for udp; only tcp
+// and tls carry an explicit transport= to ensure the far side dials us back
+// on the same non-default transport.
+func buildContact(sigIP netip.Addr, port int, transport string) *sip.ContactHeader {
 	c := &sip.ContactHeader{
 		Address: sip.Uri{Scheme: "sip", Host: sigIP.String(), Port: port},
 	}
@@ -1440,7 +1428,7 @@ func authPass(target Target) string {
 // processAnswerSDP's B-inbound install exactly like the final-200 path, and
 // aSRTP drives whether the rewritten body relayed to the caller is
 // RTP/SAVP+a=crypto (our A-outbound key) or plain RTP/AVP.
-func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.Session, mediaIP netip.Addr, startOnce *sync.Once, aSRTP legSRTP, bsrtp *legSRTP) func(res *sip.Response) error {
+func (s *Server) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.Session, mediaIP netip.Addr, aSRTP, bsrtp *legSRTP) func(res *sip.Response) error {
 	return func(res *sip.Response) error {
 		if !res.IsProvisional() {
 			return nil
@@ -1459,23 +1447,23 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 			headers []sip.Header
 		)
 		if raw := res.Body(); len(raw) > 0 {
-			if err := processAnswerSDP(sess, raw, media.SideB, startOnce, bsrtp); err != nil {
-				b.s.log.Error("early media sdp", "err", err, "code", res.StatusCode)
+			if err := processAnswerSDP(sess, raw, media.SideB, bsrtp); err != nil {
+				s.log.Error("early media sdp", "err", err, "code", res.StatusCode)
 			} else {
 				var rewritten []byte
 				var err error
-				if aSRTP.secure {
+				if aSRTP != nil {
 					rewritten, err = rewriteSDPCrypto(raw, mediaIP, sess.RTPPort(media.SideA), &sdpCrypto{suite: aSRTP.suite, keyValue: aSRTP.ourKeyValue, tag: aSRTP.tag})
 				} else {
 					// Same C1 fix as dialTarget's final-200 path: raw is the
 					// B-leg's early-media SDP, which may carry the carrier's
 					// own a=crypto — rewriteSDPCrypto(..., nil) strips it and
-					// forces RTP/AVP instead of leaking it through plain
-					// rewriteSDP to a plaintext caller.
+					// forces RTP/AVP instead of leaking it through to a
+					// plaintext caller.
 					rewritten, err = rewriteSDPCrypto(raw, mediaIP, sess.RTPPort(media.SideA), nil)
 				}
 				if err != nil {
-					b.s.log.Error("early media rewrite", "err", err, "code", res.StatusCode)
+					s.log.Error("early media rewrite", "err", err, "code", res.StatusCode)
 				} else {
 					body = rewritten
 					headers = []sip.Header{sip.NewHeader("Content-Type", "application/sdp")}
@@ -1483,17 +1471,17 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 			}
 		}
 		if err := aLeg.Respond(res.StatusCode, res.Reason, body, headers...); err != nil {
-			b.s.log.Error("relay provisional", "err", err, "code", res.StatusCode)
+			s.log.Error("relay provisional", "err", err, "code", res.StatusCode)
 		}
 		return nil
 	}
 }
 
 // processAnswerSDP arms sess's side latch to the media address carried in
-// answer and, the first time it's called across either the early-media
-// (18x) or final (2xx) path — whichever reaches it first — Starts the
-// relay loops, guarded by startOnce so Start runs exactly once per session
-// even though both paths call this. Returns the remoteMediaIP parse error
+// answer and Starts the relay loops. Both the early-media (18x) and final
+// (2xx) paths call it, and so does every failover attempt; Session.Start
+// itself is the single CompareAndSwap that makes only the first of them
+// actually start the relay. Returns the remoteMediaIP parse error
 // unchanged so callers can decide how to fail (early media falls back to a
 // status-only relay; the final path rejects the call).
 //
@@ -1502,8 +1490,8 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 // peer's advertised key is what THEY encrypt with, so it becomes our
 // inbound/decrypt context) and, when it's usable, sess.SetSRTP installs both
 // contexts for side BEFORE Relatch/Start below — SetSRTP must always run
-// strictly before this call's own startOnce.Do(sess.Start), so a fresh
-// Session never Starts with a partially-installed side; on an already-Started
+// strictly before this call's own sess.Start, so a fresh Session never
+// Starts with a partially-installed side; on an already-Started
 // Session (a later failover target's answer, or an early-media path racing
 // the final one) SetSRTP's atomic.Pointer fields make the same call race-free
 // against the running relay loops (see media.Session.SetSRTP's own doc).
@@ -1511,7 +1499,7 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 // sess.SetSRTP(side, nil, nil) is ALWAYS called for a plaintext outcome —
 // bsrtp nil, or bsrtp secure but the answer has no usable/matching crypto and
 // isn't required — never merely skipped. This matters across B-leg failover:
-// sess/startOnce are shared for the whole call (see placeCall), so an
+// sess is shared for the whole call (see placeCall), so an
 // EARLIER target's early media (18x) can have already installed secure B
 // contexts via this same function before a LATER, plaintext-answering target
 // wins; without an explicit clear here the later target's plaintext packets
@@ -1537,7 +1525,7 @@ func (b *bridge) relayProvisional(aLeg *sipgo.DialogServerSession, sess *media.S
 // offered (Finding M1 — we offer suite 80 only; a carrier answering suite 32
 // would otherwise give one-way audio, decrypting with 32 while encrypting
 // with 80) is treated identically to "no usable crypto".
-func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, startOnce *sync.Once, bsrtp *legSRTP) error {
+func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, bsrtp *legSRTP) error {
 	remote, err := remoteMediaIP(answer)
 	if err != nil {
 		return err
@@ -1545,12 +1533,15 @@ func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, start
 	switch {
 	case bsrtp == nil:
 		sess.SetSRTP(side, nil, nil)
-	case !bsrtp.secure:
-		sess.SetSRTP(side, nil, nil)
 	default:
 		answerSecure, lines := offeredCrypto(answer)
-		sel, ok := selectCrypto(lines)
-		usable := answerSecure && ok && sel.suite == bsrtp.suite
+		// parseCryptoAttrs already dropped every unsupported suite; the
+		// first surviving line is the answerer's choice (RFC 4568 §5.1.2).
+		usable := answerSecure && len(lines) > 0 && lines[0].suite == bsrtp.suite
+		var sel cryptoLine
+		if len(lines) > 0 {
+			sel = lines[0]
+		}
 		switch {
 		case usable:
 			inbound, err := media.NewSRTPContext(sel.suite, sel.keyValue)
@@ -1571,8 +1562,26 @@ func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, start
 		}
 	}
 	sess.Relatch(side, remote)
-	startOnce.Do(sess.Start)
+	sess.Start()
 	return nil
+}
+
+// recoverBWaiter is the S-01 panic umbrella for the orphan B-leg waiter
+// goroutine in dialTarget, deferred at the top of it. That goroutine
+// outlives onInvite's own recoverCall umbrella, so an unrecovered panic
+// there would kill the whole process rather than one call; this logs it
+// with a stack and lets the goroutine exit quietly. Nothing is sent on the
+// waited channel afterwards, so the main flow runs out its ring budget and
+// classifies the attempt as a timeout.
+//
+// It is a named method rather than an inline closure so the recovery itself
+// is directly testable (see TestBridgeWaiterPanicContained) without a
+// production-side injection hook.
+func (s *Server) recoverBWaiter(targetName string) {
+	if r := recover(); r != nil {
+		s.log.Error("b-leg waiter goroutine panic",
+			"panic", r, "stack", string(debug.Stack()), "target", targetName)
+	}
 }
 
 // ackThenBye tears down a B-leg that has been answered (2xx received) but
@@ -1589,79 +1598,46 @@ func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, start
 // aLeg.Context(), which is cancelled the moment the caller hangs up — mid
 // teardown. Two separate budgets, like byeBoth, so a slow Ack can't eat
 // the Bye's budget.
-func (b *bridge) ackThenBye(bLeg *sipgo.DialogClientSession, target Target) {
+func (s *Server) ackThenBye(bLeg *sipgo.DialogClientSession, target Target) {
 	ackCtx, ackCancel := byeContext()
 	err := bLeg.Ack(ackCtx)
 	ackCancel()
 	if err != nil {
-		b.s.log.Error("ack b-leg for teardown", "err", err, "target", target.Name)
+		s.log.Error("ack b-leg for teardown", "err", err, "target", target.Name)
 		_ = bLeg.Close()
 		return
 	}
 	byeCtx, cancel := byeContext()
 	defer cancel()
 	if err := bLeg.Bye(byeCtx); err != nil {
-		b.s.log.Error("bye b-leg for teardown", "err", err, "target", target.Name)
+		s.log.Error("bye b-leg for teardown", "err", err, "target", target.Name)
 	}
 }
 
 // reject answers an INVITE we will not bridge, before any dialog is
 // created. Extra headers (e.g. the quota gate's Retry-After) are appended
 // to the response.
-func (b *bridge) reject(req *sip.Request, tx sip.ServerTransaction, code int, reason string, headers ...sip.Header) {
+func (s *Server) reject(req *sip.Request, tx sip.ServerTransaction, code int, reason string, headers ...sip.Header) {
 	res := sip.NewResponseFromRequest(req, code, reason, nil)
 	for _, h := range headers {
 		res.AppendHeader(h)
 	}
 	_ = tx.Respond(res)
-	b.s.log.Info("rejected invite", "code", code, "reason", reason, "source", req.Source())
+	s.log.Info("rejected invite", "code", code, "reason", reason, "source", req.Source())
 }
 
 // recoverCall is deferred first thing in onInvite: a panic anywhere in the
 // call setup or bridging path kills only this call (never the process),
 // leaving a forensic trace. The function's own defers (aLeg/bLeg/sess
-// Close, registry.Remove) still run during the panic unwind, since defer
+// Close, endCall) still run during the panic unwind, since defer
 // execution isn't short-circuited by recover — this only stops the crash
 // from propagating past onInvite.
-func (b *bridge) recoverCall(req *sip.Request) {
+func (s *Server) recoverCall(req *sip.Request) {
 	if r := recover(); r != nil {
-		b.s.log.Error("bridge call panic; call dropped",
-			"panic", r, "stack", string(debug.Stack()), "call_id", callID(req))
+		s.log.Error("bridge call panic; call dropped",
+			"panic", r, "stack", string(debug.Stack()), "call_id", fsip.CallID(req))
 	}
 }
-
-// callID returns the A-leg's Call-ID, or "" if the request is malformed
-// enough to lack one (should not happen past ReadInvite's validation).
-func callID(req *sip.Request) string {
-	if cid := req.CallID(); cid != nil {
-		return cid.Value()
-	}
-	return ""
-}
-
-// fromTagOf and toTagOf read a message's From/To tag, returning "" when the
-// header is absent or tagless (T-07/F-08). They work on both *sip.Request
-// and *sip.Response; callers only ever compare the result against a stored
-// dialog tag, which is never empty on an established leg, so a missing
-// header fails the match — never a nil-deref panic on malformed input.
-func fromTagOf(msg sip.Message) string {
-	if f := msg.From(); f != nil {
-		tag, _ := f.Params.Get("tag")
-		return tag
-	}
-	return ""
-}
-
-func toTagOf(msg sip.Message) string {
-	if t := msg.To(); t != nil {
-		tag, _ := t.Params.Get("tag")
-		return tag
-	}
-	return ""
-}
-
-// startNano is wall-clock time for call.Record.StartUnixNano.
-func startNano() int64 { return time.Now().UnixNano() }
 
 // peerURI builds the sip.Uri sipgo needs to dial a resolved endpoint
 // (host/port/transport). The dialed number is set separately as the

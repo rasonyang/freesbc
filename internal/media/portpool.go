@@ -12,27 +12,25 @@ import (
 	"net/netip"
 	"sync"
 	"time"
-
-	"github.com/freesbc/freesbc/internal/config"
 )
 
 // ErrPortsExhausted is returned when no free port pair is left in the
 // configured range; the signaling plane maps it to 503 (spec §7).
 var ErrPortsExhausted = errors.New("media: RTP port range exhausted")
 
-// PortPair is one bound socket pair: RTP on an even port, RTCP on RTP+1.
-type PortPair struct {
+// portPair is one bound socket pair: RTP on an even port, RTCP on RTP+1.
+type portPair struct {
 	RTP  *net.UDPConn
 	RTCP *net.UDPConn
 }
 
 // RTPPort returns the bound RTP port (the RTCP port is RTPPort()+1).
-func (pp *PortPair) RTPPort() int {
+func (pp *portPair) RTPPort() int {
 	return pp.RTP.LocalAddr().(*net.UDPAddr).Port
 }
 
 // Close closes both sockets.
-func (pp *PortPair) Close() {
+func (pp *portPair) Close() {
 	_ = pp.RTP.Close()
 	_ = pp.RTCP.Close()
 }
@@ -41,8 +39,8 @@ func (pp *PortPair) Close() {
 // allocation so a hot-reloaded range or bind address applies to new
 // sessions without disturbing established ones.
 type PlaneParams struct {
-	// Range bounds the RTP/RTCP ports this pool hands out.
-	Range config.PortRange
+	// MinPort and MaxPort bound the RTP/RTCP ports this pool hands out.
+	MinPort, MaxPort uint16
 	// BindIP is the local address sockets bind to; the zero Addr binds
 	// every interface.
 	BindIP netip.Addr
@@ -55,8 +53,8 @@ type PlaneParams struct {
 // The edge proxy runs two of them — a public pool facing phones and
 // browsers, a private pool facing FreeSWITCH — so the two planes can bind
 // different addresses and draw from disjoint ranges. The trunk B2BUA
-// plane runs a single Pool, which is a PlanePool fed from the legacy
-// config fields.
+// plane runs a single pool and allocates both sides of a call from it
+// (Allocate).
 //
 // Safe for concurrent use; allocation is O(range) in the worst case and
 // holds one mutex for the whole sweep, which is what makes "no duplicate
@@ -76,19 +74,15 @@ func NewPlanePool(name string, params func() PlaneParams) *PlanePool {
 	return &PlanePool{name: name, params: params, inUse: make(map[int]struct{})}
 }
 
-// Name returns the pool's label ("public", "private", "trunk").
-func (p *PlanePool) Name() string { return p.name }
-
 // allocatePair binds the next free RTP/RTCP pair. Ports occupied by other
 // processes are skipped; a full sweep with no free pair returns an
 // ErrPortsExhausted error naming the configured range. The cursor walks
 // only even ports inside [lo, hi] and wraps before hi, so a pair (port,
 // port+1) can never be bound outside the configured range — even when hi
 // is odd or lo is odd.
-func (p *PlanePool) allocatePair() (*PortPair, error) {
+func (p *PlanePool) allocatePair() (*portPair, error) {
 	par := p.params()
-	pr := par.Range
-	lo, hi := int(pr.Min), int(pr.Max)
+	lo, hi := int(par.MinPort), int(par.MaxPort)
 	if lo%2 != 0 {
 		lo++ // RTP ports are even by convention
 	}
@@ -115,7 +109,7 @@ func (p *PlanePool) allocatePair() (*PortPair, error) {
 		p.inUse[port] = struct{}{}
 		return pair, nil
 	}
-	return nil, fmt.Errorf("%w: no free pair in %s range %d-%d", ErrPortsExhausted, p.name, pr.Min, pr.Max)
+	return nil, fmt.Errorf("%w: no free pair in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
 }
 
 // allocateSingle binds ONE socket on an even port and reserves the
@@ -125,8 +119,7 @@ func (p *PlanePool) allocatePair() (*PortPair, error) {
 // SRTCP all share a single socket.
 func (p *PlanePool) allocateSingle() (*net.UDPConn, error) {
 	par := p.params()
-	pr := par.Range
-	lo, hi := int(pr.Min), int(pr.Max)
+	lo, hi := int(par.MinPort), int(par.MaxPort)
 	if lo%2 != 0 {
 		lo++
 	}
@@ -153,18 +146,20 @@ func (p *PlanePool) allocateSingle() (*net.UDPConn, error) {
 		p.inUse[port] = struct{}{}
 		return conn, nil
 	}
-	return nil, fmt.Errorf("%w: no free port in %s range %d-%d", ErrPortsExhausted, p.name, pr.Min, pr.Max)
+	return nil, fmt.Errorf("%w: no free port in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
 }
 
 // Stats returns the number of RTP port pairs currently allocated and the
 // total number of pairs the configured range can hold.
 func (p *PlanePool) Stats() (inUse, total int) {
-	pr := p.params().Range
-	lo, hi := int(pr.Min), int(pr.Max)
+	par := p.params()
+	lo, hi := int(par.MinPort), int(par.MaxPort)
 	if lo%2 != 0 {
 		lo++
 	}
 	total = (hi - lo + 1) / 2
+	// listen.media.port_range is not validated for max > min, so an
+	// inverted range is reachable and would report a negative capacity.
 	if total < 0 {
 		total = 0
 	}
@@ -184,62 +179,7 @@ func (p *PlanePool) release(rtpPort int) {
 // timeout is the pool's default silence teardown.
 func (p *PlanePool) timeout() time.Duration { return p.params().Timeout }
 
-// Pool is the trunk B2BUA plane's port pool: a PlanePool fed from the
-// legacy config fields (rtp.port_min/port_max, else
-// listen.media.port_range, bound to rtp.bind_ip). Its API is unchanged —
-// the edge proxy builds its own PlanePools instead.
-type Pool struct {
-	*PlanePool
-}
-
-func NewPool(store *config.Store) *Pool {
-	return &Pool{PlanePool: NewPlanePool("trunk", func() PlaneParams {
-		cfg := store.Current()
-		return PlaneParams{
-			Range:   cfg.RTPPortRange(),
-			BindIP:  parseBindIP(cfg.RTP.BindIP),
-			Timeout: cfg.Listen.Media.RTPTimeout.Std(),
-		}
-	})}
-}
-
-// NewProxyPools builds the edge proxy's two pools from the public and
-// private media planes. The ranges are validated to be disjoint at config
-// time (see config.validateProxy), so the two pools can never hand out the
-// same port even when they bind the same interface.
-func NewProxyPools(store *config.Store) (public, private *PlanePool) {
-	plane := func(name string, get func(*config.Config) config.RTPPlaneConfig) *PlanePool {
-		return NewPlanePool(name, func() PlaneParams {
-			cfg := store.Current()
-			p := get(cfg)
-			return PlaneParams{
-				Range:   p.Range(),
-				BindIP:  parseBindIP(p.BindIP),
-				Timeout: cfg.Listen.Media.RTPTimeout.Std(),
-			}
-		})
-	}
-	return plane("public", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Public }),
-		plane("private", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Private })
-}
-
-// parseBindIP turns a configured bind address into a netip.Addr, or the
-// zero Addr (every interface) when unset or unparseable. Only the bind
-// plane — the advertised SDP address lives on the signaling side; the two
-// stay independent so NAT/VPN deployments can bind privately and advertise
-// publicly.
-func parseBindIP(s string) netip.Addr {
-	if s == "" {
-		return netip.Addr{}
-	}
-	ip, err := netip.ParseAddr(s)
-	if err != nil {
-		return netip.Addr{}
-	}
-	return ip
-}
-
-func bindPair(port int, bind netip.Addr) (*PortPair, error) {
+func bindPair(port int, bind netip.Addr) (*portPair, error) {
 	rtp, err := net.ListenUDP("udp", udpAddr(port, bind))
 	if err != nil {
 		return nil, err
@@ -249,7 +189,7 @@ func bindPair(port int, bind netip.Addr) (*PortPair, error) {
 		_ = rtp.Close()
 		return nil, err
 	}
-	return &PortPair{RTP: rtp, RTCP: rtcp}, nil
+	return &portPair{RTP: rtp, RTCP: rtcp}, nil
 }
 
 // udpAddr builds the local address for one socket: port with bind when it

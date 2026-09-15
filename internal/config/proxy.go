@@ -192,6 +192,16 @@ type PstnConfig struct {
 	Routes []*PstnRoute `yaml:"routes"`
 }
 
+// configured reports whether the operator wrote anything in sip.pstn. It is
+// the single predicate defaults and validation share: a section that names
+// only timers is still "configured" (and validation then reports the
+// missing gateway) rather than silently ignored.
+func (p PstnConfig) configured() bool {
+	return p.Address != "" || !p.Match.IsZero() ||
+		len(p.Gateways) > 0 || len(p.Routes) > 0 ||
+		p.AttemptTimeout != 0 || p.Cooldown != 0
+}
+
 // PstnGateway is one named carrier gateway in the multi shape.
 type PstnGateway struct {
 	Address   string `yaml:"address"`   // host:port; literal IP enforced at topology build
@@ -253,9 +263,6 @@ type WebRTCConfig struct {
 	DTLSCertFile string `yaml:"dtls_cert_file"`
 	DTLSKeyFile  string `yaml:"dtls_key_file"`
 }
-
-// RTCPMuxEnabled reports the effective rtcp-mux setting (default true).
-func (w WebRTCConfig) RTCPMuxEnabled() bool { return w.RTCPMux == nil || *w.RTCPMux }
 
 // ProxyEnabled reports whether the SIP/RTP/WebRTC edge proxy plane is
 // configured. It is the single switch main.go and validation branch on:
@@ -378,7 +385,7 @@ func proxyWithDefaults(c *Config) {
 	// configured" stays decidable — and zero still means "operator did not
 	// say", which is why validation only has to reject negatives.
 	pstn := &c.SIP.Pstn
-	if pstn.Address != "" || !pstn.Match.IsZero() || len(pstn.Gateways) > 0 || len(pstn.Routes) > 0 {
+	if pstn.configured() {
 		if pstn.AttemptTimeout == 0 {
 			pstn.AttemptTimeout = Duration(32 * time.Second)
 		}

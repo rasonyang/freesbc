@@ -18,7 +18,6 @@ import (
 	"github.com/icholy/digest"
 
 	"github.com/freesbc/freesbc/internal/config"
-	"github.com/freesbc/freesbc/internal/media"
 )
 
 // --- Task 3: registerOnce + stub-registrar UAS test harness ---
@@ -923,7 +922,7 @@ peers:
 		t.Fatalf("parse config: %v", err)
 	}
 	store := config.NewStore(cfg)
-	pool := media.NewPool(store)
+	pool := NewMediaPool(store)
 	srv := NewServer(store, pool, discardLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})
@@ -997,5 +996,62 @@ routes:
 	}
 	if params.ContactPort != 15060 {
 		t.Errorf("ContactPort = %d, want sip.advertised_port 15060 (not the 45395 bind port)", params.ContactPort)
+	}
+}
+
+// TestRegistrarBareHostAddressUsesTransportDefaultPort pins the registrar's
+// address parsing to the same transport-aware default the outbound INVITE
+// leg uses (classifyAddress + defaultPort, RFC 3263 §4.1): a peer whose
+// address carries no explicit port REGISTERs on 5061 when transport is tls
+// and 5060 otherwise. An explicit port always wins.
+func TestRegistrarBareHostAddressUsesTransportDefaultPort(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+sip:
+  bind_ip: 127.0.0.1
+  bind_port: 45397
+rtp:
+  advertised_ip: 127.0.0.1
+peers:
+  tlsbare:
+    address: tls.example.net
+    transport: tls
+    auth: { username: u, password: p }
+    register: true
+    allowed_ips: [127.0.0.1/32]
+  udpbare:
+    address: udp.example.net
+    auth: { username: u, password: p }
+    register: true
+    allowed_ips: [127.0.0.1/32]
+  tlsexplicit:
+    address: tls.example.net:5999
+    transport: tls
+    auth: { username: u, password: p }
+    register: true
+    allowed_ips: [127.0.0.1/32]
+routes:
+  - name: r
+    from: tlsbare
+    to: [tlsbare]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	srv := serverForRegistrar(t, config.NewStore(cfg))
+	r := NewRegistrar(config.NewStore(cfg), nil, srv, discardLogger())
+	for _, tc := range []struct {
+		peer     string
+		wantHost string
+		wantPort int
+	}{
+		{"tlsbare", "tls.example.net", 5061},
+		{"udpbare", "udp.example.net", 5060},
+		{"tlsexplicit", "tls.example.net", 5999},
+	} {
+		params := r.paramsFor(cfg, tc.peer, cfg.Peers[tc.peer])
+		if params.RegistrarHost != tc.wantHost || params.RegistrarPort != tc.wantPort {
+			t.Errorf("%s: registrar = %s:%d, want %s:%d",
+				tc.peer, params.RegistrarHost, params.RegistrarPort, tc.wantHost, tc.wantPort)
+		}
 	}
 }

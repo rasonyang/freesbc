@@ -45,9 +45,9 @@ func TestRemoteMediaIPMediaLevelOverride(t *testing.T) {
 }
 
 func TestRewriteSDPSetsIPAndPort(t *testing.T) {
-	out, err := rewriteSDP([]byte(offerSDP), netip.MustParseAddr("192.0.2.1"), 16400)
+	out, err := rewriteSDPCrypto([]byte(offerSDP), netip.MustParseAddr("192.0.2.1"), 16400, nil)
 	if err != nil {
-		t.Fatalf("rewriteSDP: %v", err)
+		t.Fatalf("rewriteSDPCrypto: %v", err)
 	}
 	s := string(out)
 	if !strings.Contains(s, "c=IN IP4 192.0.2.1") {
@@ -89,9 +89,9 @@ func TestRewriteSDPZeroesNonAudioAndExtraSections(t *testing.T) {
 		"m=audio 40004 RTP/AVP 0\r\n" +
 		"a=rtpmap:0 PCMU/8000\r\n"
 
-	out, err := rewriteSDP([]byte(s), netip.MustParseAddr("192.0.2.1"), 16400)
+	out, err := rewriteSDPCrypto([]byte(s), netip.MustParseAddr("192.0.2.1"), 16400, nil)
 	if err != nil {
-		t.Fatalf("rewriteSDP: %v", err)
+		t.Fatalf("rewriteSDPCrypto: %v", err)
 	}
 	out2 := string(out)
 
@@ -147,7 +147,7 @@ func TestRewriteSDPRewritesRtcpAttr(t *testing.T) {
 	s := strings.Replace(offerSDP,
 		"a=rtpmap:0 PCMU/8000\r\n",
 		"a=rtpmap:0 PCMU/8000\r\na=rtcp:40001\r\n", 1)
-	out, err := rewriteSDP([]byte(s), netip.MustParseAddr("192.0.2.1"), 16400)
+	out, err := rewriteSDPCrypto([]byte(s), netip.MustParseAddr("192.0.2.1"), 16400, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,12 +157,23 @@ func TestRewriteSDPRewritesRtcpAttr(t *testing.T) {
 }
 
 func TestRewriteSDPErrors(t *testing.T) {
-	if _, err := rewriteSDP([]byte("not sdp at all"), netip.MustParseAddr("192.0.2.1"), 16400); err == nil {
+	noAudio := "v=0\r\no=- 1 1 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=video 40000 RTP/AVP 96\r\n"
+	if _, err := rewriteSDPCrypto([]byte("not sdp at all"), netip.MustParseAddr("192.0.2.1"), 16400, nil); err == nil {
 		t.Error("expected error for unparseable SDP")
 	}
-	noAudio := "v=0\r\no=- 1 1 IN IP4 203.0.113.5\r\ns=-\r\nc=IN IP4 203.0.113.5\r\nt=0 0\r\nm=video 40000 RTP/AVP 96\r\n"
-	if _, err := rewriteSDP([]byte(noAudio), netip.MustParseAddr("192.0.2.1"), 16400); err == nil {
+	if _, err := rewriteSDPCrypto([]byte(noAudio), netip.MustParseAddr("192.0.2.1"), 16400, nil); err == nil {
 		t.Error("expected error for SDP with no audio m= line")
+	}
+	// validAudioSDP is placeCall's pre-loop probe: the same two rejections,
+	// without producing a rewritten body.
+	if err := validAudioSDP([]byte("not sdp at all")); err == nil {
+		t.Error("validAudioSDP: expected error for unparseable SDP")
+	}
+	if err := validAudioSDP([]byte(noAudio)); err == nil {
+		t.Error("validAudioSDP: expected error for SDP with no audio m= line")
+	}
+	if err := validAudioSDP([]byte(offerSDP)); err != nil {
+		t.Errorf("validAudioSDP on a good offer: %v", err)
 	}
 }
 
@@ -370,5 +381,87 @@ func TestRewriteSDPCryptoScrubsDeclinedAndSessionCryptoPlaintext(t *testing.T) {
 	video := sd.MediaDescriptions[1]
 	if len(video.Attributes) != 0 {
 		t.Errorf("declined video section must have all attributes cleared, got %+v", video.Attributes)
+	}
+}
+
+// A bare G.729 offer carries no a=rtpmap (payload type 18 is static, but
+// not one of the 0/8 the proxy plane's parser special-cases). The trunk
+// relays bytes between carriers and must accept it: the codec is the two
+// peers' business, not the bridge's.
+func TestValidAudioSDPAcceptsStaticPayloadWithoutRtpmap(t *testing.T) {
+	const g729 = "v=0\r\n" +
+		"o=- 1 1 IN IP4 203.0.113.5\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.5\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 5000 RTP/AVP 18\r\n"
+
+	if err := validAudioSDP([]byte(g729)); err != nil {
+		t.Errorf("validAudioSDP rejected a bare G.729 offer: %v", err)
+	}
+	ip, err := remoteMediaIP([]byte(g729))
+	if err != nil {
+		t.Fatalf("remoteMediaIP: %v", err)
+	}
+	if ip != netip.MustParseAddr("203.0.113.5") {
+		t.Errorf("got %v, want 203.0.113.5", ip)
+	}
+}
+
+// A first audio section the peer declined (port 0, RFC 3264 §6) must be
+// skipped: the latch address and the section rewriteSDPCrypto relays both
+// come from firstAudio, so they have to agree on the live one.
+func TestFirstAudioSkipsDeclinedSection(t *testing.T) {
+	const body = "v=0\r\n" +
+		"o=- 1 1 IN IP4 203.0.113.5\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.5\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 0 RTP/AVP 0\r\n" +
+		"c=IN IP4 198.51.100.9\r\n" +
+		"m=audio 40000 RTP/AVP 8\r\n" +
+		"c=IN IP4 198.51.100.7\r\n" +
+		"a=rtpmap:8 PCMA/8000\r\n"
+
+	if err := validAudioSDP([]byte(body)); err != nil {
+		t.Fatalf("validAudioSDP: %v", err)
+	}
+	ip, err := remoteMediaIP([]byte(body))
+	if err != nil {
+		t.Fatalf("remoteMediaIP: %v", err)
+	}
+	if ip != netip.MustParseAddr("198.51.100.7") {
+		t.Errorf("latch address %v, want the live section's 198.51.100.7", ip)
+	}
+
+	out, err := rewriteSDPCrypto([]byte(body), netip.MustParseAddr("192.0.2.1"), 16400, nil)
+	if err != nil {
+		t.Fatalf("rewriteSDPCrypto: %v", err)
+	}
+	var sd sdp.SessionDescription
+	if err := sd.Unmarshal(out); err != nil {
+		t.Fatalf("unmarshal rewritten: %v", err)
+	}
+	if len(sd.MediaDescriptions) != 2 {
+		t.Fatalf("got %d media sections, want 2", len(sd.MediaDescriptions))
+	}
+	if got := sd.MediaDescriptions[0].MediaName.Port.Value; got != 0 {
+		t.Errorf("declined section port %d, want it left declined", got)
+	}
+	if got := sd.MediaDescriptions[1].MediaName.Port.Value; got != 16400 {
+		t.Errorf("relayed section port %d, want 16400 — it must be the live section", got)
+	}
+}
+
+// A declined-only body has nothing to relay.
+func TestValidAudioSDPRejectsAllDeclined(t *testing.T) {
+	const body = "v=0\r\n" +
+		"o=- 1 1 IN IP4 203.0.113.5\r\n" +
+		"s=-\r\n" +
+		"c=IN IP4 203.0.113.5\r\n" +
+		"t=0 0\r\n" +
+		"m=audio 0 RTP/AVP 0\r\n"
+	if err := validAudioSDP([]byte(body)); err == nil {
+		t.Error("validAudioSDP accepted a body whose only audio section is declined")
 	}
 }

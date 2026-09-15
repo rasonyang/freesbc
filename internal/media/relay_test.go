@@ -8,7 +8,7 @@ import (
 
 func newLooseSession(t *testing.T, minPort, maxPort int, timeout time.Duration) *Session {
 	t.Helper()
-	p := NewPool(testStore(minPort, maxPort))
+	p := testPool(minPort, maxPort)
 	s, err := p.Allocate(SessionConfig{
 		Latch:   [2]LatchMode{LatchLoose, LatchLoose},
 		Timeout: timeout,
@@ -182,7 +182,7 @@ func TestRelayDropsHijackPackets(t *testing.T) {
 }
 
 func TestRelaySilenceTimeoutReleasesPorts(t *testing.T) {
-	p := NewPool(testStore(41200, 41203)) // exactly one session's worth
+	p := testPool(41200, 41203) // exactly one session's worth
 	s, err := p.Allocate(SessionConfig{
 		Latch:   [2]LatchMode{LatchLoose, LatchLoose},
 		Timeout: 150 * time.Millisecond,
@@ -222,7 +222,7 @@ func TestRelayActivityDefersTimeout(t *testing.T) {
 }
 
 func TestRelayPanicRecoveryKillsSession(t *testing.T) {
-	p := NewPool(testStore(41260, 41267))
+	p := testPool(41260, 41267)
 	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +230,7 @@ func TestRelayPanicRecoveryKillsSession(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		defer s.recoverRelayPanic()
+		defer recoverRelayPanic(nil, s.Close)
 		panic("injected relay bug")
 	}()
 	<-finished

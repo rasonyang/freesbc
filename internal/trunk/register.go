@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"strconv"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/internal/config"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
 // regParams is the immutable identity of one peer's registration: what
@@ -78,13 +78,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 	req.AppendHeader(&sip.FromHeader{Address: aor, Params: newTagParams()})
 	req.AppendHeader(&sip.ToHeader{Address: aor, Params: sip.NewParams()})
 
-	contact := sip.Uri{Scheme: "sip", Host: p.ContactIP.String(), Port: p.ContactPort}
-	if p.Transport != "" && p.Transport != "udp" {
-		params := sip.NewParams()
-		params.Add("transport", p.Transport)
-		contact.UriParams = params
-	}
-	req.AppendHeader(&sip.ContactHeader{Address: contact})
+	req.AppendHeader(buildContact(p.ContactIP, p.ContactPort, p.Transport))
 
 	exp := sip.ExpiresHeader(uint32(expires.Seconds()))
 	req.AppendHeader(&exp)
@@ -142,7 +136,7 @@ func grantedExpires(res *sip.Response, requested time.Duration) time.Duration {
 }
 
 // newTagParams returns header params carrying a fresh From tag (reuses
-// freshTag, the M4.1 helper in sig/b2bua.go).
+// freshTag, the M4.1 helper in b2bua.go).
 func newTagParams() sip.HeaderParams {
 	pr := sip.NewParams()
 	pr.Add("tag", freshTag())
@@ -403,7 +397,14 @@ func (r *Registrar) stopAll() {
 // it is the address the carrier will send inbound INVITEs to, so it must
 // be the advertised one, never the private bind address.
 func (r *Registrar) paramsFor(cfg *config.Config, name string, p *config.Peer) regParams {
-	host, port := splitHostPortDefault(p.Address, 5060)
+	// classifyAddress + defaultPort is the same address parsing the B2BUA's
+	// outbound leg does (see Resolver.Resolve): a bare host defaults to the
+	// transport's own SIP port, so a transport: tls peer REGISTERs on 5061
+	// exactly as its INVITEs go out on 5061.
+	host, port, explicitPort, _ := classifyAddress(p.Address)
+	if !explicitPort {
+		port = fsip.DefaultPort(p.Transport)
+	}
 	sigIP := r.srv.sigIP(cfg)
 	return regParams{
 		Name: name, RegistrarHost: host, RegistrarPort: port,
@@ -419,22 +420,4 @@ func (r *Registrar) requestedExpires(cfg *config.Config, name string) time.Durat
 		return p.RegisterExpires.Std()
 	}
 	return cfg.RegisterExpires.Std()
-}
-
-// splitHostPortDefault parses "host:port" into its parts, defaulting the
-// port to defPort when addr carries none (net.SplitHostPort errors on a
-// bare host). Mirrors peerURI's inline address parsing in b2bua.go — kept
-// separate since peerURI returns a sip.Uri (with transport params for the
-// B2BUA's outbound leg) rather than the (host, port) pair reconcile needs to
-// build a regParams.
-func splitHostPortDefault(addr string, defPort int) (string, int) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr, defPort
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return host, defPort
-	}
-	return host, port
 }

@@ -3,32 +3,23 @@ package media
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/freesbc/freesbc/internal/config"
 )
 
-// testStore builds a config store with the given media port range. Config
-// fields are exported, so tests construct the snapshot directly.
-func testStore(minPort, maxPort int) *config.Store {
-	cfg := &config.Config{
-		Listen: config.ListenConfig{
-			Media: config.MediaConfig{
-				PortRange:  config.PortRange{Min: uint16(minPort), Max: uint16(maxPort)},
-				PublicIP:   "auto",
-				RTPTimeout: config.Duration(5 * time.Minute),
-			},
-		},
-	}
-	return config.NewStore(cfg)
+// testPool builds a pool over [minPort, maxPort] bound to every interface.
+func testPool(minPort, maxPort int) *PlanePool {
+	return NewPlanePool("test", func() PlaneParams {
+		return PlaneParams{MinPort: uint16(minPort), MaxPort: uint16(maxPort), Timeout: 5 * time.Minute}
+	})
 }
 
 func TestPoolAllocateReleaseCycle(t *testing.T) {
-	p := NewPool(testStore(40000, 40007)) // room for 4 pairs
-	var pairs []*PortPair
+	p := testPool(40000, 40007) // room for 4 pairs
+	var pairs []*portPair
 	for i := 0; i < 4; i++ {
 		pair, err := p.allocatePair()
 		if err != nil {
@@ -61,7 +52,7 @@ func TestPoolSkipsForeignBoundPort(t *testing.T) {
 		t.Skipf("cannot bind fixture port: %v", err)
 	}
 	defer held.Close()
-	p := NewPool(testStore(40100, 40103))
+	p := testPool(40100, 40103)
 	pair, err := p.allocatePair()
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
@@ -73,7 +64,7 @@ func TestPoolSkipsForeignBoundPort(t *testing.T) {
 }
 
 func TestPoolStats(t *testing.T) {
-	p := NewPool(testStore(41000, 41007)) // 8 ports → 4 pairs
+	p := testPool(41000, 41007) // 8 ports → 4 pairs
 	inUse, total := p.Stats()
 	if inUse != 0 || total != 4 {
 		t.Fatalf("empty pool: inUse=%d total=%d, want 0/4", inUse, total)
@@ -90,9 +81,9 @@ func TestPoolStats(t *testing.T) {
 }
 
 func TestPoolConcurrentAllocate(t *testing.T) {
-	p := NewPool(testStore(40200, 40263)) // 32 pairs
+	p := testPool(40200, 40263) // 32 pairs
 	var wg sync.WaitGroup
-	got := make(chan *PortPair, 32)
+	got := make(chan *portPair, 32)
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
 		go func() {
@@ -125,9 +116,10 @@ func TestPoolConcurrentAllocate(t *testing.T) {
 // signaling side handles that split (Server.mediaIP); the pool only owns
 // the bind plane.
 func TestPoolBindsRTPBindIP(t *testing.T) {
-	store := testStore(40300, 40303)
-	store.Current().RTP.BindIP = "127.0.0.1"
-	p := NewPool(store)
+	bind := netip.MustParseAddr("127.0.0.1")
+	p := NewPlanePool("test", func() PlaneParams {
+		return PlaneParams{MinPort: 40300, MaxPort: 40303, BindIP: bind, Timeout: 5 * time.Minute}
+	})
 	pair, err := p.allocatePair()
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
@@ -140,9 +132,10 @@ func TestPoolBindsRTPBindIP(t *testing.T) {
 		}
 	}
 
-	// A hot-reloaded empty bind_ip applies to the NEXT allocation: bind all
-	// interfaces again (wildcard), without disturbing the established pair.
-	store.Current().RTP.BindIP = ""
+	// A hot-reloaded empty bind address applies to the NEXT allocation:
+	// bind all interfaces again (wildcard), without disturbing the
+	// established pair.
+	bind = netip.Addr{}
 	next, err := p.allocatePair()
 	if err != nil {
 		t.Fatalf("allocate after reload: %v", err)
@@ -153,28 +146,19 @@ func TestPoolBindsRTPBindIP(t *testing.T) {
 	}
 }
 
-// TestPoolRTPRangeFromConfig proves rtp.port_min/port_max drive the pool:
-// every allocated pair lands inside the configured range (RTP even,
-// RTCP = RTP+1, never past port_max), the pool exhausts exactly at the
-// range's pair capacity with an error naming the range, and a released port
-// is reused by the next allocation.
-func TestPoolRTPRangeFromConfig(t *testing.T) {
-	cfg := &config.Config{
-		Listen: config.ListenConfig{
-			Media: config.MediaConfig{
-				PublicIP:   "auto",
-				RTPTimeout: config.Duration(5 * time.Minute),
-			},
-		},
-		RTP: config.RTPNetConfig{PortMin: 20000, PortMax: 20100},
-	}
-	p := NewPool(config.NewStore(cfg))
+// TestPoolRangeBounds proves the configured range drives the pool: every
+// allocated pair lands inside it (RTP even, RTCP = RTP+1, never past
+// MaxPort), the pool exhausts exactly at the range's pair capacity with an
+// error naming the range, and a released port is reused by the next
+// allocation.
+func TestPoolRangeBounds(t *testing.T) {
+	p := testPool(20000, 20100)
 
 	// 101 ports → 50 usable even-RTP pairs (20000..20098; 20100 has no
 	// room for its RTCP at 20101).
 	const wantPairs = 50
 	seen := map[int]bool{}
-	var pairs []*PortPair
+	var pairs []*portPair
 	for i := 0; i < wantPairs; i++ {
 		pair, err := p.allocatePair()
 		if err != nil {
@@ -221,14 +205,9 @@ func TestPoolRTPRangeFromConfig(t *testing.T) {
 	}
 }
 
-// TestPoolStatsRTPRange proves Stats totals the rtp-section range when the
-// legacy range is unset.
-func TestPoolStatsRTPRange(t *testing.T) {
-	cfg := &config.Config{
-		Listen: config.ListenConfig{Media: config.MediaConfig{RTPTimeout: config.Duration(5 * time.Minute)}},
-		RTP:    config.RTPNetConfig{PortMin: 21000, PortMax: 21003}, // 4 ports → 2 pairs
-	}
-	p := NewPool(config.NewStore(cfg))
+// TestPoolStatsOddCapacity proves Stats totals the pairs a range can hold.
+func TestPoolStatsOddCapacity(t *testing.T) {
+	p := testPool(21000, 21003) // 4 ports → 2 pairs
 	if inUse, total := p.Stats(); inUse != 0 || total != 2 {
 		t.Fatalf("empty pool: inUse=%d total=%d, want 0/2", inUse, total)
 	}

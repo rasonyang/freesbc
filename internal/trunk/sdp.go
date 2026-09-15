@@ -6,12 +6,19 @@ import (
 	"strconv"
 
 	"github.com/freesbc/freesbc/internal/media"
+	fsdp "github.com/freesbc/freesbc/internal/sip/sdp"
 	"github.com/pion/sdp/v3"
 )
 
 // remoteMediaIP returns the connection address the peer expects media from:
-// the first audio media description's media-level c= if present, otherwise
-// the session-level c=. Used to arm the media latch.
+// the first relayable audio media description's media-level c= if present,
+// otherwise the session-level c=. Used to arm the media latch.
+//
+// The parse is pion/sdp directly, not the proxy plane's bounded sdp.Parse:
+// the trunk is a byte relay between carriers and must not reject a body
+// the far side would have accepted (a payload type with no a=rtpmap, a
+// large body, many m= sections). Its own rewrite is what bounds what
+// crosses the bridge.
 func remoteMediaIP(sdpBytes []byte) (netip.Addr, error) {
 	var sd sdp.SessionDescription
 	if err := sd.Unmarshal(sdpBytes); err != nil {
@@ -35,55 +42,24 @@ func remoteMediaIP(sdpBytes []byte) (netip.Addr, error) {
 	return ip, nil
 }
 
-// rewriteSDP points the SDP at our media, hiding the peer's topology from
-// the other side of the bridge: the o= origin and session-level c= become
-// mediaIP, the first audio m= port becomes rtpPort (a=rtcp, if present,
-// becomes rtpPort+1), and every other media section (additional audio,
-// video, application/T.38, etc.) is declined by zeroing its port and
-// stripping any media-level c= per RFC 3264. It returns the re-marshalled
-// SDP. Errors on unparseable input or SDP with no audio media.
-func rewriteSDP(sdpBytes []byte, mediaIP netip.Addr, rtpPort int) ([]byte, error) {
+// validAudioSDP reports whether body is an SDP the bridge can relay: it
+// parses and carries at least one live audio m= section. It is the
+// target-independent half of what rewriteSDPCrypto would reject, checked
+// once up front in placeCall so the same offer doesn't fail identically on
+// every failover attempt.
+//
+// Trunk-local rules only, for the same reason as remoteMediaIP: nothing
+// here may reject a body on codec or size policy the peers agreed between
+// themselves.
+func validAudioSDP(body []byte) error {
 	var sd sdp.SessionDescription
-	if err := sd.Unmarshal(sdpBytes); err != nil {
-		return nil, fmt.Errorf("parse sdp: %w", err)
+	if err := sd.Unmarshal(body); err != nil {
+		return fmt.Errorf("parse sdp: %w", err)
 	}
 	if firstAudio(&sd) == nil {
-		return nil, fmt.Errorf("sdp has no audio media")
+		return fmt.Errorf("sdp has no audio media")
 	}
-	addr := &sdp.Address{Address: mediaIP.String()}
-	sd.ConnectionInformation = &sdp.ConnectionInformation{
-		NetworkType: "IN",
-		AddressType: sdpAddrType(mediaIP),
-		Address:     addr,
-	}
-	sd.Origin.NetworkType = "IN"
-	sd.Origin.AddressType = sdpAddrType(mediaIP)
-	sd.Origin.UnicastAddress = mediaIP.String()
-
-	relayed := false
-	for _, md := range sd.MediaDescriptions {
-		if !relayed && md.MediaName.Media == "audio" {
-			md.MediaName.Port = sdp.RangedPort{Value: rtpPort}
-			// Drop any media-level c= so the session-level one governs.
-			md.ConnectionInformation = nil
-			for i := range md.Attributes {
-				if md.Attributes[i].Key == "rtcp" {
-					md.Attributes[i].Value = strconv.Itoa(rtpPort + 1)
-				}
-			}
-			relayed = true
-			continue
-		}
-		// Not the relayed audio section: decline it (RFC 3264 port 0) and
-		// strip any media-level c= so it can't leak the peer's address.
-		md.MediaName.Port = sdp.RangedPort{Value: 0}
-		md.ConnectionInformation = nil
-	}
-	out, err := sd.Marshal()
-	if err != nil {
-		return nil, fmt.Errorf("marshal sdp: %w", err)
-	}
-	return out, nil
+	return nil
 }
 
 // sdpCrypto is what to advertise on the relayed audio section: a suite, the
@@ -128,13 +104,14 @@ func offeredCrypto(sdpBytes []byte) (secure bool, lines []cryptoLine) {
 	return isSAVP, parseCryptoAttrs(values)
 }
 
-// rewriteSDPCrypto is rewriteSDP plus SRTP awareness: the relayed audio
+// rewriteSDPCrypto points the SDP at our media and is SRTP-aware: the relayed audio
 // section's proto becomes RTP/SAVP with one a=crypto (tagged crypto.tag) when
 // crypto != nil, or RTP/AVP with all a=crypto stripped when nil. Topology
-// hiding (o=/c=/port) is identical to rewriteSDP, but declined sections go
-// further here than in rewriteSDP: every declined (non-relayed) media
-// section has its attributes cleared entirely (md.Attributes = nil), not
-// just its connection info, and any session-level a=crypto is stripped too.
+// hiding rewrites o=, the session-level c= and the relayed audio port (plus
+// a=rtcp) to our own; every declined (non-relayed) media section is zeroed
+// per RFC 3264 and has its attributes cleared entirely (md.Attributes =
+// nil), not just its connection info, and any session-level a=crypto is
+// stripped too.
 // This closes a key-exposure bug: an SDES offerer commonly reuses ONE master
 // key across every m= line in the SDP, so a declined section's a=crypto (or
 // a session-level a=crypto that applies to it) would otherwise carry the
@@ -151,18 +128,18 @@ func rewriteSDPCrypto(sdpBytes []byte, mediaIP netip.Addr, rtpPort int, crypto *
 	if err := sd.Unmarshal(sdpBytes); err != nil {
 		return nil, fmt.Errorf("parse sdp: %w", err)
 	}
-	if firstAudio(&sd) == nil {
+	relayMD := firstAudio(&sd)
+	if relayMD == nil {
 		return nil, fmt.Errorf("sdp has no audio media")
 	}
 	addr := &sdp.Address{Address: mediaIP.String()}
-	sd.ConnectionInformation = &sdp.ConnectionInformation{NetworkType: "IN", AddressType: sdpAddrType(mediaIP), Address: addr}
+	sd.ConnectionInformation = &sdp.ConnectionInformation{NetworkType: "IN", AddressType: fsdp.AddrType(mediaIP), Address: addr}
 	sd.Origin.NetworkType = "IN"
-	sd.Origin.AddressType = sdpAddrType(mediaIP)
+	sd.Origin.AddressType = fsdp.AddrType(mediaIP)
 	sd.Origin.UnicastAddress = mediaIP.String()
 
-	relayed := false
 	for _, md := range sd.MediaDescriptions {
-		if !relayed && md.MediaName.Media == "audio" {
+		if md == relayMD {
 			md.MediaName.Port = sdp.RangedPort{Value: rtpPort}
 			md.ConnectionInformation = nil
 			// proto + crypto
@@ -188,13 +165,11 @@ func rewriteSDPCrypto(sdpBytes []byte, mediaIP netip.Addr, rtpPort int, crypto *
 					Value: cryptoAttrValue(crypto.tag, crypto.suite, crypto.keyValue)})
 			}
 			md.Attributes = attrs
-			relayed = true
 			continue
 		}
 		// Declined section: port 0 and no connection info per RFC 3264, plus
-		// (unlike plain rewriteSDP) every attribute cleared — see this
-		// function's doc comment for why a=crypto here is a key leak, not
-		// just topology.
+		// every attribute cleared — see this function's doc comment for why
+		// a=crypto here is a key leak, not just topology.
 		md.MediaName.Port = sdp.RangedPort{Value: 0}
 		md.ConnectionInformation = nil
 		md.Attributes = nil
@@ -219,18 +194,16 @@ func rewriteSDPCrypto(sdpBytes []byte, mediaIP netip.Addr, rtpPort int, crypto *
 	return out, nil
 }
 
+// firstAudio is the one audio section the bridge relays: the first
+// "m=audio" whose port is non-zero. A port-0 section is declined by the
+// peer (RFC 3264 §6) and carries no media, so skipping it here is what
+// keeps the latch address (remoteMediaIP) and the section rewriteSDPCrypto
+// actually relays pointing at the same m= line.
 func firstAudio(sd *sdp.SessionDescription) *sdp.MediaDescription {
 	for _, md := range sd.MediaDescriptions {
-		if md.MediaName.Media == "audio" {
+		if md.MediaName.Media == "audio" && md.MediaName.Port.Value != 0 {
 			return md
 		}
 	}
 	return nil
-}
-
-func sdpAddrType(ip netip.Addr) string {
-	if ip.Is6() {
-		return "IP6"
-	}
-	return "IP4"
 }

@@ -12,8 +12,6 @@ import (
 	"github.com/pion/dtls/v3"
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
-
-	"github.com/freesbc/freesbc/internal/config"
 )
 
 // testPlanePool builds a pool over an explicit port range bound to
@@ -22,7 +20,8 @@ func testPlanePool(t *testing.T, name string, lo, hi int) *PlanePool {
 	t.Helper()
 	return NewPlanePool(name, func() PlaneParams {
 		return PlaneParams{
-			Range:   config.PortRange{Min: uint16(lo), Max: uint16(hi)},
+			MinPort: uint16(lo),
+			MaxPort: uint16(hi),
 			BindIP:  netip.MustParseAddr("127.0.0.1"),
 			Timeout: 30 * time.Second,
 		}
@@ -179,7 +178,8 @@ func TestWebRTCLegDTLSRole(t *testing.T) {
 func TestWebRTCLegOnWildcardBind(t *testing.T) {
 	pubPool := NewPlanePool("public", func() PlaneParams {
 		return PlaneParams{
-			Range:   config.PortRange{Min: 41300, Max: 41339},
+			MinPort: 41300,
+			MaxPort: 41339,
 			BindIP:  netip.Addr{}, // every interface
 			Timeout: 30 * time.Second,
 		}
@@ -434,11 +434,11 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 	serverSalt := material[keyLen*2+saltLen:]
 	// The browser is the DTLS client, so it writes with the client key and
 	// reads with the server key — the mirror of what the leg derived.
-	browserOut, err := NewSRTPContextFromKeys(profile, clientKey, clientSalt)
+	browserOut, err := newSRTPContextFromKeys(profile, clientKey, clientSalt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	browserIn, err := NewSRTPContextFromKeys(profile, serverKey, serverSalt)
+	browserIn, err := newSRTPContextFromKeys(profile, serverKey, serverSalt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +461,7 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			if plain, ok := browserIn.UnprotectRTP(buf[:n]); ok {
+			if plain, ok := browserIn.unprotectRTP(buf[:n]); ok {
 				gotAtBrowser <- plain
 				return
 			}
@@ -489,7 +489,7 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 
 	// --- public → private: the browser speaks, FreeSWITCH must hear it ---
 	browserPacket := rtpPacket(0, 2000, 160)
-	protected, ok := browserOut.ProtectRTP(browserPacket)
+	protected, ok := browserOut.protectRTP(browserPacket)
 	if !ok {
 		t.Fatal("browser could not protect its RTP")
 	}
@@ -615,7 +615,7 @@ func TestAllocateAcrossUsesBothPools(t *testing.T) {
 	}
 	for _, p := range []*PlanePool{a, b} {
 		if inUse, _ := p.Stats(); inUse != 0 {
-			t.Errorf("%s leaked: %d in use", p.Name(), inUse)
+			t.Errorf("%s leaked: %d in use", p.name, inUse)
 		}
 	}
 }
