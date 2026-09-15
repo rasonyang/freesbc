@@ -24,7 +24,7 @@ import (
 //	FREESBC_FS_ADDR=192.168.31.55:5060 \
 //	FREESBC_FS_LOCAL=192.168.31.55 \
 //	FREESBC_FS_USER=1000 FREESBC_FS_PASS='...' \
-//	go test ./proxy/ -run TestFreeSWITCH -v
+//	go test ./internal/edge/ -run TestFreeSWITCH -v
 //
 // The fake switch in harness_test.go cannot answer the questions that
 // actually decide whether this works in production, because they are all

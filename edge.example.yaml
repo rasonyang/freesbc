@@ -101,7 +101,7 @@ sip:
   #     gw-mobile: { address: 223.76.90.4:16060 }  # literal IP:port; transport: udp implied
   #     gw-fixed:   { address: 223.76.90.5:16060 }
   #   routes:                     # first match wins; multiple catch-alls legal
-  #     - match: "^1[3-9]\d{9}$"  # Go regexp on the called number
+  #     - match: "^1[3-9]\\d{9}$" # Go regexp on the called number
   #       to: [gw-mobile]
   #     - to: [gw-fixed, gw-mobile]  # no match = catch-all; to: order = failover order
 

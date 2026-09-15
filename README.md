@@ -18,7 +18,7 @@ It runs two independent planes, either or both of which may be enabled:
 
 ## Why
 
-Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible, as in LibreSBC) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
+Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
 
 ## Features
 
@@ -29,11 +29,11 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 - **Edge proxy plane** — registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
 - **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures, auto-ban, optional nftables integration (auto-detected, degrades to in-memory bans, never a hard dependency)
 - **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
-- Carrier interop baseline: OPTIONS answering and session timers (RFC 4028), including the 422/Min-SE negotiation on both legs
+- Carrier interop baseline: OPTIONS answering and session-timer negotiation (RFC 4028), including the 422/Min-SE exchange on both legs; no timer tears a call down on session expiry
 
 Explicit non-goals: transcoding, CDR, clustering, and being a registrar in
 its own right — the edge proxy PROXIES registrations to FreeSWITCH rather
-than owning users or credentials. See the [design doc](freesbc-allinone-design.md).
+than owning users or credentials. See the [design doc](docs/design.md).
 
 ## Edge proxy (SIP / RTP / WebRTC)
 
@@ -105,9 +105,10 @@ FreeSWITCH ──bridge──▶ FreeSBC public UDP ──▶ PSTN carrier gatew
 
 Configure `sip.pstn`: either the single-gateway shorthand (`address` =
 the gateway) or the multi-gateway form (`gateways` = named carriers,
-`routes` = called-number prefixes selecting which gateways a call fails
-over across, in `to:` order). `match` is the address FreeSWITCH's
-dialplan dials PSTN prefixes to in both forms. A bridged call is
+`routes` = called-number patterns selecting which gateways a call fails
+over across, in `to:` order; a number no route matches is refused 503).
+`match` is the address FreeSWITCH's dialplan dials PSTN prefixes to in
+both forms. A bridged call is
 classified by its source (FreeSWITCH itself) **and** its Request-URI
 naming the match, then forwarded exactly like a call to a registered
 client: media anchored on both legs, each side offered only the SBC's own
@@ -118,14 +119,14 @@ the source check fails and the call is proxied upstream as usual.
 ```yaml
 sip:
   pstn:
-    match: 10.77.0.1:16060
+    match: 10.77.0.2:16060
     # attempt_timeout: 32s     # per-gateway attempt budget (default 32s)
     # cooldown: 30s            # passive health penalty window (default 30s)
     gateways:
       gw-mobile: { address: 223.76.90.4:16060 }   # transport: udp implied
       gw-fixed:   { address: 223.76.90.5:16060 }
     routes:                  # first match wins; multiple catch-alls legal
-      - match: "^1[3-9]\d{9}$"   # Go regexp on the called number
+      - match: "^1[3-9]\\d{9}$"  # Go regexp on the called number
         to: [gw-mobile]
       - to: [gw-fixed, gw-mobile]  # no match = catch-all
 ```
@@ -134,7 +135,8 @@ Failover: a call retries the next gateway on a transport error, a silent
 gateway (attempt budget expiry — the current attempt is CANCELled first),
 a 5xx/408, or an unanchorable answer; a 4xx like 486 or an auth challenge
 is relayed to FreeSWITCH immediately, never retried. When every gateway
-fails, FreeSWITCH sees the last genuine carrier code, else 408, else 503.
+fails, FreeSWITCH sees 488 if an answer could not be anchored, else the
+last genuine carrier code, else 408, else 503.
 Health is passive cooldown: a gateway that answered nothing before its
 budget expired is penalized for `cooldown` and dialed only when no
 healthy alternative remains (never a hard block); a successful call
@@ -226,15 +228,18 @@ re-registration, not an outage.
 - **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
   reachable media address; a client that can only reach it via a relay is
   out of scope.
-- **SUBSCRIBE/NOTIFY are answered 405, not proxied.** FreeSWITCH sends a
-  NOTIFY for message-waiting indication after a registration; MWI and BLF
-  therefore do not reach phones through the proxy. The event framework is
-  outside this phase's method set.
+- **SUBSCRIBE/NOTIFY (and UPDATE, MESSAGE, REFER, PUBLISH) are answered
+  405, not proxied.** FreeSWITCH sends a NOTIFY for message-waiting
+  indication after a registration; MWI and BLF therefore do not reach
+  phones through the proxy. The event framework is
+  not implemented.
 - **SIP over UDP is sent above the RFC 3261 §18.1.1 size guidance.** A
   realistic FreeSWITCH INVITE plus the proxy's own headers clears 1300
   bytes, and the RFC's remedy — switch to TCP — is not available when both
   the upstream and the phone are UDP. FreeSBC raises the send ceiling to
   8 KiB and relies on IP fragmentation, as production SIP elements do.
+- **WS/WSS listeners have no connection cap and no idle timeout.** The
+  trunk plane's TCP/TLS listener limits do not apply to them.
 
 ### Verification against a real FreeSWITCH
 
@@ -250,14 +255,16 @@ It confirms that sofia accepts a proxied REGISTER and **preserves the
 `fsbc=` binding token** in the contact it stores (the whole inbound-call
 path depends on this), that a switch-originated call and its hangup both
 traverse the proxy, and that audio survives a round trip through the anchor
-into FreeSWITCH's `echo` application and back.
+into FreeSWITCH's `echo` application and back. The tests drive the switch
+through `/usr/local/freeswitch/bin/fs_cli`, so run them on the FreeSWITCH
+host.
 
 
 ## Quick start
 
-Requires Go ≥ 1.22.
+Requires Go ≥ 1.25.7.
 
-> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (the deployment topology and security sections: public exposure policy and admin listener baseline).
+> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (the networking and deployment topology section and the security model section).
 
 ```sh
 go build -o freesbc ./cmd/freesbc
@@ -266,7 +273,7 @@ cp sbc.example.yaml sbc.yaml   # edit peers/routes for your setup
 ./freesbc run   -c sbc.yaml
 ```
 
-The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged.
+The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC) and the `admin` listener are read once at startup and need a restart.
 
 ## Configuration
 
@@ -318,8 +325,7 @@ The two sections are mutually independent: SIP can advertise one public address 
 
 ## Roadmap
 
-Items not yet implemented. The milestones that produced the feature list above are
-finished and are no longer tracked here; see also the edge proxy's [known
+Items not yet implemented. See also the edge proxy's [known
 limitations](#known-limitations), which are structural rather than scheduled.
 
 - **100rel/PRACK** — an INVITE carrying `Require: 100rel` is answered `420 Bad Extension` today, and the trunk plane neither advertises 100rel nor handles PRACK
@@ -345,13 +351,14 @@ Enable the optional `admin` block (a bcrypt `password_hash` — generate with
   scrape config),
 - tear down a stuck call: `curl -u admin:… -X DELETE
   http://<admin.listen>/api/calls/<call-id>` (204 killed, 404 already gone) —
-  the `<call-id>` is the `id` from `GET /api/calls`.
+  the `<call-id>` is the `id` from `GET /api/calls`. The call list and
+  teardown cover trunk-plane calls only; edge-proxy dialogs are not listed.
 
 Bind the admin listener **private** — front it with a reverse proxy for remote
 access, or serve HTTPS directly with `admin.tls_cert` / `admin.tls_key`.
-Deployment baseline: loopback-only by policy; non-loopback requires the
-checklist in
-[`docs/design.md`](docs/design.md) (security model section).
+Validation rejects a non-loopback `admin.listen` unless
+`admin.allow_remote: true` is set; read the security model section of
+[`docs/design.md`](docs/design.md) before setting it.
 
 ## Layout
 
@@ -367,12 +374,14 @@ internal/
   media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
   shield/             per-IP rate limiting, scanner fingerprinting, auto-ban
   admin/              operator HTTP API, Prometheus metrics, embedded WebUI
+test/interop/         SIPp scenarios and config for manual interop runs
 ```
 
 `trunk` and `edge` are the two SIP planes and are named for the side each
-serves, not the protocol both speak. They share protocol primitives (`sip`,
-`sip/sdp`) and nothing else; dependencies run one way, and only `app` knows
-about every package. Everything is under `internal/`: the only consumer is
+serves, not the protocol both speak. Neither imports the other: besides
+the protocol primitives (`sip`, `sip/sdp`) they share only `config`,
+`media` and `shield`; dependencies run one way, and only `app` wires the
+planes and `admin` together. Everything is under `internal/`: the only consumer is
 `cmd/freesbc`, so no package here carries an API promise.
 
 ## Development
@@ -382,7 +391,11 @@ go vet ./...
 go test ./... -race
 ```
 
-The design document is [`docs/design.md`](docs/design.md); [`freesbc-allinone-design.md`](freesbc-allinone-design.md) is the original all-in-one design note.
+Some trunk and edge tests bind `127.0.0.2`. Linux routes all of
+`127.0.0.0/8` to loopback; on macOS add the alias first
+(`sudo ifconfig lo0 alias 127.0.0.2 up`) or those tests fail.
+
+The design document is [`docs/design.md`](docs/design.md).
 
 ## License
 
