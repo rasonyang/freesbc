@@ -2,7 +2,7 @@
 
 An all-in-one open-source Session Border Controller with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
-FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**. It targets small/medium businesses and ITSPs running a single node with hundreds to a few thousand concurrent calls.
+FreeSBC is written in pure Go and ships as a single static binary with zero external dependencies — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**. It targets small/medium businesses and ITSPs running a single node; hundreds to a few thousand concurrent calls is the design target, not a measured result — the repo carries no benchmarks and no load-test harness.
 
 It runs two independent planes, either or both of which may be enabled:
 
@@ -25,9 +25,9 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 - **SIP trunk interconnect** — UDP, TCP and TLS transports (real certificate or a self-signed fallback, optional mTLS), IP-authenticated peers, and registration-based trunks via outbound REGISTER with digest auth
 - **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and full SDP rewrite
 - **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution (RFC 3263 priority/weight ordering, cached)
-- **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy, SRTP↔RTP interworking in both directions, NAT traversal via hardened first-packet latching; **no transcoding** (left to the softswitch behind)
+- **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy on the **trunk plane** (the edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP), SRTP↔RTP interworking in both directions, NAT traversal via hardened first-packet latching; **no transcoding** (left to the softswitch behind)
 - **Edge proxy plane** — registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
-- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures, auto-ban, optional nftables integration (auto-detected, degrades to in-memory bans, never a hard dependency)
+- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures with an instant ban, optional nftables integration (auto-detected, degrades to in-memory bans, never a hard dependency); the multi-failure auto-ban counter (`shield.auto_ban`) is implemented but not yet wired — nothing in the shipped planes feeds it
 - **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
 - Carrier interop baseline: OPTIONS answering and session-timer negotiation (RFC 4028), including the 422/Min-SE exchange on both legs; no timer tears a call down on session expiry
 
@@ -64,9 +64,13 @@ FreeSBC sits on the network boundary in front of FreeSWITCH:
 - **Public side**: SIP over UDP, WS and WSS; RTP; WebRTC (ICE-Lite +
   DTLS-SRTP).
 - **Private side**: SIP over UDP and plain RTP/RTCP to FreeSWITCH.
-- **All signaling and media stay anchored through FreeSBC.** FreeSWITCH is
-  never given a public endpoint's address, and a public client is never given
-  FreeSWITCH's.
+- **All signaling and media stay anchored through FreeSBC.** In SDP, in
+  Contact and in the Request-URI, FreeSWITCH is never given a public
+  endpoint's address and a public client is never given FreeSWITCH's. The
+  Via stack is ordinary proxy behaviour, not hidden: FreeSBC prepends its
+  own Via and annotates the sender's with `received=`, so FreeSWITCH does
+  see the public client's address there. From and To pass through
+  untouched, by design.
 
 It is a **proxy, not a B2BUA**: Call-ID, From/To tags and CSeq pass through
 untouched, and FreeSBC stays on the path via RFC 5658 double Record-Route.
@@ -86,7 +90,7 @@ configuration, and the "Edge proxy plane" section of
 | REGISTER | Proxied verbatim, digest and all. The Contact is rewritten toward FreeSWITCH (so inbound calls route back through the SBC) and restored on the way back (so sip.js accepts the registration). The binding expiry follows the registrar's grant, not the client's request. |
 | SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
 | Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
-| Media | Every stream anchored on an SBC port pair. Symmetric RTP: the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet. Strict source latching resists off-path hijacking. |
+| Media | Every stream anchored on an SBC port pair. Symmetric RTP: on this (edge) plane the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet; the trunk plane does not seed, so media there flows once the far side sends. Strict source latching resists off-path hijacking. |
 | WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint`. |
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role so media is never interrupted. |
