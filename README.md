@@ -5,7 +5,8 @@ An all-in-one open-source Session Border Controller with the Caddy experience: *
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.25.7-00ADD8.svg)](go.mod)
 
 - **Pure Go, one static binary, zero external dependencies** — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**.
-- **Two independent planes, either or both** — a [**Trunk B2BUA**](docs/trunk.md) for carrier/PBX interconnect, and an [**Edge proxy**](docs/edge.md) that keeps FreeSWITCH on the private LAN: SIP phones and browsers reach FreeSBC's public address, and FreeSBC is the only thing that talks to FreeSWITCH.
+- **Keeps FreeSWITCH off the public internet** — the edge proxy is the only thing with a public address; FreeSWITCH stays on the private LAN and only ever talks to FreeSBC.
+- **Two independent planes, either or both** — a [**Trunk B2BUA**](docs/trunk.md) for carrier/PBX interconnect, and an [**Edge proxy**](docs/edge.md) for SIP phones and browsers in front of FreeSWITCH.
 - **Embedded WebUI, REST API and Prometheus metrics** — a live dashboard and a validated editor for the same YAML file, behind bcrypt Basic Auth.
 
 Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
