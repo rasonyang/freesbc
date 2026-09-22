@@ -146,8 +146,7 @@ func Run(ctx context.Context, opts Options) error {
 // Known gap: the call table, kill-call, unban and shield accessors are
 // trunk-only. A proxy-only deployment therefore reports an empty call list,
 // a no-op DELETE /api/calls/{id}, a no-op unban and zeroed shield counters
-// even though the edge plane has dialogs and a shield of its own. Preserved
-// deliberately — the admin API's output must not change in this refactor.
+// even though the edge plane has dialogs and a shield of its own.
 func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Server, edgeSrv *edge.Server, version string) admin.Deps {
 	deps := admin.Deps{
 		Ports:   pool.Stats,

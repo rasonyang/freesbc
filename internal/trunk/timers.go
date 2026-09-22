@@ -29,7 +29,7 @@ func headerSeconds(m sip.Message, name string) time.Duration {
 }
 
 // challengeRealm extracts the realm from a 401/407 digest challenge
-// response (T-19/F-20): WWW-Authenticate for 401, Proxy-Authenticate for
+// response: WWW-Authenticate for 401, Proxy-Authenticate for
 // 407. Returns "" when the header is absent or unparseable — callers
 // compare it against a pinned realm, so "" simply never matches (fail
 // closed). Both double- and single-quoted realms are accepted (some

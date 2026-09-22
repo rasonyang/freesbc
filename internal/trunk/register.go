@@ -17,7 +17,7 @@ import (
 
 // regParams is the immutable identity of one peer's registration: what
 // registrar to talk to, which credentials to present, and what Contact to
-// advertise. Task 4/5's lifecycle/manager build the periodic-refresh and
+// advertise. Lifecycle/manager build the periodic-refresh and
 // shutdown un-register logic on top of this.
 type regParams struct {
 	Name          string
@@ -26,7 +26,7 @@ type regParams struct {
 	Transport     string
 	Username      string
 	Password      string
-	// Realm pins the digest realm we answer challenges for (T-19/F-20);
+	// Realm pins the digest realm we answer challenges for;
 	// empty = accept any. Part of the struct (and thus the reconcile
 	// comparison) so a realm change re-registers like any other param
 	// change.
@@ -96,7 +96,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 		return 0, nil, fmt.Errorf("register: %w", err)
 	}
 	if res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired {
-		// T-19 (F-20): when this peer pins a realm, a challenge naming any
+		// When this peer pins a realm, a challenge naming any
 		// other realm is never answered — computing a digest of our
 		// credentials for it would let a rogue registrar harvest the
 		// response for offline cracking. Fail the registration as-is.
@@ -115,7 +115,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 }
 
 // newTagParams returns header params carrying a fresh From tag (reuses
-// freshTag, the M4.1 helper in b2bua.go).
+// freshTag, the helper in b2bua.go).
 func newTagParams() sip.HeaderParams {
 	pr := sip.NewParams()
 	pr.Add("tag", freshTag())
@@ -134,7 +134,7 @@ const (
 )
 
 // registration runs one peer's register→refresh→backoff loop. It is built
-// by the manager (Task 5), one per configured outbound-register peer.
+// by the manager, one per configured outbound-register peer.
 type registration struct {
 	client        *sipgo.Client
 	params        regParams

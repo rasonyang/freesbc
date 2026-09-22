@@ -9,7 +9,7 @@ import (
 	"github.com/freesbc/freesbc/internal/config"
 )
 
-// loadServerTLSConfig loads the CONFIGURED inbound TLS identity (T-17/F-13)
+// loadServerTLSConfig loads the CONFIGURED inbound TLS identity
 // for tls:// SIP listeners: cert+key from disk, TLS >= 1.2, and — when
 // clientCAPath is set — mutual TLS (clients must present a certificate
 // chaining to that CA). File errors surface at listener bind time, failing
@@ -40,11 +40,11 @@ func loadServerTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, e
 
 // buildClientTLSConfig builds the ONE outbound TLS config sipgo uses for
 // every tls dial (sipgo v1.4.3 accepts a single UA-wide *tls.Config — see
-// WithUserAgenTLSConfig — so per-peer settings are merged here, T-17/F-13):
+// WithUserAgenTLSConfig — so per-peer settings are merged here):
 //
 //   - RootCAs = the system roots PLUS every peer's tls_ca bundle, so a
 //     carrier with a private/self-signed CA is reachable with FULL
-//     verification (previously such carriers were simply undialable).
+//     verification.
 //     Peers share the merged pool: a certificate chaining to any
 //     configured CA verifies — acceptable for one operator's own trusted
 //     carrier set, and still strict against anything outside it.

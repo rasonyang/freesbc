@@ -6,8 +6,8 @@ import (
 )
 
 // preParseFilter returns the transport-layer read filter installed on the
-// sipgo UA in Run. It is the outermost edge of the trust boundary
-// (T-01, F-01/F-10): bytes whose source IP matches no peer's allowed_ips
+// sipgo UA in Run. It is the outermost edge of the trust boundary:
+// bytes whose source IP matches no peer's allowed_ips
 // are dropped BEFORE the SIP parser, so they never reach the transaction
 // layer (no stateless 400 for malformed requests, no stray-response
 // goroutines), the handler/shield plane, the per-source connection pool, or

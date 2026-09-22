@@ -167,7 +167,7 @@ func (c *Config) validate() error {
 		}
 		p.allowedNets = nil
 		if len(p.AllowedIPs) == 0 {
-			// T-11 (F-16): an empty list silently failed closed before —
+			// An empty list silently failed closed before —
 			// the peer could never be identified and the operator got no
 			// signal. That's a config mistake, not a posture: refuse it.
 			fail("peers.%s: allowed_ips: at least one prefix required", name)
@@ -178,13 +178,12 @@ func (c *Config) validate() error {
 				fail("peers.%s: allowed_ips: %v", name, err)
 				continue
 			}
-			// T-11 (F-16): cap prefix width. allowed_ips IS the whole
+			// Cap prefix width. allowed_ips IS the whole
 			// inbound trust boundary (source-IP identification), so a
 			// fat-fingered 0.0.0.0/0 — or an over-wide range — silently
 			// opens toll fraud to every host it covers. The floors are /8
 			// (IPv4) and /32 (IPv6): the widest real-world allocation
-			// boundaries (10/8, an RIR site allocation), deliberately more
-			// permissive than the review's suggested /16//48 because this
+			// boundaries (10/8, an RIR site allocation), because this
 			// repo's own example config ships a 10.0.0.0/8 peer. A bare IP
 			// parses as its full-length prefix and always passes.
 			minBits := 8
@@ -268,7 +267,7 @@ func (c *Config) validate() error {
 		if err != nil {
 			fail("admin.listen: %q is not host:port", c.Admin.Listen)
 		} else if !ap.Addr().IsLoopback() && !c.Admin.AllowRemote {
-			// T-26 (D4-6): the admin API is the full-config exposure point
+			// The admin API is the full-config exposure point
 			// guarded only by Basic auth — non-loopback binding must be an
 			// explicit opt-in, and the error points at the TLS route.
 			fail("admin.listen: %q is not loopback; set admin.allow_remote: true to bind it "+
@@ -281,16 +280,16 @@ func (c *Config) validate() error {
 		if cerr != nil {
 			fail("admin.auth.password_hash: must be a bcrypt hash: %v", cerr)
 		} else if cost < 10 {
-			// T-26 (D4-6): cost 4 (min) makes offline cracking ~50x cheaper;
+			// Cost 4 (min) makes offline cracking ~50x cheaper;
 			// the hash travels in backups, logs, and the config itself.
 			fail("admin.auth.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
 		}
-		// T-26b: both-or-neither, so a half-configured pair can't leave the
+		// Both-or-neither, so a half-configured pair can't leave the
 		// operator believing TLS is on while it silently isn't.
 		checkFilePair(fail, "admin", "tls_cert", c.Admin.TLSCert, "tls_key", c.Admin.TLSKey)
 	}
 
-	// T-17 (F-13): SIP-plane TLS pairs — same both-or-neither rationale as
+	// SIP-plane TLS pairs — same both-or-neither rationale as
 	// the admin pair above.
 	checkFilePair(fail, "listen", "tls_cert", c.Listen.TLSCert, "tls_key", c.Listen.TLSKey)
 	if c.Listen.TLSClientCA != "" && c.Listen.TLSCert == "" {

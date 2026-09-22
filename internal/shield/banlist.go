@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// banCap is the hard ceiling on distinct banned sources (T-03, F-05): a
+// banCap is the hard ceiling on distinct banned sources: a
 // unique-source flood within one auto_ban.duration window (default 1h) must
 // not grow the table without bound. 64k entries is far beyond any realistic
 // deployment's distinct-source count while bounding memory to ~a few MiB.
@@ -21,8 +21,8 @@ const banCap = 65536
 const sweepEvery = time.Second
 
 // banList is the authoritative, always-on in-memory ban table: a source IP
-// mapped to the instant its ban expires, with lazy expiry on read. Task 4
-// adds an optional nftables backend field so bans are ALSO dropped at the
+// mapped to the instant its ban expires, with lazy expiry on read.
+// Adds an optional nftables backend field so bans are ALSO dropped at the
 // kernel; the in-memory table alone is sufficient and cross-platform.
 type banList struct {
 	mu    sync.Mutex
@@ -46,8 +46,8 @@ func newBanList() *banList {
 
 // ban blocks ip for dur (extending any existing ban), then, if kernel is
 // set and an nftables backend is attached, also installs a matching kernel
-// drop. kernel is false for bans the caller wants memory-only (T-02, F-04:
-// a single-packet scanner verdict over UDP — a forgable source — must never
+// drop. kernel is false for bans the caller wants memory-only (a
+// single-packet scanner verdict over UDP — a forgable source — must never
 // reach the kernel). It reports whether the ban was recorded: when the
 // table is at banCap and ip is not already banned, expired entries are
 // swept lazily first, and if the table is still full the addition is

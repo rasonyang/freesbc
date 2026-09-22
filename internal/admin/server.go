@@ -54,7 +54,7 @@ type Deps struct {
 	ActiveCalls func() int
 	KillCall    func(id string) bool
 	// Unban removes a shield ban by IP literal (memory table + kernel
-	// element) and reports whether a ban existed (T-02, F-04).
+	// element) and reports whether a ban existed.
 	Unban   func(ip string) bool
 	Version string
 	// Proxy reports the edge-proxy plane's counters, or is nil when that
@@ -100,7 +100,7 @@ type Server struct {
 	started time.Time
 	cfgPath string
 
-	limiter authLimiter // per-IP auth-failure rate limit (T-09/F-14)
+	limiter authLimiter // per-IP auth-failure rate limit
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -174,7 +174,7 @@ func (s *Server) Run(ctx context.Context) error {
 // bcrypt password compare, both evaluated before deciding (no timing oracle),
 // generic 401 on any failure (no user enumeration). /healthz is not wrapped.
 //
-// T-09 (F-14) hardening: (1) a request with no Authorization header at all
+// Hardening: (1) a request with no Authorization header at all
 // is rejected 401 before any bcrypt work — paying a full KDF for a request
 // that carries no credentials is exactly the unauthenticated CPU-DoS the
 // audit found, and the header's presence is public information, so skipping
@@ -184,7 +184,7 @@ func (s *Server) Run(ctx context.Context) error {
 // credentials — gets 429 until the window rolls over, bounding both
 // brute-force attempts and the bcrypt CPU a single address can demand.
 //
-// T-15 (F-15): the credentials compared are the store's CURRENT admin
+// The credentials compared are the store's CURRENT admin
 // snapshot (adminAuth), not the construction-time cfg — a hot reload's new
 // password_hash takes effect on the very next request.
 func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
@@ -214,13 +214,12 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// newHTTPServer builds the http.Server (T-24/D3-4): ReadHeaderTimeout was
-// already set; IdleTimeout reclaims keep-alive connections that would
-// otherwise pile up fd/goroutine pairs indefinitely (the unauthenticated
-// /healthz is a favorite poll target, so idle keep-alive is a real leak),
-// and Read/WriteTimeout bound slow clients — 30s leaves generous headroom
-// for the 1MiB config PUT. Extracted so a test can pin the exact timeout
-// set without waiting out any of them.
+// newHTTPServer builds the http.Server: IdleTimeout reclaims keep-alive
+// connections that would otherwise pile up fd/goroutine pairs indefinitely
+// (the unauthenticated /healthz is a favorite poll target, so idle
+// keep-alive is a real leak), and Read/WriteTimeout bound slow clients —
+// 30s leaves generous headroom for the 1MiB config PUT. Extracted so a
+// test can pin the exact timeout set without waiting out any of them.
 func (s *Server) newHTTPServer() *http.Server {
 	return &http.Server{
 		Addr:              s.cfg.Listen,
@@ -232,8 +231,8 @@ func (s *Server) newHTTPServer() *http.Server {
 	}
 }
 
-// isLoopbackListen reports whether addr is a loopback host:port (T-26b's
-// startup-warning check — config validation has already admitted whatever
+// isLoopbackListen reports whether addr is a loopback host:port
+// (startup-warning check — config validation has already admitted whatever
 // is here).
 func isLoopbackListen(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
@@ -244,14 +243,12 @@ func isLoopbackListen(addr string) bool {
 	return err == nil && ip.IsLoopback()
 }
 
-// adminAuth returns the LIVE admin auth credentials (T-15/F-15): read from
-// the store on every request, so a hot reload that swaps in a new
-// password_hash revokes the old password immediately — no restart, no grace
-// window. The bcrypt work is unchanged; only the inputs come from the
-// current snapshot instead of the construction-time cfg. When the reloaded
-// config carries no admin section at all (Admin nil), the construction-time
-// credentials keep applying — the API keeps serving rather than flipping to
-// an empty auth that would deny everyone.
+// adminAuth returns the LIVE admin auth credentials: read from the store on
+// every request, so a hot reload that swaps in a new password_hash revokes
+// the old password immediately — no restart, no grace window. When the
+// reloaded config carries no admin section at all (Admin nil), the
+// construction-time credentials keep applying — the API keeps serving
+// rather than flipping to an empty auth that would deny everyone.
 func (s *Server) adminAuth() config.AdminAuth {
 	if cur := s.store.Current().Admin; cur != nil {
 		return cur.Auth
@@ -260,7 +257,7 @@ func (s *Server) adminAuth() config.AdminAuth {
 }
 
 // watchListenChange logs a prominent warning whenever a hot-reloaded config
-// changes admin.listen (T-15/F-15): the listener is fixed at bind time, so
+// changes admin.listen: the listener is fixed at bind time, so
 // the new address only takes effect after a restart — silently keeping the
 // old one would make operators believe the change applied. Returns a stop
 // func; the subscription itself is deliberately left registered (Store
@@ -287,7 +284,7 @@ func (s *Server) watchListenChange(ctx context.Context) func() {
 }
 
 // authFailLimit, authFailWindow, and authFailMaxIPs bound the per-IP
-// auth-failure rate limiter (T-09/F-14): an IP is allowed authFailLimit
+// auth-failure rate limiter: an IP is allowed authFailLimit
 // failures per authFailWindow; the next request from it within the window is
 // answered 429 instead of 401, and it stays 429 until the window rolls over.
 // authFailMaxIPs caps the tracked-IP table so its state can never grow
@@ -364,7 +361,7 @@ func remoteIP(r *http.Request) string {
 }
 
 // recoverMW turns a handler panic into a 500 without leaking a stack trace.
-// It also injects Cache-Control: no-store on every response (T-16/F-18):
+// It also injects Cache-Control: no-store on every response:
 // the API serves live state and, on /api/config/raw, the FULL config —
 // every peer credential in plaintext — none of which belongs in a
 // browser's on-disk cache. /healthz is exempt: it is static and is what
@@ -408,7 +405,7 @@ func (s *Server) handleKickCall(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "no such active call", http.StatusNotFound)
 }
 
-// handleUnban removes a shield ban by IP (T-02, F-04) — the dep parses the
+// handleUnban removes a shield ban by IP — the dep parses the
 // literal, clears the in-memory table, and synchronously deletes the kernel
 // element. 204 if a ban existed and was removed, 404 otherwise (including
 // an unparseable IP, which cannot correspond to any ban).
