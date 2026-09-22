@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"strconv"
 	"sync"
 	"time"
 
@@ -112,27 +111,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 	if res.StatusCode != sip.StatusOK {
 		return 0, res, fmt.Errorf("register rejected: %d %s", res.StatusCode, res.Reason)
 	}
-	return grantedExpires(res, expires), res, nil
-}
-
-// grantedExpires reads the lifetime the registrar granted: the Expires
-// header if present, else the Contact's expires param, else whatever was
-// requested (a registrar that omits both but still answers 200 is assumed
-// to have granted what was asked).
-func grantedExpires(res *sip.Response, requested time.Duration) time.Duration {
-	if h := res.GetHeader("Expires"); h != nil {
-		if n, err := strconv.Atoi(h.Value()); err == nil {
-			return time.Duration(n) * time.Second
-		}
-	}
-	if c := res.Contact(); c != nil {
-		if v, ok := c.Params.Get("expires"); ok {
-			if n, err := strconv.Atoi(v); err == nil {
-				return time.Duration(n) * time.Second
-			}
-		}
-	}
-	return requested
+	return fsip.GrantedExpires(res, expires), res, nil
 }
 
 // newTagParams returns header params carrying a fresh From tag (reuses

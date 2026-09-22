@@ -259,7 +259,7 @@ type bindingInput struct {
 // that outlived the registrar's own would make FreeSBC accept calls
 // FreeSWITCH no longer routes.
 func (s *Server) recordBinding(res *sip.Response, in bindingInput) int {
-	granted := grantedExpires(res, in.requested)
+	granted := fsip.GrantedExpires(res, in.requested)
 	if in.unregister || granted <= 0 {
 		s.loc.Remove(in.aor, in.callID)
 		s.metrics.SetRegistrations(s.loc.Count())
@@ -366,29 +366,7 @@ func requestedExpires(req *sip.Request) (time.Duration, bool) {
 		}
 	}
 	// No Expires at all: the registrar decides. Treat it as a
-	// registration (not an un-REGISTER) and let grantedExpires read the
+	// registration (not an un-REGISTER) and let fsip.GrantedExpires read the
 	// answer off the response.
 	return 0, false
-}
-
-// grantedExpires reads what the registrar actually granted, preferring the
-// response's Contact expires parameter over its Expires header.
-func grantedExpires(res *sip.Response, requested time.Duration) time.Duration {
-	for _, h := range res.GetHeaders("Contact") {
-		c, ok := h.(*sip.ContactHeader)
-		if !ok || c.Params == nil {
-			continue
-		}
-		if v, ok := c.Params.Get("expires"); ok {
-			if n, err := strconv.Atoi(v); err == nil {
-				return time.Duration(n) * time.Second
-			}
-		}
-	}
-	if h := res.GetHeader("Expires"); h != nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(h.Value())); err == nil {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return requested
 }

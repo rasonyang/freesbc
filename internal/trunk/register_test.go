@@ -34,7 +34,11 @@ type stubRegistrar struct {
 	user         string
 	pass         string
 	grantExpires int
-	challenge    *digest.Challenge
+	// contactExpires, when > 0, makes the 200 OK also carry a Contact
+	// with an expires param of that many seconds — the RFC 3261 §10.3
+	// step 7 form, where the param outranks the Expires header.
+	contactExpires int
+	challenge      *digest.Challenge
 
 	mu              sync.Mutex
 	authorizedCount int
@@ -64,6 +68,14 @@ func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires 
 // never mutated afterward, so -race stays clean.
 func startStubRegistrarRealm(t *testing.T, port int, user, pass string, grantExpires int, realm string) *stubRegistrar {
 	t.Helper()
+	return startStubRegistrarFull(t, port, user, pass, grantExpires, 0, realm)
+}
+
+// startStubRegistrarFull is startStubRegistrarRealm with an extra Contact
+// expires param on the 200 OK (0 = no Contact header at all, the shape
+// every other test uses).
+func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpires, contactExpires int, realm string) *stubRegistrar {
+	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -78,9 +90,10 @@ func startStubRegistrarRealm(t *testing.T, port int, user, pass string, grantExp
 	}
 
 	r := &stubRegistrar{
-		user:         user,
-		pass:         pass,
-		grantExpires: grantExpires,
+		user:           user,
+		pass:           pass,
+		grantExpires:   grantExpires,
+		contactExpires: contactExpires,
 		challenge: &digest.Challenge{
 			Realm:     realm,
 			Nonce:     "test-nonce-fixed",
@@ -111,6 +124,14 @@ func startStubRegistrarRealm(t *testing.T, port int, user, pass string, grantExp
 		res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
 		exp := sip.ExpiresHeader(uint32(r.grantExpires))
 		res.AppendHeader(&exp)
+		if r.contactExpires > 0 {
+			pr := sip.NewParams()
+			pr.Add("expires", strconv.Itoa(r.contactExpires))
+			res.AppendHeader(&sip.ContactHeader{
+				Address: sip.Uri{User: user, Host: "127.0.0.1", Port: port},
+				Params:  pr,
+			})
+		}
 		if err := tx.Respond(res); err != nil {
 			log.Error("registrar respond 200", "err", err)
 		}
@@ -398,6 +419,32 @@ func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
 	}
 	if !reg.sawAuthorizedRegister() {
 		t.Error("registrar never received an authorized REGISTER")
+	}
+}
+
+// TestRegisterOnceContactExpiresBeatsExpiresHeader pins RFC 3261 §10.3
+// step 7: when the 200 OK carries both, the Contact's expires PARAM is
+// what the registrar granted for that binding and the Expires header is
+// only a default. Pre-fix the trunk plane read them the other way round
+// and would have refreshed on the 3600s header while the binding expired
+// after 120s.
+func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
+	// Grants Expires: 3600, but Contact: <...>;expires=120.
+	reg := startStubRegistrarFull(t, 45325, "reguser", "regpass", 3600, 120, "freesbc-test")
+	client := reg.client(t)
+	p := regParams{
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45325,
+		Transport: "udp", Username: "reguser", Password: "regpass",
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45993,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	granted, err := registerOnce(ctx, client, p, time.Hour)
+	if err != nil {
+		t.Fatalf("registerOnce: %v", err)
+	}
+	if granted != 120*time.Second {
+		t.Errorf("granted = %v, want 120s (Contact expires param, not the 3600s Expires header)", granted)
 	}
 }
 

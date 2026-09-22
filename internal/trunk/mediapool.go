@@ -1,10 +1,9 @@
 package trunk
 
 import (
-	"net/netip"
-
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
 // NewMediaPool builds the trunk B2BUA plane's RTP port pool from the live
@@ -20,24 +19,8 @@ func NewMediaPool(store *config.Store) *media.PlanePool {
 		return media.PlaneParams{
 			MinPort: r.Min,
 			MaxPort: r.Max,
-			BindIP:  parseBindIP(cfg.RTP.BindIP),
+			BindIP:  fsip.ParseBindIP(cfg.RTP.BindIP),
 			Timeout: cfg.Listen.Media.RTPTimeout.Std(),
 		}
 	})
-}
-
-// parseBindIP turns a configured bind address into a netip.Addr, or the
-// zero Addr (every interface) when unset or unparseable. Only the bind
-// plane — the advertised SDP address lives on the signaling side; the two
-// stay independent so NAT/VPN deployments can bind privately and advertise
-// publicly.
-func parseBindIP(s string) netip.Addr {
-	if s == "" {
-		return netip.Addr{}
-	}
-	ip, err := netip.ParseAddr(s)
-	if err != nil {
-		return netip.Addr{}
-	}
-	return ip
 }
