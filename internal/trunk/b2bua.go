@@ -879,322 +879,20 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	retried422 := false
 
 	for {
-		var err error
-		bLeg, err = s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
-		if err != nil {
-			s.log.Error("invite b-leg", "err", err, "target", target.Name)
-			// Invite() itself failed (dial/DNS/transport error before any
-			// request even went out, or went out and was synchronously
-			// rejected): the endpoint never had a chance to respond — normally
-			// a genuine connect failure worth cooling down. But sipgo resolves
-			// a hostname/SRV endpoint using aLeg.Context() (the request is
-			// dialed via that context), so a caller CANCEL/hangup can itself
-			// make Invite() fail instantly here (a cancelled-context resolve
-			// error) for a perfectly healthy target — e.g. a 422 retry's
-			// Invite() racing a caller hangup. Gate on the same
-			// aLeg.Context().Err() signal the WaitAnswer-error classification
-			// below already uses, so only a genuine unreachable-host dial
-			// error (caller still present) cools the endpoint down; a
-			// caller-cancellation-induced Invite failure does not.
-			return nil, attemptResult{retryable: true, kind: failDial, penalize: aLeg.Context().Err() == nil}
-		}
-
-		// attemptCtx caps how long THIS target is allowed to ring before we give
-		// up on it and fail over — cfg.RingTimeout, not the whole-call budget.
-		// It's a child of aLeg.Context(), not context.Background(): a caller
-		// CANCEL/hangup must still abort the attempt immediately rather than
-		// waiting out the ring timer. Deriving from aLeg.Context() also means a
-		// parent cancellation (caller gone) propagates into attemptCtx as
-		// context.Canceled, while an attemptCtx-only expiry propagates as
-		// context.DeadlineExceeded — that distinction is exactly how the
-		// WaitAnswer-error classification below tells a caller CANCEL apart
-		// from a ring timeout (see the comment there). WaitAnswer's own
-		// ctx.Done() path (github.com/emiago/sipgo@v1.4.3 dialog_client.go)
-		// sends the target a real CANCEL and returns ctx.Err() from
-		// inviteCancel — so attemptCtx expiring both cancels the hung target on
-		// the wire and gives us a reliable signal to classify on. Each loop
-		// iteration (i.e. each of up to two INVITEs) gets its own attemptCtx
-		// — a fresh ring-timeout budget for the retry, not a shared one.
-		attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
-
-		// WaitAnswer alone cannot be trusted to honor attemptCtx.
-		// When the target never sends ANY response, sipgo's WaitAnswer enters
-		// inviteCancel, which — per RFC 3261 §9.1 (no CANCEL before a
-		// provisional) — blocks until the target responds or the INVITE
-		// transaction dies on Timer_B (~32s). A silent/blackholed target
-		// would therefore pin this attempt for ~32s and ring_timeout/failover
-		// would never fire. Race WaitAnswer against the deadline so the
-		// per-attempt ring budget always holds; the goroutine finishes on its
-		// own (CANCEL+487 once a late response arrives, or Timer_B teardown),
-		// which costs nothing extra — the transaction would retransmit for
-		// the same ~32s regardless.
-		//
-		// responded tracks whether the target answered within the ring
-		// budget: the deadline path below cools the endpoint down only when
-		// nothing at all was heard in time (a mere ring timeout — 180
-		// received, no answer — must not penalize, same as the
-		// InviteResponse==nil check in the classification path).
-		var responded atomic.Bool
-		var abandoned atomic.Bool
-		waited := make(chan error, 1)
-		relay := s.relayProvisional(aLeg, sess, mediaIP, aSRTP, bSRTP)
-		// bLeg and attemptCtx are passed as ARGUMENTS, not captured: the
-		// compiler may share the captured bLeg cell with dialTarget's return
-		// slot (bLeg escapes both ways), and the deadline path's return below
-		// would then race the goroutine's read of it (-race catches this as a
-		// write at the return statement vs the closure's WaitAnswer call).
-		// Argument copies are written once at goroutine start, so the
-		// goroutine owns its values and the main flow can return freely.
-		go func(bLeg *sipgo.DialogClientSession, attemptCtx context.Context) {
-			// This goroutine outlives onInvite's recoverCall umbrella —
-			// it keeps running (inviteCancel, ackThenBye) for up to Timer_B
-			// (~32s) after dialTarget has already returned on an abandoned or
-			// raced attempt — so a panic here (including a nil-deref induced
-			// by a data race on shared dialog state) would kill the
-			// WHOLE process, not just this call. Contain it: log and exit the
-			// goroutine. Nothing is sent on waited after a panic; the main
-			// path then simply runs out its ring budget and grace and
-			// classifies the attempt as a timeout, which is the same outcome
-			// an in-band error would have produced.
-			defer s.recoverBWaiter(target.Name)
-			err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
-				OnResponse: func(res *sip.Response) error {
-					// Once the main path has abandoned this attempt
-					// (ring deadline AND grace both expired), stop touching
-					// any shared dialog/media state — relay can reach
-					// aLeg.Respond, and the main flow may concurrently be
-					// responding the A-leg or dialing the next target, so a
-					// late relay racing an abandoned attempt is an
-					// unsynchronized WriteResponse (a data race, not just a
-					// mis-aimed response).
-					// responded also stays unset for late responses, so the
-					// penalize read on the deadline path reflects only what
-					// arrived in time. (A post-abandon OnResponse is rare —
-					// WaitAnswer enters inviteCancel once attemptCtx is done
-					// and inviteCancel never calls OnResponse — but its
-					// select can pick a just-arrived response over ctx.Done
-					// in the same instant, and that is the window this
-					// closes.)
-					if abandoned.Load() {
-						return nil
-					}
-					// Realm pinning — when THIS target's auth
-					// pins a realm, a challenge naming any other realm must
-					// never be answered with a digest of our credentials
-					// (a rogue or compromised server would harvest the
-					// response for offline cracking). OnResponse runs
-					// BEFORE sipgo's built-in digest retry, so returning an
-					// error here aborts WaitAnswer without any
-					// Authorization header ever being sent for this
-					// attempt; the classification below then reports it as
-					// the ordinary unsatisfied-challenge failDial.
-					if auth := target.Peer.Auth; auth != nil && auth.Realm != "" &&
-						(res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired) &&
-						challengeRealm(res) != auth.Realm {
-						return fmt.Errorf("auth challenge realm %q does not match pinned realm %q", challengeRealm(res), auth.Realm)
-					}
-					responded.Store(true)
-					return relay(res)
-				},
-				Username: authUser(target),
-				Password: authPass(target),
-			})
-			// A 2xx can race the deadline: inviteCancel consumes it and
-			// returns an error, but the carrier now thinks the call is up —
-			// tear that phantom call down here, because the main loop below
-			// has already moved on and must never read InviteResponse again
-			// for this attempt.
-			if abandoned.Load() && carrierAnswered(bLeg) {
-				s.ackThenBye(bLeg, target)
-			}
-			waited <- err
-		}(bLeg, attemptCtx)
-
-		var waitErr error
-		select {
-		case waitErr = <-waited:
-			// WaitAnswer returned first: classify below, exactly as before.
-		case <-attemptCtx.Done():
-			// The ring budget expired before WaitAnswer returned. Give the
-			// goroutine a short grace to finish before abandoning the
-			// attempt: it may be mid-relay of a provisional response (an
-			// aLeg.Respond from OnResponse) or already in the CANCEL dance.
-			// Once it delivers, classification runs on this goroutine's
-			// sequential path below, so aLeg.Respond is never invoked from
-			// two goroutines at once. A target that never sent ANY response
-			// leaves the goroutine blocked in sipgo's inviteCancel (RFC 3261
-			// §9.1 forbids CANCEL before a provisional) until the INVITE
-			// transaction dies on Timer_B (~32s) — the grace expires and we
-			// abandon the attempt, so ring_timeout/failover still hold.
-			// 250ms is far more than the relay/CANCEL dance needs;
-			// in the abandoned case the goroutine never touches the A-leg
-			// again (OnResponse only runs once a response arrived, and an
-			// abandoned attempt means none did within the budget).
-			grace := time.NewTimer(250 * time.Millisecond)
-			defer grace.Stop()
-			select {
-			case waitErr = <-waited:
-				// Delivered within the grace window: fall through to the
-				// normal classification below (attemptCtx.Err() is
-				// DeadlineExceeded here for a ring timeout, Canceled for a
-				// caller hangup — both classified by the existing cases).
-			case <-grace.C:
-				abandoned.Store(true)
-				cancel()
-				s.log.Info("b-leg not answered", "err", attemptCtx.Err(), "target", target.Name)
-				if attemptCtx.Err() == context.DeadlineExceeded {
-					// Caller still present (else attemptCtx would carry
-					// Canceled, not DeadlineExceeded — it derives from
-					// aLeg.Context()).
-					return nil, attemptResult{
-						retryable: true,
-						kind:      failRing,
-						penalize:  !responded.Load(),
-					}
-				}
-				// Parent context cancelled: the caller is gone. Mirror the
-				// aLeg.Context().Err() classification case below (zero-value
-				// kind/code — nothing reaches a caller that no longer
-				// exists) and never penalize: this wasn't the endpoint's
-				// fault.
-				return nil, attemptResult{retryable: true, kind: failDial}
-			}
-		}
-		if waitErr == nil {
-			cancel()
+		attemptLeg, attemptRes, answered, carrierMinSE := s.dialAttempt(c, cfg, target, mediaIP, bTarget, bOffer, bHeaders, retried422)
+		if answered {
+			bLeg = attemptLeg
 			break
 		}
-		s.log.Info("b-leg not answered", "err", waitErr, "target", target.Name)
-		// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
-		// it sees, including 1xx provisionals — not just the final one. If
-		// the transaction dies mid-ring (e.g. a transport error after a
-		// 100/180, or the call context is cancelled while still ringing),
-		// WaitAnswer returns an error but InviteResponse is left holding
-		// that stale provisional. A 1xx can never legally be relayed as a
-		// FINAL response (it would violate the SIP transaction model — see
-		// placeCall, which relays a real final code, when every target is
-		// exhausted), so only trust InviteResponse here when it is itself a
-		// final (non-provisional) response — that's the line between a
-		// genuine carrier failure (failReal, its own code) and one of our
-		// own synthesized ones (failDial, 503: dial error, timeout, CANCEL
-		// race, or a stale provisional).
-
-		// A 422 carries the carrier's Min-SE floor in a header —
-		// retry THIS target once with Session-Expires raised to meet it,
-		// rather than treating it as an ordinary carrier failure. A 422 is
-		// a non-2xx final on an unanswered B-leg (same as any other failReal
-		// candidate below), so just Close — no ACK/BYE. This must run before
-		// the raced-2xx teardown and classification switch below: a 422 is
-		// never a success, so neither of those apply to it.
-		if !retried422 && bLeg.InviteResponse != nil && bLeg.InviteResponse.StatusCode == 422 {
-			if carrierMinSE := headerSeconds(bLeg.InviteResponse, "Min-SE"); carrierMinSE > 0 {
-				retried422 = true
-				bLeg.Close()
-				cancel()
-				bHeaders[3] = sessionExpiresHeader(carrierMinSE, "uas")
-				continue
-			}
+		if carrierMinSE > 0 {
+			// The target 422'd with a usable Min-SE floor and a retry is
+			// still owed to it: raise Session-Expires to meet the floor and
+			// dial this same target once more.
+			retried422 = true
+			bHeaders[3] = sessionExpiresHeader(carrierMinSE, "uas")
+			continue
 		}
-
-		// InviteResponse can also hold a 2xx here: WaitAnswer returns an
-		// error (ctx cancellation racing a just-arrived answer, or a
-		// malformed 2xx whose DialogIDFromResponse failed) while the
-		// carrier has already answered for real. That answer is a live,
-		// billable carrier call the carrier now thinks is up — it is
-		// classified below, but first it must be torn down with a
-		// real ACK+BYE rather than silently abandoned to ring up ~32s of
-		// carrier billing for a call nobody is using.
-		res := attemptResult{retryable: true, kind: failDial}
-		// The endpoint sent NOTHING at all (no provisional, no final — not
-		// even a stale one left over from a dead transaction) and the caller
-		// is still present: this is our own ring-timeout or a transport
-		// failure with no signal that the endpoint is reachable, which is
-		// exactly the genuine-connect-failure case that should cool the
-		// endpoint down. This condition is deliberately narrower than
-		// "kind == failDial": it excludes the caller-CANCEL case
-		// (aLeg.Context().Err() != nil, handled below) and every case where
-		// InviteResponse is non-nil — a raced/stale 2xx or provisional, or an
-		// unsatisfied 401/407 challenge — all of which prove the endpoint
-		// DID respond and so must not be penalized.
-		if bLeg.InviteResponse == nil && aLeg.Context().Err() == nil {
-			res.penalize = true
-		}
-
-		// A target can answer 200 in the window between our CANCEL and its
-		// arrival (caller hangup, ring timeout, or a malformed 2xx). This
-		// runs UNCONDITIONALLY, above the classification switch below,
-		// because the switch's cases are mutually exclusive: if the caller
-		// also CANCELed in that same window (the common "impatient caller
-		// hangs up as the callee picks up" case), aLeg.Context().Err() != nil
-		// is ALSO true, and that case would otherwise win and skip teardown
-		// entirely — leaving a live carrier call nobody tears down for
-		// ~32s. Tear the phantom call down with ACK+BYE before classifying,
-		// regardless of which case ends up classifying the attempt. Best
-		// effort, independent of the A-leg's fate (which may already be
-		// cancelled — the caller-CANCEL case above): ackThenBye bounds both
-		// its own ACK and BYE via byeContext's 5s.
-		if carrierAnswered(bLeg) {
-			s.ackThenBye(bLeg, target)
-		}
-		switch {
-		case aLeg.Context().Err() != nil:
-			// The A-leg itself is gone (caller CANCEL/hangup): placeCall's
-			// own aLeg.Context().Err() check, right after this return, stops
-			// the failover loop before trying another target. The exact
-			// kind/code here never reaches the caller (there is no caller
-			// left to respond to), so failDial's zero-value default is fine
-			// — the important thing is NOT to misclassify this as failRing,
-			// which would be a lie (nothing "timed out"; the caller left).
-
-		case carrierAnswered(bLeg):
-			// Raced 2xx (see the comment above the switch — teardown already
-			// ran there, unconditionally). This 2xx must never be relayed to
-			// the caller as a success (dialTarget already returned
-			// retryable=true; the caller only ever sees the eventual
-			// classification below) or counted as failReal (it isn't a
-			// failure); it classifies exactly like any other outcome on
-			// this attempt — failRing if the ring deadline had already
-			// expired, failDial/503 otherwise.
-			if attemptCtx.Err() == context.DeadlineExceeded {
-				res.kind = failRing
-			}
-
-		case attemptCtx.Err() == context.DeadlineExceeded:
-			// aLeg.Context() is still live (checked above) but the
-			// PER-ATTEMPT deadline fired: this target simply rang too long.
-			// WaitAnswer already sent it a CANCEL (see attemptCtx's comment
-			// above) — placeCall fails over to the next target.
-			res.kind = failRing
-
-		case bLeg.InviteResponse != nil &&
-			bLeg.InviteResponse.StatusCode >= 300 &&
-			bLeg.InviteResponse.StatusCode != sip.StatusUnauthorized &&
-			bLeg.InviteResponse.StatusCode != sip.StatusProxyAuthRequired:
-			// A genuine carrier failure final (>=300), excluding 401/407:
-			// those are hop-by-hop challenges, handled in the case below,
-			// never a code the caller could act on. A second/unusable 422
-			// (retried422 already true, or no usable Min-SE) lands here too
-			// — 422 >= 300 and isn't 401/407 — and is reported as failReal
-			// with its own code, same as any other genuine carrier decline.
-			res.kind = failReal
-			res.realCode = bLeg.InviteResponse.StatusCode
-			res.realReason = bLeg.InviteResponse.Reason
-
-		case bLeg.InviteResponse != nil &&
-			(bLeg.InviteResponse.StatusCode == sip.StatusUnauthorized || bLeg.InviteResponse.StatusCode == sip.StatusProxyAuthRequired):
-			// The target challenged and we couldn't (or didn't) satisfy it:
-			// WaitAnswer only attempts its own digest retry when
-			// opts.Password is non-empty (see authUser/authPass) — an
-			// IP-auth trunk that unexpectedly challenges, or a retry whose
-			// credentials the target still rejects, ends up here. A 401/407
-			// is a negotiation with THIS target, not something the caller
-			// can use, so it stays failDial — placeCall's 503 — rather than
-			// leaking the challenge upstream as a bogus 401/407.
-			s.log.Debug("b-leg auth challenge unsatisfied", "code", bLeg.InviteResponse.StatusCode, "target", target.Name)
-		}
-		cancel()
-		_ = bLeg.Close()
-		return nil, res
+		return nil, attemptRes
 	}
 
 	// Past this point the B-leg is answered (2xx): a live, billable carrier
@@ -1312,6 +1010,350 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	}
 
 	return bLeg, attemptResult{ok: true, aAnswer: aAnswer, bOffer: bOffer}
+}
+
+// dialAttempt drives ONE INVITE to target to the point where the attempt is
+// decided: it sends the request, relays the provisional responses
+// (relayProvisional via WaitAnswer's OnResponse), bounds the ring with its
+// own per-attempt deadline, and classifies the outcome. Everything it owns
+// is created and retired inside the attempt — the attempt context and its
+// cancel, the waiter goroutine and its grace timer, the responded/abandoned
+// flags — so dialTarget's retry loop has nothing to unwind between
+// attempts.
+//
+// It reports the three outcomes that loop distinguishes:
+//
+//   - answered true: WaitAnswer returned a 2xx and bLeg is the answered
+//     B-leg, which dialTarget takes over for the post-answer commit. The
+//     returned attemptResult carries nothing in this case.
+//   - minSE non-zero: the target replied 422 naming a usable Min-SE floor
+//     and a retry is still owed to it. The B-leg is already Closed;
+//     dialTarget re-dials this same target with Session-Expires raised to
+//     minSE.
+//   - otherwise: the attempt failed and the returned attemptResult is what
+//     dialTarget hands back to placeCall verbatim.
+//
+// retried422 is dialTarget's at-most-one-retry-per-target state, passed in
+// so that a second 422 asks for no further retry and falls through to the
+// ordinary failReal classification below instead. bTarget, bOffer and
+// bHeaders are the request this attempt sends, built by dialTarget once per
+// target and (index 3 of bHeaders only) rewritten by it between attempts.
+func (s *Server) dialAttempt(c *call, cfg *config.Config, target Target, mediaIP netip.Addr, bTarget sip.Uri, bOffer []byte, bHeaders []sip.Header, retried422 bool) (bLeg *sipgo.DialogClientSession, outcome attemptResult, answered bool, minSE time.Duration) {
+	aLeg, sess, aSRTP, bSRTP := c.aLeg, c.sess, c.aSRTP, c.bSRTP
+	var err error
+	bLeg, err = s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, bHeaders...)
+	if err != nil {
+		s.log.Error("invite b-leg", "err", err, "target", target.Name)
+		// Invite() itself failed (dial/DNS/transport error before any
+		// request even went out, or went out and was synchronously
+		// rejected): the endpoint never had a chance to respond — normally
+		// a genuine connect failure worth cooling down. But sipgo resolves
+		// a hostname/SRV endpoint using aLeg.Context() (the request is
+		// dialed via that context), so a caller CANCEL/hangup can itself
+		// make Invite() fail instantly here (a cancelled-context resolve
+		// error) for a perfectly healthy target — e.g. a 422 retry's
+		// Invite() racing a caller hangup. Gate on the same
+		// aLeg.Context().Err() signal the WaitAnswer-error classification
+		// below already uses, so only a genuine unreachable-host dial
+		// error (caller still present) cools the endpoint down; a
+		// caller-cancellation-induced Invite failure does not.
+		return nil, attemptResult{retryable: true, kind: failDial, penalize: aLeg.Context().Err() == nil}, false, 0
+	}
+
+	// attemptCtx caps how long THIS target is allowed to ring before we give
+	// up on it and fail over — cfg.RingTimeout, not the whole-call budget.
+	// It's a child of aLeg.Context(), not context.Background(): a caller
+	// CANCEL/hangup must still abort the attempt immediately rather than
+	// waiting out the ring timer. Deriving from aLeg.Context() also means a
+	// parent cancellation (caller gone) propagates into attemptCtx as
+	// context.Canceled, while an attemptCtx-only expiry propagates as
+	// context.DeadlineExceeded — that distinction is exactly how the
+	// WaitAnswer-error classification below tells a caller CANCEL apart
+	// from a ring timeout (see the comment there). WaitAnswer's own
+	// ctx.Done() path (github.com/emiago/sipgo@v1.4.3 dialog_client.go)
+	// sends the target a real CANCEL and returns ctx.Err() from
+	// inviteCancel — so attemptCtx expiring both cancels the hung target on
+	// the wire and gives us a reliable signal to classify on. Each loop
+	// iteration (i.e. each of up to two INVITEs) gets its own attemptCtx
+	// — a fresh ring-timeout budget for the retry, not a shared one.
+	attemptCtx, cancel := context.WithTimeout(aLeg.Context(), cfg.RingTimeout.Std())
+
+	// WaitAnswer alone cannot be trusted to honor attemptCtx.
+	// When the target never sends ANY response, sipgo's WaitAnswer enters
+	// inviteCancel, which — per RFC 3261 §9.1 (no CANCEL before a
+	// provisional) — blocks until the target responds or the INVITE
+	// transaction dies on Timer_B (~32s). A silent/blackholed target
+	// would therefore pin this attempt for ~32s and ring_timeout/failover
+	// would never fire. Race WaitAnswer against the deadline so the
+	// per-attempt ring budget always holds; the goroutine finishes on its
+	// own (CANCEL+487 once a late response arrives, or Timer_B teardown),
+	// which costs nothing extra — the transaction would retransmit for
+	// the same ~32s regardless.
+	//
+	// responded tracks whether the target answered within the ring
+	// budget: the deadline path below cools the endpoint down only when
+	// nothing at all was heard in time (a mere ring timeout — 180
+	// received, no answer — must not penalize, same as the
+	// InviteResponse==nil check in the classification path).
+	var responded atomic.Bool
+	var abandoned atomic.Bool
+	waited := make(chan error, 1)
+	relay := s.relayProvisional(aLeg, sess, mediaIP, aSRTP, bSRTP)
+	// bLeg and attemptCtx are passed as ARGUMENTS, not captured: the
+	// compiler may share the captured bLeg cell with dialTarget's return
+	// slot (bLeg escapes both ways), and the deadline path's return below
+	// would then race the goroutine's read of it (-race catches this as a
+	// write at the return statement vs the closure's WaitAnswer call).
+	// Argument copies are written once at goroutine start, so the
+	// goroutine owns its values and the main flow can return freely.
+	go func(bLeg *sipgo.DialogClientSession, attemptCtx context.Context) {
+		// This goroutine outlives onInvite's recoverCall umbrella —
+		// it keeps running (inviteCancel, ackThenBye) for up to Timer_B
+		// (~32s) after dialTarget has already returned on an abandoned or
+		// raced attempt — so a panic here (including a nil-deref induced
+		// by a data race on shared dialog state) would kill the
+		// WHOLE process, not just this call. Contain it: log and exit the
+		// goroutine. Nothing is sent on waited after a panic; the main
+		// path then simply runs out its ring budget and grace and
+		// classifies the attempt as a timeout, which is the same outcome
+		// an in-band error would have produced.
+		defer s.recoverBWaiter(target.Name)
+		err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
+			OnResponse: func(res *sip.Response) error {
+				// Once the main path has abandoned this attempt
+				// (ring deadline AND grace both expired), stop touching
+				// any shared dialog/media state — relay can reach
+				// aLeg.Respond, and the main flow may concurrently be
+				// responding the A-leg or dialing the next target, so a
+				// late relay racing an abandoned attempt is an
+				// unsynchronized WriteResponse (a data race, not just a
+				// mis-aimed response).
+				// responded also stays unset for late responses, so the
+				// penalize read on the deadline path reflects only what
+				// arrived in time. (A post-abandon OnResponse is rare —
+				// WaitAnswer enters inviteCancel once attemptCtx is done
+				// and inviteCancel never calls OnResponse — but its
+				// select can pick a just-arrived response over ctx.Done
+				// in the same instant, and that is the window this
+				// closes.)
+				if abandoned.Load() {
+					return nil
+				}
+				// Realm pinning — when THIS target's auth
+				// pins a realm, a challenge naming any other realm must
+				// never be answered with a digest of our credentials
+				// (a rogue or compromised server would harvest the
+				// response for offline cracking). OnResponse runs
+				// BEFORE sipgo's built-in digest retry, so returning an
+				// error here aborts WaitAnswer without any
+				// Authorization header ever being sent for this
+				// attempt; the classification below then reports it as
+				// the ordinary unsatisfied-challenge failDial.
+				if auth := target.Peer.Auth; auth != nil && auth.Realm != "" &&
+					(res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired) &&
+					challengeRealm(res) != auth.Realm {
+					return fmt.Errorf("auth challenge realm %q does not match pinned realm %q", challengeRealm(res), auth.Realm)
+				}
+				responded.Store(true)
+				return relay(res)
+			},
+			Username: authUser(target),
+			Password: authPass(target),
+		})
+		// A 2xx can race the deadline: inviteCancel consumes it and
+		// returns an error, but the carrier now thinks the call is up —
+		// tear that phantom call down here, because the main loop below
+		// has already moved on and must never read InviteResponse again
+		// for this attempt.
+		if abandoned.Load() && carrierAnswered(bLeg) {
+			s.ackThenBye(bLeg, target)
+		}
+		waited <- err
+	}(bLeg, attemptCtx)
+
+	var waitErr error
+	select {
+	case waitErr = <-waited:
+		// WaitAnswer returned first: classify below, exactly as before.
+	case <-attemptCtx.Done():
+		// The ring budget expired before WaitAnswer returned. Give the
+		// goroutine a short grace to finish before abandoning the
+		// attempt: it may be mid-relay of a provisional response (an
+		// aLeg.Respond from OnResponse) or already in the CANCEL dance.
+		// Once it delivers, classification runs on this goroutine's
+		// sequential path below, so aLeg.Respond is never invoked from
+		// two goroutines at once. A target that never sent ANY response
+		// leaves the goroutine blocked in sipgo's inviteCancel (RFC 3261
+		// §9.1 forbids CANCEL before a provisional) until the INVITE
+		// transaction dies on Timer_B (~32s) — the grace expires and we
+		// abandon the attempt, so ring_timeout/failover still hold.
+		// 250ms is far more than the relay/CANCEL dance needs;
+		// in the abandoned case the goroutine never touches the A-leg
+		// again (OnResponse only runs once a response arrived, and an
+		// abandoned attempt means none did within the budget).
+		grace := time.NewTimer(250 * time.Millisecond)
+		defer grace.Stop()
+		select {
+		case waitErr = <-waited:
+			// Delivered within the grace window: fall through to the
+			// normal classification below (attemptCtx.Err() is
+			// DeadlineExceeded here for a ring timeout, Canceled for a
+			// caller hangup — both classified by the existing cases).
+		case <-grace.C:
+			abandoned.Store(true)
+			cancel()
+			s.log.Info("b-leg not answered", "err", attemptCtx.Err(), "target", target.Name)
+			if attemptCtx.Err() == context.DeadlineExceeded {
+				// Caller still present (else attemptCtx would carry
+				// Canceled, not DeadlineExceeded — it derives from
+				// aLeg.Context()).
+				return nil, attemptResult{
+					retryable: true,
+					kind:      failRing,
+					penalize:  !responded.Load(),
+				}, false, 0
+			}
+			// Parent context cancelled: the caller is gone. Mirror the
+			// aLeg.Context().Err() classification case below (zero-value
+			// kind/code — nothing reaches a caller that no longer
+			// exists) and never penalize: this wasn't the endpoint's
+			// fault.
+			return nil, attemptResult{retryable: true, kind: failDial}, false, 0
+		}
+	}
+	if waitErr == nil {
+		cancel()
+		return bLeg, attemptResult{}, true, 0
+	}
+	s.log.Info("b-leg not answered", "err", waitErr, "target", target.Name)
+	// bLeg.InviteResponse is set by sipgo's WaitAnswer for EVERY response
+	// it sees, including 1xx provisionals — not just the final one. If
+	// the transaction dies mid-ring (e.g. a transport error after a
+	// 100/180, or the call context is cancelled while still ringing),
+	// WaitAnswer returns an error but InviteResponse is left holding
+	// that stale provisional. A 1xx can never legally be relayed as a
+	// FINAL response (it would violate the SIP transaction model — see
+	// placeCall, which relays a real final code, when every target is
+	// exhausted), so only trust InviteResponse here when it is itself a
+	// final (non-provisional) response — that's the line between a
+	// genuine carrier failure (failReal, its own code) and one of our
+	// own synthesized ones (failDial, 503: dial error, timeout, CANCEL
+	// race, or a stale provisional).
+
+	// A 422 carries the carrier's Min-SE floor in a header —
+	// retry THIS target once with Session-Expires raised to meet it,
+	// rather than treating it as an ordinary carrier failure. A 422 is
+	// a non-2xx final on an unanswered B-leg (same as any other failReal
+	// candidate below), so just Close — no ACK/BYE. This must run before
+	// the raced-2xx teardown and classification switch below: a 422 is
+	// never a success, so neither of those apply to it.
+	if !retried422 && bLeg.InviteResponse != nil && bLeg.InviteResponse.StatusCode == 422 {
+		if carrierMinSE := headerSeconds(bLeg.InviteResponse, "Min-SE"); carrierMinSE > 0 {
+			bLeg.Close()
+			cancel()
+			return nil, attemptResult{}, false, carrierMinSE
+		}
+	}
+
+	// InviteResponse can also hold a 2xx here: WaitAnswer returns an
+	// error (ctx cancellation racing a just-arrived answer, or a
+	// malformed 2xx whose DialogIDFromResponse failed) while the
+	// carrier has already answered for real. That answer is a live,
+	// billable carrier call the carrier now thinks is up — it is
+	// classified below, but first it must be torn down with a
+	// real ACK+BYE rather than silently abandoned to ring up ~32s of
+	// carrier billing for a call nobody is using.
+	res := attemptResult{retryable: true, kind: failDial}
+	// The endpoint sent NOTHING at all (no provisional, no final — not
+	// even a stale one left over from a dead transaction) and the caller
+	// is still present: this is our own ring-timeout or a transport
+	// failure with no signal that the endpoint is reachable, which is
+	// exactly the genuine-connect-failure case that should cool the
+	// endpoint down. This condition is deliberately narrower than
+	// "kind == failDial": it excludes the caller-CANCEL case
+	// (aLeg.Context().Err() != nil, handled below) and every case where
+	// InviteResponse is non-nil — a raced/stale 2xx or provisional, or an
+	// unsatisfied 401/407 challenge — all of which prove the endpoint
+	// DID respond and so must not be penalized.
+	if bLeg.InviteResponse == nil && aLeg.Context().Err() == nil {
+		res.penalize = true
+	}
+
+	// A target can answer 200 in the window between our CANCEL and its
+	// arrival (caller hangup, ring timeout, or a malformed 2xx). This
+	// runs UNCONDITIONALLY, above the classification switch below,
+	// because the switch's cases are mutually exclusive: if the caller
+	// also CANCELed in that same window (the common "impatient caller
+	// hangs up as the callee picks up" case), aLeg.Context().Err() != nil
+	// is ALSO true, and that case would otherwise win and skip teardown
+	// entirely — leaving a live carrier call nobody tears down for
+	// ~32s. Tear the phantom call down with ACK+BYE before classifying,
+	// regardless of which case ends up classifying the attempt. Best
+	// effort, independent of the A-leg's fate (which may already be
+	// cancelled — the caller-CANCEL case above): ackThenBye bounds both
+	// its own ACK and BYE via byeContext's 5s.
+	if carrierAnswered(bLeg) {
+		s.ackThenBye(bLeg, target)
+	}
+	switch {
+	case aLeg.Context().Err() != nil:
+		// The A-leg itself is gone (caller CANCEL/hangup): placeCall's
+		// own aLeg.Context().Err() check, right after this return, stops
+		// the failover loop before trying another target. The exact
+		// kind/code here never reaches the caller (there is no caller
+		// left to respond to), so failDial's zero-value default is fine
+		// — the important thing is NOT to misclassify this as failRing,
+		// which would be a lie (nothing "timed out"; the caller left).
+
+	case carrierAnswered(bLeg):
+		// Raced 2xx (see the comment above the switch — teardown already
+		// ran there, unconditionally). This 2xx must never be relayed to
+		// the caller as a success (dialTarget already returned
+		// retryable=true; the caller only ever sees the eventual
+		// classification below) or counted as failReal (it isn't a
+		// failure); it classifies exactly like any other outcome on
+		// this attempt — failRing if the ring deadline had already
+		// expired, failDial/503 otherwise.
+		if attemptCtx.Err() == context.DeadlineExceeded {
+			res.kind = failRing
+		}
+
+	case attemptCtx.Err() == context.DeadlineExceeded:
+		// aLeg.Context() is still live (checked above) but the
+		// PER-ATTEMPT deadline fired: this target simply rang too long.
+		// WaitAnswer already sent it a CANCEL (see attemptCtx's comment
+		// above) — placeCall fails over to the next target.
+		res.kind = failRing
+
+	case bLeg.InviteResponse != nil &&
+		bLeg.InviteResponse.StatusCode >= 300 &&
+		bLeg.InviteResponse.StatusCode != sip.StatusUnauthorized &&
+		bLeg.InviteResponse.StatusCode != sip.StatusProxyAuthRequired:
+		// A genuine carrier failure final (>=300), excluding 401/407:
+		// those are hop-by-hop challenges, handled in the case below,
+		// never a code the caller could act on. A second/unusable 422
+		// (retried422 already true, or no usable Min-SE) lands here too
+		// — 422 >= 300 and isn't 401/407 — and is reported as failReal
+		// with its own code, same as any other genuine carrier decline.
+		res.kind = failReal
+		res.realCode = bLeg.InviteResponse.StatusCode
+		res.realReason = bLeg.InviteResponse.Reason
+
+	case bLeg.InviteResponse != nil &&
+		(bLeg.InviteResponse.StatusCode == sip.StatusUnauthorized || bLeg.InviteResponse.StatusCode == sip.StatusProxyAuthRequired):
+		// The target challenged and we couldn't (or didn't) satisfy it:
+		// WaitAnswer only attempts its own digest retry when
+		// opts.Password is non-empty (see authUser/authPass) — an
+		// IP-auth trunk that unexpectedly challenges, or a retry whose
+		// credentials the target still rejects, ends up here. A 401/407
+		// is a negotiation with THIS target, not something the caller
+		// can use, so it stays failDial — placeCall's 503 — rather than
+		// leaking the challenge upstream as a bogus 401/407.
+		s.log.Debug("b-leg auth challenge unsatisfied", "code", bLeg.InviteResponse.StatusCode, "target", target.Name)
+	}
+	cancel()
+	_ = bLeg.Close()
+	return nil, res, false, 0
 }
 
 // carrierAnswered reports whether the B-leg holds a genuine 2xx from the
