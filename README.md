@@ -5,7 +5,7 @@ An all-in-one open-source Session Border Controller with the Caddy experience: *
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.25.7-00ADD8.svg)](go.mod)
 
 - **Pure Go, one static binary, zero external dependencies** — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**.
-- **Two independent planes, either or both** — a [**Trunk B2BUA**](docs/trunk.md) for carrier/PBX interconnect, and an [**Edge proxy**](docs/edge.md) for SIP phones and browsers in front of FreeSWITCH.
+- **Two independent planes, either or both** — a [**Trunk B2BUA**](docs/trunk.md) for carrier/PBX interconnect, and an [**Edge proxy**](docs/edge.md) that keeps FreeSWITCH on the private LAN: SIP phones and browsers reach FreeSBC's public address, and FreeSBC is the only thing that talks to FreeSWITCH.
 - **Embedded WebUI, REST API and Prometheus metrics** — a live dashboard and a validated editor for the same YAML file, behind bcrypt Basic Auth.
 
 Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables + Ansible) means many components, four languages, and a config pipeline that spans four layers. FreeSBC collapses all of that into one process with a declarative config file as the single source of truth.
@@ -61,12 +61,35 @@ Then validate and run:
 
 The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC) and the `admin` listener are read once at startup and need a restart.
 
+## Keep FreeSWITCH off the public internet
+
+The edge plane exists so that FreeSBC is the only element with a public address. FreeSWITCH is a literal private `IP:port` upstream and never needs a public IP, a port forward, or NAT handling of its own.
+
+```text
+  Internet ──▶ FreeSBC  203.0.113.7   public: SIP/UDP, WS/WSS, RTP, WebRTC
+                  │
+                  │ private LAN/VPN: plain SIP/UDP + RTP, sent from 10.77.0.2
+                  ▼
+              FreeSWITCH  10.77.0.10:5060   no public IP, no port forward
+```
+
+What the SBC absorbs, so FreeSWITCH never sees it:
+
+- **Public traffic itself.** Every request FreeSWITCH receives is sent from FreeSBC's private socket (`sip.private.bind`), so its sofia profile only has to accept that one address. In the other direction the edge's pre-parse read filter drops anything arriving on the private bind whose source is not a configured upstream.
+- **Scanners and floods.** Per-IP rate limiting and the scanner User-Agent signature list (instant ban) run on every public request; the private plane is exempt from the shield entirely, and every denial is a silent drop rather than a response that confirms the SBC exists. Edge-plane bans are in-memory — the optional nftables backend is wired to the trunk plane only.
+- **Its own addresses.** Every SDP body the edge plane emits is constructed, never derived from the other leg, so a public client is never given FreeSWITCH's address and FreeSWITCH is never given the client's; the REGISTER Contact is rewritten toward the SBC and restored on the way back, and all media is anchored on FreeSBC ports. The Via stack is ordinary proxy behaviour, not hidden: FreeSBC annotates the sender's Via with `received=`, so FreeSWITCH does see the public client's address there.
+- **Transport and NAT variety.** WS/WSS and WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) are terminated at the edge and relayed to FreeSWITCH as plain SIP over UDP and plain RTP. `received=`/`rport` handling and symmetric-RTP latching happen at the SBC.
+
+What stays with FreeSWITCH: it remains the authoritative registrar and owns users, credentials, dial plans and all call logic. REGISTER and its digest challenge are proxied verbatim and FreeSBC never holds a credential. The private plane is trusted and unmetered by design — FreeSBC does not enforce that; your network must keep it unreachable from anywhere else.
+
+Details: [`docs/edge.md`](docs/edge.md) (topology, behaviour table, known limitations) and [`docs/design.md`](docs/design.md) (§12 networking and deployment topology, §14 security model).
+
 ## Which plane do I need?
 
 | Goal | Plane | Configure |
 |---|---|---|
 | Interconnect carriers with a PBX/softswitch over SIP trunks | [Trunk B2BUA](docs/trunk.md) | `peers:` and `routes:` |
-| Put SIP phones and sip.js browsers in front of FreeSWITCH | [Edge proxy](docs/edge.md) | `network:`, `sip.public/private`, `sip.upstream` (or `sip.upstreams`), `rtp.public/private`, `webrtc:` |
+| Put SIP phones and sip.js browsers in front of FreeSWITCH, keeping FreeSWITCH itself on the private LAN | [Edge proxy](docs/edge.md) | `network:`, `sip.public/private`, `sip.upstream` (or `sip.upstreams`), `rtp.public/private`, `webrtc:` |
 | Both at once, in one process | Both | both sets of sections in one file |
 
 ## Features
@@ -75,7 +98,7 @@ The config file is watched: edits are validated and hot-swapped atomically. A ba
 - **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and full SDP rewrite
 - **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution with RFC 3263 priority/weight ordering, cached
 - **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy on the trunk plane, SRTP↔RTP interworking in both directions, and NAT traversal via hardened first-packet latching
-- **Edge proxy plane** — registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
+- **Edge proxy plane** — the only public-facing element in front of a FreeSWITCH that stays on the private LAN: registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
 - **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures with an instant ban, and optional nftables integration: auto-detected, degrades to in-memory bans, never a hard dependency
 - **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
 - **Carrier interop baseline** — OPTIONS answering and session-timer negotiation (RFC 4028), including the 422/Min-SE exchange on both legs
