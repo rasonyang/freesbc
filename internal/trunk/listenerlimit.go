@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// TCP/TLS listener resource bounds (T-05, F-02). sipgo v1.4.3's TCP accept
+// TCP/TLS listener resource bounds. sipgo v1.4.3's TCP accept
 // loop is unbounded and its per-connection read loop sets no read deadline
 // (transport_tcp.go Serve/readConnection), so a connection flood or a
 // silent/slow-feeding connection each consume resources without bound.
@@ -57,7 +57,7 @@ func (l *tcpLimitListener) Accept() (net.Conn, error) {
 // connection that stops sending (including one slow-feeding a partial
 // message into the stream parser) is closed after idle. Writes are
 // deliberately left deadline-free: response traffic is bounded by dialog
-// and transaction timers, and the finding (F-02) is about read-side
+// and transaction timers, and the finding is about read-side
 // resource retention.
 type idleTimeoutConn struct {
 	net.Conn

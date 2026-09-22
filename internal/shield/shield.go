@@ -22,7 +22,7 @@ const (
 
 // Shield is FreeSBC's front-door security plane. It is consulted before peer
 // identification on every inbound request; configured peers are exempt from
-// the ban/scanner plane but still rate-limited (loosely, T-18/F-19), and
+// the ban/scanner plane but still rate-limited (loosely), and
 // every denial is a silent Drop. Params (rate limit, auto_ban) hot-reload from
 // the config store per call; the nftables mode is fixed at construction.
 type Shield struct {
@@ -94,17 +94,17 @@ func newShield(store *config.Store, log *slog.Logger, kernel bool) *Shield {
 
 // Check is the per-request gate (spec §3): configured peers are exempt from
 // the ban/scanner plane but not from rate limiting — a separate, looser
-// per-IP limit (shield.peer_rate_limit, T-18/F-19) caps them, since a
+// per-IP limit (shield.peer_rate_limit) caps them, since a
 // spoofed peer source would otherwise have no rate ceiling at all (a real
 // peer's legitimate load stays far below the threshold, so it never sees
 // the limiter). For non-peers: a banned source and a rate-limit violation
 // Drop; otherwise a scanner UA is dropped AND instantly banned — but only
-// AFTER the rate limiter has had its say (T-04, F-03: the UA is a
+// AFTER the rate limiter has had its say (the UA is a
 // client-controlled "ban me" signal, so it must first burn through the
 // source's rate budget like any other traffic, never skip the limiter).
 // transport is the lowercased request transport ("udp"/"tcp"/"tls"/""): a
 // single-packet scanner verdict only syncs to the kernel for
-// connection-oriented transports (T-02, F-04 — see kernelSync).
+// connection-oriented transports (see kernelSync).
 func (s *Shield) Check(src netip.Addr, userAgent string, transport string) Verdict {
 	cfg := s.store.Current()
 	if isConfiguredPeer(cfg, src) {
@@ -142,7 +142,7 @@ func (s *Shield) Check(src netip.Addr, userAgent string, transport string) Verdi
 // transport may sync to nftables: only connection-oriented transports
 // (tcp/tls) qualify. A UDP verdict rests on one forgable datagram, so it
 // stays memory-only — a spoofed packet must not be able to kernel-blackhole
-// a victim's IP (T-02, F-04). Multi-packet auto-bans (RecordUnidentified)
+// a victim's IP. Multi-packet auto-bans (RecordUnidentified)
 // sync regardless of transport.
 func kernelSync(transport string) bool {
 	t := strings.ToLower(transport)
@@ -153,7 +153,7 @@ func kernelSync(transport string) bool {
 type Stats struct {
 	BannedCurrent int
 	// BanAddsRejected counts ban additions refused at the ban table's hard
-	// cap (T-03) — an indicator that a source flood is exhausting the table.
+	// cap — an indicator that a source flood is exhausting the table.
 	BanAddsRejected int64
 	DropsByReason   map[string]int64
 }
@@ -191,7 +191,7 @@ func (s *Shield) RecordUnidentified(src netip.Addr) {
 }
 
 // Unban removes any ban on ip — from the in-memory table and, best-effort,
-// the kernel set — and reports whether a ban existed (T-02, F-04: the admin
+// the kernel set — and reports whether a ban existed (the admin
 // API's DELETE /api/bans/{ip} calls this). The kernel delete runs
 // synchronously via nftBackend.unban rather than through the worker queue,
 // so an operator unban takes effect even while the queue is saturated.
@@ -225,7 +225,7 @@ func (s *Shield) rateLimit(cfg *config.Config) config.RateLimit {
 	return s.rlOpts
 }
 
-// peerRateLimit is rateLimit's counterpart for the peer limiter (T-18).
+// peerRateLimit is rateLimit's counterpart for the peer limiter.
 func (s *Shield) peerRateLimit(cfg *config.Config) config.RateLimit {
 	s.prlMu.Lock()
 	defer s.prlMu.Unlock()

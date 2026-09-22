@@ -14,7 +14,7 @@ import (
 	"github.com/freesbc/freesbc/internal/config"
 )
 
-// nftBanQCap bounds the pending kernel-sync queue (T-04, F-03): a ban storm
+// nftBanQCap bounds the pending kernel-sync queue: a ban storm
 // (e.g. unique-source auto-ban flood) must not translate into an unbounded
 // pile of pending fork+execs. When the queue is full the kernel sync for
 // that ban is dropped — the in-memory ban table stays authoritative either
@@ -36,15 +36,15 @@ type nftBanReq struct {
 // any failure is logged and swallowed, never breaking banning or the SBC. All
 // nft invocations go through run (injectable for tests).
 //
-// Since T-04, bans are applied by a single worker goroutine consuming a
+// Bans are applied by a single worker goroutine consuming a
 // bounded queue: execs are serialized (one fork+exec at a time) and the
 // queue caps how many may pile up — see ban.
 type nftBackend struct {
 	log *slog.Logger
 	run func(ctx context.Context, args ...string) error
 
-	// listens are the SIP listeners the setup rules are scoped to (T-02,
-	// F-04): the kernel drop rules match only udp/tcp traffic toward these
+	// listens are the SIP listeners the setup rules are scoped to: the
+	// kernel drop rules match only udp/tcp traffic toward these
 	// ports. Captured at construction; hot-reloaded listen changes don't
 	// rebuild the rules (same fixed-at-construction caveat as the nftables
 	// mode itself).
@@ -97,8 +97,8 @@ func (n *nftBackend) start() {
 	go n.worker(ctx)
 }
 
-// worker serially drains the ban queue: exactly one nft exec runs at a time
-// (T-04). On stop it drops whatever is still queued — a shutting-down shield
+// worker serially drains the ban queue: exactly one nft exec runs at a time.
+// On stop it drops whatever is still queued — a shutting-down shield
 // tears the whole ruleset down anyway (see close).
 func (n *nftBackend) worker(ctx context.Context) {
 	defer close(n.done)
@@ -123,7 +123,7 @@ func (n *nftBackend) stopWorker() {
 }
 
 // setup installs the managed ruleset: a dedicated table, two timeout sets
-// (v4/v6), and an input-hook chain whose drop rules are scoped (T-02, F-04)
+// (v4/v6), and an input-hook chain whose drop rules are scoped
 // to udp/tcp traffic toward the configured SIP listener ports — a banned
 // source is never blanket-blackholed for everything on the box. If no udp
 // or tcp/tls listeners are configured, no drop rules are installed at all
@@ -227,7 +227,7 @@ func (n *nftBackend) execWithTimeout(ctx context.Context, args ...string) error 
 // unban removes the kernel element for ip directly — not via the worker
 // queue: an operator unban is rare and must take effect even when the queue
 // is full, since a dropped delete would leave the kernel blackholing a
-// source the in-memory table has already forgotten (T-02, F-04).
+// source the in-memory table has already forgotten.
 func (n *nftBackend) unban(ip netip.Addr) {
 	set := "banned4"
 	if ip.Is6() {

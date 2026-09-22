@@ -27,7 +27,7 @@ type Config struct {
 	PeerCooldown    Duration         `yaml:"peer_cooldown"`    // skip a peer endpoint this long after a connect failure
 	SRVCacheTTL     Duration         `yaml:"srv_cache_ttl"`    // cache DNS SRV/endpoint resolutions this long (stdlib exposes no record TTL)
 	// MaxConcurrentCalls caps total in-flight bridged calls across every
-	// peer (0 = unlimited, the default). Enforced by bridge.onInvite's T-06
+	// peer (0 = unlimited, the default). Enforced by bridge.onInvite's
 	// quota gate; a per-peer cap lives on Peer.
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
 
@@ -59,8 +59,8 @@ type Config struct {
 type ListenConfig struct {
 	SIP   []SIPListen `yaml:"sip"`
 	Media MediaConfig `yaml:"media"`
-	// TLSCert/TLSKey are the inbound TLS identity for tls:// SIP listeners
-	// (T-17/F-13): with them set, listeners present this certificate and
+	// TLSCert/TLSKey are the inbound TLS identity for tls:// SIP listeners:
+	// with them set, listeners present this certificate and
 	// verification is possible against a real trust anchor — instead of the
 	// default fresh self-signed certificate (kept when unset, with a
 	// startup warning). TLSClientCA turns inbound TLS into mutual TLS:
@@ -161,17 +161,17 @@ type Peer struct {
 	MediaLatch string `yaml:"media_latch"`
 	// SRTP is this peer's media-encryption policy: "disabled" (default,
 	// plaintext RTP), "optional" (SRTP if offered/accepted, else RTP), or
-	// "required" (RTP/SAVP + a=crypto mandatory, else the leg fails). See M5.
+	// "required" (RTP/SAVP + a=crypto mandatory, else the leg fails).
 	SRTP string `yaml:"srtp"`
 	// RegisterExpires overrides the global register_expires for this peer
 	// (0 = use the global default). Only meaningful with register: true.
 	RegisterExpires Duration `yaml:"register_expires"`
 	// MaxConcurrentCalls caps how many bridged calls this peer may have in
 	// flight at once (0 = unlimited, the default). Enforced by
-	// bridge.onInvite's T-06 quota gate.
+	// bridge.onInvite's quota gate.
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
-	// TLSCA is the outbound trust anchor for dialing this peer over tls
-	// (T-17/F-13): a PEM CA bundle ADDED to the system roots, so a carrier
+	// TLSCA is the outbound trust anchor for dialing this peer over tls:
+	// a PEM CA bundle ADDED to the system roots, so a carrier
 	// with a private/self-signed CA is reachable without disabling
 	// verification. TLSClientCert/TLSClientKey present OUR client
 	// certificate when the carrier requires mutual TLS (both-or-neither).
@@ -197,12 +197,12 @@ func (p *Peer) AllowsIP(addr netip.Addr) bool {
 type PeerAuth struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
-	// Realm pins the digest realm we will answer a challenge FOR
-	// (T-19/F-20): when set, a 401/407 whose WWW-/Proxy-Authenticate
+	// Realm pins the digest realm we will answer a challenge FOR:
+	// when set, a 401/407 whose WWW-/Proxy-Authenticate
 	// names any other realm is treated as an auth failure — the SBC never
 	// computes a digest of its credentials for it, so a rogue or
 	// compromised server can't harvest responses for offline cracking.
-	// Empty = accept whatever realm the far end names (pre-T-19 behavior).
+	// Empty = accept whatever realm the far end names.
 	Realm string `yaml:"realm"`
 }
 
@@ -232,7 +232,7 @@ type RouteTransform struct {
 type ShieldConfig struct {
 	RateLimit string `yaml:"rate_limit"`
 	// PeerRateLimit is the looser per-IP limit applied to CONFIGURED peer
-	// sources (T-18/F-19): peers are exempt from the ban/scanner plane but
+	// sources: peers are exempt from the ban/scanner plane but
 	// not from rate limiting, so a spoofed peer source still has a ceiling.
 	PeerRateLimit string  `yaml:"peer_rate_limit"`
 	AutoBan       AutoBan `yaml:"auto_ban"`
@@ -248,13 +248,13 @@ type AutoBan struct {
 type AdminConfig struct {
 	Listen string    `yaml:"listen"`
 	Auth   AdminAuth `yaml:"auth"`
-	// AllowRemote permits a NON-loopback listen address (T-26/D4-6). By
+	// AllowRemote permits a NON-loopback listen address. By
 	// default the admin API — plaintext Basic auth in front of the FULL
 	// config including every peer credential — must stay loopback-only;
 	// binding it wider is a conscious, flagged decision, not a typo.
 	// Prefer TLS (tls_cert/tls_key) or a reverse proxy when doing so.
 	AllowRemote bool `yaml:"allow_remote"`
-	// TLSCert/TLSKey (T-26b, extends the reviewed plan): when both are set,
+	// TLSCert/TLSKey: when both are set,
 	// the admin listener serves HTTPS with this certificate (TLS >= 1.2),
 	// so a non-loopback (LAN) deployment doesn't send Basic credentials in
 	// the clear. Both-or-neither; a change takes effect on restart (no hot

@@ -130,9 +130,8 @@ type dialog struct {
 
 // dialogTable is the proxy's one store of calls, keyed by Call-ID.
 //
-// Call-ID alone, not the full RFC 3261 §12 dialog identifier, and not the
-// Call-ID|from-tag the CANCEL bridge used to be keyed by. Two reasons, and
-// they point the same way:
+// Call-ID alone, not the full RFC 3261 §12 dialog identifier. Two reasons,
+// and they point the same way:
 //
 //   - An in-dialog request from the CALLEE carries the callee's tag in
 //     From, so a from-tag key could not find the record that routes it.
@@ -345,8 +344,7 @@ func (d *dialog) confirm(r dialogRoute) {
 }
 
 // endUnlessUp ends a dialog whose INVITE never connected. It is what every
-// INVITE path defers in place of the stack-local "committed" flag the three
-// paths used to keep: the record's own state is the flag.
+// INVITE path defers: the record's own state is the flag.
 func (d *dialog) endUnlessUp() {
 	d.tab.mu.Lock()
 	early := d.state == dialogEarly

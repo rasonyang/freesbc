@@ -25,7 +25,7 @@ import (
 
 // Server is the SIP signaling front door. It binds the configured
 // listeners, identifies inbound requests by transport source IP, answers
-// OPTIONS health checks, and (M3.3) hosts the B2BUA bridge for INVITE.
+// OPTIONS health checks, and hosts the B2BUA bridge for INVITE.
 type Server struct {
 	store *config.Store
 	pool  *media.PlanePool
@@ -45,7 +45,7 @@ type Server struct {
 	dialogCli *sipgo.DialogClientCache
 	registrar *Registrar
 
-	// shield is the front-door security plane (M6): consulted before
+	// shield is the front-door security plane: consulted before
 	// identify() on every inbound request (see withShield). Built in Run,
 	// so it is nil on a *Server constructed directly by unit tests (e.g.
 	// NewServer without Run) — withShield and dropUnidentified nil-guard
@@ -61,7 +61,7 @@ type Server struct {
 	// resolver turns a peer into ordered dialable endpoints (DNS SRV with
 	// A/AAAA fallback, priority/weight); health tracks per-endpoint cooldowns
 	// after connect failures. Both are internally synchronized and shared
-	// across concurrent calls. (M4.4)
+	// across concurrent calls.
 	resolver *Resolver
 	health   *endpointHealth
 
@@ -72,7 +72,7 @@ type Server struct {
 	// the log once per call.
 	warnAutoIPOnce sync.Once
 
-	// T-05 (F-02) TCP/TLS listener resource bounds — see listenerlimit.go.
+	// TCP/TLS listener resource bounds — see listenerlimit.go.
 	// tcpConns counts live connections across every tcp/tls listener; a
 	// single shared counter makes the cap global (N listeners can't each
 	// admit the full quota). tcpMaxConns is the cap itself and tcpIdleTimeout
@@ -84,8 +84,8 @@ type Server struct {
 	tcpMaxConns    int64
 	tcpIdleTimeout time.Duration
 
-	// quota counts in-flight initial INVITEs per peer and globally (T-06,
-	// F-06 — see callQuota in b2bua.go and bridge.onInvite's gate). The
+	// quota counts in-flight initial INVITEs per peer and globally
+	// (see callQuota in b2bua.go and bridge.onInvite's gate). The
 	// zero value is usable; it needs no Run-time wiring.
 	quota callQuota
 
@@ -111,7 +111,7 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		resolver: newResolver(time.Now().UnixNano()),
 		health:   newEndpointHealth(),
 
-		// T-05 defaults (see listenerlimit.go): 1024 concurrent TCP/TLS
+		// Defaults (see listenerlimit.go): 1024 concurrent TCP/TLS
 		// connections and a 120s idle read deadline per connection.
 		tcpMaxConns:    1024,
 		tcpIdleTimeout: 120 * time.Second,
@@ -146,7 +146,7 @@ func (s *Server) ShieldStats() shield.Stats {
 
 // Unban removes any shield ban on ip (in-memory table + kernel set) and
 // reports whether one existed. Nil-safe: false before Run builds the
-// shield. Wired to the admin API's DELETE /api/bans/{ip} (T-02, F-04).
+// shield. Wired to the admin API's DELETE /api/bans/{ip}.
 func (s *Server) Unban(ip netip.Addr) bool {
 	sh := s.shield.Load()
 	if sh == nil {
@@ -160,7 +160,7 @@ func (s *Server) Unban(ip netip.Addr) bool {
 // a bind failure), or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
 	sipgoLog := s.log.With("caller", "sipgo")
-	// T-17 (F-13): outbound TLS trust anchors/client certs, merged from the
+	// Outbound TLS trust anchors/client certs, merged from the
 	// per-peer config into sipgo's single UA-wide tls.Config (see
 	// buildClientTLSConfig). Built once at startup — cert material is not
 	// hot-rotated.
@@ -171,7 +171,7 @@ func (s *Server) Run(ctx context.Context) error {
 	uaOpts := []sipgo.UserAgentOption{
 		sipgo.WithUserAgentTransportLayerOptions(
 			sip.WithTransportLayerLogger(sipgoLog),
-			// T-01 (F-01/F-10): drop non-peer source bytes before parsing
+			// Drop non-peer source bytes before parsing
 			// (see preParseFilter in readfilter.go).
 			sip.WithTransportLayerReadFilter(s.preParseFilter()),
 		),
@@ -357,7 +357,7 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 		s.listening(l)
 		return tl.ServeTCP(newTCPLimitListener(ln, s))
 	case "tls":
-		// T-17 (F-13): a CONFIGURED certificate replaces the fallback
+		// A CONFIGURED certificate replaces the fallback
 		// self-signed one — clients (or our own outbound side, with a
 		// matching trust anchor) can then verify this listener for real.
 		// mTLS engages when tls_client_ca is set. Read at bind time from
@@ -414,7 +414,7 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 // withShield wraps a request handler so every inbound request passes the
 // security plane before identification. A Drop verdict silently discards the
 // request (no response); sipgo terminates the unfinalized transaction when the
-// handler returns (see dropUnidentified). Since T-01, non-peer source bytes
+// handler returns (see dropUnidentified). Non-peer source bytes
 // are dropped by the transport-layer read filter before they can become a
 // request (see preParseFilter), so the shield here only ever sees requests
 // from allowed sources — configured-peer exemptions apply. s.shield is nil on
@@ -422,7 +422,7 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 // nil-guarded to a no-op in that case.
 func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func(*sip.Request, sip.ServerTransaction) {
 	return func(req *sip.Request, tx sip.ServerTransaction) {
-		// T-20 (D1-8): ONE panic umbrella for every handler path — a panic
+		// ONE panic umbrella for every handler path — a panic
 		// anywhere in handler code (onOptions/onAck/onBye/onNoRoute and the
 		// sipgo dialog code they call) kills only this request, never the
 		// process, and leaves a forensic trace. onInvite additionally keeps
@@ -445,14 +445,14 @@ func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func
 	}
 }
 
-// dropUnidentified is the shield seam (M6): a request from a source that
+// dropUnidentified is the shield seam: a request from a source that
 // matches no peer is silently dropped (spec §6 step 2). No response is
 // sent; sipgo calls tx.TerminateGracefully() immediately after the handler
 // returns (server.go handleRequest), which terminates the unfinalized
 // transaction right away — stopping its auto-100 timer and keeping the
 // drop silent instead of merely letting the transaction age out.
 //
-// Since T-01 this handler never runs for udp/tcp/tls traffic: the
+// This handler never runs for udp/tcp/tls traffic: the
 // pre-parse read filter drops non-peer bytes before parsing, so no such
 // request can reach identify() over the wire. It remains as the guard for
 // any future transport path that bypasses the filter, and for *Server
@@ -478,7 +478,7 @@ func (s *Server) dropUnidentified(req *sip.Request) {
 //  1. `preferred`, when set and a valid IP (validation guarantees it is not
 //     unspecified — advertising 0.0.0.0/:: would be unroutable/a blackhole).
 //  2. The configured listen.media.public_ip, when it is a literal address
-//     (not "auto" — STUN-based discovery for "auto" is a later milestone).
+//     (not "auto").
 //  3. Otherwise, the first listen.sip host that is NOT unspecified (0.0.0.0
 //     / ::): a listener commonly binds every interface (0.0.0.0) while the
 //     SBC still has one real, routable address to advertise, so an
@@ -564,7 +564,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 
 // onAck routes an in-dialog ACK to the dialog-server cache so sipgo's
 // dialog layer can transition the A-leg dialog to confirmed. INVITEs we
-// reject before ReadInvite (Task 5's 404s) have no dialog registered, so
+// reject before ReadInvite (404s) have no dialog registered, so
 // ReadAck's "no such dialog" case is expected and merely logged.
 func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 	if _, _, ok := s.identify(req); !ok {
@@ -582,7 +582,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 //
 // If NEITHER does, the BYE matches no call we know about and must be
 // answered 481 Call/Transaction Does Not Exist (RFC 3261 §15) rather than
-// silently dropped — this is not the M3.1 "unknown source" shield (the
+// silently dropped — this is not the "unknown source" shield (the
 // peer IS known; its BYE just doesn't correspond to anything). Both
 // ReadBye implementations (dialog_server.go/dialog_client.go) only ever
 // call tx.Respond after their own dialog lookup succeeds, so when

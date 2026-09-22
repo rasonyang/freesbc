@@ -20,7 +20,7 @@ type Decision struct {
 // match.to regex matches toNumber. A route with no match clause (nil
 // compiled regex) matches any number. Routes are tried in config order;
 // the first hit wins (spec §5: no priority numbers). ok is false when no
-// route matches — the caller rejects such calls (404 in M3.3).
+// route matches — the caller rejects such calls (404).
 func matchRoute(cfg *config.Config, fromPeer, toNumber string) (*config.Route, bool) {
 	for _, r := range cfg.Routes {
 		if r.From != fromPeer {
@@ -53,7 +53,7 @@ func transformNumber(route *config.Route, toNumber string) string {
 // the route's To list (validated to reference real peers) into ordered
 // failover Targets. ok is false when no route matches. Resolve is pure and
 // stateless: peer health/cooldown skipping and failover execution are the
-// B2BUA's job (M3.3).
+// B2BUA's job.
 func Resolve(cfg *config.Config, fromPeer, toNumber string) (*Decision, bool) {
 	route, ok := matchRoute(cfg, fromPeer, toNumber)
 	if !ok {

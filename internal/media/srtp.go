@@ -72,7 +72,7 @@ type SRTPContext struct {
 
 // NewSRTPContext builds a context from a 30-byte SDES inline value
 // (16-byte master key followed by a 14-byte master salt), with replay
-// protection enabled (T-08/F-09, RFC 3711 §3.3.2/§3.4.2 MUST): a
+// protection enabled (RFC 3711 §3.3.2/§3.4.2 MUST): a
 // replayed/too-old packet fails unprotect and is dropped by the relay's
 // existing fail-closed path — pion's default is no replay protection, which
 // would let a captured valid packet be re-injected indefinitely. The
@@ -100,7 +100,7 @@ func newContext(profile srtp.ProtectionProfile, masterKey, masterSalt []byte) (*
 }
 
 // srtpReplayWindow and srtcpReplayWindow are the replay-protection window
-// sizes passed to pion (T-08/F-09). 64 covers any plausible jitter/out-of-
+// sizes passed to pion. 64 covers any plausible jitter/out-of-
 // order arrival on a single media stream; RTCP gets 128 since its
 // compounds are rarer and arrive more irregularly. Both bound the index
 // space a replayer can claim: anything older than the window (or already

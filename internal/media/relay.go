@@ -68,10 +68,10 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 					continue
 				}
 			}
-			// T-22 (D5-4): only NOW is the packet proven genuine — plaintext
+			// Only NOW is the packet proven genuine — plaintext
 			// path: the latch accepted it; secure path: SRTP auth passed.
 			// Refresh the silence watchdog here, never on latch-accept alone:
-			// pre-fix, a party who knows the latched source address could
+			// A party who knows the latched source address could
 			// feed garbage that failed auth yet renewed rtp_timeout
 			// indefinitely, keeping a dead call alive forever.
 			s.lastRx.Store(time.Now().UnixNano())
