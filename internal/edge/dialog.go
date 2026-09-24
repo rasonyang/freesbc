@@ -9,6 +9,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
@@ -44,9 +45,19 @@ const (
 // is only in the forwarded copy. cancel is always the WHOLE series'
 // cancel, never a per-attempt one, so a CANCEL that lands between two
 // attempts still ends the series.
+//
+// An attempt is tracked BEFORE its INVITE is sent, so a CANCEL can never
+// fall in a window where the INVITE is out but untracked. sent and
+// cancelled (guarded by the table's mutex) settle the one race that is
+// left: a CANCEL that takes the attempt before the INVITE is on the wire
+// must not send its CANCEL ahead of the INVITE (the next hop would answer
+// 481 and then ring), so it leaves that to the sender, which CANCELs as
+// soon as markSent tells it the attempt was taken.
 type inviteAttempt struct {
 	req    *sip.Request
 	cancel context.CancelFunc
+
+	sent, cancelled bool
 }
 
 // dialogRoute is where an in-dialog request goes once the call is up.
@@ -147,6 +158,24 @@ type dialog struct {
 	inFlight *inviteAttempt
 	route    dialogRoute
 
+	// cancelled is set, synchronously, the moment the caller's CANCEL (or
+	// the INVITE backstop) gives up on the call. From then on no 2xx may
+	// confirm the record: sipgo answers the caller 487 as soon as the
+	// OnCancel hook returns, so a 2xx relayed after that would confirm a
+	// call the caller has already been told is over. callerGone says the
+	// caller's own transaction has been finalised by sipgo (a CANCEL, not
+	// the backstop), so nothing more may be sent on it.
+	cancelled, callerGone bool
+
+	// The dialog's two identities, as the caller's INVITE named them (the
+	// From and To addresses; the tags are above), and the highest CSeq each
+	// endpoint has used in it (index 0 the caller, 1 the callee). They are
+	// what a BYE FreeSBC originates itself — when the media ends the call —
+	// is built from: RFC 3261 §12.2.1.1 wants the sender's local CSeq to go
+	// up, and the proxy can only know it by watching.
+	callerURI, calleeURI sip.Uri
+	cseq                 [2]uint32
+
 	// media is the anchored session. It is attached once, right after the
 	// record is created, and then only closed — never replaced.
 	media *mediaSession
@@ -184,6 +213,12 @@ type dialogTable struct {
 	mu       sync.Mutex
 	byCallID map[string][]*dialog
 
+	// onMediaEnd is called, once, for a confirmed dialog that ended because
+	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
+	// rather than by signaling. Both endpoints still believe the call is
+	// up, so the server tells them. Set once, before any call exists.
+	onMediaEnd func(d *dialog)
+
 	metrics *Metrics
 	log     *slog.Logger
 }
@@ -201,7 +236,8 @@ func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
 // left alone: the new INVITE opens a new record beside it, and only the
 // tags of later requests decide which one they belong to. An INVITE can
 // therefore never tear down somebody else's call by reusing its Call-ID.
-func (t *dialogTable) begin(callID, callerTag string, callerPlane plane) (*dialog, bool) {
+func (t *dialogTable) begin(req *sip.Request, callerPlane plane) (*dialog, bool) {
+	callID, callerTag := fsip.CallID(req), fsip.FromTag(req)
 	d := &dialog{
 		tab:         t,
 		callID:      callID,
@@ -209,6 +245,13 @@ func (t *dialogTable) begin(callID, callerTag string, callerPlane plane) (*dialo
 		callerPlane: callerPlane,
 		forks:       map[string]*earlyFork{},
 		origin:      [2]sdpOrigin{newSDPOrigin(), newSDPOrigin()},
+		cseq:        [2]uint32{fsip.CSeqNumber(req), 0},
+	}
+	if f := req.From(); f != nil {
+		d.callerURI = f.Address
+	}
+	if to := req.To(); to != nil {
+		d.calleeURI = to.Address
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -428,14 +471,29 @@ func (d *dialog) reject2xx(calleeTag string) (first bool) {
 	return true
 }
 
-// track points the CANCEL bridge at the INVITE now in flight. A failover
-// series re-tracks per attempt, deliberately overwriting the previous
-// entry: it is one dialog the caller is waiting on, whatever we had to try
-// to connect it.
-func (d *dialog) track(a *inviteAttempt) {
+// track points the CANCEL bridge at the INVITE about to be sent. A
+// failover series re-tracks per attempt, deliberately overwriting the
+// previous entry: it is one dialog the caller is waiting on, whatever we
+// had to try to connect it. It refuses (false) once the series has been
+// cancelled: the INVITE must then not be sent at all.
+func (d *dialog) track(a *inviteAttempt) bool {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
+	if d.cancelled {
+		return false
+	}
 	d.inFlight = a
+	return true
+}
+
+// markSent records that a tracked attempt's INVITE is on the wire, and
+// reports whether a CANCEL took the attempt before it was: the sender must
+// then send that CANCEL itself, now that it can follow the INVITE.
+func (d *dialog) markSent(a *inviteAttempt) (cancelNow bool) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	a.sent = true
+	return a.cancelled
 }
 
 // untrack clears the CANCEL bridge at the end of a series. Between two
@@ -447,17 +505,116 @@ func (d *dialog) untrack() {
 	d.inFlight = nil
 }
 
-// takeAttempt removes and returns the in-flight INVITE, so exactly one
-// caller ever cancels it.
-func (d *dialog) takeAttempt() (*inviteAttempt, bool) {
+// cancelReason says who is giving up on a call.
+type cancelReason int
+
+const (
+	// cancelByCaller: the caller's CANCEL matched its INVITE's server
+	// transaction, which sipgo has therefore already finalised (487).
+	cancelByCaller cancelReason = iota
+	// cancelOrphan: a CANCEL sipgo could not match, found by Call-ID and
+	// From tag. It only acts on an attempt actually in flight.
+	cancelOrphan
+	// cancelBackstop: the INVITE's own budget ran out; the caller is still
+	// waiting for a final response.
+	cancelBackstop
+)
+
+// cancelSeries gives up on the call: no 2xx may confirm it from now on,
+// and the in-flight INVITE, if any, is taken — removed, so exactly one
+// caller ever cancels it. sendNow says whether that INVITE is already on
+// the wire and needs a CANCEL now; when it is not, markSent hands the
+// CANCEL to the sender.
+func (d *dialog) cancelSeries(why cancelReason) (a *inviteAttempt, sendNow bool) {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
-	a := d.inFlight
+	a = d.inFlight
+	if a == nil && why == cancelOrphan {
+		// Nothing in flight: an orphan CANCEL between two attempts has
+		// nothing to act on, and must not end the series.
+		return nil, false
+	}
+	d.cancelled = true
+	if why == cancelByCaller {
+		d.callerGone = true
+	}
 	if a == nil {
 		return nil, false
 	}
 	d.inFlight = nil
-	return a, true
+	a.cancelled = true
+	return a, a.sent
+}
+
+// wasCancelled reports whether the call has been given up on.
+func (d *dialog) wasCancelled() bool {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.cancelled
+}
+
+// callerCancelled reports whether the caller's transaction was finalised
+// by its own CANCEL, so no response may be sent on it.
+func (d *dialog) callerCancelled() bool {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.callerGone
+}
+
+// noteCSeq records the CSeq of an in-dialog request, by the endpoint that
+// sent it.
+func (d *dialog) noteCSeq(req *sip.Request) {
+	seq := fsip.CSeqNumber(req)
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	i := 1
+	if fsip.FromTag(req) == d.callerTag {
+		i = 0
+	}
+	if seq > d.cseq[i] {
+		d.cseq[i] = seq
+	}
+}
+
+// byeInfo is what a BYE FreeSBC originates toward one endpoint needs.
+type byeInfo struct {
+	callID string
+	// toward names the endpoint the BYE goes to; the BYE is sent on
+	// behalf of the other one.
+	toward    plane
+	fromURI   sip.Uri
+	fromTag   string
+	toURI     sip.Uri
+	toTag     string
+	cseq      uint32
+	remote    string
+	contact   sip.Uri
+	transport string
+}
+
+// byes describes the two BYEs that end this dialog from the middle: one to
+// the caller on the callee's behalf, one to the callee on the caller's.
+func (d *dialog) byes() [2]byeInfo {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	r := d.route
+	at := func(p plane) (string, sip.Uri) {
+		if p == planePublic {
+			return r.publicRemote, r.publicContact
+		}
+		return r.privateRemote, r.privateContact
+	}
+	calleePlane := otherPlane(d.callerPlane)
+	cRemote, cContact := at(d.callerPlane)
+	eRemote, eContact := at(calleePlane)
+	return [2]byeInfo{
+		{callID: d.callID, toward: d.callerPlane,
+			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
+			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport},
+		{callID: d.callID, toward: calleePlane,
+			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
+			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport},
+	}
 }
 
 // confirm promotes an early dialog to a confirmed one: a 2xx from the fork
@@ -470,11 +627,12 @@ func (d *dialog) takeAttempt() (*inviteAttempt, bool) {
 // moment it sees the 2xx always finds the record.
 //
 // It reports false for a dialog that has already ended (shutdown racing
-// the answer) or has no media: nothing may be committed on top of either.
+// the answer), has no media, or was cancelled: nothing may be committed on
+// top of any of them.
 func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	t := d.tab
 	t.mu.Lock()
-	if d.state != dialogEarly || d.media == nil {
+	if d.state != dialogEarly || d.media == nil || d.cancelled {
 		t.mu.Unlock()
 		return false
 	}
@@ -500,7 +658,12 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	// the silence watchdog), so it cannot outlive the call.
 	go func() {
 		<-sess.Done()
-		d.end()
+		// Whoever ended the dialog first closed the session; only when the
+		// media ended it — nobody else had — are the endpoints still to be
+		// told.
+		if d.end() && t.onMediaEnd != nil {
+			t.onMediaEnd(d)
+		}
 	}()
 	return true
 }
@@ -522,13 +685,14 @@ func (d *dialog) endUnlessUp() {
 // dialog's end exactly once.
 //
 // Idempotent, and safe to race: the state transition under the table's
-// mutex is what elects the one caller that does the work.
-func (d *dialog) end() {
+// mutex is what elects the one caller that does the work. It reports
+// whether this call ended a confirmed dialog.
+func (d *dialog) end() bool {
 	t := d.tab
 	t.mu.Lock()
 	if d.state == dialogEnded {
 		t.mu.Unlock()
-		return
+		return false
 	}
 	wasUp := d.state == dialogConfirmed
 	d.state = dialogEnded
@@ -538,7 +702,7 @@ func (d *dialog) end() {
 	t.mu.Unlock()
 
 	if sess == nil {
-		return
+		return wasUp
 	}
 	st := sess.Stats()
 	webrtc := sess.IsWebRTC()
@@ -546,9 +710,10 @@ func (d *dialog) end() {
 	if !wasUp {
 		// An INVITE that never connected: nothing was ever counted as
 		// started, so nothing is counted as ended.
-		return
+		return false
 	}
 	t.metrics.DialogEnded()
 	t.metrics.MediaEnded(webrtc, st)
 	t.log.Info("call ended", "sip_call_id", d.callID, "stats", st)
+	return true
 }

@@ -3,7 +3,10 @@ package edge
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
@@ -29,6 +32,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 		return
 	}
+	d.noteCSeq(req)
 	body := req.Body()
 	if len(body) == 0 {
 		// An offerless re-INVITE would make FreeSBC the offerer and
@@ -52,7 +56,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 	fsip.SetContact(out, to.uri())
 	fsip.SetSDPBody(out, reOffer)
 
-	ctx, cancel := context.WithTimeout(context.Background(), inviteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
 	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
@@ -144,7 +148,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrP
 // terminates the INVITE itself, which fires the OnCancel hook that
 // cancels our upstream leg — so this path only sees an orphan.
 func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	if d, ok := s.dialogs.early(fsip.CallID(req), fsip.FromTag(req)); ok && s.cancelPending(d) {
+	if d, ok := s.dialogs.early(fsip.CallID(req), fsip.FromTag(req)); ok && s.cancelCall(d, cancelOrphan) {
 		s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
 		return
 	}
@@ -163,6 +167,9 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.
 	if !ok {
 		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 		return
+	}
+	if d != nil {
+		d.noteCSeq(req)
 	}
 	out, err := s.prepareForward(req, from, to, dest, false)
 	if err != nil {
@@ -327,5 +334,80 @@ func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
 		if b, ok := s.bindingForRequest(req); ok {
 			out.Recipient = clientRequestURI(b)
 		}
+	}
+}
+
+// byeBothEnds tells both endpoints of a confirmed dialog that the call is
+// over, when it was the media that ended it (the silence watchdog, or a
+// WebRTC peer whose certificate did not match its fingerprint). Neither
+// endpoint sent a BYE, so both still believe the call is up: FreeSWITCH
+// would keep the channel and answer 481 to its own later BYE, and a phone
+// would sit in a silent call (RFC 3261 §15). FreeSBC sends each one a BYE
+// on behalf of the other, built from the identities and CSeqs the dialog
+// record kept.
+func (s *Server) byeBothEnds(d *dialog) {
+	s.log.Info("media ended the call; sending BYE to both ends", "sip_call_id", d.callID)
+	for _, b := range d.byes() {
+		go s.sendMiddleBye(b)
+	}
+}
+
+// sendMiddleBye sends one BYE FreeSBC originates in the middle of a
+// dialog.
+func (s *Server) sendMiddleBye(b byeInfo) {
+	var toward side
+	if b.toward == planePrivate {
+		toward = s.topo.private
+	} else {
+		var ok bool
+		if toward, ok = s.topo.publicSide(b.transport); !ok {
+			return
+		}
+	}
+	if b.remote == "" {
+		return
+	}
+	ruri := b.contact
+	if ruri.Host == "" {
+		host, port, err := net.SplitHostPort(b.remote)
+		if err != nil {
+			return
+		}
+		ruri = sip.Uri{Host: host}
+		ruri.Port, _ = strconv.Atoi(port)
+	}
+	req := sip.NewRequest(sip.BYE, ruri)
+	req.AppendHeader(toward.via(fsip.NewBranch()))
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	from := &sip.FromHeader{Address: b.fromURI, Params: sip.NewParams()}
+	from.Params.Add("tag", b.fromTag)
+	req.AppendHeader(from)
+	to := &sip.ToHeader{Address: b.toURI, Params: sip.NewParams()}
+	to.Params.Add("tag", b.toTag)
+	req.AppendHeader(to)
+	callID := sip.CallIDHeader(b.callID)
+	req.AppendHeader(&callID)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: b.cseq, MethodName: sip.BYE})
+	req.SetTransport(strings.ToUpper(toward.transport))
+	req.SetDestination(b.remote)
+	if toward.laddr.IP != nil && toward.laddr.Port > 0 {
+		// Pinned to the listener, as prepareForward does, so the BYE leaves
+		// by the socket the endpoint's NAT pinhole or WebSocket is on.
+		req.Laddr = toward.laddr
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	clTx, err := s.client.TransactionRequest(ctx, req, noBuild)
+	if err != nil {
+		s.log.Debug("bye after media end", "err", err, "sip_call_id", b.callID)
+		return
+	}
+	defer clTx.Terminate()
+	select {
+	case <-clTx.Responses():
+	case <-clTx.Done():
+	case <-ctx.Done():
 	}
 }
