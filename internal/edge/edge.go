@@ -65,8 +65,15 @@ type Server struct {
 	// otherwise untestable.
 	inviteBackstop atomic.Int64
 
-	// ready is closed once every listener is bound and serving.
+	// ready is closed once every listener is bound and handed to its
+	// serving goroutine. Nothing in production waits on it; it is the
+	// happens-before edge the tests use to read srv and client safely.
 	ready chan struct{}
+
+	// early counts, per public source IP, the INVITEs this proxy has taken
+	// media for and not yet seen answered (see admitEarly).
+	earlyMu sync.Mutex
+	early   map[netip.Addr]int
 }
 
 // udpMTUOnce raises sipgo's UDP send ceiling, once per process.
@@ -130,6 +137,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		upstreamCooldown: newCooldownTable(),
 		privSources:      newPrivateSources(),
 		ready:            make(chan struct{}),
+		early:            map[netip.Addr]int{},
 		webrtcEnabled:    cfg.WebRTC.Enabled,
 	}
 	s.dialogs = newDialogTable(s.metrics, s.log)
@@ -146,11 +154,6 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 	}
 	return s, nil
 }
-
-// Ready is closed once every listener is bound and serving, so a caller
-// knows the proxy is actually reachable. It is never closed if Run returns
-// a bind error.
-func (s *Server) Ready() <-chan struct{} { return s.ready }
 
 // inviteBudget is the INVITE backstop: inviteTimeout unless a test
 // shortened it.
@@ -230,8 +233,8 @@ func (s *Server) Run(ctx context.Context) error {
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
 	// report and would leave callers with no way to know when the proxy is
-	// actually reachable — Ready() below is only honest if every socket is
-	// already open when it fires.
+	// actually reachable — ready below is only honest if every socket is
+	// already open when it is closed.
 	opened := make([]listener, 0, len(listeners))
 	for _, l := range listeners {
 		ln, err := s.openListener(l.transport, l.addr)
@@ -489,6 +492,21 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		// upstream-trusted path (see topology.fromUpstream) from being
 		// reachable by a spoofed source on a public listener.
 		if info.LocalAddr == nil || !fsip.SameAddr(info.LocalAddr.String(), privateAddr) {
+			// A public read. A source the shield has banned gets nothing
+			// back at all: guard would drop its requests silently, but
+			// sipgo answers some messages on its own before any handler
+			// runs — a stateless 400 to a malformed request, a 200 to a
+			// CANCEL that matches a transaction — so the ban is enforced
+			// here, before parsing. FreeSWITCH is exempt exactly as guard
+			// exempts it (arrivedOnPrivate: the transport address it uses on
+			// the private socket), since its PSTN INVITEs arrive here on the
+			// public one.
+			if sh := s.shield; sh != nil && info.RemoteAddr != nil {
+				if ip, ok := fsip.AddrOf(info.RemoteAddr); ok &&
+					sh.Banned(ip.Unmap()) && !s.privSources.has(info.RemoteAddr.String()) {
+					return false
+				}
+			}
 			return true
 		}
 		ip, ok := fsip.AddrOf(info.RemoteAddr)
@@ -506,19 +524,27 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 
 // guard wraps every handler with the panic umbrella and the security
 // plane. A panic anywhere in handler code kills only this request, never
-// the process, and leaves a forensic trace.
+// the process, leaves a forensic trace and is counted
+// (freesbc_sip_handler_panics_total), so it cannot pass unnoticed. The
+// requester is answered 500 only when it has not already had a final
+// response: a transaction finalises once, and a 500 after, say, a relayed
+// 200 would only be counted, never delivered.
 // The transport source address is parsed ONCE here and handed to the
 // handler: a request whose source cannot be parsed is dropped before
 // anything else looks at it, and the handlers that need the address (the
 // REGISTER binding, the INVITE plane dispatch) do not re-derive it.
 func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
-	return func(req *sip.Request, tx sip.ServerTransaction) {
+	return func(req *sip.Request, stx sip.ServerTransaction) {
+		tx := &finalTracker{ServerTransaction: stx}
 		defer func() {
 			if r := recover(); r != nil {
+				s.metrics.HandlerPanicked()
 				s.log.Error("proxy handler panic",
 					"panic", r, "stack", string(debug.Stack()),
 					"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
-				_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Internal Error", nil))
+				if !tx.finalised.Load() && req.Method != sip.ACK {
+					s.respond(req, tx, sip.NewResponseFromRequest(req, 500, "Server Internal Error", nil))
+				}
 			}
 		}()
 		src, ok := fsip.SourceAddrPort(req)
@@ -536,6 +562,21 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		}
 		next(req, tx, src)
 	}
+}
+
+// finalTracker is the server transaction guard hands a handler: it
+// records whether a final response has gone out on it, which is what the
+// panic path needs to know.
+type finalTracker struct {
+	sip.ServerTransaction
+	finalised atomic.Bool
+}
+
+func (t *finalTracker) Respond(res *sip.Response) error {
+	if res.StatusCode >= 200 {
+		t.finalised.Store(true)
+	}
+	return t.ServerTransaction.Respond(res)
 }
 
 // handler is a guarded request handler: sipgo's shape plus the parsed

@@ -39,6 +39,7 @@ type collector struct {
 	proxyPortFail   *prometheus.Desc
 	proxyICEFail    *prometheus.Desc
 	proxyDTLSFail   *prometheus.Desc
+	proxyPanics     *prometheus.Desc
 }
 
 func newCollector(deps Deps) *collector {
@@ -70,6 +71,7 @@ func newCollector(deps Deps) *collector {
 		proxyPortFail:  prometheus.NewDesc("freesbc_media_port_allocation_failure_total", "Calls rejected because a media port pool was exhausted.", nil, nil),
 		proxyICEFail:   prometheus.NewDesc("freesbc_webrtc_ice_failure_total", "WebRTC legs that never completed ICE.", nil, nil),
 		proxyDTLSFail:  prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
+		proxyPanics:    prometheus.NewDesc("freesbc_sip_handler_panics_total", "Edge SIP handler panics recovered (each one lost a request).", nil, nil),
 	}
 }
 
@@ -86,7 +88,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegs, c.proxyDialogs, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
-		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail,
+		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
 	} {
 		ch <- d
 	}
@@ -145,6 +147,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.proxyPortFail, float64(p.PortAllocationFailures))
 	counter(c.proxyICEFail, float64(p.ICEFailures))
 	counter(c.proxyDTLSFail, float64(p.DTLSFailures))
+	counter(c.proxyPanics, float64(p.HandlerPanics))
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

@@ -22,6 +22,17 @@ import (
 // (much smaller) budget, attempt_timeout, enforced by the pump.
 const inviteTimeout = 5 * time.Minute
 
+// maxEarlyPerSource caps the calls one public source IP may have in
+// flight — media allocated, no answer yet — at once. Media is anchored
+// before the INVITE reaches FreeSWITCH, and so before FreeSWITCH has
+// authenticated the caller: without a cap, an unauthenticated flood holds
+// a port pair per INVITE on each plane (plus, for a browser offer, an ICE
+// agent) for the length of FreeSWITCH's 407 round trip, or up to Timer B
+// when the upstream is silent. The cap is per IP, not per transport
+// address, so it also bounds a flood spread over many source ports; it is
+// generous enough for many phones ringing out through one NAT at once.
+const maxEarlyPerSource = 64
+
 // pstnDrain is how long the pump waits after a budget-expiry CANCEL for the
 // final response that CANCEL provokes. Long enough for a local gateway's
 // 487 (a few RTTs), short enough that a dead gateway cannot stall the
@@ -50,13 +61,16 @@ const (
 // attemptResult is what one gateway attempt reports back to the failover
 // loop. ok means a 2xx was accepted and the dialog is confirmed; retryable
 // false means the pump already relayed a final response that ends the call
-// (3xx, 401/407 or a 4xx other than 408 — the server transaction can
-// finalise only once, so the series must stop); penalize asks the caller
+// (3xx, 401/407, a 4xx other than 408, or a 6xx — the server transaction
+// can finalise only once, so the series must stop); penalize asks the caller
 // to put the gateway into cooldown (it produced no response at all while
 // FreeSWITCH was still waiting); kind/code/reason feed the exhausted-budget
-// synthesis.
+// synthesis. global is a 6xx that could not be relayed as it arrived (it
+// raced the attempt's expiry CANCEL): the series stops and FreeSWITCH is
+// sent that code.
 type attemptResult struct {
 	ok        bool
+	global    bool
 	retryable bool
 	penalize  bool
 	kind      attemptKind
@@ -152,6 +166,15 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		s.reject(req, tx, 488, "Not Acceptable Here")
 		return
 	}
+
+	release, ok := s.admitEarly(src.Addr())
+	if !ok {
+		s.log.Warn("rejecting call: too many unanswered calls from one source",
+			"public_remote", src.String(), "limit", maxEarlyPerSource, "sip_call_id", fsip.CallID(req))
+		s.reject(req, tx, 503, "Service Unavailable")
+		return
+	}
+	defer release()
 
 	// ctx is the whole-series backstop: the 5-minute inviteTimeout,
 	// cancellable — a client CANCEL cancels the series, never just the
@@ -333,6 +356,26 @@ func (s *Server) giveUp(ctx context.Context, d *dialog, req *sip.Request, tx sip
 	default:
 		s.reject(req, tx, code, reason)
 	}
+}
+
+// admitEarly counts a new unanswered call from a public source, refusing
+// it when the source already has maxEarlyPerSource in flight. release
+// uncounts it, and runs when the INVITE handler returns — by then the call
+// is either up (and no longer early) or gone.
+func (s *Server) admitEarly(src netip.Addr) (release func(), ok bool) {
+	s.earlyMu.Lock()
+	defer s.earlyMu.Unlock()
+	if s.early[src] >= maxEarlyPerSource {
+		return nil, false
+	}
+	s.early[src]++
+	return func() {
+		s.earlyMu.Lock()
+		defer s.earlyMu.Unlock()
+		if s.early[src]--; s.early[src] <= 0 {
+			delete(s.early, src)
+		}
+	}, true
 }
 
 // hashUserFor derives the hashing identity of a request: the From user
@@ -660,10 +703,14 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 		case res.ok:
 			s.pstnCooldown.Recover(name)
 			return
+		case res.global:
+			s.pstnCooldown.Recover(name)
+			s.reject(req, tx, res.code, res.reason)
+			return
 		case !res.retryable:
-			// The pump relayed a final that ends the call (a 3xx, 401/407
-			// or a 4xx other than 408): the server transaction is finalised
-			// and nothing more may be sent on it.
+			// The pump relayed a final that ends the call (a 3xx, 401/407,
+			// a 4xx other than 408, or a 6xx): the server transaction is
+			// finalised and nothing more may be sent on it.
 			return
 		case res.penalize:
 			// Zero responses across a whole attempt with FreeSWITCH still

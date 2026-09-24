@@ -319,11 +319,15 @@ func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
 				return attemptResult{retryable: true, kind: failDial, code: 503,
 					reason: "Service Unavailable"}
 			}
-			// A final of 408 or >= 500 is HELD, never relayed: the server
+			// A final of 408 or 5xx is HELD, never relayed: the server
 			// transaction toward FreeSWITCH can finalise only once, and a
 			// later gateway may still connect the call. The failover loop
-			// synthesises this code only when every attempt has failed.
-			if res.StatusCode >= 500 || res.StatusCode == 408 {
+			// synthesises this code only when every attempt has failed. A
+			// 6xx is NOT held: it is a global failure — the callee's
+			// definitive answer, which no other location may be tried
+			// against (RFC 3261 §16.7 step 5, §21.6) — so it falls through
+			// and is relayed like any other final that ends the series.
+			if (res.StatusCode >= 500 && res.StatusCode < 600) || res.StatusCode == 408 {
 				return attemptResult{retryable: true, kind: failReal,
 					code: res.StatusCode, reason: res.Reason}
 			}
@@ -357,11 +361,12 @@ func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
 				// The call is up: the dialog was confirmed from this 2xx.
 				return attemptResult{ok: true}
 			default:
-				// Relayed and final: a 3xx, 401/407, or a 4xx other than
-				// the held 408. These are the far end's verdict on THIS
-				// call — a wrong number will be wrong on every gateway
-				// (404/486) and a redirect is a response to this dialog —
-				// so the series stops here.
+				// Relayed and final: a 3xx, 401/407, a 4xx other than the
+				// held 408, or a 6xx. These are the far end's verdict on
+				// THIS call — a wrong number will be wrong on every gateway
+				// (404/486), a 6xx is by definition final everywhere, and a
+				// redirect is a response to this dialog — so the series
+				// stops here.
 				return attemptResult{retryable: false}
 			}
 		case <-l.clTx.Done():
@@ -429,7 +434,13 @@ func (s *Server) expirePSTNAttempt(wholeCtx context.Context, l *inviteLeg, respo
 				continue
 			}
 			switch {
-			case res.StatusCode == 200:
+			case res.StatusCode < 200:
+				// A provisional still in flight when the CANCEL went out (a
+				// gateway that starts ringing only now): it says nothing
+				// about how the attempt ended, and is never a final. Keep
+				// draining for the final the CANCEL provokes.
+				continue
+			case res.StatusCode/100 == 2:
 				// A 2xx raced the CANCEL: the gateway accepted a call the
 				// budget had already given up on. It responded, so no
 				// cooldown; complete and tear down the dialog it believes
@@ -442,6 +453,10 @@ func (s *Server) expirePSTNAttempt(wholeCtx context.Context, l *inviteLeg, respo
 				// The CANCEL's own product: the attempt failed by expiry.
 				return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
 					penalize: !responded && wholeCtx.Err() == nil}
+			case res.StatusCode >= 600:
+				// A global failure racing the CANCEL: the call is refused
+				// everywhere, so the series stops and FreeSWITCH gets it.
+				return attemptResult{global: true, code: res.StatusCode, reason: res.Reason}
 			default:
 				// Any other final racing the CANCEL is the gateway's real
 				// word on the call; surface its code like any held final.
