@@ -112,8 +112,9 @@ sip:
 
 Failover: a call retries the next gateway on a transport error, a silent
 gateway (attempt budget expiry — the current attempt is CANCELled first),
-a 5xx/408, or an unanchorable answer; a 4xx like 486 or an auth challenge
-is relayed to FreeSWITCH immediately, never retried. When every gateway
+a 5xx/408, or an unanchorable answer; a 4xx like 486, an auth challenge or
+a 6xx (a global failure, e.g. 603 Decline) is relayed to FreeSWITCH
+immediately, never retried. When every gateway
 fails, FreeSWITCH sees 488 if an answer could not be anchored, else the
 last genuine carrier code, else 408, else 503.
 Health is passive cooldown: a gateway that answered nothing before its

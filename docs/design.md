@@ -1548,11 +1548,13 @@ header-style parameters preserved) and the Contact is the public side's URI.
 
 Response handling in `pumpPSTNAttempt`:
 
-- A final of **408 or ≥ 500 is held, never relayed** — the server
+- A final of **408 or 5xx is held, never relayed** — the server
   transaction can finalise only once and a later gateway may still connect
   the call.
-- Any other final (3xx, 401/407, or a 4xx other than the held 408) is the far
-  end's verdict on this call: relay it and end the series.
+- Any other final (3xx, 401/407, a 4xx other than the held 408, or a
+  **6xx**) is the far end's verdict on this call: relay it and end the
+  series. A 6xx is a global failure (RFC 3261 §16.7 step 5, §21.6): no
+  other gateway may be tried.
 - A 2xx is the winner; the dialog is confirmed before it is relayed.
 - Each fork's first body is negotiated against the **original FreeSWITCH
   offer**, not the session's live codec list, so a failed gateway's narrow
@@ -1560,8 +1562,11 @@ Response handling in `pumpPSTNAttempt`:
   re-armed whenever the answering gateway's media address differs from the
   one the side already follows (`pointMedia`).
 - Budget expiry runs `expirePSTNAttempt`: send CANCEL on its own **5 s**
-  context, then drain for `pstnDrain = 300 ms`. A 200 arriving in the drain
-  is torn down with `refuse2xx` (ACK + BYE); a 487 or a drain timeout is `failRing`; any
+  context, then drain for `pstnDrain = 300 ms`. A **provisional** arriving
+  in the drain is skipped — it says nothing about how the attempt ended and
+  is never a final. A 2xx arriving in the drain is torn down with
+  `refuse2xx` (ACK + BYE); a 487 or a drain timeout is `failRing`; a 6xx
+  stops the series and is sent to FreeSWITCH (`attemptResult.global`); any
   other final is `failReal` with its own code.
 
 `drainCancelledInvite` exists because a final response that matches no
@@ -1579,7 +1584,7 @@ sipgo send the ACK.
 stateDiagram-v2
     [*] --> attempt: forward INVITE to target
     attempt --> ok: 2xx -> commit, then relay
-    attempt --> failReal: final 408 or >= 500 HELD, not relayed (code remembered)
+    attempt --> failReal: final 408 or 5xx HELD, not relayed (code remembered)
     attempt --> failDial: transport error / clTx.Done / whole-call ctx done
     attempt --> failRing: attempt budget expired (PSTN only)
     attempt --> failAnchor: answer could not be anchored (PSTN only)

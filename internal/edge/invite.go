@@ -50,13 +50,16 @@ const (
 // attemptResult is what one gateway attempt reports back to the failover
 // loop. ok means a 2xx was accepted and the dialog is confirmed; retryable
 // false means the pump already relayed a final response that ends the call
-// (3xx, 401/407 or a 4xx other than 408 — the server transaction can
-// finalise only once, so the series must stop); penalize asks the caller
+// (3xx, 401/407, a 4xx other than 408, or a 6xx — the server transaction
+// can finalise only once, so the series must stop); penalize asks the caller
 // to put the gateway into cooldown (it produced no response at all while
 // FreeSWITCH was still waiting); kind/code/reason feed the exhausted-budget
-// synthesis.
+// synthesis. global is a 6xx that could not be relayed as it arrived (it
+// raced the attempt's expiry CANCEL): the series stops and FreeSWITCH is
+// sent that code.
 type attemptResult struct {
 	ok        bool
+	global    bool
 	retryable bool
 	penalize  bool
 	kind      attemptKind
@@ -660,10 +663,14 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 		case res.ok:
 			s.pstnCooldown.Recover(name)
 			return
+		case res.global:
+			s.pstnCooldown.Recover(name)
+			s.reject(req, tx, res.code, res.reason)
+			return
 		case !res.retryable:
-			// The pump relayed a final that ends the call (a 3xx, 401/407
-			// or a 4xx other than 408): the server transaction is finalised
-			// and nothing more may be sent on it.
+			// The pump relayed a final that ends the call (a 3xx, 401/407,
+			// a 4xx other than 408, or a 6xx): the server transaction is
+			// finalised and nothing more may be sent on it.
 			return
 		case res.penalize:
 			// Zero responses across a whole attempt with FreeSWITCH still
