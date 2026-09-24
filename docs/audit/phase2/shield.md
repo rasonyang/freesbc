@@ -155,6 +155,21 @@ Method: reading only (every finding below is INFERENCE). `go vet ./internal/shie
   `ShieldStats().BannedCurrent == 1` (will stay 0).
 - Action: delete (the trunk kernel backend and `RecordUnidentified`), or
   rewrite so the edge shield owns the ban/kernel plane.
+- Decision (2026-09-24): delete; the ban/kernel plane is not moved to the
+  edge shield. Remove `nftables.go`, the `shield.nftables` key, the
+  `inet freesbc` table and the CAP_NET_ADMIN requirement,
+  `RecordUnidentified`, `failCounter` (and its prune call at
+  `shield.go:253`), `trunk.dropUnidentified` (its call sites keep a silent
+  drop), and `shield.auto_ban.failures` / `auto_ban.window`. Keep
+  `auto_ban.duration`, which the edge scanner ban uses (`shield.go:130`).
+  The in-memory ban list, both rate limiters and scanner detection stay;
+  the edge shield (`NewNoKernel`) is unchanged. Rationale: the trunk
+  pre-parse filter admits only `allowed_ips` peers and peers are exempt
+  from bans, so the kernel ban is never called; deletion removes no
+  production protection. SHD-007 and SHD-010 become moot. Open follow-up:
+  `DELETE /api/bans/{ip}` and the ban metrics stay wired to the trunk
+  shield only (always empty); decide separately whether to remove them or
+  wire them to the edge shield.
 
 ### P2-SHD-005 — Trunk peer `allowed_ips` are exempt from the edge plane's ban and scanner checks
 - Severity: P2
@@ -223,6 +238,7 @@ Method: reading only (every finding below is INFERENCE). `go vet ./internal/shie
 - Confirming test: inject `run` so the 5th command fails, then assert a
   `delete table` call was issued (it will not be).
 - Action: fix.
+- Decision (2026-09-24): moot; SHD-004 deletes the nftables backend.
 
 ### P2-SHD-008 — Code comment and design doc say bans are "extended"; code overwrites the expiry and can shorten it
 - Severity: P2 (docs-code drift)
@@ -258,6 +274,7 @@ Method: reading only (every finding below is INFERENCE). `go vet ./internal/shie
   treats 0 as no timeout, depending on the version. The memory and kernel
   copies disagree either way. Unreachable today because of SHD-004.
 - Action: fix (round up, or validate `>= 1s`).
+- Decision (2026-09-24): moot; SHD-004 deletes the nftables backend.
 
 ## Checklist items found clean
 - Denials are silent drops. `trunk.withShield` (`trunk/server.go:441-443`)

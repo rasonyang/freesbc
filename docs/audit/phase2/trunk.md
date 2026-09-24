@@ -130,6 +130,7 @@ correctness; P2 = maintainability / dead code / docs-code drift.
 - Impact: a certificate issued by carrier A's private CA, or any public CA, is accepted when dialing carrier B. Go's TLS client presents the first acceptable entry in `Certificates`, so carrier B may receive carrier A's client certificate (a cross-peer identity leak) or the wrong one (a failed mTLS).
 - Confirm: two TLS peers with distinct private CAs; the peer-B endpoint serves a cert signed by peer A's CA; assert that the dial fails. It will succeed.
 - Action: rewrite (per-peer `tls.Config` selected by target).
+- Decision (2026-09-24): option (c). Keep one UA-wide `tls.Config` and select per peer through callbacks: `InsecureSkipVerify: true` plus `VerifyConnection`, which verifies `cs.PeerCertificates` against the pool of the peer matched by `cs.ServerName` (its `tls_ca`, or the system roots if none) and fails when no peer matches; `GetClientCertificate` returns the certificate of the peer carried in the handshake ctx (`cri.Context()`, set by the trunk on `TransactionRequest` / dialog Invite) and no certificate when the ctx has no peer key. Rejected: (a) one sipgo UA per TLS peer (per-UA servers, handlers, read filter, dialog caches, transaction routing, shutdown); (b) a custom dialer (sipgo v1.4.3 `tlsClient` is unexported and set in `(*TransportTLS).init`, `sip/transport_tls.go:17-33`; needs a fork or `replace`). Known limits: peers sharing a hostname or IP:port cannot be distinguished (plan: reject in validation); background-ctx dials get no client cert; no per-peer SNI override; `cs.ServerName` is empty for a peer dialled by IP literal (Go omits IPs from SNI), and `VerifyConnection` must do the hostname/IP-SAN check itself. Tests: two peers with distinct private CAs, peer B's endpoint presents a cert signed by A's CA, the dial must fail after the fix (succeeds today); an mTLS test asserts B receives only B's client cert. Reuse `genCertKey` (`tls_test.go:23`).
 
 ### P2-TRK-017 — Graceful shutdown leaves bridged calls without BYE and onInvite goroutines parked (P1, config/lifecycle, INFERENCE)
 - Location: `internal/trunk/server.go:305-318` (Run returns after closing the listeners); `internal/trunk/b2bua.go:467-483` (the select waits only on the leg contexts, `sess.Done` and `killCtx`); `internal/app/app.go:55` (the pool is never closed)
@@ -203,6 +204,7 @@ Action: fix the docs.
 - Location: `internal/trunk/server.go:455-471` (`dropUnidentified` is unreachable over udp/tcp/tls because `readfilter.go:22-33` drops first)
 - Impact: `RecordUnidentified` is dead code on this plane in production. Scanning sources are never banned, which is why 001 has no kernel-level mitigation.
 - Action: delete or rewire (count read-filter rejections).
+- Decision (2026-09-24): delete, recorded under P2-SHD-004 (`phase2/shield.md`): `dropUnidentified`, `RecordUnidentified`, `failCounter`, `auto_ban.failures`/`window` and the trunk nftables backend go; `auto_ban.duration` stays for the edge scanner ban.
 
 ## Checklist items found clean (one line each)
 - Transaction keying: delegated to sipgo (branch + method); the trunk adds no transaction map.

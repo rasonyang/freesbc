@@ -6,6 +6,7 @@
 - Severity: **P0** = crash / leak / security on a public path (unauthenticated network input). **P1** = SIP/SDP/media correctness (and, where noted, security defects reachable only through an authenticated or operator path). **P2** = maintainability / dead code / docs-code drift / latent or low-impact defects.
 - Layer: transport | transaction | dialog | leg/binding | SDP | media | config/lifecycle | admin | docs.
 - Action: delete | rewrite | fix. `rewrite` is used only where the module's identity model (keys, state ownership) is wrong; see section 4.
+- Maintainer decisions (2026-09-24): P2-SHD-004 → delete; P2-TRK-016 → rewrite with option (c) (per-peer selection through `tls.Config` callbacks). Each is recorded as a "Decision (2026-09-24)" line at the finding's detail entry.
 - Repro shorthand: `DKR` = `docker run --rm -v "$PWD":/src -w /src golang:1.25.7`. Tests that bind sockets or need 127.0.0.2 (edge, trunk, media) are run through `DKR`; the pure unit tests in sip, sip/sdp, config, shield and admin run locally. Phase 3 agents also mounted Go module/build caches (`-v freesbc-gomod:/go/pkg/mod -v freesbc-gocache:/root/.cache`), which only speeds the run up.
 
 # 1. Extracted invariants (from docs/)
@@ -206,7 +207,7 @@ One row per deduplicated finding, sorted by severity, then package. Aliases are 
 | P2-TRK-012 | P1 | trunk | SDP | FACT | fix |
 | P2-TRK-013 | P1 | trunk | dialog | INFERENCE | fix |
 | P2-TRK-015 | P1 | trunk | transaction | INFERENCE | fix |
-| P2-TRK-016 | P1 | trunk | transport | INFERENCE | rewrite |
+| P2-TRK-016 | P1 | trunk | transport | INFERENCE | rewrite: option (c) (decided 2026-09-24) |
 | P2-TRK-017 (aka P2-APP-001) | P1 | trunk, app | config/lifecycle | FACT | fix |
 | P2-TRK-022 | P1 | trunk | SDP | FACT | fix |
 | P3-TRK-N01 | P1 | trunk | SDP | FACT | rewrite |
@@ -254,13 +255,13 @@ One row per deduplicated finding, sorted by severity, then package. Aliases are 
 | P2-MED-011 | P2 | media | admin | FACT | fix |
 | P2-MED-012 | P2 | media | leg/binding | INFERENCE | fix |
 | P2-MED-013 | P2 | media | admin | INFERENCE | fix |
-| P2-SHD-004 (aka P1-002, P2-TRK-026) | P2 | shield, trunk | transport | FACT (partial) | delete |
+| P2-SHD-004 (aka P1-002, P2-TRK-026) | P2 | shield, trunk | transport | FACT (partial) | delete (decided 2026-09-24) |
 | P2-SHD-005 | P2 | shield | transport | INFERENCE | fix |
 | P2-SHD-006 | P2 | shield, edge | transport | INFERENCE | fix |
-| P2-SHD-007 | P2 | shield | config/lifecycle | INFERENCE | fix |
+| P2-SHD-007 | P2 | shield | config/lifecycle | INFERENCE | moot (P2-SHD-004 delete) |
 | P2-SHD-008 | P2 | shield | docs | FACT | fix |
 | P2-SHD-009 | P2 | shield, app | admin | INFERENCE | fix |
-| P2-SHD-010 | P2 | shield | config/lifecycle | INFERENCE | fix |
+| P2-SHD-010 | P2 | shield | config/lifecycle | INFERENCE | moot (P2-SHD-004 delete) |
 | P2-SIP-002 (aka P2-SIP-003) | P2 | sip | transport | FACT | fix |
 | P2-SIP-004 | P2 | sip | transport | INFERENCE | fix |
 | P2-SIP-007 | P2 | sip | transport | INFERENCE | fix |
@@ -689,6 +690,10 @@ Format: **Location** · **Evidence** · **Reference** (RFC or invariant; invaria
 - Reference: per-peer trust; mTLS identity.
 - Repro: not tested (needs a multi-CA stub; section 5).
 - Action: rewrite (section 4).
+- Decision (2026-09-24): rewrite with option (c). Keep one UA-wide `tls.Config` and select per peer through callbacks. Set `InsecureSkipVerify: true` and a `VerifyConnection` that verifies `cs.PeerCertificates` against the pool of the peer matched by `cs.ServerName` (that peer's `tls_ca`, or the system roots if it has none) and fails when no peer matches. Set a `GetClientCertificate` that returns the certificate of the peer carried in the handshake ctx (`cri.Context()`; sipgo passes the dial ctx to `HandshakeContext` at `sip/transport_tls.go:73`); the trunk puts the peer into that ctx on `TransactionRequest` and on the dialog Invite. With no peer key in the ctx it returns no certificate.
+  - Rejected: (a) one sipgo UA per TLS peer (needs per-UA servers, handlers, read filter, dialog caches, transaction routing and shutdown); (b) a custom dialer (in sipgo v1.4.3 `tlsClient` is an unexported field of `TransportTLS`, set in the unexported `(*TransportTLS).init` method, `sip/transport_tls.go:17-33`; needs a fork or a `replace`).
+  - Known limits: peers that share a hostname or IP:port cannot be distinguished (plan: reject in validation); dials on background-ctx paths get no client certificate; no per-peer SNI override. For a peer dialled by IP literal, `cs.ServerName` is empty (sipgo passes the IP as `hostname`, and Go's `crypto/tls` omits IPs from SNI, `hostnameInSNI`), so matching by `cs.ServerName` needs a fallback for IP-addressed peers. `InsecureSkipVerify` also disables the hostname/IP-SAN check, so `VerifyConnection` must perform it.
+  - Test plan: a loopback self-signed test with two peers that have distinct private CAs, where peer B's endpoint presents a certificate signed by A's CA; the dial must fail after the fix (it succeeds today). An mTLS test asserts that B receives only B's client certificate. Both reuse `genCertKey` (`internal/trunk/tls_test.go:23`).
 
 ### P2-TRK-017 (aka P2-APP-001) — Shutdown leaves bridged trunk calls without BYE; goroutines, sessions and ports leak
 - Location: `internal/trunk/server.go:302-319` (Run waits only for listeners); `internal/trunk/b2bua.go:459-484` (select has no shutdown arm; `killCtx` from `context.Background()`); `internal/app/app.go:55`, `:137-139`.
@@ -771,12 +776,13 @@ Compact format for P2: Location · Evidence · Reference · Repro · Action. "Re
 
 ### shield
 - **P2-SHD-004 (aka P1-002, P2-TRK-026) — Trunk auto-ban, trunk ban table, admin unban and the nftables backend never act in production.** `internal/trunk/server.go:460`, `:468`, `:150`; `internal/shield/shield.go:176-191`, `:198`, `:268-306`; `internal/shield/nftables.go` (whole file); `internal/app/app.go:182-187`. FACT (partial): 0% coverage across all tests with `-coverpkg=./...` (`raw/05-cover-func-coverpkg-all.txt`); unreachability in production is INFERENCE (the trunk read filter drops non-peer bytes, and peers are exempt from bans). Documented in design.md:2681-2688 and README.md:132, yet the backend still installs a table and needs CAP_NET_ADMIN. Repro: `go test -p 1 ./... -count=1 -coverpkg=./... -coverprofile=c.out && go tool cover -func=c.out | grep -E 'dropUnidentified|Unban|unban'`. Action: delete (or move the ban/kernel plane to the edge shield).
+  - Decision (2026-09-24): delete; the ban/kernel plane is not moved to the edge shield. Remove the trunk nftables backend (`internal/shield/nftables.go`, the `shield.nftables` config key, the `inet freesbc` table, the CAP_NET_ADMIN requirement), `RecordUnidentified` (`shield.go:176-191`), `failCounter` (`shield.go:268-306`, and its prune call at `:253`), `dropUnidentified` (`trunk/server.go:460-471`; its call sites at `server.go:557`, `:571`, `:596`, `:643` and `b2bua.go:132` keep a silent drop), and `shield.auto_ban.failures` / `auto_ban.window` (`config/schema.go:313-318`, `config/validate.go:255-260`). Keep `auto_ban.duration`: the edge scanner ban uses it (`shield.go:130`). The in-memory ban list, both rate limiters and scanner detection stay; the edge shield (`NewNoKernel`, `edge/edge.go:188`) is unchanged. Rationale: the trunk pre-parse filter (`trunk/readfilter.go:22-33`) admits only `allowed_ips` peers, and `Check` returns before the ban and scanner branches for peers (`shield.go:110-118`), so the trunk plane never calls `ban` and the kernel set never gets an element; deletion removes no production protection. Consequence: P2-SHD-007 and P2-SHD-010 become moot. Open follow-up: `DELETE /api/bans/{ip}` (`admin/server.go:121`) and the ban metrics are wired to the trunk shield only (`app/app.go:182-192`), so they always report no bans (`BannedCurrent` and `BanAddsRejected` stay 0); decide separately whether to remove them or wire them to the edge shield.
 - **P2-SHD-005 — Trunk peer `allowed_ips` exempt from the edge plane's ban/scanner checks.** `internal/shield/shield.go:108-118`, `:259-266`; `internal/edge/edge.go:516-517`. INFERENCE. Ref: invariant 62, 67. Action: fix (per-plane exemption predicate).
 - **P2-SHD-006 — A ban does not close an existing TCP/WS/WSS connection.** `internal/shield/shield.go:119-137`; `internal/edge/edge.go:517-519`. INFERENCE. Action: fix.
-- **P2-SHD-007 — Failed nftables setup leaves a partial `inet freesbc` table.** `internal/shield/nftables.go:80-85`, `:173-177`. INFERENCE. Action: fix.
+- **P2-SHD-007 — Failed nftables setup leaves a partial `inet freesbc` table.** `internal/shield/nftables.go:80-85`, `:173-177`. INFERENCE. Action: fix. Moot after the P2-SHD-004 decision (2026-09-24: delete `nftables.go`).
 - **P2-SHD-008 — Re-ban overwrites and can shorten the expiry; docs say "extend".** `internal/shield/banlist.go:47` vs `:75`; design.md:2214. FACT: `TestAuditReBanDoesNotShorten` (1 h ban cut to 1 min). Repro: `go test -race -count=1 -run '^TestAuditReBanDoesNotShorten$' ./internal/shield`. Action: fix (use max) or correct the docs.
 - **P2-SHD-009 — Admin unban does not unmap IPv4-mapped input.** `internal/app/app.go:183-187`; `internal/shield/shield.go:198-204`. INFERENCE. Action: fix.
-- **P2-SHD-010 — `auto_ban.duration` < 1 s becomes nft `timeout 0s`.** `internal/shield/nftables.go:212`; `internal/config/validate.go:261-262`. INFERENCE (unreachable today, P2-SHD-004). Action: fix.
+- **P2-SHD-010 — `auto_ban.duration` < 1 s becomes nft `timeout 0s`.** `internal/shield/nftables.go:212`; `internal/config/validate.go:261-262`. INFERENCE (unreachable today, P2-SHD-004). Action: fix. Moot after the P2-SHD-004 decision (2026-09-24: delete `nftables.go`).
 
 ### sip
 - **P2-SIP-002 (aka P2-SIP-003) — The 64 KiB read-filter cap can never fire.** `internal/sip/readfilter.go:8-10`, `:23`; `internal/edge/edge.go:459-469`; sipgo `transport.go:18` (`TransportBufferReadSize = 32768`). FACT: `TestAuditReadFilterCapIsReachable`. Docs drift: design.md:1012-1013, 2642-2644, 2704 and the `edge.go:459-461` comment say the cap is enforced (invariant 58). Repro: `go test -race -count=1 -run '^TestAuditReadFilterCapIsReachable$' ./internal/sip`. Action: fix (lower the cap or document sipgo's `ParseMaxMessageLength`).
@@ -823,10 +829,10 @@ Rewrite is recommended only where the identity model (keys, state ownership) is 
 2. **Trunk call store** (`internal/trunk/calls.go`). Decisive reason: `calls`/`legs` are keyed by Call-ID and the admin ID is the dialog key, with no collision check, so a second call with the same Call-ID overwrites the first and `endCall` deletes the survivor (FACT: `TestAuditCallStoreSameCallIDOverwrite`, `TestAuditCallStoreFirstCallUnkillable`). Target: key by dialog ID (Call-ID + tags), separate admin ID, 482 for merged requests (RFC 3261 §8.2.2.2).
 3. **Trunk SDP editing** (`internal/trunk/sdp.go` `rewriteSDPCrypto` and the pion-based helpers). Decisive reason: the output is the peer's body edited in place, so the default for every attribute is pass-through; every new attribute is a potential topology leak (FACT: 7 failing subtests of trunk `TestAuditSDPLeakProperty`), the `o=` belongs to the other leg (P2-TRK-007), and the pion parser rejects `m=image` outright (P3-TRK-N01). Target: construct the body from an allow-list, as the edge does with `internal/sip/sdp` `Build`, with the SBC owning `o=` per leg.
 4. **Edge trust classification** (`internal/edge/plane.go` `privateSources`/`arrivedOnPrivate`, `internal/edge/invite.go` `isPSTNBridgeInvite`). Decisive reason: "is this FreeSWITCH" is keyed by source address, not by the local socket the packet arrived on (P2-EDG-003, P2-EDG-021). This one is INFERENCE; it is recommended because the fix changes what the trust key is, not a check.
-5. **Trunk outbound TLS wiring** (`internal/trunk/tlscert.go`, `server.go:167-182`). Decisive reason: trust roots and client certificates are owned by one UA-wide `tls.Config` rather than per peer (P2-TRK-016, INFERENCE). Because sipgo v1.4.3 accepts one client `tls.Config` per UA (invariant 115), per-peer TLS needs either a per-peer UA/transport or a `GetClientCertificate`/`VerifyConnection` keyed by the dialled target.
+5. **Trunk outbound TLS wiring** (`internal/trunk/tlscert.go`, `server.go:167-182`). Decisive reason: trust roots and client certificates are owned by one UA-wide `tls.Config` rather than per peer (P2-TRK-016, INFERENCE). Because sipgo v1.4.3 accepts one client `tls.Config` per UA (invariant 115), per-peer TLS needs either a per-peer UA/transport or a `GetClientCertificate`/`VerifyConnection` keyed by the dialled target. Decision (2026-09-24): the callback approach, option (c); see the P2-TRK-016 detail entry.
 
 Evaluated and **not** recommended for rewrite:
-- **Shield rate limiter / ban table** (P2-SHD-001/002/003). The key (source IP) is acceptable; the defects are a missing cap, a wrong eviction rule and a UDP ban policy. Patchable: capped LRU with /64 IPv6 keys, store the interval per bucket, no ban (or port-scoped ban) for UDP verdicts. Delete the unreachable trunk ban/nft plane (P2-SHD-004).
+- **Shield rate limiter / ban table** (P2-SHD-001/002/003). The key (source IP) is acceptable; the defects are a missing cap, a wrong eviction rule and a UDP ban policy. Patchable: capped LRU with /64 IPv6 keys, store the interval per bucket, no ban (or port-scoped ban) for UDP verdicts. Delete the unreachable trunk ban/nft plane (P2-SHD-004; decided 2026-09-24).
 - **Admin auth limiter** (P2-ADM-002/003). Patchable: reserve the attempt under the lock before bcrypt, evict oldest instead of clearing, key IPv6 by /64, never answer valid credentials with 429.
 - **Media latch** (P2-EDG-001/P2-MED-006). The latch model supports strict/armed modes already; the defect is the edge choosing loose mode with no preference for the signalled source. Patchable.
 
