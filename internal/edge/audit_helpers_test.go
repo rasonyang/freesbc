@@ -255,6 +255,7 @@ func auditSwapFakeSwitch(t *testing.T, h *harness, bye func(f *fakeSwitch, req *
 		defer close(f.done)
 		_ = srv.TransportLayer().ServeUDP(conn)
 	}()
+	waitUDPServing(t, srv.TransportLayer(), conn)
 	h.fs = f
 }
 

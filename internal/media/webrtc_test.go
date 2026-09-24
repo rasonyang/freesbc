@@ -122,7 +122,7 @@ func TestICECredentialsShape(t *testing.T) {
 }
 
 func TestWebRTCLegNeedsRemoteCredentials(t *testing.T) {
-	pool := testPlanePool(t, "public", 41400, 41419)
+	pool := testPlanePool(t, "public", 23400, 23419)
 	id, err := ProcessDTLSIdentity()
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestWebRTCLegNeedsRemoteCredentials(t *testing.T) {
 }
 
 func TestWebRTCLegDTLSRole(t *testing.T) {
-	pool := testPlanePool(t, "public", 41420, 41439)
+	pool := testPlanePool(t, "public", 23420, 23439)
 	id, _ := ProcessDTLSIdentity()
 	for setup, want := range map[string]string{
 		"actpass": "passive", // the browser lets us choose: we take the server role
@@ -178,8 +178,8 @@ func TestWebRTCLegDTLSRole(t *testing.T) {
 func TestWebRTCLegOnWildcardBind(t *testing.T) {
 	pubPool := NewPlanePool("public", func() PlaneParams {
 		return PlaneParams{
-			MinPort: 41300,
-			MaxPort: 41339,
+			MinPort: 23300,
+			MaxPort: 23339,
 			BindIP:  netip.Addr{}, // every interface
 			Timeout: 30 * time.Second,
 		}
@@ -289,8 +289,8 @@ func TestWebRTCLegOnWildcardBind(t *testing.T) {
 // It covers acceptance criteria 5 and 6 at the media layer: ICE succeeds,
 // DTLS succeeds, SRTP decrypt/encrypt succeeds, bidirectional audio flows.
 func TestWebRTCSessionEndToEnd(t *testing.T) {
-	pubPool := testPlanePool(t, "public", 41500, 41539)
-	privPool := testPlanePool(t, "private", 41540, 41579)
+	pubPool := testPlanePool(t, "public", 23500, 23539)
+	privPool := testPlanePool(t, "private", 23540, 23579)
 
 	id, err := ProcessDTLSIdentity()
 	if err != nil {
@@ -528,8 +528,8 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 // TestWebRTCSessionCleanup proves Close releases every resource: both
 // pools return to zero in use, so nothing leaks after a call ends.
 func TestWebRTCSessionCleanup(t *testing.T) {
-	pubPool := testPlanePool(t, "public", 41600, 41639)
-	privPool := testPlanePool(t, "private", 41640, 41679)
+	pubPool := testPlanePool(t, "public", 23600, 23639)
+	privPool := testPlanePool(t, "private", 23640, 23679)
 	id, _ := ProcessDTLSIdentity()
 
 	for i := 0; i < 5; i++ {
@@ -568,7 +568,7 @@ func TestWebRTCSessionCleanup(t *testing.T) {
 
 // A leg whose handshake never completes must not pin its port forever.
 func TestWebRTCLegHandshakeTimeout(t *testing.T) {
-	pool := testPlanePool(t, "public", 41700, 41719)
+	pool := testPlanePool(t, "public", 23700, 23719)
 	id, _ := ProcessDTLSIdentity()
 	leg, err := NewWebRTCLeg(pool, WebRTCLegConfig{
 		AdvertisedIP: netip.MustParseAddr("127.0.0.1"), Identity: id,
@@ -592,16 +592,16 @@ func TestWebRTCLegHandshakeTimeout(t *testing.T) {
 }
 
 func TestAllocateAcrossUsesBothPools(t *testing.T) {
-	a := testPlanePool(t, "public", 41800, 41819)
-	b := testPlanePool(t, "private", 41820, 41839)
+	a := testPlanePool(t, "public", 23800, 23819)
+	b := testPlanePool(t, "private", 23820, 23839)
 	sess, err := AllocateAcross(a, b, SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := sess.RTPPort(SideA); p < 41800 || p > 41819 {
+	if p := sess.RTPPort(SideA); p < 23800 || p > 23819 {
 		t.Errorf("side A port %d outside the public range", p)
 	}
-	if p := sess.RTPPort(SideB); p < 41820 || p > 41839 {
+	if p := sess.RTPPort(SideB); p < 23820 || p > 23839 {
 		t.Errorf("side B port %d outside the private range", p)
 	}
 	if inUse, _ := a.Stats(); inUse != 1 {
@@ -623,8 +623,8 @@ func TestAllocateAcrossUsesBothPools(t *testing.T) {
 // A failure allocating the SECOND side must release the first, or a
 // congested private plane would slowly drain the public one.
 func TestAllocateAcrossReleasesOnPartialFailure(t *testing.T) {
-	a := testPlanePool(t, "public", 41900, 41919)
-	full := testPlanePool(t, "private", 41920, 41921) // exactly one pair
+	a := testPlanePool(t, "public", 23900, 23919)
+	full := testPlanePool(t, "private", 23920, 23921) // exactly one pair
 	first, err := AllocateAcross(a, full, SessionConfig{})
 	if err != nil {
 		t.Fatal(err)

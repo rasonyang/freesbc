@@ -28,7 +28,7 @@ import (
 // the carrier's live dialogs, and the goroutine count (runtime.NumGoroutine
 // with a bounded retry; goleak is deliberately not used).
 //
-// Ports: SIP 47700-47799, media 48500-48799. Run in a Linux container (own
+// Ports: SIP 13700-13799, media 14500-14799. Run in a Linux container (own
 // network namespace) to avoid fixed-port collisions.
 
 const auditCalls = 4
@@ -191,7 +191,7 @@ func auditStartCarrier(t *testing.T, addr string, answerDelay time.Duration) *au
 				return
 			}
 		}
-		if err := dlg.RespondSDP(testSDPBody(48990)); err != nil {
+		if err := dlg.RespondSDP(testSDPBody(14990)); err != nil {
 			return
 		}
 		c.answered.Add(1)
@@ -286,7 +286,7 @@ func (u *auditUAC) headers(method, branch, toTag string, cseq int, ruri string) 
 func (u *auditUAC) ruri() string { return fmt.Sprintf("sip:5551234@127.0.0.1:%d", u.sbc.Port) }
 
 func (u *auditUAC) invite() {
-	body := string(testSDPBody(48992))
+	body := string(testSDPBody(14992))
 	h := u.headers("INVITE", u.callID+"-inv", "", 1, u.ruri())
 	h = append(h, "Content-Type: application/sdp", fmt.Sprintf("Content-Length: %d", len(body)), "", body)
 	u.send(strings.Join(h, "\r\n"))
@@ -526,11 +526,11 @@ func auditEstablishN(t *testing.T, sipPort int, prefix string, n int) []*auditUA
 // audit: P2-TRK-017 (control for the resource-balance suite)
 // (a) normal BYE from the caller.
 func TestAuditResourceBalanceNormalBye(t *testing.T) {
-	carrier := auditStartCarrier(t, "127.0.0.1:47701", 0)
-	as := auditStartServer(t, auditTrunkCfg(47700, 47701, 48500, 48539, ""))
-	baseline := auditWarmBaseline(t, 47700, "rb-bye")
+	carrier := auditStartCarrier(t, "127.0.0.1:13701", 0)
+	as := auditStartServer(t, auditTrunkCfg(13700, 13701, 14500, 14539, ""))
+	baseline := auditWarmBaseline(t, 13700, "rb-bye")
 
-	uacs := auditEstablishN(t, 47700, "rb-bye", auditCalls)
+	uacs := auditEstablishN(t, 13700, "rb-bye", auditCalls)
 	waitForActiveCalls(t, as.srv, auditCalls, 3*time.Second)
 	for _, u := range uacs {
 		u.hangup()
@@ -543,15 +543,15 @@ func TestAuditResourceBalanceNormalBye(t *testing.T) {
 // carrier answered must end (ACK+BYE), and nothing may stay allocated.
 func TestAuditResourceBalanceCancelRace(t *testing.T) {
 	const answerDelay = 300 * time.Millisecond
-	carrier := auditStartCarrier(t, "127.0.0.1:47711", answerDelay)
-	as := auditStartServer(t, auditTrunkCfg(47710, 47711, 48540, 48579, ""))
-	baseline := auditWarmBaseline(t, 47710, "rb-cancel")
+	carrier := auditStartCarrier(t, "127.0.0.1:13711", answerDelay)
+	as := auditStartServer(t, auditTrunkCfg(13710, 13711, 14540, 14579, ""))
+	baseline := auditWarmBaseline(t, 13710, "rb-cancel")
 
 	var uacs []*auditUAC
 	outcomes := map[int]int{}
 	const races = 20
 	for i := 0; i < races; i++ {
-		u := newAuditUAC(t, 47710, fmt.Sprintf("rb-cancel-%d", i))
+		u := newAuditUAC(t, 13710, fmt.Sprintf("rb-cancel-%d", i))
 		uacs = append(uacs, u)
 		u.invite()
 		// Sweep the CANCEL across the carrier's answer instant.
@@ -586,12 +586,12 @@ func TestAuditResourceBalanceCancelRace(t *testing.T) {
 // (c) media silence: rtp_timeout expires on every bridged call; the SBC
 // must BYE both legs and release everything.
 func TestAuditResourceBalanceMediaTimeout(t *testing.T) {
-	carrier := auditStartCarrier(t, "127.0.0.1:47721", 0)
-	as := auditStartServer(t, auditTrunkCfg(47720, 47721, 48580, 48619, "    rtp_timeout: 1s"))
-	baseline := auditWarmBaseline(t, 47720, "rb-timeout")
+	carrier := auditStartCarrier(t, "127.0.0.1:13721", 0)
+	as := auditStartServer(t, auditTrunkCfg(13720, 13721, 14580, 14619, "    rtp_timeout: 1s"))
+	baseline := auditWarmBaseline(t, 13720, "rb-timeout")
 	carrier.byes.Store(0)
 
-	uacs := auditEstablishN(t, 47720, "rb-timeout", auditCalls)
+	uacs := auditEstablishN(t, 13720, "rb-timeout", auditCalls)
 	// No RTP is ever sent; each session's watchdog fires after ~1s.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && carrier.byes.Load() < auditCalls {
@@ -607,12 +607,12 @@ func TestAuditResourceBalanceMediaTimeout(t *testing.T) {
 // the old calls' ports must still be released, and the pool must account
 // correctly under the new range.
 func TestAuditResourceBalanceReloadMidCall(t *testing.T) {
-	carrier := auditStartCarrier(t, "127.0.0.1:47731", 0)
-	as := auditStartServer(t, auditTrunkCfg(47730, 47731, 48620, 48659, ""))
-	baseline := auditWarmBaseline(t, 47730, "rb-reload")
+	carrier := auditStartCarrier(t, "127.0.0.1:13731", 0)
+	as := auditStartServer(t, auditTrunkCfg(13730, 13731, 14620, 14659, ""))
+	baseline := auditWarmBaseline(t, 13730, "rb-reload")
 
-	uacs := auditEstablishN(t, 47730, "rb-reload", auditCalls)
-	next, err := config.Parse([]byte(auditTrunkCfg(47730, 47731, 48660, 48663, "    rtp_timeout: 2m")))
+	uacs := auditEstablishN(t, 13730, "rb-reload", auditCalls)
+	next, err := config.Parse([]byte(auditTrunkCfg(13730, 13731, 14660, 14663, "    rtp_timeout: 2m")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +625,7 @@ func TestAuditResourceBalanceReloadMidCall(t *testing.T) {
 	}
 	auditBalance{srv: as.srv, carrier: carrier, baseline: baseline, wantByes: auditCalls + 1, uacs: uacs}.assert(t)
 	// The new range (one call) must be fully usable after the old calls end.
-	u := newAuditUAC(t, 47730, "rb-reload-after")
+	u := newAuditUAC(t, 13730, "rb-reload-after")
 	u.establish()
 	u.hangup()
 }
@@ -635,11 +635,11 @@ func TestAuditResourceBalanceReloadMidCall(t *testing.T) {
 // call (BYE to both legs), release all media ports, and leave no call
 // goroutine behind.
 func TestAuditResourceBalanceShutdownWithLiveCalls(t *testing.T) {
-	carrier := auditStartCarrier(t, "127.0.0.1:47741", 0)
+	carrier := auditStartCarrier(t, "127.0.0.1:13741", 0)
 	baseline := runtime.NumGoroutine()
-	as := auditStartServer(t, auditTrunkCfg(47740, 47741, 48700, 48739, ""))
+	as := auditStartServer(t, auditTrunkCfg(13740, 13741, 14700, 14739, ""))
 
-	uacs := auditEstablishN(t, 47740, "rb-shutdown", auditCalls)
+	uacs := auditEstablishN(t, 13740, "rb-shutdown", auditCalls)
 	waitForActiveCalls(t, as.srv, auditCalls, 3*time.Second)
 
 	as.cancel()
@@ -661,29 +661,29 @@ func TestAuditResourceBalanceShutdownWithLiveCalls(t *testing.T) {
 // reload that edits listen.sip, the SBC is still bound to the old port, so
 // the Contact it advertises on new calls must still name the bound port.
 func TestAuditReloadListenPortNotAdvertised(t *testing.T) {
-	carrier := auditStartCarrier(t, "127.0.0.1:47751", 0)
-	as := auditStartServer(t, auditTrunkCfg(47750, 47751, 48740, 48779, ""))
+	carrier := auditStartCarrier(t, "127.0.0.1:13751", 0)
+	as := auditStartServer(t, auditTrunkCfg(13750, 13751, 14740, 14779, ""))
 
-	u := newAuditUAC(t, 47750, "reload-listen-before")
+	u := newAuditUAC(t, 13750, "reload-listen-before")
 	u.establish()
 	before := carrier.lastContact()
 	u.hangup()
-	if before == nil || before.Address.Port != 47750 {
-		t.Fatalf("control: B-leg Contact before reload = %v, want port 47750", before)
+	if before == nil || before.Address.Port != 13750 {
+		t.Fatalf("control: B-leg Contact before reload = %v, want port 13750", before)
 	}
 
-	next, err := config.Parse([]byte(auditTrunkCfg(47799, 47751, 48740, 48779, "")))
+	next, err := config.Parse([]byte(auditTrunkCfg(13799, 13751, 14740, 14779, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	as.store.Replace(next)
 
-	u2 := newAuditUAC(t, 47750, "reload-listen-after") // the socket still bound
+	u2 := newAuditUAC(t, 13750, "reload-listen-after") // the socket still bound
 	u2.establish()
 	after := carrier.lastContact()
 	u2.hangup()
-	if after == nil || after.Address.Port != 47750 {
-		t.Errorf("after reloading listen.sip to :47799 (not bound; restart-only), the B-leg INVITE advertises Contact %v; "+
+	if after == nil || after.Address.Port != 13750 {
+		t.Errorf("after reloading listen.sip to :13799 (not bound; restart-only), the B-leg INVITE advertises Contact %v; "+
 			"the carrier's in-dialog requests would go to an unbound port", after)
 	}
 }

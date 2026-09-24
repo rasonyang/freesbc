@@ -61,7 +61,7 @@ func pump(t *testing.T, src, dst *net.UDPConn, payload string) {
 // the latched source address could renew rtp_timeout indefinitely with
 // junk and a dead call never tore down.
 func TestWatchdogNotRefreshedByGarbage(t *testing.T) {
-	s := newLooseSession(t, 41300, 41315, 500*time.Millisecond)
+	s := newLooseSession(t, 23300, 23315, 500*time.Millisecond)
 	key := mustKey(t)
 	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key)
 	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)
@@ -99,7 +99,7 @@ func TestWatchdogNotRefreshedByGarbage(t *testing.T) {
 // media must keep renewing the watchdog — the fix gates the refresh, it
 // doesn't break legitimate keepalive.
 func TestWatchdogRefreshedByValidSRTP(t *testing.T) {
-	s := newLooseSession(t, 41320, 41335, 500*time.Millisecond)
+	s := newLooseSession(t, 23320, 23335, 500*time.Millisecond)
 	key := mustKey(t)
 	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key)
 	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)
@@ -133,7 +133,7 @@ func TestWatchdogRefreshedByValidSRTP(t *testing.T) {
 }
 
 func TestRelayForwardsBothDirections(t *testing.T) {
-	s := newLooseSession(t, 41000, 41015, time.Minute)
+	s := newLooseSession(t, 23000, 23015, time.Minute)
 	s.Start()
 	ea := dialSide(t, s, SideA)
 	eb := dialSide(t, s, SideB)
@@ -149,7 +149,7 @@ func TestRelayForwardsBothDirections(t *testing.T) {
 }
 
 func TestRelayDropsHijackPackets(t *testing.T) {
-	s := newLooseSession(t, 41100, 41115, time.Minute)
+	s := newLooseSession(t, 23100, 23115, time.Minute)
 	s.Start()
 	ea := dialSide(t, s, SideA)
 	eb := dialSide(t, s, SideB)
@@ -182,7 +182,7 @@ func TestRelayDropsHijackPackets(t *testing.T) {
 }
 
 func TestRelaySilenceTimeoutReleasesPorts(t *testing.T) {
-	p := testPool(41200, 41203) // exactly one session's worth
+	p := testPool(23200, 23203) // exactly one session's worth
 	s, err := p.Allocate(SessionConfig{
 		Latch:   [2]LatchMode{LatchLoose, LatchLoose},
 		Timeout: 150 * time.Millisecond,
@@ -204,7 +204,7 @@ func TestRelaySilenceTimeoutReleasesPorts(t *testing.T) {
 }
 
 func TestRelayActivityDefersTimeout(t *testing.T) {
-	s := newLooseSession(t, 41250, 41257, 500*time.Millisecond)
+	s := newLooseSession(t, 23250, 23257, 500*time.Millisecond)
 	s.Start()
 	ea := dialSide(t, s, SideA)
 	// Keep the session alive for ~3 timeout periods with steady traffic.
@@ -222,7 +222,7 @@ func TestRelayActivityDefersTimeout(t *testing.T) {
 }
 
 func TestRelayPanicRecoveryKillsSession(t *testing.T) {
-	p := testPool(41260, 41267)
+	p := testPool(23260, 23267)
 	s, err := p.Allocate(SessionConfig{Timeout: time.Minute})
 	if err != nil {
 		t.Fatal(err)

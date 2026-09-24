@@ -425,7 +425,7 @@ func TestAdminListenChangeWarns(t *testing.T) {
 	}
 
 	reloaded := mustCfg(t)
-	reloaded.Admin = &config.AdminConfig{Listen: "127.0.0.1:45888", Auth: config.AdminAuth{
+	reloaded.Admin = &config.AdminConfig{Listen: "127.0.0.1:10102", Auth: config.AdminAuth{
 		Username: "admin", PasswordHash: string(hash),
 	}}
 	store.Replace(reloaded)
@@ -492,7 +492,7 @@ func TestAdminServesTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate hash: %v", err)
 	}
-	cfg := &config.AdminConfig{Listen: "127.0.0.1:45886", TLSCert: certPath, TLSKey: keyPath}
+	cfg := &config.AdminConfig{Listen: "127.0.0.1:10100", TLSCert: certPath, TLSKey: keyPath}
 	cfg.Auth.Username = "admin"
 	cfg.Auth.PasswordHash = string(hash)
 	s := New(cfg, config.NewStore(mustCfg(t)), emptyDeps(), slog.New(slog.NewTextHandler(io.Discard, nil)), "")

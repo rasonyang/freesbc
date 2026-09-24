@@ -17,7 +17,7 @@ import (
 )
 
 // Audit test port plan: every audit test in this package draws from
-// 47000-47999, which no pre-existing suite in the repository uses.
+// 24000-24999, which no pre-existing suite in the repository uses.
 
 // auditPool builds a loopback-bound pool whose range can be changed at
 // runtime, standing in for a hot-reloaded listen.media.port_range.

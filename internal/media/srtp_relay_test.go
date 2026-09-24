@@ -44,7 +44,7 @@ func latchBoth(t *testing.T, ea, eb *net.UDPConn) {
 }
 
 func TestRelaySRTPToRTPInterworks(t *testing.T) {
-	s := newLooseSession(t, 41200, 41215, time.Minute)
+	s := newLooseSession(t, 23200, 23215, time.Minute)
 	key := mustKey(t)
 	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key) // the A-peer's SRTP sender
 	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)  // SBC decrypts from A
@@ -66,7 +66,7 @@ func TestRelaySRTPToRTPInterworks(t *testing.T) {
 // (outbound encrypted). B must read ciphertext that only a matching SRTP
 // context can decrypt back to the original plaintext.
 func TestRelayRTPToSRTPInterworks(t *testing.T) {
-	s := newLooseSession(t, 41220, 41235, time.Minute)
+	s := newLooseSession(t, 23220, 23235, time.Minute)
 	keyB := mustKey(t)
 	sbcOutB, _ := NewSRTPContext(SuiteAES128CM80, keyB) // SBC encrypts toward B
 	peerDecB, _ := NewSRTPContext(SuiteAES128CM80, keyB)
@@ -101,7 +101,7 @@ func TestRelayRTPToSRTPInterworks(t *testing.T) {
 // SBC must decrypt with keyA and re-encrypt with keyB — proving it actually
 // re-keys rather than passing ciphertext through untouched.
 func TestRelaySRTPToSRTPRekeyed(t *testing.T) {
-	s := newLooseSession(t, 41240, 41255, time.Minute)
+	s := newLooseSession(t, 23240, 23255, time.Minute)
 	keyA := mustKey(t)
 	keyB := mustKey(t)
 	peerEncA, _ := NewSRTPContext(SuiteAES128CM80, keyA) // A-peer's sender
@@ -157,7 +157,7 @@ func TestRelaySRTPToSRTPRekeyed(t *testing.T) {
 // plaintext (nil SRTP contexts), behavior must be byte-identical to the
 // pre-SRTP relay (same as TestRelayForwardsBothDirections).
 func TestRelayPlaintextUnchanged(t *testing.T) {
-	s := newLooseSession(t, 41260, 41275, time.Minute)
+	s := newLooseSession(t, 23260, 23275, time.Minute)
 	s.SetSRTP(SideA, nil, nil)
 	s.SetSRTP(SideB, nil, nil)
 	s.Start()
@@ -171,7 +171,7 @@ func TestRelayPlaintextUnchanged(t *testing.T) {
 // TestRelayTamperedSRTPDropped: a corrupted SRTP packet from a secure A leg
 // must never reach B — bad auth tag means fail-closed drop, not passthrough.
 func TestRelayTamperedSRTPDropped(t *testing.T) {
-	s := newLooseSession(t, 41280, 41295, time.Minute)
+	s := newLooseSession(t, 23280, 23295, time.Minute)
 	key := mustKey(t)
 	peerEnc, _ := NewSRTPContext(SuiteAES128CM80, key)
 	sbcInA, _ := NewSRTPContext(SuiteAES128CM80, key)

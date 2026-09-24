@@ -20,7 +20,7 @@ import (
 // handles only once (webrtcleg.go:525), so an agent created after Close is
 // never closed and its goroutines outlive the leg.
 func TestAuditMED001CloseRacingEstablishLeaksICEAgent(t *testing.T) {
-	pool := newAuditPool("public", 47000, 47099, "127.0.0.1")
+	pool := newAuditPool("public", 24000, 24099, "127.0.0.1")
 	id, err := ProcessDTLSIdentity()
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestAuditMED001CloseRacingEstablishLeaksICEAgent(t *testing.T) {
 // certificate does NOT match what it "signalled", and its SRTP still
 // reaches FreeSWITCH before anyone verifies.
 func TestAuditMED002MediaFlowsBeforeFingerprintVerified(t *testing.T) {
-	c := auditEstablishBrowserCall(t, 47100, 47139, 47140, 47179)
+	c := auditEstablishBrowserCall(t, 24100, 24139, 24140, 24179)
 
 	other, err := selfSignedForTest()
 	if err != nil {
@@ -152,7 +152,7 @@ func TestAuditMED003SeedReflectsToLocalService(t *testing.T) {
 		{"unspecified", "0.0.0.0", "0.0.0.0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pool := newAuditPool("audit", 47180, 47199, "127.0.0.1")
+			pool := newAuditPool("audit", 24180, 24199, "127.0.0.1")
 			s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
 			if err != nil {
 				t.Fatal(err)
@@ -190,7 +190,7 @@ func TestAuditMED003SeedReflectsToLocalService(t *testing.T) {
 // has gone away (BYE lost) while side B keeps streaming: the watchdog
 // must still reclaim the call, but B's packets keep refreshing lastRx.
 func TestAuditMED004OneWaySilenceNeverReclaimed(t *testing.T) {
-	pool := newAuditPool("audit", 47200, 47219, "127.0.0.1")
+	pool := newAuditPool("audit", 24200, 24219, "127.0.0.1")
 	const timeout = 200 * time.Millisecond
 	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: timeout})
 	if err != nil {
@@ -234,7 +234,7 @@ func TestAuditMED004OneWaySilenceNeverReclaimed(t *testing.T) {
 // port before the real phone; afterwards the phone is ignored and
 // FreeSWITCH audio goes to the attacker. Needs 127.0.0.2 (Linux).
 func TestAuditMED006LooseLatchFirstPacketHijack(t *testing.T) {
-	pool := newAuditPool("audit", 47220, 47239, "")
+	pool := newAuditPool("audit", 24220, 24239, "")
 	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +288,7 @@ func TestAuditMED006LooseLatchFirstPacketHijack(t *testing.T) {
 // After a hot reload shrinks the port range, Stats reports inUse from the
 // old reservations against the new total (portpool.go:154-170).
 func TestAuditMED011StatsInUseExceedsTotalAfterShrink(t *testing.T) {
-	pool := newAuditPool("audit", 47240, 47251, "127.0.0.1") // 6 pairs
+	pool := newAuditPool("audit", 24240, 24251, "127.0.0.1") // 6 pairs
 	var pairs []*portPair
 	for i := 0; i < 3; i++ {
 		pp, err := pool.allocatePair()
@@ -303,7 +303,7 @@ func TestAuditMED011StatsInUseExceedsTotalAfterShrink(t *testing.T) {
 			pool.release(pp.RTPPort())
 		}
 	}()
-	pool.setRange(47240, 47243) // 2 pairs
+	pool.setRange(24240, 24243) // 2 pairs
 	inUse, total := pool.Stats()
 	if inUse > total {
 		t.Errorf("FACT P2-MED-011: Stats after range shrink reports inUse=%d > total=%d", inUse, total)

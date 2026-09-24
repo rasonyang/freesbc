@@ -65,7 +65,7 @@ routes:
 // and the shield-side auto-ban logic is covered by the shield package's
 // own TestRecordUnidentifiedBansAtThreshold.
 func TestShieldBansAfterFailures(t *testing.T) {
-	const port = 45700
+	const port = 11700
 	srv := startServer(t, port, fmt.Sprintf(unidentifiedShieldCfg, port))
 
 	for i := 0; i < 3; i++ {
@@ -94,7 +94,7 @@ func TestShieldBansAfterFailures(t *testing.T) {
 // still get 200 — an unconfigured source under the same limit would start
 // getting silently dropped well before this many requests.
 func TestShieldConfiguredPeerNotThrottled(t *testing.T) {
-	const port = 45701
+	const port = 11701
 	startServer(t, port, fmt.Sprintf(configuredPeerShieldCfg, port))
 
 	const n = 10
@@ -116,7 +116,7 @@ func TestShieldConfiguredPeerNotThrottled(t *testing.T) {
 // shield's scanner check anymore; that check itself is covered by the
 // shield package's own TestCheckScannerInstantBan.
 func TestShieldScannerInstantBan(t *testing.T) {
-	const port = 45702
+	const port = 11702
 	srv := startServer(t, port, fmt.Sprintf(unidentifiedShieldCfg, port))
 
 	got := roundTripWithHeaders(t, port, "OPTIONS", "scan-0", 1*time.Second, "",

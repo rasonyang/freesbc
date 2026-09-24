@@ -179,7 +179,7 @@ func roundTripWithHeaders(t *testing.T, targetPort int, method, callID string, t
 
 const knownPeerCfg = `
 listen:
-  sip: [udp://127.0.0.1:45060]
+  sip: [udp://127.0.0.1:11060]
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -217,8 +217,8 @@ func TestServerAccessorsNilSafe(t *testing.T) {
 }
 
 func TestServerAnswersOptionsFromKnownPeer(t *testing.T) {
-	startServer(t, 45060, knownPeerCfg)
-	got := roundTrip(t, 45060, "OPTIONS", "opt-known-1", 3*time.Second, "SIP/2.0 200")
+	startServer(t, 11060, knownPeerCfg)
+	got := roundTrip(t, 11060, "OPTIONS", "opt-known-1", 3*time.Second, "SIP/2.0 200")
 	if !strings.Contains(got, "SIP/2.0 200") {
 		t.Fatalf("expected 200 OK to OPTIONS, got:\n%s", got)
 	}
@@ -233,8 +233,8 @@ func TestServerAnswersOptionsFromKnownPeer(t *testing.T) {
 // offer to bridge. TestBridgePlacesCallAndBridges (sig/b2bua_test.go) is
 // the real happy-path coverage with an actual offer/answer.
 func TestServerInviteFromKnownPeerIsRoutedThenRejectedForNoSDP(t *testing.T) {
-	startServer(t, 45062, strings.Replace(knownPeerCfg, "45060", "45062", 1))
-	got := roundTrip(t, 45062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 488")
+	startServer(t, 11062, strings.Replace(knownPeerCfg, "11060", "11062", 1))
+	got := roundTrip(t, 11062, "INVITE", "inv-known-1", 3*time.Second, "SIP/2.0 488")
 	if !strings.Contains(got, "SIP/2.0 488") {
 		t.Fatalf("expected 488 (routed, but no SDP offer to bridge), got:\n%s", got)
 	}
@@ -243,10 +243,10 @@ func TestServerInviteFromKnownPeerIsRoutedThenRejectedForNoSDP(t *testing.T) {
 func TestServerDropsUnknownSource(t *testing.T) {
 	// allowed_ips excludes loopback → our OPTIONS must be silently dropped.
 	cfg := strings.Replace(
-		strings.Replace(knownPeerCfg, "45060", "45064", 1),
+		strings.Replace(knownPeerCfg, "11060", "11064", 1),
 		"127.0.0.1/32", "10.0.0.0/8", 1)
-	startServer(t, 45064, cfg)
-	got := roundTrip(t, 45064, "OPTIONS", "opt-unknown-1", 1*time.Second, "")
+	startServer(t, 11064, cfg)
+	got := roundTrip(t, 11064, "OPTIONS", "opt-unknown-1", 1*time.Second, "")
 	if strings.Contains(got, "SIP/2.0") {
 		t.Fatalf("unknown source must be dropped, but got a response:\n%s", got)
 	}
@@ -263,10 +263,10 @@ func TestServerDropsUnknownSource(t *testing.T) {
 func TestServerDropsUnknownSourceNonOptionsMethod(t *testing.T) {
 	// allowed_ips excludes loopback → our REGISTER must be silently dropped.
 	cfg := strings.Replace(
-		strings.Replace(knownPeerCfg, "45060", "45066", 1),
+		strings.Replace(knownPeerCfg, "11060", "11066", 1),
 		"127.0.0.1/32", "10.0.0.0/8", 1)
-	startServer(t, 45066, cfg)
-	got := roundTrip(t, 45066, "REGISTER", "reg-unknown-1", 1*time.Second, "")
+	startServer(t, 11066, cfg)
+	got := roundTrip(t, 11066, "REGISTER", "reg-unknown-1", 1*time.Second, "")
 	if strings.Contains(got, "SIP/2.0") {
 		t.Fatalf("unknown source must be dropped for REGISTER, but got a response:\n%s", got)
 	}
@@ -277,9 +277,9 @@ func TestServerDropsUnknownSourceNonOptionsMethod(t *testing.T) {
 // implement (REGISTER) still gets a normal 405 Method Not Allowed, since
 // it already passed the identify() security check.
 func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
-	cfg := strings.Replace(knownPeerCfg, "45060", "45068", 1)
-	startServer(t, 45068, cfg)
-	got := roundTrip(t, 45068, "REGISTER", "reg-known-1", 3*time.Second, "SIP/2.0 405")
+	cfg := strings.Replace(knownPeerCfg, "11060", "11068", 1)
+	startServer(t, 11068, cfg)
+	got := roundTrip(t, 11068, "REGISTER", "reg-known-1", 3*time.Second, "SIP/2.0 405")
 	if !strings.Contains(got, "SIP/2.0 405") {
 		t.Fatalf("expected 405 Method Not Allowed for known peer, got:\n%s", got)
 	}
@@ -414,7 +414,7 @@ routes:
 func TestServerOurSigPortNo5060Fallback(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 listen:
-  sip: [udp://127.0.0.1:45170]
+  sip: [udp://127.0.0.1:11170]
   media: { port_range: 40006-40007 }
 peers:
   p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
@@ -427,11 +427,11 @@ routes:
 		t.Fatalf("parse: %v", err)
 	}
 	srv := NewServer(config.NewStore(cfg), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if got := srv.ourSigPort(cfg, "udp"); got != 45170 {
-		t.Errorf("ourSigPort(udp) = %d, want configured 45170", got)
+	if got := srv.ourSigPort(cfg, "udp"); got != 11170 {
+		t.Errorf("ourSigPort(udp) = %d, want configured 11170", got)
 	}
-	if got := srv.ourSigPort(cfg, "tcp"); got != 45170 {
-		t.Errorf("ourSigPort(tcp) = %d, want first-listener fallback 45170", got)
+	if got := srv.ourSigPort(cfg, "tcp"); got != 11170 {
+		t.Errorf("ourSigPort(tcp) = %d, want first-listener fallback 11170", got)
 	}
 	empty := &config.Config{}
 	if got := srv.ourSigPort(empty, "udp"); got != 0 {
@@ -444,10 +444,10 @@ func TestServerDropsUnidentifiedBye(t *testing.T) {
 	// onBye's identify gate — not routed to the dialog cache. Reuse the
 	// unknown-source config (allowed_ips excludes loopback).
 	cfg := strings.Replace(
-		strings.Replace(knownPeerCfg, "45060", "45078", 1),
+		strings.Replace(knownPeerCfg, "11060", "11078", 1),
 		"127.0.0.1/32", "10.0.0.0/8", 1)
-	startServer(t, 45078, cfg)
-	got := roundTrip(t, 45078, "BYE", "bye-unknown-1", 1*time.Second, "")
+	startServer(t, 11078, cfg)
+	got := roundTrip(t, 11078, "BYE", "bye-unknown-1", 1*time.Second, "")
 	if strings.Contains(got, "SIP/2.0") {
 		t.Fatalf("unidentified BYE must be dropped, got a response:\n%s", got)
 	}
@@ -464,8 +464,8 @@ func TestServerDropsUnidentifiedBye(t *testing.T) {
 // case for genuinely unauthorized sources — this proves a known peer with
 // a stale/bogus dialog reference gets a real, visible error instead).
 func TestServerByeNoDialogGets481(t *testing.T) {
-	cfg := strings.Replace(knownPeerCfg, "45060", "45079", 1)
-	startServer(t, 45079, cfg)
+	cfg := strings.Replace(knownPeerCfg, "11060", "11079", 1)
+	startServer(t, 11079, cfg)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -473,14 +473,14 @@ func TestServerByeNoDialogGets481(t *testing.T) {
 	}
 	defer conn.Close()
 	local := conn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45079}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11079}
 
 	// Same shape as sipRequest's BYE, but the To header carries a tag —
 	// exactly the re-INVITE test's technique (TestBridgeRejectsReInvite) for
 	// making a standalone request look in-dialog without an established
 	// call behind it.
 	req := strings.Replace(
-		sipRequest("BYE", "45079", local, "bye-nodialog-1"),
+		sipRequest("BYE", "11079", local, "bye-nodialog-1"),
 		"To: <sip:sbc@127.0.0.1>",
 		"To: <sip:sbc@127.0.0.1>;tag=bye-nodialog-tag",
 		1,

@@ -56,7 +56,7 @@ type stubRegistrar struct {
 // startStubRegistrar boots the stub UAS on 127.0.0.1:port and returns once
 // it is accepting packets. Follows the same bind-our-own-socket pattern as
 // startStubCarrier in b2bua_test.go (avoids sipgo's known ListenAndServe
-// shutdown race). Ports for this file's tests: 45320-45339.
+// shutdown race). Ports for this file's tests: 11320-11339.
 func startStubRegistrar(t *testing.T, port int, user, pass string, grantExpires int) *stubRegistrar {
 	t.Helper()
 	return startStubRegistrarRealm(t, port, user, pass, grantExpires, "freesbc-test")
@@ -377,12 +377,12 @@ func startStubRegistrarMinExpires(t *testing.T, port int, user, pass string, min
 // Min-Expires: 3600 header; registerOnce must read that header and retry
 // once at 3600s, succeeding with a granted lifetime of 3600s.
 func TestRegisterOnceRetriesOn423(t *testing.T) {
-	reg := startStubRegistrarMinExpires(t, 45338, "u", "p", 3600) // 423 below 3600, then grant
+	reg := startStubRegistrarMinExpires(t, 11338, "u", "p", 3600) // 423 below 3600, then grant
 	client := reg.client(t)
 	p := regParams{
-		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45338,
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11338,
 		Transport: "udp", Username: "u", Password: "p",
-		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45995,
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11995,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -401,12 +401,12 @@ func TestRegisterOnceRetriesOn423(t *testing.T) {
 // request) parsed off the 200. Timing-based over real UDP loopback: re-run
 // once before treating a flake as failure.
 func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
-	reg := startStubRegistrar(t, 45320, "reguser", "regpass", 1800) // grants 1800s
+	reg := startStubRegistrar(t, 11320, "reguser", "regpass", 1800) // grants 1800s
 	client := reg.client(t)                                         // a sipgo client bound to loopback
 	p := regParams{
-		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45320,
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11320,
 		Transport: "udp", Username: "reguser", Password: "regpass",
-		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45999,
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11999,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -430,12 +430,12 @@ func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
 // after 120s.
 func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
 	// Grants Expires: 3600, but Contact: <...>;expires=120.
-	reg := startStubRegistrarFull(t, 45325, "reguser", "regpass", 3600, 120, "freesbc-test")
+	reg := startStubRegistrarFull(t, 11325, "reguser", "regpass", 3600, 120, "freesbc-test")
 	client := reg.client(t)
 	p := regParams{
-		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45325,
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11325,
 		Transport: "udp", Username: "reguser", Password: "regpass",
-		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45993,
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11993,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -456,12 +456,12 @@ func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
 // The matching-realm half proves the pin only blocks mismatches.
 func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
 	// Rogue registrar: challenges with a realm the peer has NOT pinned.
-	evil := startStubRegistrarRealm(t, 45321, "reguser", "regpass", 1800, "evil")
+	evil := startStubRegistrarRealm(t, 11321, "reguser", "regpass", 1800, "evil")
 	client := evil.client(t)
 	p := regParams{
-		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45321,
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11321,
 		Transport: "udp", Username: "reguser", Password: "regpass", Realm: "good",
-		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45997,
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11997,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -473,9 +473,9 @@ func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
 	}
 
 	// Matching realm: the normal digest flow resumes.
-	good := startStubRegistrarRealm(t, 45323, "reguser", "regpass", 1800, "good")
+	good := startStubRegistrarRealm(t, 11323, "reguser", "regpass", 1800, "good")
 	client = good.client(t)
-	p.RegistrarPort = 45323
+	p.RegistrarPort = 11323
 	if _, err := registerOnce(ctx, client, p, time.Hour); err != nil {
 		t.Fatalf("matching realm should register: %v", err)
 	}
@@ -489,12 +489,12 @@ func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
 // registerOnce surfaces that as an error rather than silently reporting a
 // granted lifetime.
 func TestRegisterOnceBadCredentialsFails(t *testing.T) {
-	reg := startStubRegistrar(t, 45322, "reguser", "rightpass", 1800)
+	reg := startStubRegistrar(t, 11322, "reguser", "rightpass", 1800)
 	client := reg.client(t)
 	p := regParams{
-		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45322,
+		Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11322,
 		Transport: "udp", Username: "reguser", Password: "WRONGpass",
-		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45998,
+		ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11998,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -551,7 +551,7 @@ func loopbackClient(t *testing.T) *sipgo.Client {
 // best-effort Expires:0 un-REGISTER before returning — leaving the peer
 // marked unregistered.
 func TestRegistrationRunRefreshesAndUnregisters(t *testing.T) {
-	reg := startStubRegistrar(t, 45324, "u", "p", 60)
+	reg := startStubRegistrar(t, 11324, "u", "p", 60)
 	client := reg.client(t)
 	var mu sync.Mutex
 	states := map[string]bool{}
@@ -559,9 +559,9 @@ func TestRegistrationRunRefreshesAndUnregisters(t *testing.T) {
 	rg := &registration{
 		client: client,
 		params: regParams{
-			Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 45324,
+			Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 11324,
 			Transport: "udp", Username: "u", Password: "p",
-			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45997,
+			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11997,
 		},
 		setRegistered: set,
 		log:           discardLogger(),
@@ -592,14 +592,14 @@ func TestRegistrationRunRefreshesAndUnregisters(t *testing.T) {
 func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 	// No registrar listening on this port → every register fails; the loop
 	// must mark unregistered and keep retrying (not spin, not exit).
-	client := loopbackClient(t) // a client with nothing to talk to at 45326
+	client := loopbackClient(t) // a client with nothing to talk to at 11326
 	set := func(string, bool) {}
 	rg := &registration{
 		client: client,
 		params: regParams{
-			Name: "dead", RegistrarHost: "127.0.0.1", RegistrarPort: 45326,
+			Name: "dead", RegistrarHost: "127.0.0.1", RegistrarPort: 11326,
 			Transport: "udp", Username: "u", Password: "p",
-			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 45996,
+			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11996,
 		},
 		setRegistered: set,
 		log:           discardLogger(),
@@ -617,7 +617,7 @@ func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 
 // --- Task 5: Registrar manager (reconcile, IsRegistered, startup, shutdown) ---
 //
-// Ports for this section's tests: 45330-45349.
+// Ports for this section's tests: 11330-11349.
 
 // registrarConfigYAML renders a config with a "carrier" peer at
 // 127.0.0.1:port (credentials user/pass, register: registerCarrier) and a
@@ -630,8 +630,8 @@ func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 func registrarConfigYAML(port int, user, pass string, registerCarrier bool) string {
 	return fmt.Sprintf(`
 listen:
-  sip: [udp://127.0.0.1:45999]
-  media: { port_range: 45900-45901, public_ip: 127.0.0.1 }
+  sip: [udp://127.0.0.1:11999]
+  media: { port_range: 11900-11901, public_ip: 127.0.0.1 }
 peers:
   carrier:
     address: 127.0.0.1:%d
@@ -667,7 +667,7 @@ func registrarTestStore(t *testing.T, port int, user, pass string) *config.Store
 // the original (register:true) params.
 func withCarrierRegisterFalse(t *testing.T) *config.Config {
 	t.Helper()
-	cfg, err := config.Parse([]byte(registrarConfigYAML(45332, "u", "p", false)))
+	cfg, err := config.Parse([]byte(registrarConfigYAML(11332, "u", "p", false)))
 	if err != nil {
 		t.Fatalf("parse withCarrierRegisterFalse config: %v", err)
 	}
@@ -692,9 +692,9 @@ func serverForRegistrar(t *testing.T, store *config.Store) *Server {
 // peer ("internal-pbx") reports available immediately regardless. On ctx
 // cancel, Run stops the goroutine, which un-REGISTERs before Run returns.
 func TestRegistrarReconcilesAndReportsRegistered(t *testing.T) {
-	reg := startStubRegistrar(t, 45330, "u", "p", 120)
+	reg := startStubRegistrar(t, 11330, "u", "p", 120)
 	// Config with one register:true peer pointing at the stub registrar.
-	store := registrarTestStore(t, 45330, "u", "p") // helper builds the config
+	store := registrarTestStore(t, 11330, "u", "p") // helper builds the config
 	client := reg.client(t)
 	srv := serverForRegistrar(t, store) // minimal Server exposing sigIP/ourSigPort
 	r := NewRegistrar(store, client, srv, discardLogger())
@@ -760,8 +760,8 @@ func TestSetRegisteredGenIgnoresStaleGeneration(t *testing.T) {
 func registrarConfigYAMLPublicIP(port int, user, pass, publicIP string, registerCarrier bool) string {
 	return fmt.Sprintf(`
 listen:
-  sip: [udp://127.0.0.1:45999]
-  media: { port_range: 45900-45901, public_ip: %s }
+  sip: [udp://127.0.0.1:11999]
+  media: { port_range: 11900-11901, public_ip: %s }
 peers:
   carrier:
     address: 127.0.0.1:%d
@@ -791,8 +791,8 @@ peers:
 // observes false here is a reliable (not merely low-probability) check, on
 // top of the fully deterministic unit test above.
 func TestRegistrarChangedPeerParamsDoNotFlapRegistered(t *testing.T) {
-	reg := startStubRegistrar(t, 45334, "u", "p", 120)
-	store := registrarTestStore(t, 45334, "u", "p")
+	reg := startStubRegistrar(t, 11334, "u", "p", 120)
+	store := registrarTestStore(t, 11334, "u", "p")
 	client := reg.client(t)
 	srv := serverForRegistrar(t, store)
 	r := NewRegistrar(store, client, srv, discardLogger())
@@ -801,7 +801,7 @@ func TestRegistrarChangedPeerParamsDoNotFlapRegistered(t *testing.T) {
 	go func() { _ = r.Run(ctx) }()
 	waitFor(t, 3*time.Second, func() bool { return r.IsRegistered("carrier") })
 
-	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(45334, "u", "p", "127.0.0.2", true)))
+	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(11334, "u", "p", "127.0.0.2", true)))
 	if err != nil {
 		t.Fatalf("parse changed-public-ip config: %v", err)
 	}
@@ -838,8 +838,8 @@ func TestRegistrarChangedPeerParamsDoNotFlapRegistered(t *testing.T) {
 // below checks it explicitly instead of waiting on a state transition that
 // IsRegistered's contract says can't happen.
 func TestRegistrarHotReloadStopsRemovedPeer(t *testing.T) {
-	reg := startStubRegistrar(t, 45332, "u", "p", 120)
-	store := registrarTestStore(t, 45332, "u", "p")
+	reg := startStubRegistrar(t, 11332, "u", "p", 120)
+	store := registrarTestStore(t, 11332, "u", "p")
 	client := reg.client(t)
 	srv := serverForRegistrar(t, store)
 	r := NewRegistrar(store, client, srv, discardLogger())
@@ -878,8 +878,8 @@ func TestRegistrarHotReloadStopsRemovedPeer(t *testing.T) {
 // reliable rather than merely low-probability (same reasoning as the
 // existing changed-peer test above).
 func TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister(t *testing.T) {
-	reg := startStubRegistrar(t, 45336, "u", "p", 120)
-	store := registrarTestStore(t, 45336, "u", "p")
+	reg := startStubRegistrar(t, 11336, "u", "p", 120)
+	store := registrarTestStore(t, 11336, "u", "p")
 	client := reg.client(t)
 	srv := serverForRegistrar(t, store)
 	r := NewRegistrar(store, client, srv, discardLogger())
@@ -891,7 +891,7 @@ func TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister(t *testing.T)
 	// Change only public_ip: same registrar/credentials, but regParams
 	// differ, so reconcile takes the changed-peer stop+start path against
 	// the very same stub registrar.
-	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(45336, "u", "p", "127.0.0.2", true)))
+	cfg2, err := config.Parse([]byte(registrarConfigYAMLPublicIP(11336, "u", "p", "127.0.0.2", true)))
 	if err != nil {
 		t.Fatalf("parse changed-public-ip config: %v", err)
 	}
@@ -916,8 +916,8 @@ func TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister(t *testing.T)
 // --- Fix 1 (whole-branch review): shutdown sequencing — the registrar must
 // un-REGISTER before listener sockets close ---
 //
-// Ports for this test: 45340 (stub registrar, doubling as "the carrier"
-// that probes the SBC's listener) and 45341 (the SBC's own listen.sip UDP
+// Ports for this test: 11340 (stub registrar, doubling as "the carrier"
+// that probes the SBC's listener) and 11341 (the SBC's own listen.sip UDP
 // port).
 
 // TestServerShutdownDeliversUnregisterBeforeListenerCloses is Fix 1's
@@ -950,15 +950,15 @@ func TestRegistrarChangedPeerRestartSerializesAgainstOldUnregister(t *testing.T)
 // pooled-conn path. The sequencing itself is also verified directly by
 // inspection of Run's shutdown tail (see the comment there).
 func TestServerShutdownDeliversUnregisterBeforeListenerCloses(t *testing.T) {
-	reg := startStubRegistrar(t, 45340, "u", "p", 120)
+	reg := startStubRegistrar(t, 11340, "u", "p", 120)
 
 	cfgYAML := `
 listen:
-  sip: [udp://127.0.0.1:45341]
-  media: { port_range: 45902-45903, public_ip: 127.0.0.1 }
+  sip: [udp://127.0.0.1:11341]
+  media: { port_range: 11902-11903, public_ip: 127.0.0.1 }
 peers:
   carrier:
-    address: 127.0.0.1:45340
+    address: 127.0.0.1:11340
     transport: udp
     auth: { username: u, password: p }
     register: true
@@ -978,7 +978,7 @@ peers:
 	// Wait until the SBC's listener answers (bind completed).
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		c, derr := net.Dial("udp", "127.0.0.1:45341")
+		c, derr := net.Dial("udp", "127.0.0.1:11341")
 		if derr == nil {
 			c.Close()
 			break
@@ -992,7 +992,7 @@ peers:
 
 	// Force an inbound packet on the SBC's listener from the registrar's own
 	// bound socket, attempting to seed the pooled-conn path.
-	reg.sendRawOptions(t, "127.0.0.1:45341")
+	reg.sendRawOptions(t, "127.0.0.1:11341")
 	time.Sleep(100 * time.Millisecond) // let the SBC's transport process it
 
 	cancel()
@@ -1016,14 +1016,14 @@ func TestRegistrarNATAdvertisedContact(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 sip:
   bind_ip: 127.0.0.1
-  bind_port: 45395
+  bind_port: 11395
   advertised_ip: 198.51.100.7
   advertised_port: 15060
 rtp:
   advertised_ip: 203.0.113.7
 peers:
   carrier:
-    address: 127.0.0.1:45396
+    address: 127.0.0.1:11396
     auth: { username: u, password: p }
     register: true
     allowed_ips: [127.0.0.1/32]
@@ -1042,7 +1042,7 @@ routes:
 		t.Errorf("ContactIP = %v, want sip.advertised_ip 198.51.100.7", params.ContactIP)
 	}
 	if params.ContactPort != 15060 {
-		t.Errorf("ContactPort = %d, want sip.advertised_port 15060 (not the 45395 bind port)", params.ContactPort)
+		t.Errorf("ContactPort = %d, want sip.advertised_port 15060 (not the 11395 bind port)", params.ContactPort)
 	}
 }
 
@@ -1055,7 +1055,7 @@ func TestRegistrarBareHostAddressUsesTransportDefaultPort(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 sip:
   bind_ip: 127.0.0.1
-  bind_port: 45397
+  bind_port: 11397
 rtp:
   advertised_ip: 127.0.0.1
 peers:

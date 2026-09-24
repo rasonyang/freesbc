@@ -32,7 +32,7 @@ import (
 // isn't implemented yet. Task 6 replaces the expected code with a real bridge.
 const bridgeNoRouteCfg = `
 listen:
-  sip: [udp://127.0.0.1:45070]
+  sip: [udp://127.0.0.1:11070]
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -46,8 +46,8 @@ routes:
 
 func TestBridgeRejectsUnroutableInvite(t *testing.T) {
 	// Dialed number 111 matches no route (only ^999$ exists) → 404.
-	startServer(t, 45070, bridgeNoRouteCfg)
-	got := roundTrip(t, 45070, "INVITE", "b2bua-noroute-1", 3*time.Second, "SIP/2.0 404")
+	startServer(t, 11070, bridgeNoRouteCfg)
+	got := roundTrip(t, 11070, "INVITE", "b2bua-noroute-1", 3*time.Second, "SIP/2.0 404")
 	if !strings.Contains(got, "SIP/2.0 404") {
 		t.Fatalf("unroutable INVITE must get 404, got:\n%s", got)
 	}
@@ -68,8 +68,8 @@ func TestBridgeRejectsUnroutableInvite(t *testing.T) {
 // routes/rejects normally, rather than the process having wedged or
 // corrupted shared state.
 func TestBridgeRejectsReInvite(t *testing.T) {
-	cfg := strings.Replace(bridgeNoRouteCfg, "45070", "45071", 1)
-	startServer(t, 45071, cfg)
+	cfg := strings.Replace(bridgeNoRouteCfg, "11070", "11071", 1)
+	startServer(t, 11071, cfg)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -77,13 +77,13 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	}
 	defer conn.Close()
 	local := conn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45071}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11071}
 
 	// Same shape as sipRequest's INVITE, but the To header carries a tag —
 	// exactly what distinguishes an in-dialog (re-)INVITE from an initial
 	// one.
 	req := strings.Replace(
-		sipRequest("INVITE", "45071", local, "b2bua-reinvite-1"),
+		sipRequest("INVITE", "11071", local, "b2bua-reinvite-1"),
 		"To: <sip:sbc@127.0.0.1>",
 		"To: <sip:sbc@127.0.0.1>;tag=reinvite-tag",
 		1,
@@ -114,7 +114,7 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 	// (no To-tag) still gets routed and rejected normally (bridgeNoRouteCfg
 	// only routes ^999$, so 111 gets 404) — proving ReadInvite's dialog
 	// state was never touched by the rejected re-INVITE.
-	got2 := roundTrip(t, 45071, "INVITE", "b2bua-reinvite-followup", 3*time.Second, "SIP/2.0 404")
+	got2 := roundTrip(t, 11071, "INVITE", "b2bua-reinvite-followup", 3*time.Second, "SIP/2.0 404")
 	if !strings.Contains(got2, "SIP/2.0 404") {
 		t.Fatalf("server did not survive re-INVITE rejection; follow-up initial INVITE got:\n%s", got2)
 	}
@@ -126,8 +126,8 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 // refuses it explicitly with 400 (RFC 3261 §8.1.1 mandates To on every
 // request).
 func TestInviteMissingToGets400(t *testing.T) {
-	cfg := strings.Replace(bridgeNoRouteCfg, "45070", "45760", 1)
-	startServer(t, 45760, cfg)
+	cfg := strings.Replace(bridgeNoRouteCfg, "11070", "11760", 1)
+	startServer(t, 11760, cfg)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -135,10 +135,10 @@ func TestInviteMissingToGets400(t *testing.T) {
 	}
 	defer conn.Close()
 	local := conn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45760}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11760}
 
 	// sipRequest's shape minus the To line entirely.
-	req := sipRequest("INVITE", "45760", local, "b2bua-missing-to")
+	req := sipRequest("INVITE", "11760", local, "b2bua-missing-to")
 	req = strings.Replace(req, "To: <sip:sbc@127.0.0.1>\r\n", "", 1)
 	if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
@@ -169,9 +169,9 @@ func TestInviteMissingToGets400(t *testing.T) {
 // and an Unsupported: 100rel header (RFC 3261 §21.4.20's required pairing),
 // before ever reaching Resolve/ReadInvite.
 func TestBridgeRejects100relRequire(t *testing.T) {
-	cfg := strings.Replace(knownPeerCfg, "45060", "45410", 1)
-	startServer(t, 45410, cfg)
-	got := roundTripWithHeaders(t, 45410, "INVITE", "req100rel-1", 3*time.Second, "SIP/2.0 420",
+	cfg := strings.Replace(knownPeerCfg, "11060", "11410", 1)
+	startServer(t, 11410, cfg)
+	got := roundTripWithHeaders(t, 11410, "INVITE", "req100rel-1", 3*time.Second, "SIP/2.0 420",
 		"Require: 100rel")
 	if !strings.Contains(got, "SIP/2.0 420") {
 		t.Fatalf("Require:100rel must get 420, got:\n%s", got)
@@ -187,9 +187,9 @@ func TestBridgeRejects100relRequire(t *testing.T) {
 // Min-SE header advertising the floor (RFC 4028 §5), before ever reaching
 // Resolve/ReadInvite.
 func TestBridgeRejectsLowSessionExpires(t *testing.T) {
-	cfg := strings.Replace(knownPeerCfg, "45060", "45412", 1)
-	startServer(t, 45412, cfg)
-	got := roundTripWithHeaders(t, 45412, "INVITE", "lowse-1", 3*time.Second, "SIP/2.0 422",
+	cfg := strings.Replace(knownPeerCfg, "11060", "11412", 1)
+	startServer(t, 11412, cfg)
+	got := roundTripWithHeaders(t, 11412, "INVITE", "lowse-1", 3*time.Second, "SIP/2.0 422",
 		"Session-Expires: 30")
 	if !strings.Contains(got, "SIP/2.0 422") {
 		t.Fatalf("low Session-Expires must get 422, got:\n%s", got)
@@ -207,8 +207,8 @@ func TestBridgeRejectsLowSessionExpires(t *testing.T) {
 // request from the far end is not an SBC-side failure, so a 5xx would
 // misattribute it.
 func TestBridgeMalformedInviteGets400(t *testing.T) {
-	cfg := strings.Replace(knownPeerCfg, "45060", "45072", 1)
-	startServer(t, 45072, cfg)
+	cfg := strings.Replace(knownPeerCfg, "11060", "11072", 1)
+	startServer(t, 11072, cfg)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -216,13 +216,13 @@ func TestBridgeMalformedInviteGets400(t *testing.T) {
 	}
 	defer conn.Close()
 	local := conn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45072}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11072}
 
 	// sipRequest always builds a Contact header; strip it to produce the
 	// malformed variant under test. No To-tag, so this is still an initial
 	// INVITE (not the re-INVITE 501 path above).
 	var lines []string
-	for _, line := range strings.Split(sipRequest("INVITE", "45072", local, "b2bua-malformed-1"), "\r\n") {
+	for _, line := range strings.Split(sipRequest("INVITE", "11072", local, "b2bua-malformed-1"), "\r\n") {
 		if strings.HasPrefix(line, "Contact:") {
 			continue
 		}
@@ -467,7 +467,7 @@ type stubCarrierConfig struct {
 	answerDelay time.Duration
 }
 
-// startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:45182") and
+// startStubCarrier boots the stub UAS on addr (e.g. "127.0.0.1:11182") and
 // returns once it is accepting packets. It follows the same bind-our-own-
 // socket-and-close-from-a-watcher-goroutine pattern as Server.bindListener
 // (see sig/server.go) to avoid sipgo's known shutdown-race in
@@ -601,20 +601,25 @@ func startStubCarrier(t *testing.T, addr string, answerSDP []byte, opts ...stubC
 				<-c.proceed
 			}
 		}
+		var answerErr error
 		if c.brokenAnswer {
-			if err := dlg.Respond(200, "OK", []byte("not-valid-sdp"),
-				sip.NewHeader("Content-Type", "application/sdp")); err != nil {
-				log.Error("carrier respond broken sdp", "err", err)
-				return
-			}
-		} else if err := dlg.RespondSDP(c.answerSDP); err != nil {
-			// The answer never went out (typically a CANCEL from the bridge
-			// raced it), but the dialog is still ending — signal its end the
-			// way the happy path does, so tests can wait on byeDone
-			// uniformly. established is deliberately NOT closed here: it
-			// means "the answer actually went out" (see its doc), which is
-			// false on this path.
-			log.Error("carrier respond sdp", "err", err)
+			answerErr = dlg.Respond(200, "OK", []byte("not-valid-sdp"),
+				sip.NewHeader("Content-Type", "application/sdp"))
+		} else {
+			answerErr = dlg.RespondSDP(c.answerSDP)
+		}
+		if answerErr != nil {
+			// Respond for a 2xx blocks until the ACK, so an error here does
+			// not mean the answer never went out: a CANCEL can race it, and
+			// a bridge that ACKs and BYEs at once (as it does for a broken
+			// answer) can have its BYE end the dialog before the ACK is
+			// seen, which sipgo reports as "No ACK received". Either way the
+			// dialog is ending — signal its end the way the happy path
+			// does, so tests can wait on byeDone uniformly (audit P1-006).
+			// established is deliberately NOT closed here: it means "the
+			// answer went out and was ACKed" (see its doc), which is not
+			// known on this path.
+			log.Error("carrier respond answer", "err", answerErr)
 			<-dlg.Context().Done()
 			close(c.byeDone)
 			return
@@ -768,6 +773,30 @@ func waitForActiveCalls(t *testing.T, srv *Server, want int, timeout time.Durati
 	t.Fatalf("active calls = %d, want %d", srv.ActiveCalls(), want)
 }
 
+// waitMediaReleased proves a finished call gave its media ports back: the
+// tests that use it size the pool to exactly one session, so a fresh
+// Allocate succeeds only once the call's session is closed.
+//
+// It retries for a while rather than allocating once. onInvite unwinds its
+// defers in reverse order, so endCall — which is what waitForActiveCalls
+// observes — runs before the media session is closed, and a single
+// Allocate right after the call count reaches zero races that last defer.
+// A real leak still fails: the ports never come back.
+func waitMediaReleased(t *testing.T, srv *Server) {
+	t.Helper()
+	var err error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var s *media.Session
+		if s, err = srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute}); err == nil {
+			s.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("media ports not released after teardown: %v", err)
+}
+
 // bridgeCallCfg routes local-uac → carrier with a media pool sized to
 // exactly one session (two port pairs), so the port-release assertion at
 // the end of TestBridgePlacesCallAndBridges is meaningful: a second
@@ -775,16 +804,16 @@ func waitForActiveCalls(t *testing.T, srv *Server, want int, timeout time.Durati
 // ports on teardown.
 const bridgeCallCfg = `
 listen:
-  sip: [udp://127.0.0.1:45180]
+  sip: [udp://127.0.0.1:11180]
   media:
-    port_range: 46180-46183
+    port_range: 12180-12183
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45182
+    address: 127.0.0.1:11182
     # A carrier peer is only ever the SBC's outbound target in this test
     # (the SBC never receives a fresh request *from* it), so its
     # allowed_ips is never consulted for identify() — deliberately not
@@ -816,15 +845,15 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45185})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11185})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45182", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45180, bridgeCallCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11182", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11180, bridgeCallCfg)
 
 	// --- UAC: place the call (sipgo as a client-side dialog user agent) ---
 	uacUA, err := sipgo.NewUA()
@@ -843,7 +872,7 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 	// dialog_integration_test.go client-harness pattern.
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45180}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11180}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -872,10 +901,10 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 		t.Errorf("answer c= = %v, want bridge public_ip 127.0.0.1", answerIP)
 	}
 	sideAPort := sdpAudioPort(t, answerBody)
-	if sideAPort < 46180 || sideAPort > 46183 {
-		t.Errorf("answer m=audio port %d not in media pool range 46180-46183", sideAPort)
+	if sideAPort < 12180 || sideAPort > 12183 {
+		t.Errorf("answer m=audio port %d not in media pool range 12180-12183", sideAPort)
 	}
-	if sideAPort == echoRTPPort || sideAPort == 45182 {
+	if sideAPort == echoRTPPort || sideAPort == 11182 {
 		t.Errorf("answer m=audio port %d leaks carrier topology", sideAPort)
 	}
 	// c= can't differ from the carrier's here (both loopback 127.0.0.1), so
@@ -903,7 +932,7 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 		t.Errorf("carrier invite user = %q, want 5551234", carrierOffer.Recipient.User)
 	}
 	sideBPort := sdpAudioPort(t, carrierOffer.Body())
-	if sideBPort < 46180 || sideBPort > 46183 || sideBPort == sideAPort {
+	if sideBPort < 12180 || sideBPort > 12183 || sideBPort == sideAPort {
 		t.Errorf("b-leg offer m=audio port %d invalid (side A port %d)", sideBPort, sideAPort)
 	}
 
@@ -936,13 +965,9 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
 	// The pool holds exactly one session's worth of ports
-	// (46180-46183): a fresh Allocate only succeeds if the bridge
+	// (12180-12183): a fresh Allocate only succeeds if the bridge
 	// actually released them on teardown.
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
-	}
-	s2.Close()
+	waitMediaReleased(t, srv)
 }
 
 // bridgeALegContactCfg mirrors bridgeCallCfg but lists a TCP listener
@@ -954,21 +979,21 @@ func TestBridgePlacesCallAndBridges(t *testing.T) {
 // override actually happened" (dialTarget's aLeg.Respond(..., aContact),
 // Task 5) apart from "silently fell back to the cache default": if the
 // override weren't wired up, the bridged 200 OK's Contact port would be
-// the TCP listener's (45281) instead of the UDP one (45280) the call
+// the TCP listener's (11281) instead of the UDP one (11280) the call
 // actually arrived on. The TCP listener is never dialed by the test — it
 // only needs to exist and occupy listeners[0].
 const bridgeALegContactCfg = `
 listen:
-  sip: [tcp://127.0.0.1:45281, udp://127.0.0.1:45280]
+  sip: [tcp://127.0.0.1:11281, udp://127.0.0.1:11280]
   media:
-    port_range: 46280-46283
+    port_range: 12280-12283
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45282
+    address: 127.0.0.1:11282
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -985,15 +1010,15 @@ routes:
 // puts a TCP listener first specifically so the two would diverge if the
 // override weren't wired up — see its doc comment.
 func TestBridgeALegContactMatchesInboundTransport(t *testing.T) {
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 46285})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12285})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45282", testSDPBody(echoRTPPort))
-	startServer(t, 45280, bridgeALegContactCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11282", testSDPBody(echoRTPPort))
+	startServer(t, 11280, bridgeALegContactCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1014,7 +1039,7 @@ func TestBridgeALegContactMatchesInboundTransport(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45280}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11280}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -1038,8 +1063,8 @@ func TestBridgeALegContactMatchesInboundTransport(t *testing.T) {
 	if contact.Address.Host != "127.0.0.1" {
 		t.Errorf("a-leg contact host = %q, want 127.0.0.1", contact.Address.Host)
 	}
-	if contact.Address.Port != 45280 {
-		t.Errorf("a-leg contact port = %d, want 45280 (the UDP listener the call actually arrived on, not the TCP listeners[0] port 45281 the dialog cache's default Contact would carry if the per-transport override weren't applied)", contact.Address.Port)
+	if contact.Address.Port != 11280 {
+		t.Errorf("a-leg contact port = %d, want 11280 (the UDP listener the call actually arrived on, not the TCP listeners[0] port 11281 the dialog cache's default Contact would carry if the per-transport override weren't applied)", contact.Address.Port)
 	}
 	if tr, ok := contact.Address.UriParams.Get("transport"); ok && tr != "" {
 		t.Errorf("a-leg contact transport param = %q, want none (udp is the RFC 3261 §19.1.2 default, omitted by buildContact)", tr)
@@ -1073,16 +1098,16 @@ func TestBridgeALegContactMatchesInboundTransport(t *testing.T) {
 // listeners and media pool).
 const earlyMediaCfg = `
 listen:
-  sip: [udp://127.0.0.1:45190]
+  sip: [udp://127.0.0.1:11190]
   media:
-    port_range: 46190-46193
+    port_range: 12190-12193
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45192
+    address: 127.0.0.1:11192
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -1107,7 +1132,7 @@ func TestBridgeEarlyMedia(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45195})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11195})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
@@ -1120,11 +1145,11 @@ func TestBridgeEarlyMedia(t *testing.T) {
 	// the RTP checks below run.
 	echoSDP := testSDPBody(echoRTPPort)
 	proceed := make(chan struct{})
-	carrier := startStubCarrier(t, "127.0.0.1:45192", echoSDP, stubCarrierConfig{
+	carrier := startStubCarrier(t, "127.0.0.1:11192", echoSDP, stubCarrierConfig{
 		earlySDP: echoSDP,
 		proceed:  proceed,
 	})
-	srv := startServer(t, 45190, earlyMediaCfg)
+	srv := startServer(t, 11190, earlyMediaCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1138,7 +1163,7 @@ func TestBridgeEarlyMedia(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45190}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11190}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -1181,11 +1206,11 @@ func TestBridgeEarlyMedia(t *testing.T) {
 				t.Fatal("183 sdp is byte-identical to carrier's original; bridge did not rewrite it")
 			}
 			earlySideA = sdpAudioPort(t, earlyBody)
-			if earlySideA < 46190 || earlySideA > 46193 {
-				t.Fatalf("183 m=audio port %d not in media pool range 46190-46193", earlySideA)
+			if earlySideA < 12190 || earlySideA > 12193 {
+				t.Fatalf("183 m=audio port %d not in media pool range 12190-12193", earlySideA)
 			}
 			sideBPort := sdpAudioPort(t, carrierOffer.Body())
-			if sideBPort < 46190 || sideBPort > 46193 || sideBPort == earlySideA {
+			if sideBPort < 12190 || sideBPort > 12193 || sideBPort == earlySideA {
 				t.Fatalf("b-leg offer m=audio port %d invalid (early side A port %d)", sideBPort, earlySideA)
 			}
 
@@ -1244,11 +1269,7 @@ func TestBridgeEarlyMedia(t *testing.T) {
 
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
-	}
-	s2.Close()
+	waitMediaReleased(t, srv)
 }
 
 // --- Task 8: B-leg failover across targets + outbound digest auth ---
@@ -1258,24 +1279,24 @@ func TestBridgeEarlyMedia(t *testing.T) {
 // allowed_ips deliberately differ across all three peers and from
 // 127.0.0.1 — see bridgeCallCfg's comment on why (IdentifyPeer's
 // lexicographic tie-break on 127.0.0.1 would otherwise pick the wrong
-// peer). Ports are a disjoint slice of the 45180-45199/46xxx blocks from
-// Tasks 6/7's bridgeCallCfg (45180/45182/45185, 46180-46183) and
-// earlyMediaCfg (45190/45192/45195, 46190-46193).
+// peer). Ports are a disjoint slice of the 11180-11199/46xxx blocks from
+// Tasks 6/7's bridgeCallCfg (11180/11182/11185, 12180-12183) and
+// earlyMediaCfg (11190/11192/11195, 12190-12193).
 const failoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45181]
+  sip: [udp://127.0.0.1:11181]
   media:
-    port_range: 46200-46203
+    port_range: 12200-12203
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45183
+    address: 127.0.0.1:11183
     allowed_ips: [203.0.113.0/24]
   carrier-b:
-    address: 127.0.0.1:45184
+    address: 127.0.0.1:11184
     allowed_ips: [198.51.100.0/24]
     media_latch: loose
 routes:
@@ -1297,19 +1318,19 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45186})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11186})
 	if err != nil {
 		t.Fatalf("carrier-b echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrierA := startStubCarrier(t, "127.0.0.1:45183", nil, stubCarrierConfig{
+	carrierA := startStubCarrier(t, "127.0.0.1:11183", nil, stubCarrierConfig{
 		finalStatus: 503,
 		finalReason: "Service Unavailable",
 	})
-	carrierB := startStubCarrier(t, "127.0.0.1:45184", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45181, failoverCfg)
+	carrierB := startStubCarrier(t, "127.0.0.1:11184", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11181, failoverCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1323,7 +1344,7 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45181}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11181}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -1355,11 +1376,11 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 
 	answerBody := sess.InviteResponse.Body()
 	sideAPort := sdpAudioPort(t, answerBody)
-	if sideAPort < 46200 || sideAPort > 46203 {
-		t.Errorf("answer m=audio port %d not in media pool range 46200-46203", sideAPort)
+	if sideAPort < 12200 || sideAPort > 12203 {
+		t.Errorf("answer m=audio port %d not in media pool range 12200-12203", sideAPort)
 	}
 	sideBPort := sdpAudioPort(t, carrierBOffer.Body())
-	if sideBPort < 46200 || sideBPort > 46203 || sideBPort == sideAPort {
+	if sideBPort < 12200 || sideBPort > 12203 || sideBPort == sideAPort {
 		t.Errorf("b-leg offer m=audio port %d invalid (side A port %d)", sideBPort, sideAPort)
 	}
 
@@ -1389,11 +1410,7 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
-	}
-	s2.Close()
+	waitMediaReleased(t, srv)
 }
 
 // silentFailoverCfg routes local-uac to a SILENT (blackholed) carrier-a and
@@ -1404,9 +1421,9 @@ func TestBridgeFailoverToSecondTarget(t *testing.T) {
 // ring_timeout (2s) regardless of sipgo's internal wait.
 const silentFailoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45260]
+  sip: [udp://127.0.0.1:11260]
   media:
-    port_range: 46260-46263
+    port_range: 12260-12263
     public_ip: 127.0.0.1
 ring_timeout: 2s
 peers:
@@ -1414,10 +1431,10 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45261
+    address: 127.0.0.1:11261
     allowed_ips: [203.0.113.0/24]
   carrier-b:
-    address: 127.0.0.1:45262
+    address: 127.0.0.1:11262
     allowed_ips: [198.51.100.0/24]
     media_latch: loose
 routes:
@@ -1434,17 +1451,17 @@ func TestBridgeFailoverSilentTarget(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45263})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11263})
 	if err != nil {
 		t.Fatalf("carrier-b echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	// carrier-a (127.0.0.1:45261) is deliberately left UNBOUND: a silent,
+	// carrier-a (127.0.0.1:11261) is deliberately left UNBOUND: a silent,
 	// blackholed endpoint that never answers anything — not even 100 Trying.
-	carrierB := startStubCarrier(t, "127.0.0.1:45262", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45260, silentFailoverCfg)
+	carrierB := startStubCarrier(t, "127.0.0.1:11262", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11260, silentFailoverCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1458,7 +1475,7 @@ func TestBridgeFailoverSilentTarget(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45260}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11260}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelInvite()
 
@@ -1498,7 +1515,7 @@ func TestBridgeFailoverSilentTarget(t *testing.T) {
 	// The silent endpoint never responded within the ring budget — it must
 	// be cooled down so the next call skips it, unlike a merely-ringing
 	// target (see TestBridgeFailoverToSecondTarget / the cancel test).
-	if srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45261, Transport: "udp"}) {
+	if srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 11261, Transport: "udp"}) {
 		t.Error("silent carrier-a should be cooled down after the ring timeout")
 	}
 
@@ -1506,8 +1523,8 @@ func TestBridgeFailoverSilentTarget(t *testing.T) {
 	answerBody := sess.InviteResponse.Body()
 	sideAPort := sdpAudioPort(t, answerBody)
 	sideBPort := sdpAudioPort(t, carrierBOffer.Body())
-	if sideAPort < 46260 || sideAPort > 46263 {
-		t.Errorf("answer m=audio port %d not in media pool range 46260-46263", sideAPort)
+	if sideAPort < 12260 || sideAPort > 12263 {
+		t.Errorf("answer m=audio port %d not in media pool range 12260-12263", sideAPort)
 	}
 	sideAAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideAPort}
 	sideBAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: sideBPort}
@@ -1535,9 +1552,9 @@ func TestBridgeFailoverSilentTarget(t *testing.T) {
 // TestBridgeCancelSilentTarget.
 const silentCancelCfg = `
 listen:
-  sip: [udp://127.0.0.1:45270]
+  sip: [udp://127.0.0.1:13020]
   media:
-    port_range: 46270-46273
+    port_range: 13420-13423
     public_ip: 127.0.0.1
 ring_timeout: 2s
 peers:
@@ -1545,10 +1562,10 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45271
+    address: 127.0.0.1:13021
     allowed_ips: [203.0.113.0/24]
   carrier-b:
-    address: 127.0.0.1:45272
+    address: 127.0.0.1:13022
     allowed_ips: [198.51.100.0/24]
 routes:
   - name: out
@@ -1562,8 +1579,8 @@ routes:
 // endpoint must NOT be cooled down (the caller left — not the endpoint's
 // fault).
 func TestBridgeCancelSilentTarget(t *testing.T) {
-	carrierB := startStubCarrier(t, "127.0.0.1:45272", testSDPBody(uacRTPStubPort(t)))
-	srv := startServer(t, 45270, silentCancelCfg)
+	carrierB := startStubCarrier(t, "127.0.0.1:13022", testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 13020, silentCancelCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1571,10 +1588,10 @@ func TestBridgeCancelSilentTarget(t *testing.T) {
 	}
 	defer uac.Close()
 	local := uac.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45270}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 13020}
 
 	const callID = "b2bua-cancel-silent-1"
-	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 45270)
+	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 13020)
 	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
 	}
@@ -1582,7 +1599,7 @@ func TestBridgeCancelSilentTarget(t *testing.T) {
 	// Give the B-leg INVITE a moment to go out, then CANCEL while carrier-a
 	// is still silent (there is no 180 to observe this time).
 	time.Sleep(500 * time.Millisecond)
-	cancelReq := sipCancel(callID, local, 45270)
+	cancelReq := sipCancel(callID, local, 13020)
 	if _, err := uac.WriteToUDP([]byte(cancelReq), dst); err != nil {
 		t.Fatalf("write cancel: %v", err)
 	}
@@ -1614,7 +1631,7 @@ func TestBridgeCancelSilentTarget(t *testing.T) {
 	}
 
 	// A caller CANCEL must not cool the silent endpoint down.
-	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45271, Transport: "udp"}) {
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 13021, Transport: "udp"}) {
 		t.Error("carrier-a should not be cooled down after a caller CANCEL, only after a genuine connect failure")
 	}
 
@@ -1763,9 +1780,9 @@ func (c *rawSilentCarrier) waitRawReq(t *testing.T, deadline time.Duration, want
 // AND the 250ms abandon grace have both expired.
 const lateProvisionalCfg = `
 listen:
-  sip: [udp://127.0.0.1:45730]
+  sip: [udp://127.0.0.1:11730]
   media:
-    port_range: 46730-46733
+    port_range: 12730-12733
     public_ip: 127.0.0.1
 ring_timeout: 500ms
 peers:
@@ -1773,7 +1790,7 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45731
+    address: 127.0.0.1:11731
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -1796,8 +1813,8 @@ routes:
 // carrier is alive. Timing-based over real UDP loopback: re-run once before
 // treating a flake as failure.
 func TestBridgeLateProvisionalAfterAbandonNotRelayed(t *testing.T) {
-	carrier := startRawSilentCarrier(t, "127.0.0.1:45731", 1500*time.Millisecond, 183, nil)
-	srv := startServer(t, 45730, lateProvisionalCfg)
+	carrier := startRawSilentCarrier(t, "127.0.0.1:11731", 1500*time.Millisecond, 183, nil)
+	srv := startServer(t, 11730, lateProvisionalCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1811,7 +1828,7 @@ func TestBridgeLateProvisionalAfterAbandonNotRelayed(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45730}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11730}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -1851,9 +1868,9 @@ func TestBridgeLateProvisionalAfterAbandonNotRelayed(t *testing.T) {
 // 183) after the delay.
 const raced2xxCfg = `
 listen:
-  sip: [udp://127.0.0.1:45732]
+  sip: [udp://127.0.0.1:11732]
   media:
-    port_range: 46734-46737
+    port_range: 12734-12737
     public_ip: 127.0.0.1
 ring_timeout: 500ms
 peers:
@@ -1861,7 +1878,7 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45733
+    address: 127.0.0.1:11733
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -1880,8 +1897,8 @@ routes:
 // the BYE. Timing-based over real UDP loopback: re-run once before treating
 // a flake as failure.
 func TestBridgeRaced2xxAfterAbandonTearsDown(t *testing.T) {
-	carrier := startRawSilentCarrier(t, "127.0.0.1:45733", 1500*time.Millisecond, 200, testSDPBody(uacRTPStubPort(t)))
-	srv := startServer(t, 45732, raced2xxCfg)
+	carrier := startRawSilentCarrier(t, "127.0.0.1:11733", 1500*time.Millisecond, 200, testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 11732, raced2xxCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -1895,7 +1912,7 @@ func TestBridgeRaced2xxAfterAbandonTearsDown(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45732}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11732}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -1963,9 +1980,9 @@ func TestBridgeWaiterPanicContained(t *testing.T) {
 // relay/CANCEL dance runs across the deadline→grace boundary.
 const graceEdgeCfg = `
 listen:
-  sip: [udp://127.0.0.1:45736]
+  sip: [udp://127.0.0.1:11736]
   media:
-    port_range: 46742-46745
+    port_range: 12742-12745
     public_ip: 127.0.0.1
 ring_timeout: 600ms
 peers:
@@ -1973,7 +1990,7 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45737
+    address: 127.0.0.1:11737
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -1994,9 +2011,9 @@ routes:
 // as failure.
 func TestBridgeGraceWindowEdgeRaceClean(t *testing.T) {
 	proceed := make(chan struct{})
-	carrier := startStubCarrier(t, "127.0.0.1:45737", testSDPBody(uacRTPStubPort(t)),
+	carrier := startStubCarrier(t, "127.0.0.1:11737", testSDPBody(uacRTPStubPort(t)),
 		stubCarrierConfig{earlySDP: testSDPBody(uacRTPStubPort(t)), answerDelay: 450 * time.Millisecond, proceed: proceed})
-	srv := startServer(t, 45736, graceEdgeCfg)
+	srv := startServer(t, 11736, graceEdgeCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -2010,7 +2027,7 @@ func TestBridgeGraceWindowEdgeRaceClean(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45736}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11736}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -2044,19 +2061,19 @@ func TestBridgeGraceWindowEdgeRaceClean(t *testing.T) {
 // looping forever or leaving the A-leg unanswered.
 const allFailCfg = `
 listen:
-  sip: [udp://127.0.0.1:45187]
+  sip: [udp://127.0.0.1:11187]
   media:
-    port_range: 46210-46213
+    port_range: 12210-12213
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45188
+    address: 127.0.0.1:11188
     allowed_ips: [203.0.113.4/30]
   carrier-b:
-    address: 127.0.0.1:45189
+    address: 127.0.0.1:11189
     allowed_ips: [203.0.113.8/30]
 routes:
   - name: out
@@ -2085,15 +2102,15 @@ func uacRTPStubPort(t *testing.T) int {
 // success, and that it still releases the media session it allocated even
 // though the call never bridged.
 func TestBridgeAllTargetsFail(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45188", nil, stubCarrierConfig{
+	carrierA := startStubCarrier(t, "127.0.0.1:11188", nil, stubCarrierConfig{
 		finalStatus: 503,
 		finalReason: "Service Unavailable",
 	})
-	carrierB := startStubCarrier(t, "127.0.0.1:45189", nil, stubCarrierConfig{
+	carrierB := startStubCarrier(t, "127.0.0.1:11189", nil, stubCarrierConfig{
 		finalStatus: 503,
 		finalReason: "Service Unavailable",
 	})
-	srv := startServer(t, 45187, allFailCfg)
+	srv := startServer(t, 11187, allFailCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -2107,7 +2124,7 @@ func TestBridgeAllTargetsFail(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45187}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11187}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -2146,45 +2163,30 @@ func TestBridgeAllTargetsFail(t *testing.T) {
 
 	// The media session allocated in onInvite before the loop must still be
 	// released on total failure; onInvite's own goroutine unwinds its
-	// defers asynchronously to this test, so retry briefly.
-	var (
-		s2       *media.Session
-		allocErr error
-	)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		s2, allocErr = srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-		if allocErr == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if allocErr != nil {
-		t.Fatalf("media ports not released after teardown: %v", allocErr)
-	}
-	s2.Close()
+	// defers asynchronously to this test, which waitMediaReleased allows for.
+	waitMediaReleased(t, srv)
 }
 
 // cancelFailoverCfg (Fix 1 regression) routes local-uac to two carriers in
 // failover order: carrier-a rings forever and never answers, carrier-b
-// would answer normally. Fresh port block (45200-45202/46220-46223),
+// would answer normally. Fresh port block (13060-13062/13460-13463),
 // disjoint from every other test's — see bridgeCallCfg's comment for why
 // allowed_ips differ per peer.
 const cancelFailoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45200]
+  sip: [udp://127.0.0.1:13060]
   media:
-    port_range: 46220-46223
+    port_range: 13460-13463
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45201
+    address: 127.0.0.1:13061
     allowed_ips: [203.0.113.16/28]
   carrier-b:
-    address: 127.0.0.1:45202
+    address: 127.0.0.1:13062
     allowed_ips: [198.51.100.16/28]
 routes:
   - name: out
@@ -2221,9 +2223,9 @@ routes:
 // Timing-based over real UDP loopback: re-run once before treating a flake
 // as failure.
 func TestBridgeCancelStopsFailover(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45201", nil, stubCarrierConfig{ringForever: true})
-	carrierB := startStubCarrier(t, "127.0.0.1:45202", testSDPBody(uacRTPStubPort(t)))
-	srv := startServer(t, 45200, cancelFailoverCfg)
+	carrierA := startStubCarrier(t, "127.0.0.1:13061", nil, stubCarrierConfig{ringForever: true})
+	carrierB := startStubCarrier(t, "127.0.0.1:13062", testSDPBody(uacRTPStubPort(t)))
+	srv := startServer(t, 13060, cancelFailoverCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -2231,10 +2233,10 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 	}
 	defer uac.Close()
 	local := uac.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45200}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 13060}
 
 	const callID = "b2bua-cancel-failover-1"
-	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 45200)
+	req := sipInviteWithSDP(callID, local, testSDPBody(uacRTPStubPort(t)), 13060)
 	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
 	}
@@ -2265,7 +2267,7 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 	}
 
 	// Cancel while carrier-a is still ringing and unanswered.
-	cancelReq := sipCancel(callID, local, 45200)
+	cancelReq := sipCancel(callID, local, 13060)
 	if _, err := uac.WriteToUDP([]byte(cancelReq), dst); err != nil {
 		t.Fatalf("write cancel: %v", err)
 	}
@@ -2281,7 +2283,7 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 
 	// carrier-a was reachable (it was ringing when the caller CANCELed) —
 	// the CANCEL must not have cooled it down.
-	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 45201, Transport: "udp"}) {
+	if !srv.health.Available(Endpoint{Host: "127.0.0.1", Port: 13061, Transport: "udp"}) {
 		t.Error("carrier-a should not be cooled down after a caller CANCEL, only after a genuine connect failure")
 	}
 }
@@ -2293,16 +2295,16 @@ func TestBridgeCancelStopsFailover(t *testing.T) {
 // fabricated final response).
 const ringNoFinalCfg = `
 listen:
-  sip: [udp://127.0.0.1:45250]
+  sip: [udp://127.0.0.1:13080]
   media:
-    port_range: 46250-46253
+    port_range: 13480-13483
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45251
+    address: 127.0.0.1:13081
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -2434,8 +2436,8 @@ func startFloodingRingCarrier(t *testing.T, addr string) *stubCarrier {
 // raw UDP datagrams sidesteps that entirely and observes exactly what the
 // bridge put on the wire.
 func TestBridgeStaleProvisionalNotRelayedAsFinal(t *testing.T) {
-	startFloodingRingCarrier(t, "127.0.0.1:45251")
-	srv := startServer(t, 45250, ringNoFinalCfg)
+	startFloodingRingCarrier(t, "127.0.0.1:13081")
+	srv := startServer(t, 13080, ringNoFinalCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -2443,9 +2445,9 @@ func TestBridgeStaleProvisionalNotRelayedAsFinal(t *testing.T) {
 	}
 	defer uac.Close()
 	local := uac.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45250}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 13080}
 
-	req := sipInviteWithSDP("b2bua-staleprov-1", local, testSDPBody(uacRTPStubPort(t)), 45250)
+	req := sipInviteWithSDP("b2bua-staleprov-1", local, testSDPBody(uacRTPStubPort(t)), 13080)
 	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
 	}
@@ -2545,16 +2547,16 @@ func sipCancel(callID string, localAddr *net.UDPAddr, port int) string {
 // can't collide with any other test's listeners.
 const reinviteDuringCallCfg = `
 listen:
-  sip: [udp://127.0.0.1:45196]
+  sip: [udp://127.0.0.1:11196]
   media:
-    port_range: 46196-46199
+    port_range: 12196-12199
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45197
+    address: 127.0.0.1:11197
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -2588,15 +2590,15 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45198})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11198})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45197", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45196, reinviteDuringCallCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11197", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11196, reinviteDuringCallCfg)
 
 	// --- establish the call, same shape as TestBridgePlacesCallAndBridges ---
 	uacUA, err := sipgo.NewUA()
@@ -2611,7 +2613,7 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45196}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11196}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -2663,10 +2665,10 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	}
 	defer reConn.Close()
 	reLocal := reConn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45196}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11196}
 
 	reInvite := strings.Join([]string{
-		"INVITE sip:5551234@127.0.0.1:45196 SIP/2.0",
+		"INVITE sip:5551234@127.0.0.1:11196 SIP/2.0",
 		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-reinvite-established", reLocal.String()),
 		fmt.Sprintf("From: <sip:tester@127.0.0.1>;tag=%s", realFromTag),
 		fmt.Sprintf("To: <sip:sbc@127.0.0.1>;tag=%s", realToTag),
@@ -2713,15 +2715,11 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
-	// The pool holds exactly one session's worth of ports (46196-46199): a
+	// The pool holds exactly one session's worth of ports (12196-12199): a
 	// fresh Allocate only succeeds if the bridge actually released them on
 	// teardown, proving the rejected re-INVITE didn't leak or corrupt the
 	// session either.
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
-	}
-	s2.Close()
+	waitMediaReleased(t, srv)
 }
 
 // sessionTimerRefreshCfg is TestBridgeAnswersSessionTimerRefresh's own
@@ -2729,16 +2727,16 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 // file.
 const sessionTimerRefreshCfg = `
 listen:
-  sip: [udp://127.0.0.1:45430]
+  sip: [udp://127.0.0.1:11430]
   media:
-    port_range: 46330-46333
+    port_range: 12330-12333
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45431
+    address: 127.0.0.1:11431
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -2774,15 +2772,15 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45432})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11432})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45431", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45430, sessionTimerRefreshCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11431", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11430, sessionTimerRefreshCfg)
 
 	// --- establish the call, same shape as TestBridgePlacesCallAndBridges ---
 	uacUA, err := sipgo.NewUA()
@@ -2797,7 +2795,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45430}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11430}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -2881,7 +2879,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45430}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11430}
 
 	// sendReInvite fires one in-dialog INVITE with the given CSeq and SDP
 	// body, over its own fresh socket (a distinct branch/local port per
@@ -2897,7 +2895,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 		reLocal := reConn.LocalAddr().(*net.UDPAddr)
 
 		reInvite := strings.Join([]string{
-			"INVITE sip:5551234@127.0.0.1:45430 SIP/2.0",
+			"INVITE sip:5551234@127.0.0.1:11430 SIP/2.0",
 			fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-%s", reLocal.String(), branchSuffix),
 			fmt.Sprintf("From: <sip:tester@127.0.0.1>;tag=%s", realFromTag),
 			fmt.Sprintf("To: <sip:sbc@127.0.0.1>;tag=%s", realToTag),
@@ -3030,14 +3028,10 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 
-	// The pool holds exactly one session's worth of ports (46330-46333): a
+	// The pool holds exactly one session's worth of ports (12330-12333): a
 	// fresh Allocate only succeeds if the bridge actually released them on
 	// teardown, proving neither re-INVITE leaked or corrupted the session.
-	s2, err := srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-	if err != nil {
-		t.Fatalf("media ports not released after teardown: %v", err)
-	}
-	s2.Close()
+	waitMediaReleased(t, srv)
 
 	// The per-call SDP store must also drain on teardown — otherwise a
 	// reused Call-ID (unlikely, but not impossible with a misbehaving UAC)
@@ -3059,9 +3053,9 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 // the established SDP.
 const refreshReInviteWrongTagsCfg = `
 listen:
-  sip: [udp://127.0.0.1:45440]
+  sip: [udp://127.0.0.1:11440]
   media:
-    port_range: 46340-46343
+    port_range: 12340-12343
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -3071,7 +3065,7 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.2/32]
   carrier:
-    address: 127.0.0.1:45441
+    address: 127.0.0.1:11441
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -3103,15 +3097,15 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45442})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11442})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45441", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45440, refreshReInviteWrongTagsCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11441", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11440, refreshReInviteWrongTagsCfg)
 
 	// --- establish the call, same shape as TestBridgePlacesCallAndBridges ---
 	uacUA, err := sipgo.NewUA()
@@ -3126,7 +3120,7 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45440}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11440}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3196,10 +3190,10 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 	}
 	defer intruderConn.Close()
 	intruderLocal := intruderConn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45440}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11440}
 
 	forged := strings.Join([]string{
-		"INVITE sip:5551234@127.0.0.1:45440 SIP/2.0",
+		"INVITE sip:5551234@127.0.0.1:11440 SIP/2.0",
 		fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-forged-refresh", intruderLocal.String()),
 		fmt.Sprintf("From: <sip:evil@127.0.0.2>;tag=%s", forgedFromTag),
 		fmt.Sprintf("To: <sip:sbc@127.0.0.1>;tag=%s", forgedToTag),
@@ -3265,16 +3259,16 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 // answers once WaitAnswer's built-in retry supplies a valid Authorization.
 const digestAuthCfg = `
 listen:
-  sip: [udp://127.0.0.1:45191]
+  sip: [udp://127.0.0.1:11191]
   media:
-    port_range: 46220-46223
+    port_range: 12220-12223
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45193
+    address: 127.0.0.1:11193
     allowed_ips: [203.0.113.12/30]
     media_latch: loose
     auth:
@@ -3294,18 +3288,18 @@ routes:
 // WaitAnswer exactly once per target). The UAC must see a single clean
 // 200, never the intermediate 401.
 func TestBridgeDigestAuth(t *testing.T) {
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45194})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11194})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45193", testSDPBody(echoRTPPort), stubCarrierConfig{
+	carrier := startStubCarrier(t, "127.0.0.1:11193", testSDPBody(echoRTPPort), stubCarrierConfig{
 		digestUser: "carrieruser",
 		digestPass: "carrierpass",
 	})
-	srv := startServer(t, 45191, digestAuthCfg)
+	srv := startServer(t, 11191, digestAuthCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -3319,7 +3313,7 @@ func TestBridgeDigestAuth(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11191}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3384,43 +3378,28 @@ func TestBridgeDigestAuth(t *testing.T) {
 
 	// The media session is released by onInvite's own goroutine as it
 	// unwinds its defers — asynchronously to this test, and AFTER the
-	// registry removal waitForActiveCalls observes. Retry briefly, exactly
-	// like TestBridgeAllTargetsFail does (same race, same comment there).
-	var (
-		s2       *media.Session
-		allocErr error
-	)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		s2, allocErr = srv.pool.Allocate(media.SessionConfig{Timeout: time.Minute})
-		if allocErr == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if allocErr != nil {
-		t.Fatalf("media ports not released after teardown: %v", allocErr)
-	}
-	s2.Close()
+	// registry removal waitForActiveCalls observes, which waitMediaReleased
+	// allows for.
+	waitMediaReleased(t, srv)
 }
 
 // --- M4.1 Task 2: From/CLI propagation + per-transport B-leg Contact ---
 
 // outboundFromCfg mirrors bridgeCallCfg's shape on a disjoint port set
-// (45180-45198 are already claimed by the Task 6/7/8/9 tests above — see
+// (11180-11198 are already claimed by the Task 6/7/8/9 tests above — see
 // bridgeCallCfg's comment for why allowed_ips differ per peer).
 const outboundFromCfg = `
 listen:
-  sip: [udp://127.0.0.1:45203]
+  sip: [udp://127.0.0.1:11203]
   media:
-    port_range: 46230-46233
+    port_range: 12230-12233
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45204
+    address: 127.0.0.1:11204
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -3434,21 +3413,21 @@ routes:
 // carrier-b, whose challenge matches.
 const realmPinnedCfg = `
 listen:
-  sip: [udp://127.0.0.1:45750]
+  sip: [udp://127.0.0.1:11750]
   media:
-    port_range: 46750-46753
+    port_range: 12750-12753
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45751
+    address: 127.0.0.1:11751
     allowed_ips: [203.0.113.20/30]
     media_latch: loose
     auth: { username: carrieruser, password: carrierpass, realm: freesbc-test }
   carrier-b:
-    address: 127.0.0.1:45752
+    address: 127.0.0.1:11752
     allowed_ips: [203.0.113.24/30]
     media_latch: loose
     auth: { username: carrieruser, password: carrierpass, realm: freesbc-test }
@@ -3466,11 +3445,11 @@ routes:
 // headers and the call fails over to carrier-b, whose matching challenge
 // is answered normally and bridges. The caller sees one clean 200.
 func TestBridgeRealmPinnedInvite(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45751", testSDPBody(uacRTPStubPort(t)),
+	carrierA := startStubCarrier(t, "127.0.0.1:11751", testSDPBody(uacRTPStubPort(t)),
 		stubCarrierConfig{digestUser: "carrieruser", digestPass: "carrierpass", digestRealm: "evil"})
-	carrierB := startStubCarrier(t, "127.0.0.1:45752", testSDPBody(uacRTPStubPort(t)),
+	carrierB := startStubCarrier(t, "127.0.0.1:11752", testSDPBody(uacRTPStubPort(t)),
 		stubCarrierConfig{digestUser: "carrieruser", digestPass: "carrierpass"}) // default realm = the pinned one
-	srv := startServer(t, 45750, realmPinnedCfg)
+	srv := startServer(t, 11750, realmPinnedCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -3484,7 +3463,7 @@ func TestBridgeRealmPinnedInvite(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45750}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11750}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3548,8 +3527,8 @@ func TestBridgeRealmPinnedInvite(t *testing.T) {
 // test only needs the call to reach a bridged, ACKed state so the carrier's
 // captured B-leg INVITE reflects a real end-to-end placement.
 func TestBridgeOutboundFromAndContact(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45204", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45203, outboundFromCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11204", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 11203, outboundFromCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -3565,7 +3544,7 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	// TestBridgePlacesCallAndBridges): this UAC never receives requests.
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45203}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11203}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3623,8 +3602,8 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	if from.Address.Host == "203.0.113.50" {
 		t.Error("From host = 203.0.113.50 (caller's claimed host); topology hiding failed: buildFrom forwarded the caller's host instead of rewriting to sigIP")
 	}
-	if from.Address.Port != 45203 {
-		t.Errorf("From port = %d, want bridge's outbound SIP port 45203 (from config listener)", from.Address.Port)
+	if from.Address.Port != 11203 {
+		t.Errorf("From port = %d, want bridge's outbound SIP port 11203 (from config listener)", from.Address.Port)
 	}
 	if from.DisplayName != "Caller 1001" {
 		t.Errorf("From display name = %q, want caller's display name preserved", from.DisplayName)
@@ -3642,8 +3621,8 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 	if contact.Address.Host != "127.0.0.1" {
 		t.Errorf("Contact host = %q, want sigIP 127.0.0.1", contact.Address.Host)
 	}
-	if contact.Address.Port != 45203 {
-		t.Errorf("Contact port = %d, want our SIP listen port 45203", contact.Address.Port)
+	if contact.Address.Port != 11203 {
+		t.Errorf("Contact port = %d, want our SIP listen port 11203", contact.Address.Port)
 	}
 	if tp, ok := contact.Address.UriParams.Get("transport"); ok && tp != "" && tp != "udp" {
 		t.Errorf("Contact transport param = %q, want no param or udp (carrier's transport defaults to udp)", tp)
@@ -3676,20 +3655,20 @@ func TestBridgeOutboundFromAndContact(t *testing.T) {
 const natTopoCfg = `
 sip:
   bind_ip: 0.0.0.0
-  bind_port: 45390
+  bind_port: 11390
   advertised_ip: 127.0.0.2
-  advertised_port: 45390
+  advertised_port: 11390
 rtp:
   bind_ip: 127.0.0.1
   advertised_ip: 203.0.113.7
-  port_min: 46390
-  port_max: 46393
+  port_min: 12390
+  port_max: 12393
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45391
+    address: 127.0.0.1:11391
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -3700,9 +3679,9 @@ routes:
 
 // TestBridgeNATBindAdvertisedTopology is the end-to-end proof of the
 // bind/advertised split: the A-leg caller reaches the bridge on the BIND
-// plane (127.0.0.1:45390), while every externally visible artifact claims
+// plane (127.0.0.1:11390), while every externally visible artifact claims
 // the ADVERTISED plane — the B-leg From/Contact and the A-leg answer
-// Contact carry sip.advertised_ip:advertised_port (127.0.0.2:45390, not
+// Contact carry sip.advertised_ip:advertised_port (127.0.0.2:11390, not
 // 127.0.0.1), and SDP c=/o= on both legs carry rtp.advertised_ip
 // (203.0.113.7), not the RTP bind (127.0.0.1) and not the SIP advertised
 // IP. Media must still flow end to end between the two legs' bound
@@ -3723,8 +3702,8 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 	}
 	defer echoRTP.Close()
 
-	carrier := startStubCarrier(t, "127.0.0.1:45391", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
-	srv := startServer(t, 45390, natTopoCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11391", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
+	srv := startServer(t, 11390, natTopoCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -3742,7 +3721,7 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 
 	// The caller dials the BIND address — that is all a NAT/VPN caller
 	// knows; the advertised plane is what the bridge claims on the wire.
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45390}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11390}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3782,8 +3761,8 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 		t.Errorf("answer c= = %v, want rtp.advertised_ip 203.0.113.7 (not the 127.0.0.1 RTP bind, not the SIP advertised IP)", answerIP)
 	}
 	sideAPort := sdpAudioPort(t, sess.InviteResponse.Body())
-	if sideAPort < 46390 || sideAPort > 46393 {
-		t.Errorf("answer m=audio port %d not in media pool range 46390-46393", sideAPort)
+	if sideAPort < 12390 || sideAPort > 12393 {
+		t.Errorf("answer m=audio port %d not in media pool range 12390-12393", sideAPort)
 	}
 	aContact := sess.InviteResponse.Contact()
 	if aContact == nil {
@@ -3792,8 +3771,8 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 	if aContact.Address.Host != "127.0.0.2" {
 		t.Errorf("A-leg Contact host = %q, want sip.advertised_ip 127.0.0.2 (not the 127.0.0.1 the caller reached us on)", aContact.Address.Host)
 	}
-	if aContact.Address.Port != 45390 {
-		t.Errorf("A-leg Contact port = %d, want sip.advertised_port 45390", aContact.Address.Port)
+	if aContact.Address.Port != 11390 {
+		t.Errorf("A-leg Contact port = %d, want sip.advertised_port 11390", aContact.Address.Port)
 	}
 
 	// --- B-leg INVITE: From/Contact carry the advertised signaling
@@ -3812,7 +3791,7 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 			t.Errorf("B-leg offer c= = %v, want rtp.advertised_ip 203.0.113.7", offerIP)
 		}
 		sideBPort = sdpAudioPort(t, carrierOffer.Body())
-		if sideBPort < 46390 || sideBPort > 46393 || sideBPort == sideAPort {
+		if sideBPort < 12390 || sideBPort > 12393 || sideBPort == sideAPort {
 			t.Errorf("B-leg offer m=audio port %d invalid (side A port %d)", sideBPort, sideAPort)
 		}
 		from := carrier.lastFrom()
@@ -3825,8 +3804,8 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 		if from.Address.Host != "127.0.0.2" {
 			t.Errorf("From host = %q, want sip.advertised_ip 127.0.0.2 (topology hiding; not the caller's 10.99.0.50, not the 127.0.0.1 bind)", from.Address.Host)
 		}
-		if from.Address.Port != 45390 {
-			t.Errorf("From port = %d, want sip.advertised_port 45390", from.Address.Port)
+		if from.Address.Port != 11390 {
+			t.Errorf("From port = %d, want sip.advertised_port 11390", from.Address.Port)
 		}
 		contact := carrier.lastContact()
 		if contact == nil {
@@ -3835,8 +3814,8 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 		if contact.Address.Host != "127.0.0.2" {
 			t.Errorf("Contact host = %q, want sip.advertised_ip 127.0.0.2", contact.Address.Host)
 		}
-		if contact.Address.Port != 45390 {
-			t.Errorf("Contact port = %d, want sip.advertised_port 45390", contact.Address.Port)
+		if contact.Address.Port != 11390 {
+			t.Errorf("Contact port = %d, want sip.advertised_port 11390", contact.Address.Port)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("carrier never received the B-leg INVITE")
@@ -3876,20 +3855,20 @@ func TestBridgeNATBindAdvertisedTopology(t *testing.T) {
 // realCodeCfg routes local-uac to a single carrier that declines with a
 // real final code (486 Busy Here) — proves that code reaches the caller
 // verbatim rather than being flattened to a synthetic 502/503. Fresh ports
-// (45210/45211, 46240-46243), disjoint from every earlier test's blocks
-// (45180-45204/46180-46233, 45250-45251/46250-46253).
+// (11210/11211, 12240-12243), disjoint from every earlier test's blocks
+// (11180-11204/12180-12233, 11250-11251/12250-12253).
 const realCodeCfg = `
 listen:
-  sip: [udp://127.0.0.1:45210]
+  sip: [udp://127.0.0.1:11210]
   media:
-    port_range: 46240-46243
+    port_range: 12240-12243
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45211
+    address: 127.0.0.1:11211
     allowed_ips: [203.0.113.20/30]
 routes:
   - name: out
@@ -3902,11 +3881,11 @@ routes:
 // error — and the caller must see that real code verbatim, never a
 // synthetic 502/503.
 func TestBridgePassesRealFinalCode(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45211", nil, stubCarrierConfig{
+	carrier := startStubCarrier(t, "127.0.0.1:11211", nil, stubCarrierConfig{
 		finalStatus: 486,
 		finalReason: "Busy Here",
 	})
-	startServer(t, 45210, realCodeCfg)
+	startServer(t, 11210, realCodeCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -3920,7 +3899,7 @@ func TestBridgePassesRealFinalCode(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45210}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11210}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -3950,23 +3929,23 @@ func TestBridgePassesRealFinalCode(t *testing.T) {
 
 // failoverRealCodeCfg routes local-uac to two carriers, both declining with
 // real final codes: carrier-a 486, carrier-b 404 (Task 3's "last real code
-// wins" precedence test). Fresh ports (45212-45214, 46244-46247), disjoint
+// wins" precedence test). Fresh ports (11212-11214, 12244-12247), disjoint
 // from realCodeCfg and every earlier test's blocks.
 const failoverRealCodeCfg = `
 listen:
-  sip: [udp://127.0.0.1:45212]
+  sip: [udp://127.0.0.1:11212]
   media:
-    port_range: 46244-46247
+    port_range: 12244-12247
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45213
+    address: 127.0.0.1:11213
     allowed_ips: [203.0.113.24/30]
   carrier-b:
-    address: 127.0.0.1:45214
+    address: 127.0.0.1:11214
     allowed_ips: [203.0.113.28/30]
 routes:
   - name: out
@@ -3979,15 +3958,15 @@ routes:
 // the caller sees the LAST real code (404) — not the first, and not a
 // synthetic default.
 func TestBridgeFailoverThenRealCode(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45213", nil, stubCarrierConfig{
+	carrierA := startStubCarrier(t, "127.0.0.1:11213", nil, stubCarrierConfig{
 		finalStatus: 486,
 		finalReason: "Busy Here",
 	})
-	carrierB := startStubCarrier(t, "127.0.0.1:45214", nil, stubCarrierConfig{
+	carrierB := startStubCarrier(t, "127.0.0.1:11214", nil, stubCarrierConfig{
 		finalStatus: 404,
 		finalReason: "Not Found",
 	})
-	startServer(t, 45212, failoverRealCodeCfg)
+	startServer(t, 11212, failoverRealCodeCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4001,7 +3980,7 @@ func TestBridgeFailoverThenRealCode(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45212}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11212}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4038,23 +4017,23 @@ func TestBridgeFailoverThenRealCode(t *testing.T) {
 // declines with a real 486 Busy Here; carrier-b (the LAST target) never
 // sends a final response at all, driving the same stale-provisional/
 // dial-classified path as TestBridgeStaleProvisionalNotRelayedAsFinal (see
-// startFloodingRingCarrier). Fresh ports (45215-45217, 46248-46251),
+// startFloodingRingCarrier). Fresh ports (11215-11217, 12248-12251),
 // disjoint from every earlier test's blocks.
 const trailingDialFailureCfg = `
 listen:
-  sip: [udp://127.0.0.1:45215]
+  sip: [udp://127.0.0.1:11215]
   media:
-    port_range: 46248-46251
+    port_range: 12248-12251
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45216
+    address: 127.0.0.1:11216
     allowed_ips: [203.0.113.32/30]
   carrier-b:
-    address: 127.0.0.1:45217
+    address: 127.0.0.1:11217
     allowed_ips: [203.0.113.36/30]
 routes:
   - name: out
@@ -4081,12 +4060,12 @@ routes:
 // ">10 responses" cap against the bridge's — an artifact of the test
 // client, not something the bridge does wrong.
 func TestBridgeFailoverRealCodeSurvivesTrailingDialFailure(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45216", nil, stubCarrierConfig{
+	carrierA := startStubCarrier(t, "127.0.0.1:11216", nil, stubCarrierConfig{
 		finalStatus: 486,
 		finalReason: "Busy Here",
 	})
-	carrierB := startFloodingRingCarrier(t, "127.0.0.1:45217")
-	startServer(t, 45215, trailingDialFailureCfg)
+	carrierB := startFloodingRingCarrier(t, "127.0.0.1:11217")
+	startServer(t, 11215, trailingDialFailureCfg)
 
 	uac, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -4094,9 +4073,9 @@ func TestBridgeFailoverRealCodeSurvivesTrailingDialFailure(t *testing.T) {
 	}
 	defer uac.Close()
 	local := uac.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45215}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11215}
 
-	req := sipInviteWithSDP("b2bua-trailing-dial-failure-1", local, testSDPBody(uacRTPStubPort(t)), 45215)
+	req := sipInviteWithSDP("b2bua-trailing-dial-failure-1", local, testSDPBody(uacRTPStubPort(t)), 11215)
 	if _, err := uac.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write invite: %v", err)
 	}
@@ -4148,24 +4127,24 @@ func TestBridgeFailoverRealCodeSurvivesTrailingDialFailure(t *testing.T) {
 
 // ringTimeoutFailoverCfg sets ring_timeout to 300ms so a single ringing
 // target (carrier-a, which never answers) is capped and failed over well
-// within the test's own timeouts. Fresh ports (45260-45262, 46260-46263),
+// within the test's own timeouts. Fresh ports (13040-13042, 13440-13443),
 // disjoint from every other test's — see bridgeCallCfg's comment for why
 // allowed_ips differ per peer.
 const ringTimeoutFailoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45260]
+  sip: [udp://127.0.0.1:13040]
   media:
-    port_range: 46260-46263
+    port_range: 13440-13443
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45261
+    address: 127.0.0.1:13041
     allowed_ips: [203.0.113.40/30]
   carrier-b:
-    address: 127.0.0.1:45262
+    address: 127.0.0.1:13042
     allowed_ips: [203.0.113.44/30]
 ring_timeout: 300ms
 routes:
@@ -4192,9 +4171,9 @@ routes:
 // Timing-based over real UDP loopback: re-run once before treating a flake
 // as failure.
 func TestBridgeRingTimeoutFailsOver(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45261", nil, stubCarrierConfig{ringForever: true})
-	carrierB := startStubCarrier(t, "127.0.0.1:45262", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45260, ringTimeoutFailoverCfg)
+	carrierA := startStubCarrier(t, "127.0.0.1:13041", nil, stubCarrierConfig{ringForever: true})
+	carrierB := startStubCarrier(t, "127.0.0.1:13042", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 13040, ringTimeoutFailoverCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4208,7 +4187,7 @@ func TestBridgeRingTimeoutFailsOver(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45260}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 13040}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4260,19 +4239,19 @@ func TestBridgeRingTimeoutFailsOver(t *testing.T) {
 // ringTimeoutNoFailoverCfg routes to a single carrier that rings forever,
 // with the same 300ms ring_timeout — proves the exhaustion fallback (408,
 // not 503) when a ring timeout is the ONLY kind of failure seen across
-// every target. Fresh ports (45265-45266, 46270-46273).
+// every target. Fresh ports (11265-11266, 12270-12273).
 const ringTimeoutNoFailoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45265]
+  sip: [udp://127.0.0.1:11265]
   media:
-    port_range: 46270-46273
+    port_range: 12270-12273
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45266
+    address: 127.0.0.1:11266
     allowed_ips: [203.0.113.48/30]
 ring_timeout: 300ms
 routes:
@@ -4291,8 +4270,8 @@ routes:
 // Timing-based over real UDP loopback: re-run once before treating a flake
 // as failure.
 func TestBridgeRingTimeoutNoTargetsReturns408(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45266", nil, stubCarrierConfig{ringForever: true})
-	startServer(t, 45265, ringTimeoutNoFailoverCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11266", nil, stubCarrierConfig{ringForever: true})
+	startServer(t, 11265, ringTimeoutNoFailoverCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4306,7 +4285,7 @@ func TestBridgeRingTimeoutNoTargetsReturns408(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45265}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11265}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4348,20 +4327,20 @@ func TestBridgeRingTimeoutNoTargetsReturns408(t *testing.T) {
 // INVITE with 401 Unauthorized — WaitAnswer only attempts its own digest
 // retry when Password is non-empty (see authUser/authPass), so with no
 // configured auth this 401 reaches dialTarget as a genuine final response
-// it can't do anything about. Fresh ports (45270-45271, 46300-46303),
+// it can't do anything about. Fresh ports (13120-13121, 13520-13523),
 // disjoint from every other test's.
 const authChallengeCfg = `
 listen:
-  sip: [udp://127.0.0.1:45270]
+  sip: [udp://127.0.0.1:13120]
   media:
-    port_range: 46300-46303
+    port_range: 13520-13523
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45271
+    address: 127.0.0.1:13121
     allowed_ips: [203.0.113.60/30]
 routes:
   - name: out
@@ -4385,11 +4364,11 @@ routes:
 // TestBridgeFailoverThenRealCode already cover the companion claim — a
 // genuine >=300 final, e.g. 486, still reaches the caller verbatim.)
 func TestBridgeAuthChallengeMapsTo503(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45271", nil, stubCarrierConfig{
+	carrier := startStubCarrier(t, "127.0.0.1:13121", nil, stubCarrierConfig{
 		finalStatus: 401,
 		finalReason: "Unauthorized",
 	})
-	startServer(t, 45270, authChallengeCfg)
+	startServer(t, 13120, authChallengeCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4403,7 +4382,7 @@ func TestBridgeAuthChallengeMapsTo503(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45270}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 13120}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4433,20 +4412,20 @@ func TestBridgeAuthChallengeMapsTo503(t *testing.T) {
 
 // brokenAnswerCfg routes local-uac to a single carrier that answers 200 OK
 // but with an unparseable SDP body — see stubCarrierConfig.brokenAnswer.
-// Fresh ports (45272-45273, 46310-46313), disjoint from every other
+// Fresh ports (11272-11273, 12310-12313), disjoint from every other
 // test's.
 const brokenAnswerCfg = `
 listen:
-  sip: [udp://127.0.0.1:45272]
+  sip: [udp://127.0.0.1:11272]
   media:
-    port_range: 46310-46313
+    port_range: 12310-12313
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45273
+    address: 127.0.0.1:11273
     allowed_ips: [203.0.113.64/30]
 routes:
   - name: out
@@ -4465,10 +4444,10 @@ routes:
 // dialog only ends, closing byeDone, once it has actually received that
 // BYE.
 func TestBridgeBrokenAnswerSDPGets502(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45273", nil, stubCarrierConfig{
+	carrier := startStubCarrier(t, "127.0.0.1:11273", nil, stubCarrierConfig{
 		brokenAnswer: true,
 	})
-	startServer(t, 45272, brokenAnswerCfg)
+	startServer(t, 11272, brokenAnswerCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4482,7 +4461,7 @@ func TestBridgeBrokenAnswerSDPGets502(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45272}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11272}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4526,20 +4505,20 @@ func TestBridgeBrokenAnswerSDPGets502(t *testing.T) {
 // installs OnInvite/OnAck/OnBye — no REGISTER handler — so sipgo's default
 // no-route handler answers every REGISTER 405 Method Not Allowed, never
 // 200) and lets the test observe whether an INVITE ever reaches it. Fresh
-// port block (45290 sip / 45291 carrier / 46290-46293 media), disjoint from
+// port block (11290 sip / 11291 carrier / 12290-12293 media), disjoint from
 // every other test's.
 const skipUnregisteredCfg = `
 listen:
-  sip: [udp://127.0.0.1:45290]
+  sip: [udp://127.0.0.1:11290]
   media:
-    port_range: 46290-46293
+    port_range: 12290-12293
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45291
+    address: 127.0.0.1:11291
     auth: { username: reguser, password: regpass }
     register: true
     allowed_ips: [203.0.113.9/32] # T-11: required on every peer; disjoint from local-uac so the caller still identifies as local-uac
@@ -4567,7 +4546,7 @@ routes:
 // goroutine to reconcile before placing the call): re-run once before
 // treating a flake as failure.
 func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45291", nil)
+	carrier := startStubCarrier(t, "127.0.0.1:11291", nil)
 	// startServer's own probe (dial the UDP port, then a short settle
 	// sleep) already only returns once bindListener's accept/read loop is
 	// live; b.s.registrar is assigned earlier in Run, in the same
@@ -4578,7 +4557,7 @@ func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
 	// Registrar exists. No direct read of srv.registrar from this test
 	// goroutine is needed (or safe: Run assigns it from its own goroutine
 	// with no lock, so reading it straight from the test would race).
-	startServer(t, 45290, skipUnregisteredCfg)
+	startServer(t, 11290, skipUnregisteredCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4592,7 +4571,7 @@ func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45290}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11290}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4623,23 +4602,23 @@ func TestBridgeSkipsUnregisteredTarget(t *testing.T) {
 // --- M4.3 Task 4: session-timer headers on the A-leg 200 and B-leg INVITE ---
 
 // sessionTimerCfg mirrors outboundFromCfg's shape on a disjoint port set
-// (45180-45291/45410/45412 are already claimed by earlier tests in this
+// (11180-11291/11410/11412 are already claimed by earlier tests in this
 // file — see brokenAnswerCfg's comment for the highest prior block). No
 // session_expires/min_se is set, so the config defaults apply (1800s /
 // 90s — see config/schema.go's ApplyDefaults), which is exactly what the
 // assertions below check for.
 const sessionTimerCfg = `
 listen:
-  sip: [udp://127.0.0.1:45420]
+  sip: [udp://127.0.0.1:11420]
   media:
-    port_range: 46320-46323
+    port_range: 12320-12323
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45421
+    address: 127.0.0.1:11421
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -4670,8 +4649,8 @@ func hasToken(headers []sip.Header, token string) bool {
 // negotiateSE falls back to cfg.SessionExpires (1800s, the config
 // default) on both legs — see sig/timers.go's negotiateSE.
 func TestBridgeSessionTimerHeaders(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45421", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45420, sessionTimerCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11421", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 11420, sessionTimerCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4685,7 +4664,7 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45420}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11420}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -4763,20 +4742,20 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 
 // minSERetryCfg sets a low session_expires (600s) so the B-leg's first
 // INVITE undershoots startMinSERetryCarrier's 1800s floor, forcing exactly
-// one 422 retry (M4.3 Task 5). Fresh ports (45422-45423, 46324-46327),
-// disjoint from sessionTimerCfg's 45420-45421/46320-46323 block.
+// one 422 retry (M4.3 Task 5). Fresh ports (11422-11423, 12324-12327),
+// disjoint from sessionTimerCfg's 11420-11421/12320-12323 block.
 const minSERetryCfg = `
 listen:
-  sip: [udp://127.0.0.1:45422]
+  sip: [udp://127.0.0.1:11422]
   media:
-    port_range: 46324-46327
+    port_range: 12324-12327
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45423
+    address: 127.0.0.1:11423
     allowed_ips: [203.0.113.0/24]
 session_expires: 600s
 routes:
@@ -4914,8 +4893,8 @@ func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startMinSERetryCarrier(t, "127.0.0.1:45423", testSDPBody(echoRTPPort), 1800*time.Second)
-	startServer(t, 45422, minSERetryCfg)
+	carrier := startMinSERetryCarrier(t, "127.0.0.1:11423", testSDPBody(echoRTPPort), 1800*time.Second)
+	startServer(t, 11422, minSERetryCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -4929,7 +4908,7 @@ func TestBridgeBLeg422RetriesWithMinSE(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45422}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11422}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -5066,9 +5045,9 @@ func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
 // comment — and so does not itself depend on this value).
 const healthCfg = `
 listen:
-  sip: [udp://127.0.0.1:45191]
+  sip: [udp://127.0.0.1:13000]
   media:
-    port_range: 46210-46213
+    port_range: 13400-13403
     public_ip: 127.0.0.1
 ring_timeout: 3s
 peer_cooldown: 60s
@@ -5088,7 +5067,7 @@ routes:
 `
 
 // healthRecoverCfg is TestBridgeRecoversEndpointOnSuccess's config: it routes
-// local-uac to a carrier addressed by a literal host:port (127.0.0.1:45301,
+// local-uac to a carrier addressed by a literal host:port (127.0.0.1:13101,
 // an explicit port — see classifyAddress), which Resolve returns as exactly
 // ONE endpoint, no SRV lookup involved. A single-endpoint peer is the point:
 // with only one candidate, expandTargets' cooldown-is-skip-if-alternatives
@@ -5098,9 +5077,9 @@ routes:
 // post-answer Recover call actually firing (see the test).
 const healthRecoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45300]
+  sip: [udp://127.0.0.1:13100]
   media:
-    port_range: 46300-46303
+    port_range: 13500-13503
     public_ip: 127.0.0.1
 ring_timeout: 3s
 peer_cooldown: 60s
@@ -5109,7 +5088,7 @@ peers:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45301
+    address: 127.0.0.1:13101
     transport: udp
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
@@ -5179,8 +5158,8 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	//     Invite() itself (before WaitAnswer is ever entered) sidesteps that
 	//     quirk, which is why this must be a synchronous resolve failure,
 	//     not a silent/unreachable one.
-	const livePort = 45194
-	const deadPort = 45195
+	const livePort = 13003
+	const deadPort = 13004
 	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
 
 	// A peer addressed by hostname so resolution goes through SRV; the SBC's
@@ -5188,7 +5167,7 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	// resolver stub MUST be installed before Run starts handling calls —
 	// startServerConfigured sets it inside NewServer→Run's happens-before
 	// window (goroutine start), so -race sees no data race on lookupSRV.
-	srv := startServerConfigured(t, 45191, healthCfg, func(s *Server) {
+	srv := startServerConfigured(t, 13000, healthCfg, func(s *Server) {
 		s.resolver.lookupSRV = func(_, _, _ string) (string, []*net.SRV, error) {
 			return "", []*net.SRV{
 				{Target: "deadhost..invalid.", Port: deadPort, Priority: 10, Weight: 0}, // tried first — invalid DNS syntax, never resolves
@@ -5217,7 +5196,7 @@ func TestBridgePenalizesDeadEndpointThenBridges(t *testing.T) {
 	// dial-anyway fallback involved. dead is tried first and fails to
 	// connect (invalid DNS syntax — see the comment above on
 	// "deadhost..invalid."); live is tried second and bridges.
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45191}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 13000}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -5276,10 +5255,10 @@ func TestBridgeRecoversEndpointOnSuccess(t *testing.T) {
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	const livePort = 45301
+	const livePort = 13101
 	live := startStubCarrier(t, fmt.Sprintf("127.0.0.1:%d", livePort), testSDPBody(echoRTPPort))
 
-	srv := startServer(t, 45300, healthRecoverCfg)
+	srv := startServer(t, 13100, healthRecoverCfg)
 
 	liveEndpoint := Endpoint{Host: "127.0.0.1", Port: livePort, Transport: "udp"}
 	// Pre-penalize the only endpoint this peer resolves to, BEFORE the
@@ -5301,7 +5280,7 @@ func TestBridgeRecoversEndpointOnSuccess(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45300}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 13100}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -5433,9 +5412,9 @@ func sendUntilSRTPArrives(t *testing.T, ctx *srtp.Context, src *net.UDPConn, dst
 // B-leg is dialed.
 const srtpRequiredACfg = `
 listen:
-  sip: [udp://127.0.0.1:45500]
+  sip: [udp://127.0.0.1:11500]
   media:
-    port_range: 46500-46503
+    port_range: 12500-12503
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -5443,7 +5422,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45502
+    address: 127.0.0.1:11502
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -5457,8 +5436,8 @@ routes:
 // Here, and — critically — the carrier never even sees a B-leg INVITE,
 // since the rejection happens in onInvite before any target is dialed.
 func TestBridgeSRTPRequiredCallerNoCryptoGets488(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45502", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45500, srtpRequiredACfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11502", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 11500, srtpRequiredACfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -5472,7 +5451,7 @@ func TestBridgeSRTPRequiredCallerNoCryptoGets488(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45500}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11500}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -5509,9 +5488,9 @@ func TestBridgeSRTPRequiredCallerNoCryptoGets488(t *testing.T) {
 // propagating one leg's policy onto the other.
 const srtpInterworkCfg = `
 listen:
-  sip: [udp://127.0.0.1:45510]
+  sip: [udp://127.0.0.1:11510]
   media:
-    port_range: 46510-46513
+    port_range: 12510-12513
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -5519,7 +5498,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45512
+    address: 127.0.0.1:11512
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -5543,15 +5522,15 @@ func TestBridgeSRTPInterworksSecureAToPlaintextB(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45513})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11513})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45512", testSDPBody(echoRTPPort))
-	startServer(t, 45510, srtpInterworkCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11512", testSDPBody(echoRTPPort))
+	startServer(t, 11510, srtpInterworkCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -5568,7 +5547,7 @@ func TestBridgeSRTPInterworksSecureAToPlaintextB(t *testing.T) {
 	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45510}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11510}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -5662,9 +5641,9 @@ func TestBridgeSRTPInterworksSecureAToPlaintextB(t *testing.T) {
 // independently generated keys.
 const srtpBothSecureCfg = `
 listen:
-  sip: [udp://127.0.0.1:45515]
+  sip: [udp://127.0.0.1:11515]
   media:
-    port_range: 46516-46519
+    port_range: 12516-12519
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -5672,7 +5651,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45517
+    address: 127.0.0.1:11517
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
     srtp: required
@@ -5697,7 +5676,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45518})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11518})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
@@ -5705,8 +5684,8 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
 	bAnswerKey := media.NewSDESKey()
-	carrier := startStubCarrier(t, "127.0.0.1:45517", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bAnswerKey))
-	startServer(t, 45515, srtpBothSecureCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11517", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bAnswerKey))
+	startServer(t, 11515, srtpBothSecureCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -5723,7 +5702,7 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45515}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11515}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -5845,20 +5824,20 @@ func TestBridgeSRTPBothLegsSecure(t *testing.T) {
 // a non-2xx rather than ever bridging plaintext against a required policy.
 const srtpRequiredBFailoverCfg = `
 listen:
-  sip: [udp://127.0.0.1:45520]
+  sip: [udp://127.0.0.1:11520]
   media:
-    port_range: 46520-46523
+    port_range: 12520-12523
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier-a:
-    address: 127.0.0.1:45521
+    address: 127.0.0.1:11521
     allowed_ips: [203.0.113.20/30]
     srtp: required
   carrier-b:
-    address: 127.0.0.1:45522
+    address: 127.0.0.1:11522
     allowed_ips: [203.0.113.24/30]
     srtp: required
 routes:
@@ -5874,9 +5853,9 @@ routes:
 // over from — not something it bridges anyway or gives up on after the
 // first target.
 func TestBridgeSRTPRequiredBNoCryptoFailsOver(t *testing.T) {
-	carrierA := startStubCarrier(t, "127.0.0.1:45521", testSDPBody(uacRTPStubPort(t)))
-	carrierB := startStubCarrier(t, "127.0.0.1:45522", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45520, srtpRequiredBFailoverCfg)
+	carrierA := startStubCarrier(t, "127.0.0.1:11521", testSDPBody(uacRTPStubPort(t)))
+	carrierB := startStubCarrier(t, "127.0.0.1:11522", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 11520, srtpRequiredBFailoverCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -5890,7 +5869,7 @@ func TestBridgeSRTPRequiredBNoCryptoFailsOver(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45520}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11520}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -5943,9 +5922,9 @@ func TestBridgeSRTPRequiredBNoCryptoFailsOver(t *testing.T) {
 // relying on the zero value.
 const srtpPlaintextUnchangedCfg = `
 listen:
-  sip: [udp://127.0.0.1:45530]
+  sip: [udp://127.0.0.1:11530]
   media:
-    port_range: 46530-46533
+    port_range: 12530-12533
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -5953,7 +5932,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: disabled
   carrier:
-    address: 127.0.0.1:45532
+    address: 127.0.0.1:11532
     allowed_ips: [203.0.113.0/24]
     srtp: disabled
 routes:
@@ -5975,7 +5954,7 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45533})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11533})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
@@ -5983,8 +5962,8 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
 	carrierAnswer := testSDPBody(echoRTPPort)
-	carrier := startStubCarrier(t, "127.0.0.1:45532", carrierAnswer)
-	startServer(t, 45530, srtpPlaintextUnchangedCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11532", carrierAnswer)
+	startServer(t, 11530, srtpPlaintextUnchangedCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -5998,7 +5977,7 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45530}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11530}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6080,16 +6059,16 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 // leak the carrier's key or SAVP proto through to the plaintext caller.
 const srtpInterworkReversedCfg = `
 listen:
-  sip: [udp://127.0.0.1:45540]
+  sip: [udp://127.0.0.1:11540]
   media:
-    port_range: 46540-46543
+    port_range: 12540-12543
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45542
+    address: 127.0.0.1:11542
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
     srtp: required
@@ -6124,7 +6103,7 @@ func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45543})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11543})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
@@ -6132,8 +6111,8 @@ func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
 	bKey := media.NewSDESKey()
-	carrier := startStubCarrier(t, "127.0.0.1:45542", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bKey))
-	startServer(t, 45540, srtpInterworkReversedCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11542", testSDPBodySAVP(echoRTPPort, media.SuiteAES128CM80, bKey))
+	startServer(t, 11540, srtpInterworkReversedCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -6149,7 +6128,7 @@ func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
 
 	offer := testSDPBody(uacRTPPort)
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45540}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11540}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6244,9 +6223,9 @@ func TestBridgeSRTPInterworksPlaintextAToSecureB(t *testing.T) {
 // plain RTP/AVP.
 const srtpOptionalBPlaintextCfg = `
 listen:
-  sip: [udp://127.0.0.1:45550]
+  sip: [udp://127.0.0.1:11550]
   media:
-    port_range: 46550-46553
+    port_range: 12550-12553
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -6254,7 +6233,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45552
+    address: 127.0.0.1:11552
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
     srtp: optional
@@ -6281,15 +6260,15 @@ func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45553})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11553})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45552", testSDPBody(echoRTPPort))
-	startServer(t, 45550, srtpOptionalBPlaintextCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11552", testSDPBody(echoRTPPort))
+	startServer(t, 11550, srtpOptionalBPlaintextCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -6306,7 +6285,7 @@ func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
 	aKey := media.NewSDESKey()
 	offer := testSDPBodySAVP(uacRTPPort, media.SuiteAES128CM80, aKey)
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45550}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11550}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6423,9 +6402,9 @@ func TestBridgeSRTPOptionalBAnswersPlaintextBridges(t *testing.T) {
 // required so the A-leg must negotiate SRTP and answer with real crypto.
 const srtpTagEchoCfg = `
 listen:
-  sip: [udp://127.0.0.1:45560]
+  sip: [udp://127.0.0.1:11560]
   media:
-    port_range: 46560-46563
+    port_range: 12560-12563
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -6433,7 +6412,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45562
+    address: 127.0.0.1:11562
     allowed_ips: [203.0.113.0/24]
 routes:
   - name: out
@@ -6450,8 +6429,8 @@ routes:
 // though it selected the OFFER's tag-2 line — a strict caller would then map
 // the SBC's key to its own tag-1 (unsupported-suite) line and get dead air.
 func TestBridgeSRTPAnswerEchoesOfferedTag(t *testing.T) {
-	carrier := startStubCarrier(t, "127.0.0.1:45562", testSDPBody(uacRTPStubPort(t)))
-	startServer(t, 45560, srtpTagEchoCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11562", testSDPBody(uacRTPStubPort(t)))
+	startServer(t, 11560, srtpTagEchoCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -6481,7 +6460,7 @@ func TestBridgeSRTPAnswerEchoesOfferedTag(t *testing.T) {
 		"a=crypto:1 AES_256_GCM inline:" + unsupportedKeyB64 + "\r\n" +
 		"a=crypto:" + cryptoAttrValue(2, media.SuiteAES128CM80, tag2Key) + "\r\n")
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45560}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11560}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6553,16 +6532,16 @@ func (s *syncLogBuf) String() string {
 // required alone drives bSRTP.secure here.
 const srtpBLegNonTLSWarnCfg = `
 listen:
-  sip: [udp://127.0.0.1:45570]
+  sip: [udp://127.0.0.1:11570]
   media:
-    port_range: 46570-46573
+    port_range: 12570-12573
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45572
+    address: 127.0.0.1:11572
     allowed_ips: [203.0.113.0/24]
     srtp: required
 routes:
@@ -6581,10 +6560,10 @@ routes:
 // peer.
 func TestBridgeSRTPBLegNonTLSWarn(t *testing.T) {
 	bKey := media.NewSDESKey()
-	carrier := startStubCarrier(t, "127.0.0.1:45572", testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM80, bKey))
+	carrier := startStubCarrier(t, "127.0.0.1:11572", testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM80, bKey))
 
 	var logBuf syncLogBuf
-	startServerConfigured(t, 45570, srtpBLegNonTLSWarnCfg, func(srv *Server) {
+	startServerConfigured(t, 11570, srtpBLegNonTLSWarnCfg, func(srv *Server) {
 		srv.log = slog.New(slog.NewTextHandler(&logBuf, nil))
 	})
 
@@ -6600,7 +6579,7 @@ func TestBridgeSRTPBLegNonTLSWarn(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45570}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11570}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6646,9 +6625,9 @@ func TestBridgeSRTPBLegNonTLSWarn(t *testing.T) {
 // mismatched crypto, not one that declined it.
 const srtpOptionalBAnswersUnusableSAVPCfg = `
 listen:
-  sip: [udp://127.0.0.1:45580]
+  sip: [udp://127.0.0.1:11580]
   media:
-    port_range: 46580-46583
+    port_range: 12580-12583
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -6656,7 +6635,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     srtp: required
   carrier:
-    address: 127.0.0.1:45582
+    address: 127.0.0.1:11582
     allowed_ips: [203.0.113.0/24]
     srtp: optional
 routes:
@@ -6680,9 +6659,9 @@ routes:
 func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
 	aKey := media.NewSDESKey()
 	wrongSuiteKey := media.NewSDESKey()
-	carrier := startStubCarrier(t, "127.0.0.1:45582",
+	carrier := startStubCarrier(t, "127.0.0.1:11582",
 		testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM32, wrongSuiteKey))
-	startServer(t, 45580, srtpOptionalBAnswersUnusableSAVPCfg)
+	startServer(t, 11580, srtpOptionalBAnswersUnusableSAVPCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -6698,7 +6677,7 @@ func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
 
 	offer := testSDPBodySAVP(uacRTPStubPort(t), media.SuiteAES128CM80, aKey)
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45580}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11580}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -6737,16 +6716,16 @@ func TestBridgeSRTPOptionalBAnswersUnusableSAVPFailsOver(t *testing.T) {
 // TestKillCallTearsDownBothLegs.
 const killCallCfg = `
 listen:
-  sip: [udp://127.0.0.1:45611]
+  sip: [udp://127.0.0.1:11611]
   media:
-    port_range: 46610-46613
+    port_range: 12610-12613
     public_ip: 127.0.0.1
 peers:
   local-uac:
     address: 127.0.0.1:5070
     allowed_ips: [127.0.0.1/32]
   carrier:
-    address: 127.0.0.1:45610
+    address: 127.0.0.1:11610
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -6777,8 +6756,8 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
-	carrier := startStubCarrier(t, "127.0.0.1:45610", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
-	srv := startServer(t, 45611, killCallCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11610", testSDPBody(echoRTP.LocalAddr().(*net.UDPAddr).Port))
+	srv := startServer(t, 11611, killCallCfg)
 
 	uacUA, err := sipgo.NewUA()
 	if err != nil {
@@ -6839,7 +6818,7 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45611}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11611}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sess, err := dialogCli.Invite(ctx, bridgeURI, testSDPBody(uacRTPStubPort(t)),
@@ -6864,6 +6843,16 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 	// The call's ID as the SBC sees it is the A-leg Call-ID = the UAC's
 	// Call-ID.
 	callID := sess.InviteRequest.CallID().Value()
+
+	// Calls is what /api/calls lists, and its ID is what the kick takes.
+	recs := srv.Calls()
+	if len(recs) != 1 {
+		t.Fatalf("Calls() = %d records, want the one live call", len(recs))
+	}
+	if r := recs[0]; r.ID != callID || r.FromPeer != "local-uac" || r.ToPeer != "carrier" || r.StartUnixNano == 0 {
+		t.Errorf("Calls()[0] = %+v, want ID %q from local-uac to carrier with a start time", r, callID)
+	}
+
 	killStart := time.Now()
 	if !srv.KillCall(callID) {
 		t.Fatalf("KillCall(%q) returned false for a live call", callID)
@@ -6887,6 +6876,9 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 	}
 	// registry drains:
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
+	if recs := srv.Calls(); len(recs) != 0 {
+		t.Errorf("Calls() after the kick = %+v, want none", recs)
+	}
 	// a second kick / unknown id → false:
 	if srv.KillCall(callID) {
 		t.Error("second KillCall should return false (call gone)")
@@ -6904,9 +6896,9 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 // carrier.
 const peerCallCapCfg = `
 listen:
-  sip: [udp://127.0.0.1:45720]
+  sip: [udp://127.0.0.1:11720]
   media:
-    port_range: 46720-46723
+    port_range: 12720-12723
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -6914,11 +6906,11 @@ peers:
     allowed_ips: [127.0.0.1/32]
     max_concurrent_calls: 1
   carrier:
-    address: 127.0.0.1:45721
+    address: 127.0.0.1:11721
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
   carrier2:
-    address: 127.0.0.1:45723
+    address: 127.0.0.1:11723
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -6945,23 +6937,23 @@ func TestPeerCallCapRejectsWith503(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45722})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11722})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP2, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45724})
+	echoRTP2, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11724})
 	if err != nil {
 		t.Fatalf("carrier2 echo rtp socket: %v", err)
 	}
 	defer echoRTP2.Close()
 	echoRTP2Port := echoRTP2.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45721", testSDPBody(echoRTPPort))
-	carrier2 := startStubCarrier(t, "127.0.0.1:45723", testSDPBody(echoRTP2Port))
-	srv := startServer(t, 45720, peerCallCapCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11721", testSDPBody(echoRTPPort))
+	carrier2 := startStubCarrier(t, "127.0.0.1:11723", testSDPBody(echoRTP2Port))
+	srv := startServer(t, 11720, peerCallCapCfg)
 
 	// --- establish the first call: fills the peer's single quota slot ---
 	uacUA, err := sipgo.NewUA()
@@ -6976,7 +6968,7 @@ func TestPeerCallCapRejectsWith503(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45720}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11720}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
@@ -7012,9 +7004,9 @@ func TestPeerCallCapRejectsWith503(t *testing.T) {
 	}
 	defer capConn.Close()
 	capLocal := capConn.LocalAddr().(*net.UDPAddr)
-	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45720}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11720}
 
-	req := sipInviteWithSDP("b2bua-quota-overcap", capLocal, testSDPBody(uacRTPPort), 45720)
+	req := sipInviteWithSDP("b2bua-quota-overcap", capLocal, testSDPBody(uacRTPPort), 11720)
 	if _, err := capConn.WriteToUDP([]byte(req), dst); err != nil {
 		t.Fatalf("write over-cap invite: %v", err)
 	}
@@ -7072,7 +7064,7 @@ func TestPeerCallCapRejectsWith503(t *testing.T) {
 	defer uac2Client.Close()
 	dialogCli2 := sipgo.NewDialogClientCache(uac2Client, sip.ContactHeader{})
 
-	bridge2URI := sip.Uri{User: "5559999", Host: "127.0.0.1", Port: 45720}
+	bridge2URI := sip.Uri{User: "5559999", Host: "127.0.0.1", Port: 11720}
 	var sess2 *sipgo.DialogClientSession
 	invite2Deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(invite2Deadline) {
@@ -7150,9 +7142,9 @@ func TestCallQuotaAcquire(t *testing.T) {
 // ^5551234$, so any other number 404s after the quota gate.
 const peerCallCapFailureCfg = `
 listen:
-  sip: [udp://127.0.0.1:45726]
+  sip: [udp://127.0.0.1:11726]
   media:
-    port_range: 46726-46729
+    port_range: 12726-12729
     public_ip: 127.0.0.1
 peers:
   local-uac:
@@ -7160,7 +7152,7 @@ peers:
     allowed_ips: [127.0.0.1/32]
     max_concurrent_calls: 1
   carrier:
-    address: 127.0.0.1:45727
+    address: 127.0.0.1:11727
     allowed_ips: [203.0.113.0/24]
     media_latch: loose
 routes:
@@ -7183,18 +7175,18 @@ func TestPeerCallCapReleasedOnFailure(t *testing.T) {
 	defer uacRTP.Close()
 	uacRTPPort := uacRTP.LocalAddr().(*net.UDPAddr).Port
 
-	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 45728})
+	echoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 11728})
 	if err != nil {
 		t.Fatalf("carrier echo rtp socket: %v", err)
 	}
 	defer echoRTP.Close()
 	echoRTPPort := echoRTP.LocalAddr().(*net.UDPAddr).Port
 
-	carrier := startStubCarrier(t, "127.0.0.1:45727", testSDPBody(echoRTPPort))
-	srv := startServer(t, 45726, peerCallCapFailureCfg)
+	carrier := startStubCarrier(t, "127.0.0.1:11727", testSDPBody(echoRTPPort))
+	srv := startServer(t, 11726, peerCallCapFailureCfg)
 
 	// A failed call: 404 before any dialing, but AFTER the quota gate.
-	got := roundTrip(t, 45726, "INVITE", "b2bua-cap-fail", 3*time.Second, "SIP/2.0 404")
+	got := roundTrip(t, 11726, "INVITE", "b2bua-cap-fail", 3*time.Second, "SIP/2.0 404")
 	if !strings.Contains(got, "SIP/2.0 404") {
 		t.Fatalf("unroutable INVITE must get 404, got:\n%s", got)
 	}
@@ -7213,7 +7205,7 @@ func TestPeerCallCapReleasedOnFailure(t *testing.T) {
 	defer uacClient.Close()
 	dialogCli := sipgo.NewDialogClientCache(uacClient, sip.ContactHeader{})
 
-	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 45726}
+	bridgeURI := sip.Uri{User: "5551234", Host: "127.0.0.1", Port: 11726}
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 

@@ -22,7 +22,7 @@ func TestNewMediaPoolRangePrecedence(t *testing.T) {
 			name: "rtp section",
 			cfg: &config.Config{
 				Listen: config.ListenConfig{Media: config.MediaConfig{RTPTimeout: config.Duration(5 * time.Minute)}},
-				RTP:    config.RTPNetConfig{PortMin: 21000, PortMax: 21003}, // 4 ports → 2 pairs
+				RTP:    config.RTPNetConfig{PortMin: 15000, PortMax: 15003}, // 4 ports → 2 pairs
 			},
 			pairs: 2,
 		},
@@ -30,7 +30,7 @@ func TestNewMediaPoolRangePrecedence(t *testing.T) {
 			name: "legacy listen.media range",
 			cfg: &config.Config{
 				Listen: config.ListenConfig{Media: config.MediaConfig{
-					PortRange:  config.PortRange{Min: 22000, Max: 22007}, // 8 ports → 4 pairs
+					PortRange:  config.PortRange{Min: 15100, Max: 15107}, // 8 ports → 4 pairs
 					RTPTimeout: config.Duration(5 * time.Minute),
 				}},
 			},
