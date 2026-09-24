@@ -48,13 +48,13 @@ const (
 )
 
 // attemptResult is what one gateway attempt reports back to the failover
-// loop. ok means a 2xx was relayed and the dialog is live (final carries
-// it); retryable false means the pump already relayed a final response
-// that ends the call (3xx, 401/407 or a 4xx other than 408 — the server
-// transaction can finalise only once, so the series must stop); penalize
-// asks the caller to put the gateway into cooldown (it produced no
-// response at all while FreeSWITCH was still waiting); kind/code/reason
-// feed the exhausted-budget synthesis.
+// loop. ok means a 2xx was accepted and the dialog is confirmed; retryable
+// false means the pump already relayed a final response that ends the call
+// (3xx, 401/407 or a 4xx other than 408 — the server transaction can
+// finalise only once, so the series must stop); penalize asks the caller
+// to put the gateway into cooldown (it produced no response at all while
+// FreeSWITCH was still waiting); kind/code/reason feed the exhausted-budget
+// synthesis.
 type attemptResult struct {
 	ok        bool
 	retryable bool
@@ -62,7 +62,6 @@ type attemptResult struct {
 	kind      attemptKind
 	code      int
 	reason    string
-	final     *sip.Response // the relayed 2xx, when ok
 }
 
 // onInvite proxies a call in whichever direction it is going and anchors
@@ -73,8 +72,8 @@ type attemptResult struct {
 // at a registered binding — but they share this shape:
 //
 //	parse the offer → allocate media → build the far-side offer →
-//	forward → on the answer, negotiate codecs and build the near-side
-//	answer → relay → tie the media session's lifetime to the dialog.
+//	forward → on each fork's answer, negotiate codecs and build the
+//	near-side answer → on the 2xx, confirm the dialog → relay.
 func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
 	if isInDialog(req) {
 		s.onReInvite(req, tx)
@@ -126,6 +125,18 @@ func (s *Server) isPSTNBridgeInvite(req *sip.Request, src netip.AddrPort) bool {
 	return port == s.topo.pstn.match.Port
 }
 
+// beginDialog opens the call's record, or answers 482 when the INVITE
+// merges with one still in progress (RFC 3261 §8.2.2.2: same Call-ID and
+// From tag as a transaction the proxy is already working on).
+func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane) (*dialog, bool) {
+	d, ok := s.dialogs.begin(req, callerPlane)
+	if !ok {
+		s.reject(req, tx, 482, "Loop Detected")
+		return nil, false
+	}
+	return d, true
+}
+
 // inviteToUpstream handles a call placed BY a public client.
 func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
 	from, ok := s.publicSideFor(req)
@@ -145,13 +156,16 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// ctx is the whole-series backstop: the 5-minute inviteTimeout,
 	// cancellable — a client CANCEL cancels the series, never just the
 	// attempt in flight.
-	ctx, cancel := context.WithTimeout(context.Background(), inviteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
 	// One record from here to teardown: the dialog owns the media session,
-	// the CANCEL bridge and the answer bookkeeping, and end() is the single
+	// the CANCEL bridge and the per-fork answers, and end() is the single
 	// exit whether the call connects or not.
-	d := s.dialogs.begin(fsip.CallID(req))
+	d, ok := s.beginDialog(req, tx, planePublic)
+	if !ok {
+		return
+	}
 	defer d.endUnlessUp()
 
 	offer, err := s.buildUpstreamOffer(ctx, d, body)
@@ -169,8 +183,13 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// cancel — never a per-attempt one — so a CANCEL landing between two
 	// attempts still ends the whole series through the stale entry, and the
 	// loop's ctx check stops the next attempt from starting.
+	//
+	// The hook runs inside sipgo's transaction lock, and sipgo sends the
+	// client its 487 only after the hook returns, so it does no network
+	// I/O: it marks the call cancelled (from now on no 2xx can confirm it)
+	// and hands the CANCEL to a goroutine.
 	if !tx.OnCancel(func(*sip.Request) {
-		if !s.cancelPending(req) {
+		if !s.cancelCall(d, cancelByCaller) {
 			// No attempt in flight (between attempts, or before the first):
 			// there is nothing to CANCEL on the wire, but the series must
 			// still stop.
@@ -222,8 +241,15 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 			"upstream", name, "attempt", attempt+1,
 			"rtp_public_port", sess.publicPort,
 			"rtp_private_port", sess.privatePort,
-			"codec", codecNames(sess.codecs))
+			"codec", codecNames(sess.negotiated()))
 
+		// The pending entry points at THIS attempt's forwarded request — its
+		// Via branch and destination are what a CANCEL must carry — BEFORE
+		// the INVITE is sent, so no CANCEL can land between the two.
+		a := &inviteAttempt{req: out, cancel: cancel}
+		if !d.track(a) {
+			break // the caller cancelled before this attempt started
+		}
 		// Started on ctx, the series context: the client transaction must
 		// outlive the attempt so its CANCEL and its retransmissions are
 		// still matched.
@@ -240,26 +266,32 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 			s.upstreamCooldown.Penalize(name, cooldown)
 			continue
 		}
-		// The pending entry now points at THIS attempt's forwarded request —
-		// its Via branch and destination are what a CANCEL must carry.
-		d.track(&inviteAttempt{req: out, cancel: cancel, fromTag: fsip.FromTag(req)})
+		if d.markSent(a) {
+			// A CANCEL took the attempt while the INVITE was being sent: it
+			// could not go out ahead of the INVITE, so it goes out now.
+			go s.sendCancel(a)
+		}
 
-		final, responded := s.pumpInvite(ctx, req, tx, clTx, offer, s.topo.private, true)
-		clTx.Terminate()
+		// In-dialog traffic rides the WINNING switch: directionFor sends the
+		// client's ACKs and BYEs to this address, and the winner's Contact is
+		// what their Request-URI names.
+		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+			near: from, far: s.topo.private, callee: calleeUpstream,
+			calleeRemote: entry.host, transport: from.transport}
+		r := s.pumpInvite(ctx, l)
 
-		if final != nil {
+		if r.final != nil {
 			// ANY final response ends the series — pumpInvite has already
-			// relayed it. A 486 is the callee's own judgement and must never
-			// be retried on another switch (D7); only a 2xx commits the call.
+			// relayed it (and, for a 2xx, confirmed the dialog first). A 486
+			// is the callee's own judgement and must never be retried on
+			// another switch (D7).
 			s.upstreamCooldown.Recover(name)
-			if final.StatusCode/100 == 2 {
-				// In-dialog traffic rides the WINNING switch: directionFor
-				// sends the client's ACKs and BYEs to this address, and the
-				// winner's Contact is what their Request-URI names.
-				s.commit(d, req, final, entry.host, from.transport, false)
-			}
 			return
 		}
+		if r.finalised {
+			return // the pump answered the client itself (488)
+		}
+		responded := r.responded
 		// No final response. Retry another node ONLY when this one produced
 		// nothing at all AND the attempt failed at the transport level. The
 		// `!responded` half is an invariant, not a heuristic: a node that
@@ -279,13 +311,28 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 			"upstream", name, "cooldown", cooldown.String(), "sip_call_id", fsip.CallID(req))
 	}
 
-	if ctx.Err() != nil {
-		return // the caller is already answered (the CANCEL handling did it)
-	}
 	// Every node failed and nothing was relayed: 503 tells the client's own
 	// failover (or the human) to try again rather than pretending the callee
 	// is unreachable.
-	s.reject(req, tx, 503, "Service Unavailable")
+	s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
+}
+
+// giveUp sends the one final response a caller is owed when its INVITE
+// ended without one being relayed: nothing when its own CANCEL already got
+// it a 487 from sipgo; 408 when the backstop expired (RFC 3261 §16.7 step
+// 6, §16.8); 487 when an orphan CANCEL ended it; the path's own status
+// otherwise.
+func (s *Server) giveUp(ctx context.Context, d *dialog, req *sip.Request, tx sip.ServerTransaction,
+	code int, reason string) {
+	switch {
+	case d.callerCancelled():
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		s.reject(req, tx, 408, "Request Timeout")
+	case ctx.Err() != nil || d.wasCancelled():
+		s.reject(req, tx, 487, "Request Terminated")
+	default:
+		s.reject(req, tx, code, reason)
+	}
 }
 
 // hashUserFor derives the hashing identity of a request: the From user
@@ -331,11 +378,14 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), inviteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
 	// One record from here to teardown, as in inviteToUpstream.
-	d := s.dialogs.begin(fsip.CallID(req))
+	d, ok := s.beginDialog(req, tx, planePrivate)
+	if !ok {
+		return
+	}
 	defer d.endUnlessUp()
 
 	offer, err := s.buildPublicOffer(d, body)
@@ -362,31 +412,49 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		"public_remote", dest,
 		"rtp_public_port", sess.publicPort,
 		"rtp_private_port", sess.privatePort,
-		"codec", codecNames(sess.codecs))
-
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
-	if err != nil {
-		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)
-		s.reject(req, tx, 480, "Temporarily Unavailable")
-		return
-	}
-	defer clTx.Terminate()
-	d.track(&inviteAttempt{req: out, cancel: cancel, fromTag: fsip.FromTag(req)})
-	defer d.untrack()
+		"codec", codecNames(sess.negotiated()))
 
 	// A CANCEL from FreeSWITCH terminates this server transaction; when it
 	// does, the INVITE we sent must be cancelled too or the far side would
 	// keep ringing. A false return means the transaction is ALREADY
-	// terminated — the CANCEL beat this registration — in which case the
-	// hook will never fire and the far-side leg must be cancelled right
-	// here instead.
-	if !tx.OnCancel(func(*sip.Request) { s.cancelPending(req) }) {
-		s.cancelPending(req)
+	// terminated — the CANCEL beat this registration — and nothing has
+	// been sent yet: ending here is the whole of the work left.
+	if !tx.OnCancel(func(*sip.Request) {
+		if !s.cancelCall(d, cancelByCaller) {
+			cancel()
+		}
+	}) {
+		return
+	}
+	a := &inviteAttempt{req: out, cancel: cancel}
+	if !d.track(a) {
+		return // cancelled before the INVITE went out
+	}
+	defer d.untrack()
+
+	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	if err != nil {
+		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)
+		s.giveUp(ctx, d, req, tx, 480, "Temporarily Unavailable")
+		return
+	}
+	if d.markSent(a) {
+		go s.sendCancel(a)
 	}
 
-	final, _ := s.pumpInvite(ctx, req, tx, clTx, offer, s.topo.private, false)
-	if final != nil && final.StatusCode/100 == 2 {
-		s.commit(d, req, final, dest, binding.Transport, true)
+	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+		near: s.topo.private, far: to, callee: calleeClient,
+		calleeRemote: dest, transport: binding.Transport, fromPrivate: true}
+	if r := s.pumpInvite(ctx, l); !r.finalised {
+		// The client never gave a final response: its INVITE timed out
+		// (Timer B), its transport failed, or the backstop expired. The
+		// proxy owes FreeSWITCH a final either way (RFC 3261 §16.7 step 6)
+		// rather than leaving it to its own Timer B.
+		code, reason := 480, "Temporarily Unavailable"
+		if errors.Is(clTx.Err(), sip.ErrTransactionTimeout) {
+			code, reason = 408, "Request Timeout"
+		}
+		s.giveUp(ctx, d, req, tx, code, reason)
 	}
 }
 
@@ -395,8 +463,8 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 // dialed in order until one connects the call. Each attempt is a fresh
 // forward of FreeSWITCH's ORIGINAL INVITE — same Call-ID, CSeq, From and
 // To, a new Via branch and its own copy of the offer — so every carrier
-// sees an ordinary, complete INVITE while the media session and the dialog
-// FreeSWITCH sees are shared across all of them.
+// sees an ordinary, complete INVITE while the media session and the record
+// FreeSWITCH's INVITE opened are shared across all of them.
 //
 // A failed attempt's final is never relayed to FreeSWITCH: the server
 // transaction can finalise only once, and a later gateway may still connect
@@ -436,12 +504,17 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 	// wholeCtx is the whole-call backstop the entire attempt series runs
 	// under: the 5-minute inviteTimeout, cancellable — a FreeSWITCH CANCEL
 	// cancels the series, never just the attempt in flight.
-	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), inviteTimeout)
+	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer wholeCancel()
 
 	// One record from here to teardown, as in inviteToUpstream. The whole
-	// failover series shares it: one media session, one CANCEL bridge.
-	d := s.dialogs.begin(fsip.CallID(req))
+	// failover series shares it: one media session, one CANCEL bridge. The
+	// caller is FreeSWITCH, whose in-dialog requests arrive on the private
+	// socket (the double Record-Route puts it first in its route set).
+	d, ok := s.beginDialog(req, tx, planePrivate)
+	if !ok {
+		return
+	}
 	defer d.endUnlessUp()
 
 	offer, err := s.buildPublicOffer(d, body)
@@ -488,7 +561,7 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 	// entry, and the loop's wholeCtx check stops the next attempt from
 	// starting.
 	if !tx.OnCancel(func(*sip.Request) {
-		if !s.cancelPending(req) {
+		if !s.cancelCall(d, cancelByCaller) {
 			// No attempt in flight (between attempts, or before the first):
 			// there is nothing to CANCEL on the wire, but the series must
 			// still stop.
@@ -529,7 +602,7 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 		// Every attempt re-forwards the ORIGINAL request (prepareForward
 		// clones, so FreeSWITCH's INVITE stays intact): a fresh Via branch
 		// and Record-Route pair per attempt, same Call-ID/CSeq/From/To —
-		// it is one dialog FreeSWITCH is still waiting on, whatever we had
+		// it is one call FreeSWITCH is still waiting on, whatever we had
 		// to try to connect it.
 		out, err := s.prepareForward(req, s.topo.private, to, gw.host, true)
 		if err != nil {
@@ -549,8 +622,13 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 			"public_remote", gw.host,
 			"rtp_public_port", sess.publicPort,
 			"rtp_private_port", sess.privatePort,
-			"codec", codecNames(sess.codecs))
+			"codec", codecNames(sess.negotiated()))
 
+		// Tracked before it is sent, as in inviteToUpstream.
+		a := &inviteAttempt{req: out, cancel: wholeCancel}
+		if !d.track(a) {
+			break // FreeSWITCH cancelled before this attempt started
+		}
 		// Started on wholeCtx, NOT on an attempt context: the client
 		// transaction must survive the attempt budget so the expiry path
 		// can complete a CANCEL against it (decision #4).
@@ -566,20 +644,21 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 			s.pstnCooldown.Penalize(name, cooldown)
 			continue
 		}
-		// The pending entry now points at THIS attempt's forwarded request
-		// — its Via branch and destination are what a CANCEL must carry.
-		d.track(&inviteAttempt{req: out, cancel: wholeCancel, fromTag: fsip.FromTag(req)})
+		if d.markSent(a) {
+			go s.sendCancel(a)
+		}
 
-		res := s.pumpPSTNAttempt(wholeCtx, budget, req, out, tx, clTx, offer, to, name)
-		clTx.Terminate()
+		// In-dialog traffic rides the WINNING gateway: directionFor sends
+		// FreeSWITCH's ACKs and BYEs to this address, and the winner's
+		// Contact is what their Request-URI names.
+		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+			near: s.topo.private, far: to, callee: calleePSTN,
+			calleeRemote: gw.host, transport: "udp", fromPrivate: true}
+		res := s.pumpPSTNAttempt(wholeCtx, budget, l, name)
 
 		switch {
 		case res.ok:
 			s.pstnCooldown.Recover(name)
-			// In-dialog traffic rides the WINNING gateway: directionFor
-			// sends FreeSWITCH's ACKs and BYEs to this address, and the
-			// winner's Contact is what their Request-URI names.
-			s.commit(d, req, res.final, gw.host, "udp", true)
 			return
 		case !res.retryable:
 			// The pump relayed a final that ends the call (a 3xx, 401/407
@@ -607,8 +686,10 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 		// wholeCancel (see the OnCancel hook above).
 	}
 
-	if wholeCtx.Err() != nil {
-		return // the caller is already answered (the CANCEL handling did it)
+	if wholeCtx.Err() != nil || d.wasCancelled() {
+		// FreeSWITCH cancelled (sipgo answered it), or the backstop expired.
+		s.giveUp(wholeCtx, d, req, tx, 408, "Request Timeout")
+		return
 	}
 	// Every gateway failed and nothing was relayed: synthesise the ONE
 	// status FreeSWITCH sees. An anchor failure answers 488 (no carrier can
@@ -625,299 +706,6 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 408, "Request Timeout")
 	default:
 		s.reject(req, tx, 503, "Service Unavailable")
-	}
-}
-
-// pumpPSTNAttempt drives one gateway attempt to its end and classifies the
-// outcome for the failover loop. It is deliberately NOT pumpInvite with
-// options: the two differ in exactly the ways failover forces — an
-// attempt can end in a retry (its 408/>=500 finals are HELD, never
-// relayed), its budget is a timer rather than the transaction's context,
-// and an answer it can no longer serve must be torn down rather than left
-// to retransmit.
-//
-// wholeCtx is the whole-call context the client transaction was started on
-// (it survives the attempt budget — the CANCEL the budget expiry sends is
-// what ends the attempt). budget bounds the attempt. req is FreeSWITCH's
-// original INVITE, toward which responses are relayed; out is THIS
-// attempt's forwarded request, whose Via branch and destination the CANCEL
-// must echo. to is the public side the INVITE went out on (the identity a
-// teardown toward the gateway must advertise).
-func (s *Server) pumpPSTNAttempt(wholeCtx context.Context, budget time.Duration,
-	req, out *sip.Request, tx sip.ServerTransaction, clTx sip.ClientTransaction,
-	offer *offerResult, to side, gateway string) attemptResult {
-
-	// The budget is enforced by a timer, NOT a derived context: the client
-	// transaction must outlive the budget so the expiry path can complete a
-	// CANCEL against a live transaction.
-	timer := time.NewTimer(budget)
-	defer timer.Stop()
-
-	answered := false  // this attempt has already negotiated its answer
-	responded := false // any response was received (liveness evidence)
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue // a 100 Trying is hop-by-hop; ours already went out
-			}
-			if wholeCtx.Err() != nil {
-				// FreeSWITCH cancelled while this response was in flight:
-				// nothing may be relayed (its transaction is already
-				// terminated). A 2xx that raced the CANCEL still believes
-				// it has a live dialog — complete and tear it down. A
-				// provisional leaves the gateway's 487 still to come, so
-				// drain for it.
-				if res.StatusCode/100 == 2 {
-					go s.ackThenBye(res, to)
-				}
-				if res.StatusCode < 200 {
-					s.drainCancelledInvite(clTx, to)
-				}
-				return attemptResult{retryable: true, kind: failDial, code: 503,
-					reason: "Service Unavailable"}
-			}
-			// A final of 408 or >= 500 is HELD, never relayed: the server
-			// transaction toward FreeSWITCH can finalise only once, and a
-			// later gateway may still connect the call. The failover loop
-			// synthesises this code only when every attempt has failed.
-			if res.StatusCode >= 500 || res.StatusCode == 408 {
-				return attemptResult{retryable: true, kind: failReal,
-					code: res.StatusCode, reason: res.Reason}
-			}
-			responded = true
-			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
-				// FreeSWITCH must see FreeSBC as the dialog's remote
-				// target, or its in-dialog requests would bypass the SBC
-				// and its media anchor.
-				fsip.SetContact(relayed, s.topo.private.uri())
-				if len(res.Body()) == 0 {
-					return nil
-				}
-				var body []byte
-				if answered {
-					// A restated answer (the 200 echoing a body-bearing 183,
-					// say): repeat the body FreeSWITCH already accepted —
-					// re-negotiating would re-latch media under it.
-					body = offer.dialog.lastAnswer()
-				} else {
-					// Only the first body-bearing response OF THIS ATTEMPT
-					// is negotiated. rePoint tells applyPSTNAnswer whether
-					// an EARLIER attempt already latched the public side to
-					// a failed gateway: the latch must be re-armed to this
-					// gateway's address, or its media would be refused as a
-					// hijack.
-					var err error
-					body, err = s.applyPSTNAnswer(offer, res.Body(), offer.dialog.lastAnswer() != nil)
-					if err != nil {
-						return err
-					}
-					answered = true
-					// The relay starts on the first anchorable answer;
-					// Session.Start's own CompareAndSwap makes every later
-					// attempt's call a no-op.
-					offer.sess().rtp.Start()
-				}
-				fsip.SetSDPBody(relayed, body)
-				offer.dialog.setLastAnswer(relayed.Body())
-				return nil
-			})
-			switch {
-			case errors.Is(err, errResponseDropped):
-				s.log.Debug("dropping unroutable pstn response", "code", res.StatusCode,
-					"sip_call_id", fsip.CallID(req), "gateway", gateway)
-				continue
-			case err != nil:
-				s.log.Warn("pstn media negotiation failed", "err", err,
-					"sip_call_id", fsip.CallID(req), "gateway", gateway)
-				if res.StatusCode/100 == 2 {
-					// The gateway believes the dialog is live and will
-					// retransmit its 200: complete and tear it down. The
-					// teardown goes out the PUBLIC side — the gateway can
-					// only route responses back to the public identity.
-					go s.ackThenBye(res, to)
-				}
-				// Nothing of this response reaches FreeSWITCH — not even a
-				// media-bearing provisional that could not be anchored. 488
-				// outranks every other failure at exhaustion.
-				return attemptResult{retryable: true, kind: failAnchor,
-					code: 488, reason: "Not Acceptable Here"}
-			}
-			switch {
-			case res.StatusCode < 200:
-				// A provisional; keep pumping.
-			case res.StatusCode < 300:
-				// The call is up: the dialog is committed from this 2xx.
-				return attemptResult{ok: true, final: res}
-			default:
-				// Relayed and final: a 3xx, 401/407, or a 4xx other than
-				// the held 408. These are the far end's verdict on THIS
-				// call — a wrong number will be wrong on every gateway
-				// (404/486) and a redirect is a response to this dialog —
-				// so the series stops here.
-				return attemptResult{retryable: false}
-			}
-		case <-clTx.Done():
-			// The transaction died without a final: the INVITE never got
-			// out, or the remote vanished mid-ring. Zero responses while
-			// FreeSWITCH is still waiting is the cooldown case.
-			return attemptResult{retryable: true, kind: failDial, code: 503,
-				reason: "Service Unavailable", penalize: !responded && wholeCtx.Err() == nil}
-		case <-wholeCtx.Done():
-			// FreeSWITCH cancelled (or the 5-minute backstop fired): the
-			// attempt ends, and the series with it. No penalize: the caller
-			// gave up; the gateway was not given its chance to fail. The
-			// CANCEL is already on the wire (the OnCancel hook sent it before
-			// cancelling this context), but its 487 is not necessarily here
-			// yet — drain for it.
-			s.drainCancelledInvite(clTx, to)
-			return attemptResult{retryable: true, kind: failDial, code: 503,
-				reason: "Service Unavailable"}
-		case <-timer.C:
-			return s.expirePSTNAttempt(wholeCtx, req, out, clTx, to, responded, gateway)
-		}
-	}
-}
-
-// expirePSTNAttempt ends an attempt whose budget ran out. It sends the
-// CANCEL (built from the attempt's own forwarded request, so it carries the
-// Via branch and destination the gateway will match), then drains the
-// transaction briefly for the final that CANCEL provokes — the drain is
-// what tells a gateway that answered (a 2xx that raced the CANCEL, which
-// must be ACKed and BYEd or it retransmits its 200) from one that was
-// simply silent (nothing within pstnDrain: the cooldown case).
-func (s *Server) expirePSTNAttempt(wholeCtx context.Context, req, out *sip.Request,
-	clTx sip.ClientTransaction, to side, responded bool,
-	gateway string) attemptResult {
-	s.log.Warn("pstn attempt budget expired; cancelling",
-		"gateway", gateway, "sip_call_id", fsip.CallID(req))
-
-	// A short-lived transaction of its own: per RFC 3261 §9.1 the CANCEL
-	// echoes the INVITE's branch, which fsip.BuildCancel(out) provides.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.client.TransactionRequest(ctx, fsip.BuildCancel(out), noBuild); err != nil {
-		s.log.Debug("cancel pstn attempt", "err", err, "sip_call_id", fsip.CallID(req))
-		return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-			penalize: !responded && wholeCtx.Err() == nil}
-	}
-
-	// Drain briefly. Nothing read here is relayed — the attempt is over —
-	// but what arrives classifies how it ended.
-	drain := time.NewTimer(pstnDrain)
-	defer drain.Stop()
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue
-			}
-			switch {
-			case res.StatusCode == 200:
-				// A 2xx raced the CANCEL: the gateway accepted a call the
-				// budget had already given up on. It responded, so no
-				// cooldown; complete and tear down the dialog it believes
-				// exists.
-				s.log.Warn("pstn gateway answered as its attempt expired",
-					"gateway", gateway, "sip_call_id", fsip.CallID(req))
-				go s.ackThenBye(res, to)
-				return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout"}
-			case res.StatusCode == 487:
-				// The CANCEL's own product: the attempt failed by expiry.
-				return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-					penalize: !responded && wholeCtx.Err() == nil}
-			default:
-				// Any other final racing the CANCEL is the gateway's real
-				// word on the call; surface its code like any held final.
-				return attemptResult{retryable: true, kind: failReal,
-					code: res.StatusCode, reason: res.Reason}
-			}
-		case <-drain.C:
-			// Nothing within the drain: a silent gateway. Ring timeout;
-			// cooldown when FreeSWITCH was still waiting for it.
-			return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-				penalize: !responded && wholeCtx.Err() == nil}
-		case <-wholeCtx.Done():
-			// The call ended while we were draining the attempt; nothing
-			// more may be relayed either way.
-			return attemptResult{retryable: true, kind: failRing, code: 408, reason: "Request Timeout",
-				penalize: !responded && wholeCtx.Err() == nil}
-		}
-	}
-}
-
-// drainCancelledInvite reads whatever the far end still has to say after the
-// call has been cancelled, briefly and without relaying any of it.
-//
-// The CANCEL for the forwarded INVITE is already on the wire (cancelPending
-// sent it before cancelling the caller's context), but the final it provokes
-// — the 487, or a 2xx that raced the CANCEL — may still be in flight. The
-// caller returns as soon as this function does and then Terminate()s the
-// client transaction, and a final response that matches no transaction is
-// never ACKed (RFC 3261 §17.1.1.3): the far end retransmits it until Timer H
-// and the log fills with "ACK missed". Keeping the transaction alive to
-// match the final is what makes sipgo's transaction layer send that ACK.
-//
-// Nothing read here may be relayed — the caller's server transaction is
-// already terminated. A 2xx is the one response with work left in it: the
-// far end believes it has a live dialog, so it is completed and torn down.
-// from is the side that teardown must go out on, as in ackThenBye.
-func (s *Server) drainCancelledInvite(clTx sip.ClientTransaction, from side) {
-	drain := time.NewTimer(pstnDrain)
-	defer drain.Stop()
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue // a 100 Trying carries nothing to match
-			}
-			if res.StatusCode/100 == 2 {
-				go s.ackThenBye(res, from)
-			}
-			if res.StatusCode >= 200 {
-				// The final: a non-2xx was ACKed by the transaction layer on
-				// its way in, a 2xx is being torn down. Nothing left to wait
-				// for.
-				return
-			}
-		case <-clTx.Done():
-			// The transaction died under us (a transport error, or a
-			// Terminate from another path): no response can be matched any
-			// more, so there is nothing left to drain for.
-			return
-		case <-drain.C:
-			return
-		}
 	}
 }
 
@@ -939,454 +727,6 @@ func pstnRequestURI(u sip.Uri, gw netip.AddrPort) sip.Uri {
 		u.UriParams.Remove("transport")
 	}
 	return u
-}
-
-// pumpInvite relays every response of a forwarded INVITE, rewriting the
-// Contact and negotiating the SDP answer on whichever response carries
-// one. It returns the final response, or nil if the transaction died, plus
-// whether the far side responded AT ALL — any fsip.Forwardable response, even a
-// provisional one, counts.
-//
-// The responded flag is what makes retrying another node safe: a retry is
-// only allowed when nothing was answered, so a node that spoke is always
-// heard out and a call whose answer was already applied can never be
-// re-negotiated against a second node (see inviteToUpstream).
-//
-// toUpstream selects which direction's answer processing applies.
-func (s *Server) pumpInvite(ctx context.Context, req *sip.Request, tx sip.ServerTransaction,
-	clTx sip.ClientTransaction, offer *offerResult, near side, toUpstream bool) (*sip.Response, bool) {
-
-	answered := false
-	responded := false
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue // a 100 Trying is hop-by-hop; ours already went out
-			}
-			responded = true
-			err := s.relayResponse(req, tx, res, func(out *sip.Response) error {
-				// Whichever side answers, the near side must see FreeSBC as
-				// the dialog's remote target — otherwise in-dialog requests
-				// would bypass the SBC and its media anchor.
-				fsip.SetContact(out, near.uri())
-				if len(res.Body()) == 0 {
-					return nil
-				}
-				if answered {
-					// A restated answer: send the body we already built, so
-					// the near side sees a consistent session.
-					fsip.SetSDPBody(out, offer.dialog.lastAnswer())
-				} else {
-					var body []byte
-					var err error
-					if toUpstream {
-						body, err = s.applyUpstreamAnswer(offer, res.Body(), offer.offer.Audio.WebRTC())
-					} else {
-						body, err = s.applyPublicAnswer(offer, res.Body())
-					}
-					if err != nil {
-						return err
-					}
-					fsip.SetSDPBody(out, body)
-					// Only the FIRST answer is negotiated. A later
-					// provisional or the 200 restating the same answer must
-					// not reallocate or re-latch anything.
-					answered = true
-				}
-				offer.dialog.setLastAnswer(out.Body())
-				return nil
-			})
-			switch {
-			case errors.Is(err, errResponseDropped):
-				continue
-			case err != nil:
-				s.log.Warn("media negotiation failed", "err", err, "sip_call_id", fsip.CallID(req))
-				// Relaying an answer we cannot anchor would set up a call
-				// with no audio, so refuse the requesting side. If the
-				// answer came in a 2xx, the far end now believes it has a
-				// live dialog — it must be ACKed and then BYEd, or it sits
-				// there retransmitting its 200 until its own timers give
-				// up.
-				if res.StatusCode/100 == 2 {
-					go s.ackThenBye(res, near)
-				}
-				s.reject(req, tx, 488, "Not Acceptable Here")
-				return nil, responded
-			}
-			if res.StatusCode >= 200 {
-				return res, responded
-			}
-		case <-clTx.Done():
-			if err := clTx.Err(); err != nil {
-				s.log.Debug("invite client transaction ended", "err", err, "sip_call_id", fsip.CallID(req))
-			}
-			return nil, responded
-		case <-ctx.Done():
-			// The caller is gone: FreeSWITCH cancelled, or the backstop
-			// fired. The CANCEL is on the wire, but the far end's 487 may
-			// still be in flight — drain for it so the transaction layer can
-			// match it and send the ACK the far end expects, instead of the
-			// caller terminating the transaction first and leaving the 487
-			// unACKed.
-			s.drainCancelledInvite(clTx, near)
-			return nil, responded
-		}
-	}
-}
-
-// ackThenBye completes and immediately tears down a dialog FreeSBC
-// accepted at the SIP layer but cannot anchor media for. RFC 3261 requires
-// a 2xx to be ACKed; without that the far end retransmits its 200 until
-// Timer H, and the dialog lingers either way. ACK, then BYE.
-func (s *Server) ackThenBye(res *sip.Response, from side) {
-	seq := fsip.CSeqNumber(res)
-	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), seq)
-	if err := s.client.WriteRequest(ack, noBuild); err != nil {
-		s.log.Debug("ack unanchorable answer", "err", err)
-		return
-	}
-
-	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), seq+1)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	clTx, err := s.client.TransactionRequest(ctx, bye, noBuild)
-	if err != nil {
-		s.log.Debug("bye unanchorable dialog", "err", err)
-		return
-	}
-	defer clTx.Terminate()
-	select {
-	case <-clTx.Responses():
-	case <-clTx.Done():
-	case <-ctx.Done():
-	}
-}
-
-// commit records the dialog an answered INVITE established and hands its
-// media session over to it: from here the session's lifetime is the
-// dialog's, and dialog.end() is what releases it.
-//
-// calleeRemote is the address the call was connected to; fromPrivate says
-// which plane the caller is on, which is the only thing the three call
-// paths disagree about.
-func (s *Server) commit(d *dialog, req *sip.Request, final *sip.Response,
-	calleeRemote, transport string, fromPrivate bool) {
-
-	r := dialogRoute{transport: transport}
-	// The caller's signaling address is always where its INVITE came from;
-	// the callee's is the destination this call was finally connected to —
-	// the WINNING switch or gateway, so in-dialog traffic rides it.
-	callerRemote, callerContact := &r.publicRemote, &r.publicContact
-	calleeAddr, calleeContact := &r.privateRemote, &r.privateContact
-	if fromPrivate {
-		callerRemote, callerContact = &r.privateRemote, &r.privateContact
-		calleeAddr, calleeContact = &r.publicRemote, &r.publicContact
-	}
-	*callerRemote, *calleeAddr = req.Source(), calleeRemote
-	// Which endpoint's Contact arrived on which message follows from the
-	// direction and nothing else: the caller's rode in on the INVITE, the
-	// callee's came back on the 200.
-	if u, ok := fsip.ContactURI(req); ok {
-		*callerContact = u
-	}
-	if u, ok := fsip.ContactURI(final); ok {
-		*calleeContact = u
-	}
-	d.confirm(r)
-}
-
-// onReInvite proxies an in-dialog INVITE — a hold or unhold from a client,
-// a session-timer refresh from FreeSWITCH, a codec change from either.
-//
-// The body MUST be rewritten. Forwarding it unchanged would hand each side
-// the other's media address mid-call, so the anchor would simply fall away
-// on the first refresh and (for a browser) FreeSWITCH would receive ICE
-// candidates and a DTLS fingerprint. What is NOT re-done is allocation:
-// the session keeps the ports and, for a WebRTC leg, the ICE and DTLS
-// state it already holds, so a renegotiation never interrupts media.
-func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
-	from, to, dest, ok := s.directionFor(req)
-	if !ok {
-		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
-		return
-	}
-	body := req.Body()
-	if len(body) == 0 {
-		// An offerless re-INVITE would make FreeSBC the offerer and
-		// require answering against the ACK. Not supported; refusing is
-		// honest and leaves the existing session untouched.
-		s.reject(req, tx, 488, "Not Acceptable Here")
-		return
-	}
-	d, found := s.dialogs.confirmed(fsip.CallID(req))
-	if !found || d.session() == nil {
-		// No anchored session to renegotiate against. Forwarding the body
-		// as-is here would be the exact leak this function exists to
-		// prevent, so refuse instead.
-		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
-		return
-	}
-
-	reOffer, parsed, err := s.rebuildInDialogOffer(d, body, to.plane)
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
-	}
-	out, err := s.prepareForward(req, from, to, dest, false)
-	if err != nil {
-		s.reject(req, tx, 483, "Too Many Hops")
-		return
-	}
-	s.retargetInDialog(req, out, to)
-	fsip.SetContact(out, to.uri())
-	fsip.SetSDPBody(out, reOffer)
-
-	ctx, cancel := context.WithTimeout(context.Background(), inviteTimeout)
-	defer cancel()
-
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
-	if err != nil {
-		s.log.Debug("forward re-INVITE", "err", err, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 503, "Service Unavailable")
-		return
-	}
-	defer clTx.Terminate()
-
-	answered := false
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				// sipgo never closes this channel — it ends a transaction
-				// through Done() — so this arm is unreachable. A closed
-				// channel is permanently ready, so stop selecting on it and
-				// let the loop end the way it ends for any transaction
-				// that produced no further response.
-				responses = nil
-				continue
-			}
-			if !fsip.Forwardable(res) {
-				continue
-			}
-			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
-				fsip.SetContact(relayed, from.uri())
-				if len(res.Body()) == 0 {
-					return nil
-				}
-				if answered {
-					fsip.SetSDPBody(relayed, d.lastAnswer())
-					return nil
-				}
-				reAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
-				if err != nil {
-					return err
-				}
-				fsip.SetSDPBody(relayed, reAnswer)
-				d.setLastAnswer(relayed.Body())
-				answered = true
-				return nil
-			})
-			switch {
-			case errors.Is(err, errResponseDropped):
-				s.log.Debug("dropping unroutable re-INVITE response", "code", res.StatusCode, "sip_call_id", fsip.CallID(req))
-				continue
-			case err != nil:
-				s.log.Warn("re-INVITE media negotiation failed", "err", err, "sip_call_id", fsip.CallID(req))
-				s.reject(req, tx, 488, "Not Acceptable Here")
-				return
-			}
-			if res.StatusCode >= 200 {
-				return
-			}
-		case <-clTx.Done():
-			s.reject(req, tx, 408, "Request Timeout")
-			return
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// onAck forwards an ACK. A 2xx ACK is a separate end-to-end transaction
-// (RFC 3261 §17.1.1.3) and must be sent statelessly, not through a client
-// transaction — sipgo enforces this by refusing an ACK in
-// TransactionRequest.
-func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	from, to, dest, ok := s.directionFor(req)
-	if !ok {
-		return // nothing to forward it to; an ACK gets no response
-	}
-	out, err := s.prepareForward(req, from, to, dest, false)
-	if err != nil {
-		return
-	}
-	s.retargetInDialog(req, out, to)
-	if err := s.client.WriteRequest(out, noBuild); err != nil {
-		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
-	}
-}
-
-// onCancel forwards a CANCEL that sipgo did not already match to a live
-// INVITE server transaction. When it DID match, sipgo answers 200 and
-// terminates the INVITE itself, which fires the OnCancel hook that
-// cancels our upstream leg — so this path only sees an orphan.
-func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	if s.cancelPending(req) {
-		s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
-		return
-	}
-	// RFC 3261 §9.2: a CANCEL matching no transaction is answered 481, not
-	// 200. Answering 200 would tell the sender its request was cancelled
-	// when nothing was.
-	s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
-}
-
-// onInDialog forwards BYE, INFO and in-dialog INVITE. Direction is decided
-// by where the request came from, and a BYE additionally tears the media
-// session down.
-func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
-	from, to, dest, ok := s.directionFor(req)
-	if !ok {
-		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
-		return
-	}
-	out, err := s.prepareForward(req, from, to, dest, false)
-	if err != nil {
-		s.reject(req, tx, 483, "Too Many Hops")
-		return
-	}
-	s.retargetInDialog(req, out, to)
-	fsip.SetContact(out, to.uri())
-
-	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
-	defer cancel()
-	if _, err := s.forwardAndRelay(ctx, req, tx, out); err != nil {
-		s.log.Warn("forward in-dialog request failed", "err", err,
-			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
-		// The far side never answered, or the request never got out. For a
-		// BYE the dialog is over either way, and answering 408 tells the
-		// switch its hangup FAILED when the proxy is the one that could
-		// not deliver — sofia treats that as a failed BYE and keeps the
-		// leg. Answer 200 instead: the dialog IS being ended, which the
-		// teardown below reflects. And make one stateless attempt to put
-		// the BYE on the wire toward the far side ourselves, so a phone
-		// that never saw it is told the call is over and stops sending
-		// media. A duplicate BYE is harmless (a dialog is only ended once);
-		// the far end's answer to it has no transaction left to match and
-		// is absorbed by the transport layer.
-		if req.Method == sip.BYE {
-			// A clone: the failed client transaction may still hold the
-			// original request (a retransmission timer winding down), so
-			// handing the same object to WriteRequest would race it.
-			if werr := s.client.WriteRequest(out.Clone(), noBuild); werr != nil {
-				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
-					"sip_call_id", fsip.CallID(req))
-			}
-			s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
-		}
-	}
-	if req.Method == sip.BYE {
-		s.teardown(fsip.CallID(req))
-	}
-}
-
-// teardown ends a call's media as soon as its dialog ends, rather than
-// waiting for the silence watchdog — the difference between a port
-// returning to the pool immediately and minutes later.
-func (s *Server) teardown(callID string) {
-	if d, ok := s.dialogs.confirmed(callID); ok {
-		d.end()
-	}
-}
-
-// directionFor decides where an in-dialog request goes, and from which
-// side. Requests from FreeSWITCH go to the client; everything else goes
-// upstream.
-func (s *Server) directionFor(req *sip.Request) (from, to side, dest string, ok bool) {
-	if s.arrivedOnPrivate(req) {
-		// An IN-DIALOG request from FreeSWITCH carries no binding token.
-		// The token only ever rides on the contact FreeSBC REGISTERED; a
-		// dialog's remote target is the Contact FreeSBC put in the INVITE
-		// or the 200, which names the SBC and nothing else. So the dialog
-		// record — not the location table — is what identifies the client
-		// here. Getting this wrong 481s every callee-side hangup.
-		if r, found := s.dialogs.routeFor(fsip.CallID(req)); found && r.publicRemote != "" {
-			if to, ok = s.topo.publicSide(r.transport); ok {
-				return s.topo.private, to, r.publicRemote, true
-			}
-		}
-		// No dialog on record: fall back to the binding token, which is
-		// how a PRE-dialog request (an inbound INVITE) is routed.
-		b, found := s.bindingForRequest(req)
-		if !found {
-			return side{}, side{}, "", false
-		}
-		to, ok = s.topo.publicSide(b.Transport)
-		if !ok {
-			return side{}, side{}, "", false
-		}
-		return s.topo.private, to, b.Source.String(), true
-	}
-	from, ok = s.publicSideFor(req)
-	if !ok {
-		return side{}, side{}, "", false
-	}
-	// The dialog's own record of which switch carries it beats hashing: an
-	// inbound call placed BY fs-b (forwardInboundInvite records
-	// PrivateRemote = its source) must have the client's ACK and BYE return
-	// to fs-b even though the client's user hashes to fs-a. That record is
-	// the whole stickiness guarantee — a dialog must never migrate between
-	// switches mid-call.
-	if r, found := s.dialogs.routeFor(fsip.CallID(req)); found && r.privateRemote != "" {
-		return from, s.topo.private, r.privateRemote, true
-	}
-	// No dialog on record — a race where the ACK beat commitCall, or a
-	// dialog already evicted. Recompute the node from the same identity and
-	// the same pool the INVITE was hashed with: for every request the caller
-	// itself causes that is the node the INVITE went to, so the dialog stays
-	// put without any shared state. It deliberately NEVER 481s: a request
-	// the SBC cannot place is still better forwarded to the most plausible
-	// switch than refused, and the switch itself answers honestly if the
-	// dialog is unknown to it.
-	if name, entry, found := s.selectUpstream(hashUserFor(req)); found {
-		s.log.Debug("in-dialog request without a dialog record; hashing upstream",
-			"sip_call_id", fsip.CallID(req), "upstream", name)
-		return from, s.topo.private, entry.host, true
-	}
-	// An empty pool cannot happen on a validated config: sip.upstream.address
-	// or sip.upstreams.nodes is exactly what enables the proxy at all.
-	return side{}, side{}, "", false
-}
-
-// farContact returns the Request-URI an in-dialog request should carry on
-// its way out: the far endpoint's own Contact, recorded when the dialog was
-// established. Returns ok=false when there is no dialog on record, in
-// which case the caller leaves the Request-URI alone.
-func (s *Server) farContact(req *sip.Request, toward plane) (sip.Uri, bool) {
-	r, found := s.dialogs.routeFor(fsip.CallID(req))
-	if !found {
-		return sip.Uri{}, false
-	}
-	u := r.privateContact
-	if toward == planePublic {
-		u = r.publicContact
-	}
-	if u.Host == "" {
-		return sip.Uri{}, false
-	}
-	return u, true
 }
 
 // publicSideFor returns the public side matching a request's transport.
@@ -1458,71 +798,6 @@ func clientRequestURI(b Binding) sip.Uri {
 		params.Add("transport", b.Transport)
 	}
 	return sip.Uri{User: b.User, Host: host, Port: port, UriParams: params}
-}
-
-// retargetInDialog replaces the Request-URI of a forwarded in-dialog
-// request with the far endpoint's own Contact, undoing the topology hiding
-// the proxy applied when the dialog was established. Falls back to the
-// registration binding (for a request that reaches a client outside any
-// dialog we track), and leaves the URI alone when neither is known.
-func (s *Server) retargetInDialog(req, out *sip.Request, to side) {
-	if u, ok := s.farContact(req, to.plane); ok {
-		out.Recipient = u
-		return
-	}
-	if to.plane == planePublic {
-		if b, ok := s.bindingForRequest(req); ok {
-			out.Recipient = clientRequestURI(b)
-		}
-	}
-}
-
-// cancelPending sends a CANCEL for the INVITE FreeSBC forwarded on behalf
-// of this one.
-//
-// The CANCEL must carry the SAME top Via branch as the INVITE it cancels
-// (RFC 3261 §9.1) — that is how the next hop matches the two — so it is
-// built from the forwarded request rather than from the CANCEL we
-// received, whose branch belongs to a different transaction.
-func (s *Server) cancelPending(req *sip.Request) bool {
-	d, ok := s.dialogs.get(fsip.CallID(req))
-	if !ok {
-		return false
-	}
-	// Taken, not read: exactly one caller may cancel an attempt, and the
-	// INVITE exchange is over for the proxy either way.
-	// The From tag must match the INVITE's (RFC 3261 §9.1). A CANCEL that
-	// names a live Call-ID with somebody else's tag is not a cancel for
-	// this attempt, and is answered like any unknown CANCEL.
-	a, ok := d.takeAttempt(fsip.FromTag(req))
-	if !ok {
-		return false
-	}
-	// Once the CANCEL has been sent and answered, the INVITE exchange is
-	// over as far as the proxy is concerned: the caller has already been
-	// finalised (sipgo answers the CANCEL and 487s the INVITE server
-	// transaction itself), so there is nothing left to relay. Cancelling
-	// the INVITE's context here is what releases its media promptly —
-	// without it the media session would sit on its ports until the
-	// forwarded INVITE's own transaction timer expired, which is up to
-	// 32 seconds of capacity held by a call nobody is on.
-	defer a.cancel()
-
-	cancelReq := fsip.BuildCancel(a.req)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	clTx, err := s.client.TransactionRequest(ctx, cancelReq, noBuild)
-	if err != nil {
-		s.log.Debug("forward CANCEL", "err", err, "sip_call_id", fsip.CallID(req))
-		return true
-	}
-	defer clTx.Terminate()
-	select {
-	case <-clTx.Responses():
-	case <-clTx.Done():
-	case <-ctx.Done():
-	}
-	return true
 }
 
 // rejectMedia maps a media-setup failure to the right SIP status: no

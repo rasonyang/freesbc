@@ -7,7 +7,10 @@ import (
 	"net/netip"
 	"sync"
 
+	"github.com/emiago/sipgo/sip"
+
 	"github.com/freesbc/freesbc/internal/media"
+	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
@@ -29,10 +32,39 @@ type mediaSession struct {
 	publicPort  int
 	privatePort int
 
+	// mu guards codecs and applied, which the INVITE path, re-INVITEs from
+	// either side and the logs all touch.
+	mu sync.Mutex
 	// codecs is the list negotiated for this call, for logs and metrics.
 	codecs []sdp.Codec
+	// applied is the media address each side was last pointed at from
+	// signaling, indexed by plane. It is what tells an answer or re-offer
+	// that MOVES a side's media (which re-arms the latch) from one that
+	// restates it (which must not: re-latching mid-call drops audio).
+	applied [2]netip.AddrPort
 
 	closeOnce sync.Once
+}
+
+// negotiated is the codec list currently agreed for the call.
+func (m *mediaSession) negotiated() []sdp.Codec {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.codecs
+}
+
+// setNegotiated records a newly agreed codec list.
+func (m *mediaSession) setNegotiated(cs []sdp.Codec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.codecs = cs
+}
+
+// seedApplied records the address a side was seeded with at allocation.
+func (m *mediaSession) seedApplied(p plane, addr netip.AddrPort) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.applied[p] = addr
 }
 
 // Close releases every socket, port reservation and relay goroutine.
@@ -158,7 +190,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 	// not a relay of the client's, so it must not reuse the client's o=
 	// line (which would leak the client's session id and, in some stacks,
 	// its address).
-	id, version := d.nextOrigin()
+	id, version := d.nextOrigin(planePrivate)
 	body, err := sdp.Build{
 		Address:        s.topo.privateMediaIP,
 		Port:           sess.privatePort,
@@ -195,15 +227,18 @@ func (s *Server) allocateRTP(offer *sdp.Session) (*mediaSession, error) {
 	// Seed the public side from the client's own offer so audio can flow
 	// toward it immediately; its first packet still corrects the port
 	// (symmetric RTP through NAT).
-	sess.SetRemote(media.SideA, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.Port)))
+	remote := netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.Port))
+	sess.SetRemote(media.SideA, remote)
 	if offer.Audio.RTCPPort > 0 {
 		sess.SetRTCPRemote(media.SideA, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.RTCPPort)))
 	}
-	return &mediaSession{
+	ms := &mediaSession{
 		rtp:         sess,
 		publicPort:  sess.RTPPort(media.SideA),
 		privatePort: sess.RTPPort(media.SideB),
-	}, nil
+	}
+	ms.seedApplied(planePublic, remote)
+	return ms, nil
 }
 
 // allocateWebRTC builds the browser leg and its private RTP pair, and
@@ -268,51 +303,158 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 	}, nil
 }
 
-// applyUpstreamAnswer processes FreeSWITCH's answer and produces the body
-// the public client will see.
+// forkAnswer returns the body the caller is sent with one response of a
+// forwarded INVITE, negotiating it the first time the response's fork (its
+// To tag) sends a body.
 //
-// Two things happen here that the call depends on: the private media latch
-// is armed with the address FreeSWITCH signalled (so its first packet is
-// accepted and the reverse direction gets a destination), and the codec
-// list is intersected down to what both ends agreed on.
-func (s *Server) applyUpstreamAnswer(res *offerResult, answerBody []byte, publicIsWebRTC bool) ([]byte, error) {
+// Every fork's answer is its own (RFC 3264 §6): negotiated against the
+// ORIGINAL offer — never against a previous fork's agreement, whose narrow
+// taste must not cost this one its codecs — built with the fork's own o=
+// identity, and restated byte for byte whenever the same fork repeats it.
+// Whichever fork's answer was seen last is the one the anchored media
+// follows, so a 2xx from a fork that is not the one ringing re-points the
+// media to the address it signalled.
+//
+// A nil body with a nil error means there is nothing to put in the relayed
+// response (a body-less provisional).
+func (s *Server) forkAnswer(l *inviteLeg, res *sip.Response) ([]byte, error) {
+	d := l.dialog()
+	f := d.fork(fsip.ToTag(res))
+	if prev := d.forkAnswer(f); prev != nil {
+		// A restated answer (the 200 echoing a body-bearing 183, say): the
+		// body this fork already has — re-negotiating would re-latch media
+		// under it.
+		s.followFork(l, f)
+		return prev, nil
+	}
+	if len(res.Body()) == 0 {
+		if res.StatusCode/100 != 2 {
+			return nil, nil
+		}
+		// A body-less 2xx on a fork that never answered. A far end that
+		// answered in one early dialog and confirmed in another without
+		// restating (the To tag of a 183 and a 200 need not match) means
+		// the answer the media already follows.
+		if a := d.lastApplied(); a != nil {
+			return d.forkAnswer(a), nil
+		}
+		return nil, errNoAnswer
+	}
+	return s.negotiateFork(l, f, res.Body())
+}
+
+// negotiateFork negotiates one fork's answer, points the media at it and
+// builds the caller's body.
+func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([]byte, error) {
 	answer, err := sdp.Parse(answerBody)
 	if err != nil {
-		return nil, fmt.Errorf("proxy: upstream answer: %w", err)
+		return nil, fmt.Errorf("proxy: answer: %w", err)
 	}
-	sess := res.sess()
-	agreed, err := sdp.Negotiate(sess.codecs, answer.Audio.Codecs)
+	offer := l.offer.offer
+	agreed, err := sdp.Negotiate(filterCodecs(offer.Audio.Codecs), answer.Audio.Codecs)
 	if err != nil {
 		return nil, negotiateError(err)
 	}
-	sess.codecs = agreed
-
-	// Arm the private-side latch with the address FreeSWITCH will send
-	// from. Until this happens the relay has nowhere to forward to and
-	// (under strict latching) would reject FreeSWITCH's own packets.
-	if sess.webrtc != nil {
-		sess.webrtc.SetPrivateRemote(netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port)))
-	} else {
-		sess.rtp.SetRemote(media.SideB, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port)))
-		if answer.Audio.RTCPPort > 0 {
-			sess.rtp.SetRTCPRemote(media.SideB, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort)))
+	sess := l.offer.sess()
+	if l.callee != calleeUpstream {
+		// A client or carrier leg is always the plain RTP relay (an inbound
+		// call is never offered to a browser as WebRTC) — checked rather
+		// than assumed, because reaching into the wrong leg would be a nil
+		// dereference on the call path.
+		if _, err := sess.rtpLeg(); err != nil {
+			return nil, err
 		}
-		sess.rtp.Start()
+	}
+	remote := netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port))
+	var rtcp netip.AddrPort
+	if answer.Audio.RTCPPort > 0 {
+		rtcp = netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort))
 	}
 
-	id, version := res.dialog.nextOrigin()
+	d := l.dialog()
+	callerPlane := planePublic
+	if l.callee.calleePlane() == planePublic {
+		callerPlane = planePrivate
+	}
+	addr, port := s.anchorFor(sess, callerPlane)
+	id, version := d.nextForkOrigin(f)
 	build := sdp.Build{
-		Address:        s.topo.publicMediaIP,
-		Port:           sess.publicPort,
+		Address:        addr,
+		Port:           port,
 		Codecs:         agreed,
 		Direction:      answer.Audio.Direction,
 		SessionID:      id,
 		SessionVersion: version,
 	}
-	if publicIsWebRTC {
+	if callerPlane == planePublic && sess.webrtc != nil {
 		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
 	}
-	return build.MarshalDeclining(res.offer)
+	body, err := build.MarshalDeclining(offer)
+	if err != nil {
+		return nil, err
+	}
+	d.setForkAnswer(f, body, agreed, remote, rtcp)
+	s.followFork(l, f)
+	return body, nil
+}
+
+// followFork points the callee-facing media side at the address a fork's
+// answer signalled, unless it already follows that fork.
+func (s *Server) followFork(l *inviteLeg, f *earlyFork) {
+	d := l.dialog()
+	if d.lastApplied() == f {
+		return
+	}
+	remote, rtcp, codecs := d.forkMedia(f)
+	sess := l.offer.sess()
+	s.pointMedia(sess, l.callee.calleePlane(), remote, rtcp)
+	sess.setNegotiated(codecs)
+	d.setApplied(f)
+}
+
+// pointMedia arms one side of the session with a media address signalled
+// in SDP, and starts the plain RTP relay.
+//
+// Seeding the latch is what lets the side's first packet be accepted and
+// gives the reverse direction a destination. When the side was already
+// pointed somewhere else — another fork's answer, a failed gateway, a
+// re-offer that moved the far end's port — the latch is re-armed first:
+// once latched, an unsolicited packet cannot move it, and neither can a
+// plain seed, so an authorised change of address has to say so. An answer
+// that restates the address the side already follows leaves the latch
+// alone.
+func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.AddrPort) {
+	sess.mu.Lock()
+	prev := sess.applied[p]
+	sess.applied[p] = remote
+	sess.mu.Unlock()
+	moved := prev.IsValid() && prev != remote
+
+	if sess.webrtc != nil {
+		// The browser side is ICE's business, not SDP's; only the private
+		// side follows signaling.
+		if p == planePrivate {
+			if moved {
+				sess.webrtc.RelatchPrivate(remote.Addr())
+			}
+			sess.webrtc.SetPrivateRemote(remote)
+		}
+		return
+	}
+	side := media.SideB
+	if p == planePublic {
+		side = media.SideA
+	}
+	if moved {
+		sess.rtp.Relatch(side, remote.Addr())
+	}
+	sess.rtp.SetRemote(side, remote)
+	if rtcp.IsValid() {
+		sess.rtp.SetRTCPRemote(side, rtcp)
+	}
+	// Start is idempotent: the first anchored answer starts the relay, and
+	// every later one (another fork, another gateway) is a no-op.
+	sess.rtp.Start()
 }
 
 // buildPublicOffer is the mirror of buildUpstreamOffer for a call coming
@@ -346,7 +488,8 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 		return nil, err
 	}
 	// The upstream offer is on side B (private).
-	sess.SetRemote(media.SideB, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.Port)))
+	remote := netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.Port))
+	sess.SetRemote(media.SideB, remote)
 	if offer.Audio.RTCPPort > 0 {
 		sess.SetRTCPRemote(media.SideB, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.RTCPPort)))
 	}
@@ -356,10 +499,11 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 		privatePort: sess.RTPPort(media.SideB),
 		codecs:      codecs,
 	}
+	ms.seedApplied(planePrivate, remote)
 	// From here the session belongs to the dialog: every failure below
 	// leaves it to the dialog's own end(), which is the single teardown.
 	d.attach(ms)
-	id, version := d.nextOrigin()
+	id, version := d.nextOrigin(planePublic)
 	body, err := sdp.Build{
 		Address:        s.topo.publicMediaIP,
 		Port:           ms.publicPort,
@@ -372,94 +516,6 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 		return nil, err
 	}
 	return &offerResult{dialog: d, sdp: body, offer: offer}, nil
-}
-
-// applyPublicAnswer processes the client's answer to an inbound call and
-// produces the body FreeSWITCH will see.
-func (s *Server) applyPublicAnswer(res *offerResult, answerBody []byte) ([]byte, error) {
-	answer, err := sdp.Parse(answerBody)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: public answer: %w", err)
-	}
-	sess := res.sess()
-	agreed, err := sdp.Negotiate(sess.codecs, answer.Audio.Codecs)
-	if err != nil {
-		return nil, negotiateError(err)
-	}
-	sess.codecs = agreed
-	sess.rtp.SetRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port)))
-	if answer.Audio.RTCPPort > 0 {
-		sess.rtp.SetRTCPRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort)))
-	}
-	sess.rtp.Start()
-
-	id, version := res.dialog.nextOrigin()
-	return sdp.Build{
-		Address:        s.topo.privateMediaIP,
-		Port:           sess.privatePort,
-		Codecs:         agreed,
-		Direction:      answer.Audio.Direction,
-		SessionID:      id,
-		SessionVersion: version,
-	}.MarshalDeclining(res.offer)
-}
-
-// applyPSTNAnswer processes a PSTN carrier's answer (to the offer FreeSBC
-// sent on behalf of a FreeSWITCH-bridged call) and produces the body
-// FreeSWITCH will see.
-//
-// It deliberately does NOT Start the relay: a call may fail over across
-// several gateways, each of which may answer once, and the pump guards the
-// single Start with a sync.Once shared by every attempt. It also never
-// touches the private leg's latch (Side B, FreeSWITCH-facing) — that
-// address cannot change mid-call, and a re-latch there would race the
-// packets FreeSWITCH is already sending.
-//
-// rePoint is the failover re-latch: when an earlier attempt already latched
-// Side A to a gateway that failed, the latch would decline this attempt's
-// answer as a hijack (SetRemote's seed is refused once latched). Relatch
-// first re-arms the latch to the answering gateway's IP, so its media is
-// accepted and its address becomes the new send target.
-func (s *Server) applyPSTNAnswer(res *offerResult, answerBody []byte, rePoint bool) ([]byte, error) {
-	answer, err := sdp.Parse(answerBody)
-	if err != nil {
-		return nil, fmt.Errorf("proxy: carrier answer: %w", err)
-	}
-	// Every attempt negotiates against the ORIGINAL offer FreeSWITCH made,
-	// never the session's live codec list: the list is shrunk to each
-	// previous attempt's agreement (below), and a failed gateway's narrow
-	// taste must not cost the next gateway its codecs. The session list
-	// stays in step afterwards so later relays describe what is agreed.
-	base := filterCodecs(res.offer.Audio.Codecs)
-	agreed, err := sdp.Negotiate(base, answer.Audio.Codecs)
-	if err != nil {
-		return nil, negotiateError(err)
-	}
-	// A carrier gateway is never a browser, so this leg is always the plain
-	// RTP relay — checked rather than assumed, because reaching into the
-	// wrong leg would be a nil dereference on the call path.
-	sess := res.sess()
-	rtp, err := sess.rtpLeg()
-	if err != nil {
-		return nil, err
-	}
-	sess.codecs = agreed
-	if rePoint {
-		rtp.Relatch(media.SideA, answer.Audio.Address)
-	}
-	rtp.SetRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.Port)))
-	if answer.Audio.RTCPPort > 0 {
-		rtp.SetRTCPRemote(media.SideA, netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort)))
-	}
-	id, version := res.dialog.nextOrigin()
-	return sdp.Build{
-		Address:        s.topo.privateMediaIP,
-		Port:           sess.privatePort,
-		Codecs:         agreed,
-		Direction:      answer.Audio.Direction,
-		SessionID:      id,
-		SessionVersion: version,
-	}.MarshalDeclining(res.offer)
 }
 
 // anchorFor is the address and port this session presents on one plane —
@@ -513,7 +569,7 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 		return nil, nil, fmt.Errorf("%w: re-offer had %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
 	addr, port := s.anchorFor(d.session(), toward)
-	id, version := d.nextOrigin()
+	id, version := d.nextOrigin(toward)
 	out, err := sdp.Build{
 		Address: addr,
 		Port:    port,
@@ -543,10 +599,10 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byt
 		return nil, negotiateError(err)
 	}
 	sess := d.session()
-	sess.codecs = agreed
+	sess.setNegotiated(agreed)
 
 	addr, port := s.anchorFor(sess, toward)
-	id, version := d.nextOrigin()
+	id, version := d.nextOrigin(toward)
 	build := sdp.Build{
 		Address:        addr,
 		Port:           port,

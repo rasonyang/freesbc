@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -58,6 +59,11 @@ type Server struct {
 	privSources *privateSources
 
 	webrtcEnabled bool
+
+	// inviteBackstop, when non-zero, replaces inviteTimeout as the INVITE
+	// backstop (nanoseconds). Only tests set it: the 5-minute default is
+	// otherwise untestable.
+	inviteBackstop atomic.Int64
 
 	// ready is closed once every listener is bound and serving.
 	ready chan struct{}
@@ -127,6 +133,7 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		webrtcEnabled:    cfg.WebRTC.Enabled,
 	}
 	s.dialogs = newDialogTable(s.metrics, s.log)
+	s.dialogs.onMediaEnd = s.byeBothEnds
 	if s.webrtcEnabled {
 		if cfg.WebRTC.DTLSCertFile != "" {
 			s.identity, err = media.LoadDTLSIdentity(cfg.WebRTC.DTLSCertFile, cfg.WebRTC.DTLSKeyFile)
@@ -144,6 +151,15 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 // knows the proxy is actually reachable. It is never closed if Run returns
 // a bind error.
 func (s *Server) Ready() <-chan struct{} { return s.ready }
+
+// inviteBudget is the INVITE backstop: inviteTimeout unless a test
+// shortened it.
+func (s *Server) inviteBudget() time.Duration {
+	if d := s.inviteBackstop.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return inviteTimeout
+}
 
 // Metrics exposes the proxy's counters.
 func (s *Server) Metrics() *Metrics { return s.metrics }

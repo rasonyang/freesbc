@@ -143,7 +143,7 @@ Created once, alive for the process lifetime:
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
 | `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:249`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
-| `edge.dialogTable` | edge | `edge.New` (`edge.go:129`) | keyed by Call-ID |
+| `edge.dialogTable` | edge | `edge.New` (`edge.go:129`) | grouped by Call-ID, matched on Call-ID + both tags |
 | `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:123-124`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
 | `edge.privateSources` | edge | `edge.New` | 256-entry, 10-minute TTL map of private-listener sources |
 | `media.DTLSIdentity` | media | `edge.New` when `webrtc.enabled` | one per process, shared by every WebRTC leg |
@@ -198,8 +198,8 @@ Created once, alive for the process lifetime:
 |---|---|---|
 | per listener: closer, and `ln.Serve` | `Run` (`edge.go:251-263`) | `listenCtx` cancel / serve error |
 | `Location.Prune` ticker (30 s) | `Run` (`edge.go:279-293`) | `listenCtx` cancel |
-| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:341`) | session `Done` closed |
-| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:238`) | `WebRTCSession.Start` returns |
+| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
+| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:248`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
@@ -1124,7 +1124,7 @@ Credentials, challenges and nonces are never logged.
 **Failover rule**: the next node is tried whenever the attempt produced **no
 final response** (`register.go:129-150`). A node that answered only
 provisionally and then died is still failed over — unlike the INVITE path,
-where `responded` alone stops the series (`invite.go:271`). The cooldown
+where `responded` alone stops the series (`invite.go:303`). The cooldown
 penalty, by contrast, is applied only when the attempt produced **zero**
 responses. **Any** final response — accept, challenge, or rejection — is a
 real judgement and ends the series. A 401/407 from a node reached after failover is expected,
@@ -1228,45 +1228,90 @@ retried.
 
 ### 7.7 Dialog record
 
-`dialogTable` is keyed by **Call-ID alone** — not the full RFC 3261 §12
-dialog identifier and not `Call-ID|from-tag` — because an in-dialog request
-from the callee carries the *callee's* tag in From, and a CANCEL carries the
-same Call-ID and From tag as its INVITE. The From tag is still checked
-against the record (for CANCEL), but it is not a key. The stated consequence
-is **one media session per Call-ID**.
+A dialog is identified the RFC 3261 §12 way: **Call-ID + the caller's tag +
+the callee's tag**. `dialogTable` groups records by Call-ID
+(`byCallID map[string][]*dialog`) and every lookup then matches tags:
 
-`dialog` holds the state, the in-flight attempt, the route, the media
-session (attached once, then only closed), the last answer body FreeSBC
-built, and an `sdpOrigin` whose id is fixed for the session's life and whose
-version increments on every generated body. **Every mutable field of the
-`dialog` record is guarded by the table's mutex** — the attached
-`mediaSession`'s own `codecs` field is the exception: it is rewritten without
-any lock (`media.go:288,389,446,546`), protected only by the discipline that
-exactly one response pump ever negotiates a session.
+- `lookup(callID, fromTag, toTag)` (`dialog.go:286-304`) finds a
+  **confirmed** record whose tags the request names in either orientation;
+  From = caller's tag and To = callee's tag means the request is from the
+  caller, the reverse means it is from the callee. A request missing either
+  tag names no dialog.
+- `early(callID, fromTag)` (`dialog.go:271-280`) finds the **in-flight**
+  record a CANCEL applies to: same Call-ID and the INVITE's From tag
+  (RFC 3261 §9.1), so a CANCEL that merely guessed a live Call-ID cannot end
+  someone else's call.
+- `begin(callID, callerTag, callerPlane)` (`dialog.go:239-265`) refuses —
+  the handler answers **482 Loop Detected** — when an **early** record with
+  the same Call-ID and caller tag exists (a merged request, §8.2.2.2). A
+  confirmed record with the same identifiers is left alone: the new INVITE
+  opens a record beside it. An INVITE can therefore never tear down another
+  call by reusing its Call-ID.
+
+`dialog` holds the Call-ID, both tags, the plane the caller's in-dialog
+requests arrive on (`callerPlane`), the state, the in-flight attempt, the
+route, the media session (attached once, then only closed), the early forks,
+the relayed 2xx, the set of refused 2xx tags, and **one `sdpOrigin` per leg**
+(`origin [2]sdpOrigin`, indexed by plane). Each leg's id is fixed for the
+session's life and its version goes up by exactly one per body that leg is
+sent (RFC 3264 §8), so FreeSWITCH sees 1 → 2 across a re-INVITE rather than
+jumps caused by bodies built for the other leg. **Every mutable field of the
+`dialog` record is guarded by the table's mutex**; the attached
+`mediaSession` guards its own `codecs` and `applied` fields with its own
+mutex (`media.go`).
+
+**Forks (early dialogs).** While the record is early, every response of the
+forwarded INVITE is attributed to a fork by its To tag (`fork`,
+`dialog.go:384-395`). An `earlyFork` holds that fork's own answer body, the
+codecs it agreed, the media address it signalled and its own `o=` identity.
+The first body a fork sends is negotiated against the **original** offer
+(`negotiateFork`, `media.go`); a later body on the same fork is answered with
+the same bytes again; a body on another fork is negotiated afresh. The
+anchored media follows whichever fork answered last (`followFork` →
+`pointMedia`), re-arming the latch when the address moves; a 2xx from a fork
+re-points it to that fork. A body-less 2xx on a fork that never answered
+reuses the answer the media is following (a far end whose 183 and 200 carry
+different To tags); with no answer at all it cannot be anchored. There is
+still **one media session per record**, so early media from two forks at
+once shares one anchor.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> dialogEarly: dialogTable.begin(callID)
-    dialogEarly --> dialogConfirmed: confirm(route)
+    [*] --> dialogEarly: begin(callID, callerTag)
+    dialogEarly --> dialogEarly: response on fork (To tag)
+    dialogEarly --> dialogConfirmed: confirm(calleeTag, route) before relaying the 2xx
     dialogEarly --> dialogEnded: endUnlessUp / end
     dialogConfirmed --> dialogEnded: end
     dialogEnded --> [*]
 ```
 
-Transitions: `begin` (`dialog.go:168-178`) inserts a new record in
-`dialogEarly` and **`end()`s any previous record for the same Call-ID**;
-`confirm` (`dialog.go:321-345`) moves early → confirmed, but refuses when the
-state is not early **or no media was ever anchored**; `endUnlessUp`
-(`dialog.go:350-357`) ends only a still-early dialog and is deferred by every
-INVITE path; `end` (`dialog.go:366-398`) is the single exit for a BYE, the
-media watchdog, shutdown, a failed INVITE and a Call-ID takeover. `end` is
-idempotent — the state transition under the table mutex elects the one caller
-that does the work — and deletes the map entry only if it is still the entry
-for this dialog, so a later call on the same Call-ID is not evicted.
+Transitions: `confirm` (`dialog.go:632-669`) runs **before the 2xx is
+relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:142-169,560-582`),
+so the ACK the caller sends the instant it sees the 2xx always finds the
+record. It records the callee's tag and the route, adopts the confirming
+fork's `o=` identity for the caller's leg, drops the fork table, and refuses
+when the state is not early **or no media was ever anchored**. `endUnlessUp`
+(`dialog.go:673-680`) ends only a still-early dialog and is deferred by every
+INVITE path; `end` (`dialog.go:690-719`) is the single exit for a BYE, the
+media watchdog, shutdown and a failed INVITE. `end` is idempotent — the state
+transition under the table mutex elects the one caller that does the work —
+and removes exactly this record from its Call-ID's list.
 
 `confirm` releases the lock before touching metrics, then starts **one
 goroutine per call**: `<-sess.Done(); d.end()`. That goroutine's only exit is
 the session's `Done` channel, so it cannot outlive the call.
+
+**2xx retransmissions and late forks (Timer M).** The INVITE client
+transaction is **not** terminated after a 2xx: sipgo keeps it in the RFC 6026
+Accepted state until Timer M (64·T1) and passes every later 2xx to the
+`OnRetransmission` hook `watch2xx` installs (`invite_leg.go:73-107`). A
+retransmission of the confirmed dialog's own 2xx is relayed again — the same
+response, never re-negotiated — so one lost 200 on the caller's leg no longer
+fails the call (RFC 3261 §13.3.1.4, §16.7 step 10). A 2xx from **another**
+fork, after the record is confirmed, is a second dialog with no media anchor:
+FreeSBC ACKs and BYEs it once (`refuse2xx`) and only re-ACKs its
+retransmissions (`reject2xx` remembers the tag). The same applies to a 2xx
+FreeSBC cannot anchor and to one that races a CANCEL.
 
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
 (`edge.go:152`). `freesbc_active_sip_dialogs` is a separate mechanism over the
@@ -1275,17 +1320,24 @@ in `confirm`/`end` (`edge/metrics.go:67-68`), sampled through
 `Snapshot().ActiveDialogs` (`admin/metrics.go:57,129`).
 
 An `inviteAttempt` holds the request **as forwarded** (so a CANCEL carries
-the same top-Via branch), the **series** cancel function (never a per-attempt
-one), and the caller's From tag. `track` deliberately overwrites per attempt,
-and the stale entry deliberately survives between two attempts so a CANCEL
-arriving in that window still ends the series. `takeAttempt(fromTag)`
-returns nothing when there is no attempt **or the From tag does not match**,
-leaving the attempt in place; on a match it removes and returns it, so
-exactly one caller ever cancels.
+the same top-Via branch) and the **series** cancel function (never a
+per-attempt one). `track` deliberately overwrites per attempt, and the stale
+entry deliberately survives between two attempts so a CANCEL arriving in
+that window still ends the series. `cancelSeries` removes and returns it,
+so exactly one caller ever cancels (see the CANCEL paragraph in §7.8 for
+`sent`/`cancelled`).
 
 **There is no SIP-level dialog expiry timer.** The only automatic
 reclamation of a confirmed dialog is the media silence watchdog, surfaced
-through `sess.Done()`. An early dialog is bounded by
+through `sess.Done()`. When it is the media that ends the dialog (the
+watchdog, or a WebRTC peer whose certificate does not match its
+fingerprint), `end()` reports it and the watcher calls the table's
+`onMediaEnd` — `byeBothEnds` (`indialog.go:348-353`) — which sends **each
+endpoint a BYE on behalf of the other** (RFC 3261 §15): From/To and tags
+from the record, the Request-URI the endpoint's own Contact, the CSeq one
+above the highest the other endpoint used, out the same pinned socket
+`prepareForward` would use. Otherwise both would keep a silent call and
+FreeSWITCH's own later BYE would get 481. An early dialog is bounded by
 `inviteTimeout = 5 minutes`.
 
 ### 7.8 Forwarding mechanics
@@ -1335,46 +1387,87 @@ transaction is absorbed by sipgo's transaction layer. An ACK that cannot be
 routed is dropped with no response.
 
 **CANCEL.** When sipgo matches a CANCEL to a live INVITE server transaction
-it answers 200 to the CANCEL, finalises the INVITE server transaction with
-**487** toward the requester itself, and fires the `OnCancel` hook
-(`invite.go:500-502`);
-the hook calls `cancelPending`. The `onCancel` handler therefore only ever
-sees an **orphan** CANCEL: it answers **200** if `cancelPending` succeeded
-and **481 Call/Transaction Does Not Exist** otherwise, because answering 200
-would tell the sender its request was cancelled when nothing was.
+it answers 200 to the CANCEL, fires the `OnCancel` hook
+(`invite.go:191-204`, `:422-428`, `:563-576`) **while holding the server
+transaction's lock**, and only after the hook returns finalises the INVITE
+server transaction with **487** toward the requester itself. The hook
+therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
+(`invite_leg.go:594-605`), which **synchronously** marks the record
+cancelled (`cancelSeries`, `dialog.go:528-547`) — from that instant
+`confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
+relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
+to a goroutine (`sendCancel`, `invite_leg.go:619-635`). `sendCancel` builds
+the CANCEL from the **forwarded** request so it carries that branch, sends
+it on a **5 s** context, and cancels the series context as soon as it is on
+the wire (which is what releases the media promptly instead of waiting on
+the forwarded INVITE's transaction timer).
 
-`cancelPending(req)` looks the dialog up by Call-ID in any state, calls
-`takeAttempt(FromTag(req))` — **the From tag must match the INVITE's**, so a
-CANCEL that merely guessed a live Call-ID cannot tear down someone else's
-call — then defers the series cancel (which is what releases the media
-promptly instead of waiting on the forwarded INVITE's transaction timer),
-builds the CANCEL from the **forwarded** request so it carries that branch,
-and sends it on a **5 s** context.
+An attempt is **tracked before its INVITE is sent** (`track`,
+`dialog.go:479-487`), so no CANCEL can fall between the send and the
+bookkeeping. A CANCEL that takes an attempt whose INVITE is not on the wire
+yet does not send its CANCEL (it would overtake the INVITE, be answered 481,
+and leave the INVITE ringing); `markSent` (`dialog.go:492-497`) tells the
+sender, which CANCELs the moment the INVITE is out. `track` refuses once
+the series is cancelled, so no later attempt starts.
+
+The `onCancel` handler only ever sees an **orphan** CANCEL: it looks up the
+early record by Call-ID **and From tag** (`dialogTable.early`) and answers
+**200** if there was an attempt to cancel and **481 Call/Transaction Does
+Not Exist** otherwise, because answering 200 would tell the sender its
+request was cancelled when nothing was. RFC 3261 §16.10 would have a proxy
+with no response context forward such a CANCEL statelessly; FreeSBC
+deliberately does not. Every INVITE it forwards has a record here, so an
+orphan CANCEL that matches none has nothing downstream to cancel, and
+relaying it would let any source that knows a Call-ID inject CANCELs toward
+FreeSWITCH.
 
 Once the series context is cancelled, `pumpInvite` does not simply return: it
 calls `drainCancelledInvite` for `pstnDrain` (300 ms) so the far end's 487 is
 still matched by the live client transaction and ACKed by the transaction
-layer (RFC 3261 §17.1.1.3, `invite.go:1035-1043`). The same helper serves all
-three call paths, not only PSTN.
+layer (RFC 3261 §17.1.1.3, `invite_leg.go:482-520`). The same helper serves
+all three call paths, not only PSTN. A 2xx that arrives after the caller
+cancelled is never relayed or confirmed: it is ACKed and BYEd.
+
+**INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
+still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
+(`invite_leg.go:640-645`): it CANCELs the pending branch (RFC 3261 §16.8)
+and drains for its 487, and `giveUp` (`invite.go:325-336`) then sends the
+caller **408 Request Timeout** (§16.7 step 6). `giveUp` is the one place a
+caller's missing final is synthesised: nothing when its own CANCEL already
+got it a 487 from sipgo, **408** at the backstop, **487** when an orphan
+CANCEL ended the call, and the path's own status otherwise. A path that has
+already finalised the caller (a relayed final, or the pump's own 488) sends
+nothing more: a transaction finalises once. The pump's 488 for an answer it
+cannot anchor on a **provisional** also CANCELs that branch, which would
+otherwise ring on.
 
 **BYE / INFO** (`onInDialog`): resolve direction, forward without
 Record-Route, retarget the Request-URI to the far end's own Contact, rewrite
-the Contact, and relay under a **32 s** budget. On a forwarding failure and
+the Contact, and relay under a **32 s** budget. The CSeq of every in-dialog request is
+recorded per endpoint (`noteCSeq`). On a forwarding failure and
 **only for BYE**, FreeSBC makes one stateless re-send attempt toward the far
 side and then answers **200** to the requester — answering 408 would tell the
-switch its hangup failed and sofia would keep the leg. After a BYE it calls
-`teardown(callID)`, which ends a **confirmed** dialog immediately so the
-ports return to the pool now rather than minutes later.
+switch its hangup failed and sofia would keep the leg. A BYE ends a dialog
+only when its tags name that confirmed dialog **and** the far end agreed:
+a 2xx, a 481 or 408 (which end the dialog for the sender too, §12.2.1.2), or
+no answer at all (`byeEndsDialog`, `indialog.go:223-228`). A BYE with tags
+that match no dialog is still forwarded — the endpoint answers 481 — but
+tears nothing down, and a 401/407 challenge leaves the call up.
 
-**Direction resolution** (`directionFor`):
+**Direction resolution** (`directionFor`, `indialog.go:241-306`):
 
-- From FreeSWITCH: prefer the dialog record's `publicRemote` and transport;
-  an in-dialog request from FreeSWITCH carries **no** binding token, so the
-  dialog record — not the location table — identifies the client. Fallback:
-  `bindingForRequest(req)`.
-- From a public client: prefer the dialog record's `privateRemote` — a
-  dialog must never migrate between switches mid-call — and otherwise hash to
-  an upstream. **This fallback deliberately never 481s.**
+- A request whose Call-ID and tags name a confirmed dialog is routed by that
+  record — `publicRemote` toward the client, `privateRemote` (the winning
+  switch or gateway: a dialog never migrates mid-call) toward FreeSWITCH —
+  **provided it arrived on the plane of the endpoint its tags say sent it**.
+  A request that names the caller's tags but came in on the callee's side is
+  not treated as that dialog's.
+- Otherwise, from FreeSWITCH: `bindingForRequest(req)` (an in-dialog request
+  from FreeSWITCH carries no binding token, so without a record this only
+  helps a pre-dialog request).
+- Otherwise, from a public client: hash to an upstream. **This fallback
+  deliberately never 481s**; the switch answers honestly. Such a request
+  carries no dialog, so nothing is torn down on its account.
 
 `retargetInDialog` restores the far end's own Contact as the Request-URI,
 undoing the topology hiding applied when the dialog was established: sofia
@@ -1391,19 +1484,21 @@ token, that first binding wins.
 
 Reached whenever an INVITE carries a To tag.
 
-1. `directionFor` else **481**.
+1. `directionFor` must name a confirmed dialog with a media session, else
+   **481**. Forwarding the body as-is here would be the exact leak the
+   function exists to prevent.
 2. Empty body → **488**; an offerless re-INVITE would make FreeSBC the
    offerer, which is unsupported, and refusing leaves the existing session
    untouched.
-3. No confirmed dialog, or no media session → **481**. Forwarding the body
-   as-is here would be the exact leak the function exists to prevent.
+3. (No allocation: the session keeps its ports.)
 4. Rebuild the offer from scratch against the session's **existing** anchor
    ports (`anchorFor`) with a bumped `o=` version; nothing is allocated.
 5. Forward without Record-Route; **retarget the Request-URI to the far end's
-   own Contact** (`retargetInDialog`, `invite.go:1151`) and rewrite the
+   own Contact** (`retargetInDialog`, `indialog.go:321`) and rewrite the
    Contact.
-6. Relay responses; the first body-bearing response is rebuilt as an answer,
-   later ones repeat the stored body. A `clTx.Done()` yields **408**.
+6. Relay responses; the first body-bearing response of **this transaction**
+   is rebuilt as an answer, later ones repeat that body. A `clTx.Done()`
+   yields **408**.
 
 For a WebRTC leg the rebuilt answer restates exactly the same ICE
 credentials, fingerprint and DTLS role — changing any of them would look like
@@ -1418,7 +1513,7 @@ any gateway**.
 
 Per call: the public side must be `udp` (else 503); the gateway list is
 `orderByAvailability`'s **available** half against `pstnCooldown`
-(`invite.go:479` discards the cooled half), so a cooling gateway is dropped
+(`invite.go:552` discards the cooled half), so a cooling gateway is dropped
 rather than tried at the tail as an upstream node would be (§7.6) — unless
 every candidate is cooling, in which case the route's own order is dialled
 unchanged (`topology.go:559-561`); the whole call is
@@ -1438,13 +1533,15 @@ Response handling in `pumpPSTNAttempt`:
   the call.
 - Any other final (3xx, 401/407, or a 4xx other than the held 408) is the far
   end's verdict on this call: relay it and end the series.
-- A 2xx is the winner.
-- The first body-bearing response of an attempt is negotiated against the
-  **original FreeSWITCH offer**, not the session's live codec list, so a
-  failed gateway's narrow taste does not cost the next gateway its codecs.
+- A 2xx is the winner; the dialog is confirmed before it is relayed.
+- Each fork's first body is negotiated against the **original FreeSWITCH
+  offer**, not the session's live codec list, so a failed gateway's narrow
+  taste does not cost the next gateway its codecs; the public latch is
+  re-armed whenever the answering gateway's media address differs from the
+  one the side already follows (`pointMedia`).
 - Budget expiry runs `expirePSTNAttempt`: send CANCEL on its own **5 s**
   context, then drain for `pstnDrain = 300 ms`. A 200 arriving in the drain
-  is torn down with `ackThenBye`; a 487 or a drain timeout is `failRing`; any
+  is torn down with `refuse2xx` (ACK + BYE); a 487 or a drain timeout is `failRing`; any
   other final is `failReal` with its own code.
 
 `drainCancelledInvite` exists because a final response that matches no
@@ -1461,7 +1558,7 @@ sipgo send the ACK.
 ```mermaid
 stateDiagram-v2
     [*] --> attempt: forward INVITE to target
-    attempt --> ok: 2xx relayed -> commit
+    attempt --> ok: 2xx -> commit, then relay
     attempt --> failReal: final 408 or >= 500 HELD, not relayed (code remembered)
     attempt --> failDial: transport error / clTx.Done / whole-call ctx done
     attempt --> failRing: attempt budget expired (PSTN only)
@@ -1476,18 +1573,21 @@ stateDiagram-v2
 ```
 
 `attemptKind` and `attemptResult` are defined at `invite.go:41-66`; the
-classification is produced by `pumpPSTNAttempt` (`invite.go:646-790`) and
-`expirePSTNAttempt` (`invite.go:799-867`); the upstream path uses the
+classification is produced by `pumpPSTNAttempt` (`invite_leg.go:279-386`) and
+`expirePSTNAttempt` (`invite_leg.go:395-465`); the upstream path uses the
 simpler `final == nil && !responded && clTx.Err() != nil` retry rule in
-`inviteToUpstream` (`invite.go:271-273`).
+`inviteToUpstream`.
 
 ### 7.12 Response synthesis by path
 
 | Path | No target answered |
 |---|---|
-| `inviteToUpstream` | **503 Service Unavailable** (silent if the series context already expired) |
-| `inviteToPSTN` | 488 / last real code / 408 / 503, in that order |
-| `inviteToClient` | **no status is synthesised once the INVITE has been forwarded and the client simply never answers**; the handler returns and FreeSWITCH learns of it at Timer B. Before that it does answer: **404** (no binding), **480** (the binding's transport has no public side, or the forward itself failed), **488** (offerless, or an answer that cannot be anchored) and **483** (`invite.go:314,322,330,350,370,1024`) |
+| `inviteToUpstream` | **503 Service Unavailable**; **408** at the backstop; nothing after the caller's own CANCEL |
+| `inviteToPSTN` | 488 / last real code / 408 / 503, in that order; **408** at the backstop; nothing after FreeSWITCH's CANCEL |
+| `inviteToClient` | a client that never gives a final is answered for it: **408** when its INVITE timed out (Timer B) or the backstop expired, **480** when its transport failed. Before forwarding: **404** (no binding), **480** (the binding's transport has no public side, or the forward itself failed), **488** (offerless, or an answer that cannot be anchored) and **483**; **482** when the INVITE merges with one in progress |
+
+In every path the pump's own **488** (an answer that cannot be anchored) is
+the caller's one final: `pumpResult.finalised` stops any second one.
 
 ---
 
@@ -1667,9 +1767,11 @@ latched source address from keeping a dead call alive with junk.
 The watchdog is the backstop for a half-dead call whose BYE was lost. On the
 trunk plane it fires `sess.Done()`, which the `onInvite` select turns into
 BYEs on both legs; on the edge plane it fires the per-dialog media watcher
-goroutine, which calls `dialog.end()`. That watcher is launched by `confirm`
-(`dialog.go:338-344`), so it exists only for a **confirmed** dialog; an early
-one is reclaimed by `endUnlessUp` and the 5-minute `inviteTimeout` instead.
+goroutine, which calls `dialog.end()` and then sends a BYE to both
+endpoints (§7.7). That watcher is launched by `confirm` (`dialog.go:659-667`),
+so it exists only for a **confirmed** dialog; an early one is reclaimed by
+`endUnlessUp` and the 5-minute `inviteTimeout` (which CANCELs the branch and
+answers 408) instead.
 
 ### 8.6 SRTP
 
@@ -1883,27 +1985,29 @@ whose correctness rests on "this leg is never WebRTC" states the invariant.
   from that point every failure leaves it to the dialog's own `end()` — and
   build the private body with a **fresh session identity** at
   `privateMediaIP:privatePort`.
-- **Upstream answer** (`applyUpstreamAnswer`): negotiate, arm the private
-  latch, start the relay (for a WebRTC session the relay is started by
-  `WebRTCSession.Start` in the establishment goroutine instead), and build
-  the public body — adding the DTLS/ICE block when the public leg is WebRTC.
-- **FreeSWITCH → public client** (`buildPublicOffer`): the mirror image, with
-  one structural limitation: the public leg **cannot** be WebRTC here,
-  because a DTLS-SRTP offer requires the answerer's fingerprint and ICE
-  credentials and an offer by definition has not seen them. FreeSBC offers
-  plain RTP even to a WebSocket client.
-- **Public answer** (`applyPublicAnswer`, `media.go:379-405`): the answer
-  half of `buildPublicOffer` — negotiate against the session's codec list,
-  `SetRemote(SideA, …)` (plus `SetRTCPRemote` when the answer carried an
-  `a=rtcp` port), `Start` the relay, and build the private body at
-  `privateMediaIP:privatePort`.
-- **PSTN answer** (`applyPSTNAnswer`): negotiates against the original
-  FreeSWITCH offer; `Relatch`es side A **before** `SetRemote`, because a latch
-  already armed to a failed gateway would decline this attempt's answer as a
-  hijack; deliberately does **not** start the relay (the pump does, guarded by
-  the CompareAndSwap); and **never touches side B's latch**, because the
-  FreeSWITCH address cannot change mid-call and a re-latch there would race
-  packets in flight.
+- **Answers, per fork** (`forkAnswer` → `negotiateFork` → `followFork` →
+  `pointMedia`, `media.go`): one path for all three directions. A fork's
+  first body is negotiated against the **original offer** (never a previous
+  fork's or gateway's agreement), the caller's body is built at the caller
+  plane's anchor with the fork's own `o=` identity — adding the DTLS/ICE
+  block when the caller is a browser — and the callee-facing side is pointed
+  at the address the answer signalled: `SetRemote` (plus `SetRTCPRemote`
+  for an explicit `a=rtcp`) and `Start` for the plain relay,
+  `SetPrivateRemote` for a WebRTC session (whose relay is started by
+  `WebRTCSession.Start` in the establishment goroutine instead). When that
+  side already followed a **different** address (another fork, a failed
+  gateway), the latch is re-armed first with `Relatch` / `RelatchPrivate`,
+  because a latch armed to the old address would decline the new one's
+  media as a hijack; an answer restating the same address leaves the latch
+  alone. Only the callee-facing side is ever pointed by an answer: the
+  caller's side keeps the address its offer seeded.
+- **FreeSWITCH → public client** (`buildPublicOffer`): the mirror image of
+  `buildUpstreamOffer`, with one structural limitation: the public leg
+  **cannot** be WebRTC here, because a DTLS-SRTP offer requires the
+  answerer's fingerprint and ICE credentials and an offer by definition has
+  not seen them. FreeSBC offers plain RTP even to a WebSocket client. A
+  client or carrier answer is always handled on the plain relay (`rtpLeg()`
+  is checked).
 - **In-dialog rebuild**: `anchorFor` returns the session's existing address
   and port — nothing allocates. Direction passes through **unreversed**,
   because FreeSBC is a relay in the middle: a caller putting the call on hold
@@ -2136,23 +2240,25 @@ sequenceDiagram
     participant FS as FreeSWITCH
 
     P->>S: INVITE
-    S->>H: onInvite, then d.track of an attempt holding the forwarded request, the series cancel and the From tag
+    S->>H: onInvite, then d.track of an attempt holding the forwarded request and the series cancel (before sending)
     H->>FS: INVITE
     FS-->>H: 180 Ringing (relayed to P)
     P->>S: CANCEL (matching branch)
     S-->>P: 200 OK (to the CANCEL, generated by sipgo)
-    S->>H: tx.OnCancel -> cancelPending(req)
-    Note over H: dialogs.get(callID), takeAttempt(fromTag) matches
+    S->>H: tx.OnCancel -> cancelCall(d) (under sipgo's tx lock: no I/O)
+    Note over H: cancelSeries marks the call cancelled and takes the attempt; go sendCancel
+    S-->>P: 487 Request Terminated (generated by sipgo once the hook returns)
     H->>FS: CANCEL (built from the FORWARDED request, same top-Via branch)
-    Note over H: defer a.cancel() -> series ctx cancelled -> media released now
-    S-->>P: 487 Request Terminated (generated by sipgo's own server transaction)
+    Note over H: a.cancel() once the CANCEL is on the wire -> series ctx cancelled -> media released now
     FS-->>H: 487 Request Terminated
     Note over H: pumpInvite ctx.Done -> drainCancelledInvite (300 ms), the upstream 487 is matched and ACKed by the transaction layer, never relayed
     Note over H: endUnlessUp -> dialog.end -> media session closed, ports released
 ```
 
-A CANCEL whose From tag does not match the INVITE's leaves the attempt in
-place, sends **zero** CANCELs upstream, and is answered **481**.
+An orphan CANCEL (one sipgo did not match to the server transaction) is
+looked up by Call-ID **and From tag**; one whose From tag does not match the
+INVITE's leaves the attempt in place, sends **zero** CANCELs upstream, and is
+answered **481**.
 
 ### 9.9 Normal BYE teardown (edge plane)
 
@@ -2163,11 +2269,11 @@ sequenceDiagram
     participant FS as FreeSWITCH
 
     P->>H: BYE (Route set from the double Record-Route)
-    Note over H: directionFor: dialog record's privateRemote wins over the hash
+    Note over H: directionFor: Call-ID + both tags name the dialog; its privateRemote wins over the hash
     H->>FS: BYE (no Record-Route, R-URI retargeted to the far Contact, 32s budget)
     FS-->>H: 200 OK
     H-->>P: 200 OK (relayed, our Via popped)
-    H->>H: teardown(callID) -> dialogs.confirmed(callID).end()
+    H->>H: byeEndsDialog(200) -> d.end() (only the dialog the tags named)
     Note over H: sess.Stats() snapshotted, sess.Close(), ports released, DialogEnded/MediaEnded
 ```
 
@@ -2204,8 +2310,8 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **trunk upstream registration** | `Registrar`; one goroutine per peer | `reconcile` (`register.go:309-372`) | unregistered ⇄ registered, with backoff; terminal `unregister` on cancel | `setRegisteredGen` writes only when the generation still matches, so a superseded goroutine cannot clobber the replacement | its own goroutine; the registrar under `mu` | config publication (peer removed/changed) or `stopAll` at shutdown | `Registrar.mu` (RWMutex) over `state`, `running`, `epoch`; the old goroutine is awaited **outside** the lock |
 | **endpoint health / cooldown (trunk)** | `endpointHealth` | `NewServer` | absent ⇄ `until[key]` | lazy expiry, no sweeper; skip-if-alternatives, never a hard block; keyed per `host:port/transport` | `Penalize` (dial failure), `Recover` (bridged success) | only `Recover`; entries are otherwise never removed | `endpointHealth.mu` |
 | **edge binding** (`Binding`) | `Location` | `recordBinding` → `Location.Put` | active → refreshed (same token) / expired / removed | expiry always comes from the registrar's **response**; `Source` is the transport source, never the Contact host; ≤ 10 per AoR, ≤ 20000 total | handler goroutines, the WS close hook, the prune ticker | un-REGISTER, `granted <= 0`, WebSocket close, expiry + prune | `Location.mu` (RWMutex) |
-| **edge dialog** (`*edge.dialog`) | `dialogTable` | `begin(callID)` | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) | keyed by Call-ID alone ⇒ **one media session per Call-ID**; `confirm` refuses without media; `end` deletes the map entry only if it is still this dialog's | any handler goroutine, via the table's methods | BYE (`teardown`), media watchdog, `endUnlessUp`, `closeAll`, Call-ID takeover in `begin` | `dialogTable.mu` guards the map **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
-| **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt | tracked → overwritten by the next attempt → taken by `takeAttempt` or cleared by `untrack` | holds the request **as forwarded** and the **series** cancel; `takeAttempt` requires a From-tag match and guarantees exactly one canceller | handler goroutines through `track`/`untrack`/`takeAttempt` | `defer d.untrack()` on handler return; `takeAttempt` on CANCEL | `dialogTable.mu` |
+| **edge dialog** (`*edge.dialog`) | `dialogTable` | `begin(callID, callerTag, callerPlane)` | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end accepted, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
+| **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **edge upstream / PSTN cooldown** | two `cooldownTable`s on `Server` | `edge.New` (always allocated) | absent ⇄ `until[name]` | keyed by **name**, never address; all-cooling falls back to dialling everything | handler goroutines only | `Recover` on any final (upstream) or success (PSTN); lazy expiry otherwise | `cooldownTable.mu` |
 | **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx atomic.Int64`, per-latch `mu` |
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
@@ -2794,8 +2900,8 @@ cannot echo a secret because expansion runs after the unmarshal.
 | Trunk registration | peer removed/changed by reload, or shutdown | un-REGISTER bounded at ~2 s per attempt |
 | Endpoint cooldown | `Recover` on a bridged success; otherwise entries expire logically but are never deleted | `peer_cooldown` (default 30 s) |
 | SRV cache entry | expires logically; never deleted | `srv_cache_ttl`, or `min(ttl, 10 s)` for a negative result |
-| Edge dialog + media session + ports | BYE (`teardown`), media watchdog, `endUnlessUp` on a failed INVITE, `closeAll` at shutdown, Call-ID takeover in `begin` | early dialogs bounded by `inviteTimeout` (5 min); confirmed ones by `rtp_timeout` |
-| Edge in-flight attempt | `untrack` on handler return, or `takeAttempt` on CANCEL | the series context |
+| Edge dialog + media session + ports | a tag-matched BYE the far end accepted, media watchdog (then BYE to both ends), `endUnlessUp` on a failed INVITE, `closeAll` at shutdown | early dialogs bounded by `inviteTimeout` (5 min, then CANCEL + 408); confirmed ones by `rtp_timeout` |
+| Edge in-flight attempt | `untrack` on handler return, or `cancelSeries` on CANCEL / backstop | the series context |
 | Edge binding | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker | the registrar's granted lifetime |
 | Edge upstream/PSTN cooldown | `Recover`, or lazy expiry | the configured cooldown (default 30 s) |
 | WebRTC leg | `WebRTCSession.Close`, establishment failure, fingerprint mismatch | the establishment deadline (30 s default) |
@@ -2849,7 +2955,8 @@ the process survives. A media relay panic kills exactly one session.
 the trunk plane `onInvite`'s select sends BYEs on both legs and unwinds its
 defers; on the edge plane the per-dialog watcher calls `dialog.end()`, which
 closes the media session, releases both port pairs, folds the stats into the
-process counters and logs `"call ended"`.
+process counters and logs `"call ended"`, and then sends a BYE to each
+endpoint on behalf of the other.
 
 **Transaction timeouts.** A trunk attempt that never answers ends at
 `ring_timeout` + 250 ms and fails over; a fully silent target's abandoned
@@ -2930,8 +3037,10 @@ Stated because the code establishes them, not as future work.
   not WebRTC clients.
 - **No RTCP accounting.** RTCP is relayed but never counted, inspected or
   rewritten; there are no drop or authentication-failure counters.
-- **One media session per Call-ID** on the edge plane. A forking upstream
-  that produced two dialogs on one Call-ID would need two.
+- **One media session per call** on the edge plane. Early dialogs from a
+  forking far end each get their own answer, and the media follows the fork
+  that answered last and then the one that sent the 2xx; a 2xx from a
+  second fork after that is ACKed and BYEd rather than relayed.
 
 **Signalling**
 
@@ -3009,5 +3118,5 @@ Stated because the code establishes them, not as future work.
 | `internal/media` | port pools, latching, the payload-agnostic relay, SRTP contexts and transforms, the silence watchdog, the ICE-lite/DTLS-SRTP browser leg, packet/byte counters | SIP, SDP, or any protocol above UDP. Its doc: "It knows nothing about SIP" |
 | `internal/shield` | the ban table, per-IP token buckets, scanner signatures, the unidentified-source failure counter, the optional nftables backend | being a hard dependency of anything; the in-memory table is always authoritative and nftables is an accelerator |
 | `internal/trunk` | B2BUA call and leg state, peer identification, routing and number transformation, failover and endpoint cooldown, outbound registration, DNS/SRV resolution, per-leg SDES policy and SDP rewriting, the trunk listener limits | proxy dialogs, registrations, bindings, upstream routing; any edge concept |
-| `internal/edge` | proxy dialogs keyed by Call-ID, the registration binding table, upstream and PSTN routing with cooldown, plane classification, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | B2BUA call state; carrier peers; DNS; any trunk concept |
+| `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the registration binding table, upstream and PSTN routing with cooldown, plane classification, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | B2BUA call state; carrier peers; DNS; any trunk concept |
 | `internal/admin` | HTTP routing, Basic auth and its limiter, the Prometheus registry and collector, the redacted config view, the raw config round-trip, the embedded WebUI | reading plane state directly — everything arrives through `admin.Deps` closures built in `internal/app` |

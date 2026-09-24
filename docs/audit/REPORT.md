@@ -438,6 +438,7 @@ Format: **Location** · **Evidence** · **Reference** (RFC or invariant; invaria
 - Reference: RFC 3261 §9.1, §16.10.
 - Repro: not tested (race cannot be forced from outside; section 5).
 - Action: fix. Track before sending, or re-check ctx after `track` and CANCEL.
+- Resolution (issue #26): fixed by tracking before sending. The window still cannot be forced over a socket (it lies inside one handler goroutine), so it is covered by `TestAuditCancelBeforeInviteSentIsNotLost`, which drives the dialog's attempt protocol directly (`track` → CANCEL → `markSent`) rather than failing on main first.
 
 ### P2-EDG-009 — Backstop or no-answer expiry sends neither CANCEL nor a final response
 - Location: `internal/edge/invite.go:1035-1043`, `:282-284` (5-min `inviteTimeout` path drains only); `:387-391` (`inviteToClient` sends no final when `pumpInvite` returns nil).
@@ -759,6 +760,7 @@ Compact format for P2: Location · Evidence · Reference · Repro · Action. "Re
 - **P2-EDG-026 — Teardown ACK/BYE not pinned to a listener socket.** `internal/sip/request.go:69-81` via `internal/edge/invite.go:1054`, `:1060-1063` vs `forward.go:77-87`. INFERENCE (wildcard binds untested). Action: fix.
 - **P2-EDG-027 — In-flight INVITE can outlive shutdown and allocate after `closeAll`.** `internal/edge/edge.go:307`, `:174`, `:185`. INFERENCE. `TestAuditBalanceShutdownWithLiveDialogs` passed for 3 confirmed calls + 1 ringing INVITE; the mid-allocation window was not hit. Repro: `DKR go test -race -count=1 -run '^TestAuditBalanceShutdownWithLiveDialogs$' ./internal/edge` (passes). Action: fix (wait for handler goroutines).
 - **P2-EDG-029 — Orphan CANCEL answered 481 instead of forwarded statelessly.** `internal/edge/invite.go:1245-1254`. INFERENCE. Ref: RFC 3261 §16.10. Action: fix or document.
+  - Resolution (issue #26): documented, not changed. Every INVITE the edge forwards has a dialog record, so an orphan CANCEL that matches none (by Call-ID and From tag) has nothing downstream to cancel; forwarding it would let any source that knows a Call-ID inject CANCELs toward FreeSWITCH. It keeps its 481 (`TestOrphanCancelWrongFromTagDoesNotCancel`); the deviation is recorded in docs/design.md §7.8.
 - **P2-EDG-031 — Media allocated before the upstream authenticates the caller.** `internal/edge/invite.go:157` vs `:230`; no edge call quota. INFERENCE. Action: fix (quota or lazy allocation).
 - **P2-EDG-033 — Edge docs and comments drift.** design.md §7.7 citations off by 1-2 lines (see appendix table rows 38-41); §7.8 cites the OnCancel hook at `invite.go:500-502` (hooks at `:172-185`, `:383`, `:490-504`); §7.8 says sipgo sends 487 then fires OnCancel (the reverse is true); stale identifiers `forwardInboundInvite`/`PrivateRemote` (`invite.go:1347-1348`) and `commitCall` (`:1355`). INFERENCE. Action: fix (docs).
 - **P2-EDG-034 — `guard` recover hides handler panics and can send 500 after a final.** `internal/edge/edge.go:500-506`. INFERENCE. Action: fix (panic counter; no 500 once finalised).
