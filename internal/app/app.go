@@ -221,6 +221,7 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 				PortAllocationFailures: s.MediaPortAllocationFailures,
 				ICEFailures:            s.WebRTCICEFailures,
 				DTLSFailures:           s.WebRTCDTLSFailures,
+				HandlerPanics:          s.HandlerPanics,
 			}
 		}
 	}

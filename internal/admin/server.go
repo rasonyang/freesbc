@@ -89,6 +89,7 @@ type ProxyStats struct {
 	PortAllocationFailures uint64 `json:"media_port_allocation_failure_total"`
 	ICEFailures            uint64 `json:"webrtc_ice_failure_total"`
 	DTLSFailures           uint64 `json:"webrtc_dtls_failure_total"`
+	HandlerPanics          uint64 `json:"sip_handler_panics_total"`
 }
 
 // Server is the admin HTTP server.

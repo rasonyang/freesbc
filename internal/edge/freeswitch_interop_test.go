@@ -124,7 +124,7 @@ shield:
 		}
 	}()
 	select {
-	case <-srv.Ready():
+	case <-srv.ready:
 	case <-time.After(10 * time.Second):
 		t.Fatal("proxy never became ready")
 	}

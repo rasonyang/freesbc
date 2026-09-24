@@ -141,10 +141,10 @@ Created once, alive for the process lifetime:
 | `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:285`) | one goroutine per `register: true` peer |
 | `trunk.Resolver` | trunk | `NewServer` | SRV cache + singleflight + seeded `rand` |
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
-| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:249`) | immutable snapshot afterwards |
+| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:268`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
-| `edge.dialogTable` | edge | `edge.New` (`edge.go:129`) | grouped by Call-ID, matched on Call-ID + both tags |
-| `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:123-124`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
+| `edge.dialogTable` | edge | `edge.New` (`edge.go:143`) | grouped by Call-ID, matched on Call-ID + both tags |
+| `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:136-137`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
 | `edge.privateSources` | edge | `edge.New` | 256-entry, 10-minute TTL map of private-listener sources |
 | `media.DTLSIdentity` | media | `edge.New` when `webrtc.enabled` | one per process, shared by every WebRTC leg |
 | `shield.Shield` ×(0..2) | shield | trunk `Run` (`shield.New`), edge `Run` (`shield.NewNoKernel`) | separate instances; only the trunk one manages nftables |
@@ -196,8 +196,8 @@ Created once, alive for the process lifetime:
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: closer, and `ln.Serve` | `Run` (`edge.go:251-263`) | `listenCtx` cancel / serve error |
-| `Location.Prune` ticker (30 s) | `Run` (`edge.go:279-293`) | `listenCtx` cancel |
+| per listener: closer, and `ln.Serve` | `Run` (`edge.go:272-283`) | `listenCtx` cancel / serve error |
+| `Location.Prune` ticker (30 s) | `Run` (`edge.go:297-312`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
 | WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:248`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
@@ -280,9 +280,12 @@ ws/wss listener on the trunk plane. TCP and TLS listeners are wrapped in
 `listen.tls_cert`/`tls_key` if present, otherwise mints a self-signed
 certificate and logs `"TLS listener using self-signed certificate"`.
 
-**Edge** (`edge.go:204-263`) binds **every socket synchronously before
+**Edge** (`edge.go:223-283`) binds **every socket synchronously before
 serving any of them**; on any failure every already-opened listener is closed
-and `Run` returns. That is what makes `Ready()` honest. The listener list is
+and `Run` returns. The unexported `ready` channel closes once every socket
+is open; nothing in production waits on it (the exported `Ready()` was dead
+code and was removed) — it is the happens-before edge the test harness uses.
+The listener list is
 every enabled `cfg.PublicSIPListeners()` entry (`udp`, `ws`, `wss`) plus one
 synthetic `"udp-private"` entry for `sip.private.bind`.
 
@@ -293,7 +296,7 @@ unsynchronised variable, which the race detector flags on every graceful
 shutdown.
 
 After binding, the edge plane replaces its topology with
-`s.topo = s.topo.pinned(opened)` (`edge.go:249`). A wildcard bind does not
+`s.topo = s.topo.pinned(opened)` (`edge.go:268`). A wildcard bind does not
 come up as the address it was written with — on a dual-stack host `0.0.0.0`
 yields a socket whose local address is `[::]:port` — and sipgo keys its
 connection pool by the socket's real local address. Without pinning, an
@@ -1027,11 +1030,29 @@ full, **refuses to insert** rather than grow.
 all three: transport is `udp`, the source IP is in the upstream pool
 (ignoring port), and the exact `addr:port` is in `privateSources`.
 
-**`guard`** wraps every handler: a `recover()` that logs and answers 500;
+**`guard`** wraps every handler: a `recover()` that logs the panic, counts
+it (`freesbc_sip_handler_panics_total`) and answers 500 **only when the
+transaction has not already had a final response** (the handler is given a
+`finalTracker` wrapping the server transaction, which records that);
 `fsip.SourceAddrPort(req)` (an unparseable source is **silently dropped**
 before metrics, shield and handler); `metrics.RequestIn(method, transport)`;
 then, only for requests that did *not* arrive on the private plane,
 `shield.Check(...)` with a silent return on `Drop`.
+
+A source the shield has **banned** is also dropped by the edge read filter,
+before parsing: sipgo answers some messages itself before any handler runs
+(a stateless 400 to a malformed request, a 200 to a CANCEL matching a
+transaction), so `guard` alone could not keep a ban silent. The filter
+exempts FreeSWITCH exactly as `guard` does (its `privateSources` transport
+address). `shield.Shield.Banned` is the read-only query it uses.
+
+**Unanswered calls per source.** Media is anchored before FreeSWITCH has
+authenticated the caller, so `inviteToUpstream` admits at most
+`maxEarlyPerSource` (**64**) calls per public source IP that have media and
+no answer yet (`admitEarly`); one more is refused **503** before anything is
+allocated. The count is per IP so a flood spread over many source ports is
+bounded too, and the slot is released when the INVITE handler returns
+(answered or not).
 
 ### 7.2 Topology snapshot
 
@@ -1124,7 +1145,7 @@ Credentials, challenges and nonces are never logged.
 **Failover rule**: the next node is tried whenever the attempt produced **no
 final response** (`register.go:129-150`). A node that answered only
 provisionally and then died is still failed over — unlike the INVITE path,
-where `responded` alone stops the series (`invite.go:303`). The cooldown
+where `responded` alone stops the series (`invite.go:326`). The cooldown
 penalty, by contrast, is applied only when the attempt produced **zero**
 responses. **Any** final response — accept, challenge, or rejection — is a
 real judgement and ends the series. A 401/407 from a node reached after failover is expected,
@@ -1286,7 +1307,7 @@ stateDiagram-v2
 ```
 
 Transitions: `confirm` (`dialog.go:632-669`) runs **before the 2xx is
-relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:142-169,560-582`),
+relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:142-169,575-597`),
 so the ACK the caller sends the instant it sees the 2xx always finds the
 record. It records the callee's tag and the route, adopts the confirming
 fork's `o=` identity for the caller's leg, drops the fork table, and refuses
@@ -1314,7 +1335,7 @@ retransmissions (`reject2xx` remembers the tag). The same applies to a 2xx
 FreeSBC cannot anchor and to one that races a CANCEL.
 
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
-(`edge.go:152`). `freesbc_active_sip_dialogs` is a separate mechanism over the
+(`edge.go:171`). `freesbc_active_sip_dialogs` is a separate mechanism over the
 same set: the `Metrics.dialogs` gauge moved by `DialogStarted`/`DialogEnded`
 in `confirm`/`end` (`edge/metrics.go:67-68`), sampled through
 `Snapshot().ActiveDialogs` (`admin/metrics.go:57,129`).
@@ -1332,7 +1353,7 @@ reclamation of a confirmed dialog is the media silence watchdog, surfaced
 through `sess.Done()`. When it is the media that ends the dialog (the
 watchdog, or a WebRTC peer whose certificate does not match its
 fingerprint), `end()` reports it and the watcher calls the table's
-`onMediaEnd` — `byeBothEnds` (`indialog.go:348-353`) — which sends **each
+`onMediaEnd` — `byeBothEnds` (`indialog.go:435-440`) — which sends **each
 endpoint a BYE on behalf of the other** (RFC 3261 §15): From/To and tags
 from the record, the Request-URI the endpoint's own Contact, the CSeq one
 above the highest the other endpoint used, out the same pinned socket
@@ -1388,15 +1409,15 @@ routed is dropped with no response.
 
 **CANCEL.** When sipgo matches a CANCEL to a live INVITE server transaction
 it answers 200 to the CANCEL, fires the `OnCancel` hook
-(`invite.go:191-204`, `:422-428`, `:563-576`) **while holding the server
+(`invite.go:214-227`, `:465-471`, `:606-619`) **while holding the server
 transaction's lock**, and only after the hook returns finalises the INVITE
 server transaction with **487** toward the requester itself. The hook
 therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
-(`invite_leg.go:594-605`), which **synchronously** marks the record
+(`invite_leg.go:609-620`), which **synchronously** marks the record
 cancelled (`cancelSeries`, `dialog.go:528-547`) — from that instant
 `confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
 relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
-to a goroutine (`sendCancel`, `invite_leg.go:619-635`). `sendCancel` builds
+to a goroutine (`sendCancel`, `invite_leg.go:634-650`). `sendCancel` builds
 the CANCEL from the **forwarded** request so it carries that branch, sends
 it on a **5 s** context, and cancels the series context as soon as it is on
 the wire (which is what releases the media promptly instead of waiting on
@@ -1424,14 +1445,14 @@ FreeSWITCH.
 Once the series context is cancelled, `pumpInvite` does not simply return: it
 calls `drainCancelledInvite` for `pstnDrain` (300 ms) so the far end's 487 is
 still matched by the live client transaction and ACKed by the transaction
-layer (RFC 3261 §17.1.1.3, `invite_leg.go:482-520`). The same helper serves
+layer (RFC 3261 §17.1.1.3, `invite_leg.go:497-535`). The same helper serves
 all three call paths, not only PSTN. A 2xx that arrives after the caller
 cancelled is never relayed or confirmed: it is ACKed and BYEd.
 
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
-(`invite_leg.go:640-645`): it CANCELs the pending branch (RFC 3261 §16.8)
-and drains for its 487, and `giveUp` (`invite.go:325-336`) then sends the
+(`invite_leg.go:655-660`): it CANCELs the pending branch (RFC 3261 §16.8)
+and drains for its 487, and `giveUp` (`invite.go:348-359`) then sends the
 caller **408 Request Timeout** (§16.7 step 6). `giveUp` is the one place a
 caller's missing final is synthesised: nothing when its own CANCEL already
 got it a 487 from sipgo, **408** at the backstop, **487** when an orphan
@@ -1450,11 +1471,11 @@ side and then answers **200** to the requester — answering 408 would tell the
 switch its hangup failed and sofia would keep the leg. A BYE ends a dialog
 only when its tags name that confirmed dialog **and** the far end agreed:
 a 2xx, a 481 or 408 (which end the dialog for the sender too, §12.2.1.2), or
-no answer at all (`byeEndsDialog`, `indialog.go:223-228`). A BYE with tags
+no answer at all (`byeEndsDialog`, `indialog.go:310-315`). A BYE with tags
 that match no dialog is still forwarded — the endpoint answers 481 — but
 tears nothing down, and a 401/407 challenge leaves the call up.
 
-**Direction resolution** (`directionFor`, `indialog.go:241-306`):
+**Direction resolution** (`directionFor`, `indialog.go:328-393`):
 
 - A request whose Call-ID and tags name a confirmed dialog is routed by that
   record — `publicRemote` toward the client, `privateRemote` (the winning
@@ -1533,7 +1554,7 @@ any gateway**.
 
 Per call: the public side must be `udp` (else 503); the gateway list is
 `orderByAvailability`'s **available** half against `pstnCooldown`
-(`invite.go:552` discards the cooled half), so a cooling gateway is dropped
+(`invite.go:595` discards the cooled half), so a cooling gateway is dropped
 rather than tried at the tail as an upstream node would be (§7.6) — unless
 every candidate is cooling, in which case the route's own order is dialled
 unchanged (`topology.go:559-561`); the whole call is
@@ -1597,9 +1618,9 @@ stateDiagram-v2
     ok --> [*]
 ```
 
-`attemptKind` and `attemptResult` are defined at `invite.go:41-66`; the
-classification is produced by `pumpPSTNAttempt` (`invite_leg.go:279-386`) and
-`expirePSTNAttempt` (`invite_leg.go:395-465`); the upstream path uses the
+`attemptKind` and `attemptResult` are defined at `invite.go:52-79`; the
+classification is produced by `pumpPSTNAttempt` (`invite_leg.go:279-391`) and
+`expirePSTNAttempt` (`invite_leg.go:400-480`); the upstream path uses the
 simpler `final == nil && !responded && clTx.Err() != nil` retry rule in
 `inviteToUpstream`.
 
@@ -2458,7 +2479,7 @@ spin.
 | `trunk.withShield` | every registered trunk handler; logs and answers 500 |
 | `trunk.recoverCall` | the whole INVITE path (the inner umbrella wins, so the outer never sees INVITE panics) |
 | `trunk.recoverBWaiter` | the orphan B-leg waiter goroutine |
-| `edge.guard` | every registered edge handler; logs and answers 500 |
+| `edge.guard` | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` | every relay goroutine; closes **that session only** |
 | `admin.recoverMW` | every HTTP handler; re-panics `http.ErrAbortHandler` per the stdlib convention |
 
@@ -2649,13 +2670,14 @@ permanent series per call."
 | `freesbc_media_port_allocation_failure_total` | Counter | — | edge `rejectMedia` on `ErrPortsExhausted` |
 | `freesbc_webrtc_ice_failure_total` | Counter | — | edge, classified by `errors.Is` against `ErrICEFailed`/`ErrWebRTCNotReady` and unclassified errors |
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
+| `freesbc_sip_handler_panics_total` | Counter | — | edge `guard`, one per recovered handler panic |
 
 Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:109-118`). In a deployed system `freesbc_shield_banned_current`
 and `freesbc_shield_ban_adds_rejected_total` therefore stay at 0 and
 `freesbc_shield_drops_total` reports only `reason="rate"`. The ban and scanner
-branches run on the **edge** shield (`edge.go:517`), which `internal/app`
+branches run on the **edge** shield (`edge.go:559`), which `internal/app`
 never wires into `admin.Deps` — `Deps.Shield` and `Deps.Unban` are set only
 when the trunk server exists (`app.go:166-193`) — so edge bans reach neither
 `/metrics` nor `DELETE /api/bans/{ip}`.
@@ -2771,8 +2793,10 @@ port capacity. This gap is recorded in `internal/app/app.go:146-150`.
 runs before the SIP parser, the transaction layer, the connection pool and
 any log. The trunk's filter accepts only bytes whose source IP matches a
 configured peer's `allowed_ips` (no size cap). The edge's filter enforces a
-**64 KiB** size cap on every read and, for reads arriving on the private
-bind, requires an upstream source IP. Neither filter ever returns an error,
+**64 KiB** size cap on every read; for reads arriving on the private bind it
+requires an upstream source IP, and for public reads it drops a source the
+edge shield has banned (so a ban stays silent even for what sipgo would
+answer before any handler). Neither filter ever returns an error,
 because sipgo treats a filter error as fatal to the whole read loop.
 
 **Peer allowlist (trunk).** Identification is the transport source IP and

@@ -255,7 +255,7 @@ shield:
 		}
 	}()
 	select {
-	case <-srv.Ready():
+	case <-srv.ready:
 	case <-h.done:
 		t.Fatal("proxy exited before it was ready")
 	case <-time.After(10 * time.Second):
@@ -463,7 +463,7 @@ shield:
 		}
 	}()
 	select {
-	case <-srv.Ready():
+	case <-srv.ready:
 	case <-h.done:
 		t.Fatal("proxy exited before it was ready")
 	case <-time.After(10 * time.Second):
