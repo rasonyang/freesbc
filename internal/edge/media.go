@@ -528,13 +528,15 @@ func (s *Server) anchorFor(m *mediaSession, p plane) (netip.Addr, int) {
 	return s.topo.privateMediaIP, m.privatePort
 }
 
-// setWebRTCAnswer fills in the browser-facing half of an answer: the
-// ICE-Lite credentials, the DTLS role and FreeSBC's own fingerprint.
+// setWebRTCAnswer fills in the browser-facing half of a body: the ICE-Lite
+// credentials, the DTLS role and FreeSBC's own fingerprint.
 //
-// A re-INVITE's answer must restate exactly these values — changing any of
-// them would look like an ICE restart and tear down the media path the
-// session is still using — which is why the initial answer and the
-// in-dialog one are built by the same function rather than side by side.
+// Every in-dialog body toward the browser — the answer to its re-offer and
+// a re-offer FreeSWITCH makes to it — must restate exactly these values:
+// changing any of them would look like an ICE restart or a new DTLS
+// association and tear down the media path the session is still using.
+// That is why the initial answer and every in-dialog body are built by the
+// same function rather than side by side.
 func (s *Server) setWebRTCAnswer(build *sdp.Build, leg *media.WebRTCLeg) {
 	ufrag, pwd := leg.LocalCredentials()
 	build.DTLS, build.RTCPMux = true, true
@@ -568,9 +570,10 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 	if !sdp.HasMedia(codecs) {
 		return nil, nil, fmt.Errorf("%w: re-offer had %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
-	addr, port := s.anchorFor(d.session(), toward)
+	sess := d.session()
+	addr, port := s.anchorFor(sess, toward)
 	id, version := d.nextOrigin(toward)
-	out, err := sdp.Build{
+	build := sdp.Build{
 		Address: addr,
 		Port:    port,
 		Codecs:  codecs,
@@ -580,7 +583,16 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 		Direction:      offer.Audio.Direction,
 		SessionID:      id,
 		SessionVersion: version,
-	}.Marshal()
+	}
+	if toward == planePublic && sess.webrtc != nil {
+		// A re-offer toward a browser describes the SAME DTLS-SRTP stream:
+		// the profile, ICE-Lite credentials, fingerprint and the DTLS role
+		// already in use (RFC 5763 §5, RFC 8842 §5.3). A plain RTP/AVP
+		// re-offer would be refused, or taken as a request to drop the
+		// secure transport.
+		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
+	}
+	out, err := build.Marshal()
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: build in-dialog offer: %w", err)
 	}
@@ -588,15 +600,17 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 }
 
 // rebuildInDialogAnswer rewrites the answer to a re-INVITE for the near
-// side, and records the newly agreed codec list on the session.
-func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byte, toward plane) ([]byte, error) {
+// side, and records the newly agreed codec list on the session. It also
+// returns the far end's answer as parsed, for the media update the 2xx
+// applies.
+func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byte, toward plane) ([]byte, *sdp.Session, error) {
 	answer, err := sdp.Parse(body)
 	if err != nil {
-		return nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
+		return nil, nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
 	}
 	agreed, err := sdp.Negotiate(filterCodecs(offer.Audio.Codecs), answer.Audio.Codecs)
 	if err != nil {
-		return nil, negotiateError(err)
+		return nil, nil, negotiateError(err)
 	}
 	sess := d.session()
 	sess.setNegotiated(agreed)
@@ -614,5 +628,9 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byt
 	if toward == planePublic && sess.webrtc != nil {
 		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
 	}
-	return build.MarshalDeclining(offer)
+	out, err := build.MarshalDeclining(offer)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, answer, nil
 }

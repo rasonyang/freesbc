@@ -7,11 +7,13 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
 
 	fsip "github.com/freesbc/freesbc/internal/sip"
+	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // onReInvite proxies an in-dialog INVITE — a hold or unhold from a client,
@@ -65,11 +67,44 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 503, "Service Unavailable")
 		return
 	}
-	defer clTx.Terminate()
 
-	// The answer body built for THIS transaction: a 200 restating the
-	// answer an earlier provisional carried gets the same body again.
+	// The answer built for THIS transaction — never another re-INVITE's,
+	// which may be crossing this one from the other side (glare) — and the
+	// answer as the far end sent it. A 200 restating the answer an earlier
+	// provisional carried gets the same body again.
 	var answer []byte
+	var farAnswer *sdp.Session
+	// The relayed 2xx, for its retransmissions: as with the initial INVITE
+	// the client transaction is kept until Timer M, and each retransmitted
+	// 2xx is relayed again (RFC 3261 §13.3.1.4).
+	var mu sync.Mutex
+	var okOut *sip.Response
+	refused := false
+	clTx.OnRetransmission(func(res *sip.Response) {
+		mu.Lock()
+		ok, again := okOut, refused
+		mu.Unlock()
+		if again {
+			// A 2xx FreeSBC could not anchor, retransmitted: its ACK was
+			// lost, so send it again.
+			go s.ack2xx(res, to)
+			return
+		}
+		if ok == nil || fsip.ToTag(res) != fsip.ToTag(ok) {
+			return
+		}
+		out := ok.Clone()
+		out.SetDestination(req.Source())
+		s.metrics.ResponseOut(out.StatusCode)
+		_ = tx.Respond(out)
+	})
+	finalised := false
+	defer func() {
+		if !finalised {
+			clTx.Terminate()
+		}
+	}()
+
 	responses := clTx.Responses()
 	for {
 		select {
@@ -86,21 +121,28 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 			if !fsip.Forwardable(res) {
 				continue
 			}
+			is2xx := res.StatusCode/100 == 2
 			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
 				fsip.SetContact(relayed, from.uri())
-				if len(res.Body()) == 0 {
-					return nil
+				if len(res.Body()) > 0 && answer == nil {
+					reAnswer, parsedAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
+					if err != nil {
+						return err
+					}
+					answer, farAnswer = reAnswer, parsedAnswer
 				}
-				if answer != nil {
+				if len(res.Body()) > 0 {
 					fsip.SetSDPBody(relayed, answer)
-					return nil
 				}
-				reAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
-				if err != nil {
-					return err
+				if is2xx {
+					// The offer/answer exchange is complete: whichever side
+					// moved its media, the anchor follows now (RFC 3264
+					// §8.3.1-8.3.2).
+					s.applyReInvite(d, from.plane, parsed, to.plane, farAnswer)
+					mu.Lock()
+					okOut = relayed.Clone()
+					mu.Unlock()
 				}
-				fsip.SetSDPBody(relayed, reAnswer)
-				answer = reAnswer
 				return nil
 			})
 			switch {
@@ -110,9 +152,26 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 			case err != nil:
 				s.log.Warn("re-INVITE media negotiation failed", "err", err, "sip_call_id", fsip.CallID(req))
 				s.reject(req, tx, 488, "Not Acceptable Here")
+				if is2xx {
+					// The far end accepted a session FreeSBC cannot anchor.
+					// Its 2xx must still be ACKed (RFC 3261 §13.3.1.4) or it
+					// retransmits and then drops the call; and the two ends
+					// now disagree about the session — media would flow in a
+					// form one of them never agreed to — so the call is ended
+					// on both sides rather than left half-renegotiated.
+					finalised = true
+					mu.Lock()
+					refused = true
+					mu.Unlock()
+					s.ack2xx(res, to)
+					if d.end() {
+						s.byeBothEnds(d)
+					}
+				}
 				return
 			}
 			if res.StatusCode >= 200 {
+				finalised = is2xx
 				return
 			}
 		case <-clTx.Done():
@@ -121,6 +180,34 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction) {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// applyReInvite points the anchored media at whatever a completed
+// re-INVITE moved: the offerer's side at the address its offer signalled,
+// the answerer's side at its answer's. A side whose address is unchanged
+// (a hold, a session-timer refresh) is left alone, and a side that
+// signalled no usable address (port 0, or the RFC 2543 hold address
+// 0.0.0.0) keeps the one it had.
+func (s *Server) applyReInvite(d *dialog, offerer plane, offer *sdp.Session, answerer plane, answer *sdp.Session) {
+	sess := d.session()
+	for _, x := range []struct {
+		p    plane
+		body *sdp.Session
+	}{{offerer, offer}, {answerer, answer}} {
+		if x.body == nil {
+			continue
+		}
+		a := x.body.Audio
+		if !a.Address.IsValid() || a.Address.IsUnspecified() || a.Port <= 0 {
+			continue
+		}
+		remote := netip.AddrPortFrom(a.Address, uint16(a.Port))
+		var rtcp netip.AddrPort
+		if a.RTCPPort > 0 {
+			rtcp = netip.AddrPortFrom(a.Address, uint16(a.RTCPPort))
+		}
+		s.pointMedia(sess, x.p, remote, rtcp)
 	}
 }
 

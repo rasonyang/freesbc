@@ -1490,19 +1490,39 @@ Reached whenever an INVITE carries a To tag.
 2. Empty body → **488**; an offerless re-INVITE would make FreeSBC the
    offerer, which is unsupported, and refusing leaves the existing session
    untouched.
-3. (No allocation: the session keeps its ports.)
-4. Rebuild the offer from scratch against the session's **existing** anchor
-   ports (`anchorFor`) with a bumped `o=` version; nothing is allocated.
-5. Forward without Record-Route; **retarget the Request-URI to the far end's
-   own Contact** (`retargetInDialog`, `indialog.go:321`) and rewrite the
-   Contact.
-6. Relay responses; the first body-bearing response of **this transaction**
-   is rebuilt as an answer, later ones repeat that body. A `clTx.Done()`
-   yields **408**.
+3. Rebuild the offer from scratch against the session's **existing** anchor
+   ports (`anchorFor`) with the next `o=` version of the leg it goes to;
+   nothing is allocated. A re-offer **toward a browser** carries the same
+   DTLS-SRTP block as its answers — `UDP/TLS/RTP/SAVPF`, the ICE-Lite
+   credentials, the fingerprint and the DTLS role already in use (RFC 5763
+   §5, RFC 8842 §5.3) — so it describes the stream the browser already has.
+4. Forward without Record-Route; **retarget the Request-URI to the far end's
+   own Contact** (`retargetInDialog`) and rewrite the Contact.
+5. Relay responses; the first body-bearing response of **this transaction**
+   is rebuilt as an answer, later ones repeat **that** body — never another
+   re-INVITE's, so crossing re-INVITEs from both sides (glare) each keep
+   their own plane's answer. A `clTx.Done()` yields **408**.
+6. On the **2xx** the exchange is complete and the anchor follows it
+   (`applyReInvite`, RFC 3264 §8.3.1-8.3.2): the offerer's side is pointed at
+   the address its re-offer signalled and the answerer's side at its
+   answer's, through `pointMedia`, which re-arms the latch only for a side
+   whose address actually moved. A hold or a session-timer refresh that
+   restates the same address leaves the latch alone; a side that signalled
+   port 0 or `0.0.0.0` keeps the address it had. The browser side of a
+   WebRTC session is never re-pointed: ICE owns it.
+7. A **2xx whose answer cannot be anchored** is ACKed (RFC 3261 §13.3.1.4;
+   its retransmissions are re-ACKed), the requester is answered **488**, and
+   the call is ended with a BYE to both sides: the two ends now disagree
+   about the session, and media would flow in a form one of them never
+   agreed to.
+8. The client transaction is kept until Timer M after a 2xx, and each 2xx
+   retransmission is relayed again, as for the initial INVITE.
 
-For a WebRTC leg the rebuilt answer restates exactly the same ICE
-credentials, fingerprint and DTLS role — changing any of them would look like
-an ICE restart and tear the media path down.
+For a WebRTC leg every in-dialog body toward the browser restates exactly
+the same ICE credentials, fingerprint and DTLS role — changing any of them
+would look like an ICE restart and tear the media path down. A browser
+re-offer that changes its own ICE credentials (an ICE restart) is not
+supported.
 
 ### 7.10 PSTN side
 
