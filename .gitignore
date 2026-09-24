@@ -16,3 +16,4 @@ coverage.html
 
 # Local tooling state
 /.superpowers/
+docs/audit/raw/
