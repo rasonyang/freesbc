@@ -116,6 +116,16 @@ func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
 	}
 }
 
+// RelatchPrivate re-arms the private side's latches to ip, for an
+// authorised change of FreeSWITCH's media address signalled in SDP (a
+// re-INVITE, or an answer from another fork). Once latched, a latch only
+// moves this way; follow it with SetPrivateRemote to give the relay the
+// new destination.
+func (s *WebRTCSession) RelatchPrivate(ip netip.Addr) {
+	s.privRTP.relatch(ip)
+	s.privRTCP.relatch(ip)
+}
+
 // Done is closed when the session ends (Close or silence timeout).
 func (s *WebRTCSession) Done() <-chan struct{} { return s.done }
 

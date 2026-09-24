@@ -68,7 +68,8 @@ configuration, and the "Edge proxy plane" section of
 | WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint`. |
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role so media is never interrupted. |
-| Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored is ACKed and BYEd rather than left as a zombie dialog. |
+| Dialogs | Identified by Call-ID and both tags (RFC 3261 §12): only a BYE that names the dialog's tags, and that its far end accepts, ends it. The dialog is on record before its 2xx is relayed, so an immediate ACK always finds it; 2xx retransmissions are relayed until Timer M. |
+| Lifecycle | Media is released deterministically on BYE (from either side), CANCEL, a failed final response, dialog teardown, media silence, and shutdown. A 2xx whose SDP cannot be anchored — or one from a second fork — is ACKed and BYEd rather than left as a zombie dialog. |
 
 ## PSTN trunk
 
@@ -197,8 +198,12 @@ These are structural rather than scheduled.
   SIP/UDP phones, not WebRTC clients. Browser-originated calls are
   unaffected.
 - **Offerless INVITE is refused (488)** in both directions.
-- **One media session per Call-ID.** An upstream that forked one Call-ID into
-  two dialogs would need two sessions — a B2BUA's problem, not a proxy's.
+- **One media session per call.** Dialogs are identified by Call-ID and both
+  tags, and each early dialog of a forking far end gets its own answer; the
+  anchored media follows the fork that answered last and, once one sends a
+  2xx, that fork. A 2xx from a second fork after that is ACKed and BYEd
+  rather than relayed — two confirmed dialogs would need two sessions, a
+  B2BUA's problem, not a proxy's.
 - **Upstreams are UDP FreeSWITCHes at literal addresses.** One or a pool
   (`sip.upstreams`), with per-user hashing and passive failover between
   pool members — but no SRV, no TCP/TLS upstream, and no failover to a

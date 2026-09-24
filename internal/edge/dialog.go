@@ -3,26 +3,32 @@ package edge
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+
+	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // dialogState is where one proxied call stands in its life. The three
-// states are the ones the code actually distinguishes — they are not a
-// model of RFC 3261 §12, which is the endpoints' business, not a proxy's.
+// states are the ones the code actually distinguishes.
 type dialogState int
 
 const (
 	// dialogEarly: an INVITE is in flight and no 2xx has been relayed. The
 	// media session is allocated but not committed, and a CANCEL still
 	// applies — the attempt below is what one is built from. A failover
-	// series stays in this state across every attempt.
+	// series stays in this state across every attempt, and every early
+	// dialog the far side opens (one per To tag, see earlyFork) hangs off
+	// this one record.
 	dialogEarly dialogState = iota
-	// dialogConfirmed: a 2xx was relayed. The media session is committed,
-	// both endpoints' signaling addresses and Contacts are recorded, and
-	// in-dialog requests are routed by this record.
+	// dialogConfirmed: a 2xx was accepted. The record now names exactly one
+	// dialog — Call-ID, the caller's tag and the answering fork's tag — the
+	// media session is committed, both endpoints' signaling addresses and
+	// Contacts are recorded, and in-dialog requests carrying those three
+	// identifiers are routed by this record.
 	dialogConfirmed
 	// dialogEnded: terminal. The media session is closed and the record is
 	// out of the table. Every later end() is a no-op, which is what makes
@@ -38,15 +44,9 @@ const (
 // is only in the forwarded copy. cancel is always the WHOLE series'
 // cancel, never a per-attempt one, so a CANCEL that lands between two
 // attempts still ends the series.
-// fromTag is the CALLER's From tag, taken from the INVITE we received. A
-// CANCEL carries the same Call-ID and the same From tag as the INVITE it
-// cancels (RFC 3261 §9.1), so requiring it to match is what stops an
-// orphan CANCEL that merely guessed a live Call-ID from tearing down
-// somebody else's in-flight call.
 type inviteAttempt struct {
-	req     *sip.Request
-	cancel  context.CancelFunc
-	fromTag string
+	req    *sip.Request
+	cancel context.CancelFunc
 }
 
 // dialogRoute is where an in-dialog request goes once the call is up.
@@ -72,12 +72,14 @@ type dialogRoute struct {
 	privateContact sip.Uri
 }
 
-// sdpOrigin is the o= identity FreeSBC uses for every body it generates on
-// one dialog. The id must stay constant for the life of the session (RFC
-// 4566): a changed id means a NEW session, which some endpoints answer by
-// tearing the old one down. The version must increase on every body built
-// for the same id, and some endpoints use it to decide whether a re-offer
-// changed anything.
+// sdpOrigin is the o= identity FreeSBC uses for the bodies it generates
+// toward ONE leg of one dialog. The id must stay constant for the life of
+// the session (RFC 4566): a changed id means a NEW session, which some
+// endpoints answer by tearing the old one down. The version must go up by
+// exactly one on every new body the same leg is sent (RFC 3264 §8), which
+// is why there is one origin per leg rather than one per call: a shared
+// counter would advance for the other leg's bodies too, and each endpoint
+// would see its versions jump.
 type sdpOrigin struct {
 	id      uint64
 	version uint64
@@ -94,22 +96,52 @@ func (o *sdpOrigin) next() (id, version uint64) {
 	return o.id, o.version
 }
 
+// earlyFork is one early dialog the far side opened on the INVITE FreeSBC
+// forwarded, identified by the To tag its responses carry (RFC 3261
+// §12.1.2, §13.2.2.4).
+//
+// Each fork's answer is its own (RFC 3264 §6): the body FreeSBC built for
+// the caller from it, the codecs it agreed, the media address it signalled
+// and the o= identity of the bodies the caller is sent on its behalf. A
+// later response on the same fork that restates the answer gets the SAME
+// body again; a response on another fork is negotiated afresh, and the
+// anchored media follows whichever fork answered last — and, once one of
+// them sends a 2xx, that one.
+type earlyFork struct {
+	answer []byte
+	codecs []sdp.Codec
+	remote netip.AddrPort
+	rtcp   netip.AddrPort // explicit a=rtcp, when the answer carried one
+	origin sdpOrigin
+}
+
 // dialog is one proxied call, from the first forwarded INVITE to the
 // teardown of its media — the single owner of everything whose lifetime is
 // the call's.
 //
 // The proxy does not own the dialog on the wire (the endpoints do), so
-// this record holds only what the proxy needs: enough identity to match an
-// in-dialog request, the media session whose lifetime must follow the
-// dialog's, the CANCEL bridge while the INVITE is in flight, and the two
-// pieces of signaling bookkeeping that must not be re-derived mid-call
-// (the answer body already sent, and the o= identity).
+// this record holds only what the proxy needs: the dialog identifiers to
+// match an in-dialog request against, the media session whose lifetime
+// must follow the dialog's, the CANCEL bridge while the INVITE is in
+// flight, the per-fork answers while it is early, and the per-leg o=
+// identities.
 //
 // Every mutable field is guarded by the owning table's mutex; the record
 // is never mutated directly outside this file.
 type dialog struct {
 	tab    *dialogTable
 	callID string
+	// callerTag is the From tag of the INVITE that opened the record.
+	// calleeTag is the To tag of the 2xx that confirmed it; empty while
+	// early. Together with the Call-ID they are the RFC 3261 §12 dialog
+	// identifier, and an in-dialog request must name both to be routed by
+	// this record.
+	callerTag string
+	calleeTag string
+	// callerPlane is the plane the caller's in-dialog requests arrive on.
+	// A request whose tags say "from the caller" but which arrived on the
+	// other plane is not this dialog's.
+	callerPlane plane
 
 	state    dialogState
 	inFlight *inviteAttempt
@@ -119,95 +151,113 @@ type dialog struct {
 	// record is created, and then only closed — never replaced.
 	media *mediaSession
 
-	// answer is the body FreeSBC built for the near side the first time
-	// the far side answered. A 200 OK that restates the answer already
-	// sent in a reliable provisional must repeat OUR body, not re-run
-	// negotiation — re-latching mid-call would drop audio.
-	answer []byte
+	// forks holds the early dialogs by To tag, and applied names the one
+	// whose answer the media currently follows. Both are cleared on
+	// confirmation: the confirmed fork's state moves into the record.
+	forks   map[string]*earlyFork
+	applied *earlyFork
 
-	origin sdpOrigin
+	// ok is the 2xx as relayed to the caller. The far end retransmits its
+	// 2xx until the caller's ACK reaches it, and each retransmission is
+	// answered by relaying this same response again (RFC 3261 §13.3.1.4,
+	// RFC 6026 §7.2) — never re-negotiated.
+	ok *sip.Response
+	// rejected records the To tags of 2xx responses FreeSBC refused to
+	// relay (another fork's 2xx after this record was confirmed, or one it
+	// could not anchor) and has already ACKed and BYEd: a retransmission
+	// of one is only re-ACKed.
+	rejected map[string]bool
+
+	// origin is the o= identity per leg, indexed by plane.
+	origin [2]sdpOrigin
 }
 
-// dialogTable is the proxy's one store of calls, keyed by Call-ID.
+// dialogTable is the proxy's one store of calls.
 //
-// Call-ID alone, not the full RFC 3261 §12 dialog identifier. Two reasons,
-// and they point the same way:
-//
-//   - An in-dialog request from the CALLEE carries the callee's tag in
-//     From, so a from-tag key could not find the record that routes it.
-//     Every in-dialog lookup (directionFor, farContact, the re-INVITE
-//     path, teardown) is by Call-ID for exactly that reason.
-//   - A CANCEL carries the same Call-ID and the same From tag as the
-//     INVITE it cancels (§9.1), so the Call-ID alone finds the record.
-//     The tag still has to agree before an attempt is cancelled, but that
-//     is a check on the record (see inviteAttempt.fromTag), not a key.
-//
-// One entry per Call-ID also means FreeSBC anchors one media session per
-// call: a forking upstream that produced two dialogs on one Call-ID would
-// need two, which is a B2BUA's problem, not a proxy's. The limitation is
-// real and documented; what matters here is that the table can never grow
-// without bound, because every record leaves it through end().
+// Records are grouped by Call-ID for lookup, and a Call-ID may carry more
+// than one: RFC 3261 §12 identifies a dialog by the Call-ID AND both tags,
+// so two calls that share a Call-ID (a client that reuses one, or a
+// spiral) are two records, and a request is matched against a record's
+// tags before anything acts on it. Every record leaves the table through
+// end(), so it can never grow without bound.
 type dialogTable struct {
 	mu       sync.Mutex
-	byCallID map[string]*dialog
+	byCallID map[string][]*dialog
 
 	metrics *Metrics
 	log     *slog.Logger
 }
 
 func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
-	return &dialogTable{byCallID: map[string]*dialog{}, metrics: m, log: log}
+	return &dialogTable{byCallID: map[string][]*dialog{}, metrics: m, log: log}
 }
 
-// begin opens an early dialog for a Call-ID a call is being placed on.
+// begin opens an early dialog for an INVITE a call is being placed with.
 //
-// A record already under that Call-ID is ended: a new out-of-dialog INVITE
-// reusing a live Call-ID is the client abandoning the old call, and
-// leaving the old media session anchored would orphan its ports.
-func (t *dialogTable) begin(callID string) *dialog {
-	d := &dialog{tab: t, callID: callID, origin: newSDPOrigin()}
-	t.mu.Lock()
-	prev := t.byCallID[callID]
-	t.byCallID[callID] = d
-	t.mu.Unlock()
-	if prev != nil {
-		prev.end()
+// It refuses (ok false) when an early record with the same Call-ID and
+// caller tag already exists: that is a second INVITE for a transaction
+// still in progress — a merged request (RFC 3261 §8.2.2.2), which the
+// caller answers 482. A CONFIRMED record with the same identifiers is
+// left alone: the new INVITE opens a new record beside it, and only the
+// tags of later requests decide which one they belong to. An INVITE can
+// therefore never tear down somebody else's call by reusing its Call-ID.
+func (t *dialogTable) begin(callID, callerTag string, callerPlane plane) (*dialog, bool) {
+	d := &dialog{
+		tab:         t,
+		callID:      callID,
+		callerTag:   callerTag,
+		callerPlane: callerPlane,
+		forks:       map[string]*earlyFork{},
+		origin:      [2]sdpOrigin{newSDPOrigin(), newSDPOrigin()},
 	}
-	return d
-}
-
-// get returns the record for a Call-ID in any state. It is the CANCEL
-// bridge's lookup: a CANCEL applies to an early dialog.
-func (t *dialogTable) get(callID string) (*dialog, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	d, ok := t.byCallID[callID]
-	return d, ok
-}
-
-// confirmed returns the record for a Call-ID only once the call is up. An
-// in-dialog request has nothing to do with an INVITE still in flight, so
-// every in-dialog path asks for this and not get.
-func (t *dialogTable) confirmed(callID string) (*dialog, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	d, ok := t.byCallID[callID]
-	if !ok || d.state != dialogConfirmed {
-		return nil, false
+	for _, o := range t.byCallID[callID] {
+		if o.state == dialogEarly && o.callerTag == callerTag {
+			return nil, false
+		}
 	}
+	t.byCallID[callID] = append(t.byCallID[callID], d)
 	return d, true
 }
 
-// routeFor is confirmed plus the routing snapshot, which is all the
-// in-dialog forwarding paths need.
-func (t *dialogTable) routeFor(callID string) (dialogRoute, bool) {
+// early returns the in-flight record a CANCEL applies to: same Call-ID and
+// the same From tag as the INVITE it cancels (RFC 3261 §9.1). The tag is
+// what stops a CANCEL that merely guessed a live Call-ID from ending
+// somebody else's call.
+func (t *dialogTable) early(callID, callerTag string) (*dialog, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	d, ok := t.byCallID[callID]
-	if !ok || d.state != dialogConfirmed {
-		return dialogRoute{}, false
+	for _, d := range t.byCallID[callID] {
+		if d.state == dialogEarly && d.callerTag == callerTag {
+			return d, true
+		}
 	}
-	return d.route, true
+	return nil, false
+}
+
+// lookup finds the confirmed dialog an in-dialog request belongs to. The
+// request must name both tags: from the caller, its From tag is the
+// caller's and its To tag the callee's; from the callee, the other way
+// round. fromCaller reports which.
+func (t *dialogTable) lookup(callID, fromTag, toTag string) (d *dialog, fromCaller, ok bool) {
+	if fromTag == "" || toTag == "" {
+		return nil, false, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, d := range t.byCallID[callID] {
+		if d.state != dialogConfirmed {
+			continue
+		}
+		switch {
+		case fromTag == d.callerTag && toTag == d.calleeTag:
+			return d, true, true
+		case fromTag == d.calleeTag && toTag == d.callerTag:
+			return d, false, true
+		}
+	}
+	return nil, false, false
 }
 
 // count is the number of calls that are up — the same number the dialog
@@ -216,9 +266,11 @@ func (t *dialogTable) count() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	n := 0
-	for _, d := range t.byCallID {
-		if d.state == dialogConfirmed {
-			n++
+	for _, ds := range t.byCallID {
+		for _, d := range ds {
+			if d.state == dialogConfirmed {
+				n++
+			}
 		}
 	}
 	return n
@@ -228,14 +280,31 @@ func (t *dialogTable) count() int {
 // reservation or relay goroutine outlives the process's SIP plane.
 func (t *dialogTable) closeAll() {
 	t.mu.Lock()
-	all := make([]*dialog, 0, len(t.byCallID))
-	for _, d := range t.byCallID {
-		all = append(all, d)
+	var all []*dialog
+	for _, ds := range t.byCallID {
+		all = append(all, ds...)
 	}
 	t.mu.Unlock()
 	for _, d := range all {
 		d.end()
 	}
+}
+
+// removeLocked drops d from the table. The caller holds t.mu.
+func (t *dialogTable) removeLocked(d *dialog) {
+	ds := t.byCallID[d.callID]
+	for i, o := range ds {
+		if o != d {
+			continue
+		}
+		ds = append(ds[:i:i], ds[i+1:]...)
+		break
+	}
+	if len(ds) == 0 {
+		delete(t.byCallID, d.callID)
+		return
+	}
+	t.byCallID[d.callID] = ds
 }
 
 // attach records the media session this dialog anchors. Called once, on
@@ -253,27 +322,110 @@ func (d *dialog) session() *mediaSession {
 	return d.media
 }
 
+// routeSnapshot is the confirmed dialog's routing record.
+func (d *dialog) routeSnapshot() dialogRoute {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.route
+}
+
 // nextOrigin is the o= identity and version for a body FreeSBC is about to
-// generate on this dialog.
-func (d *dialog) nextOrigin() (id, version uint64) {
+// send toward one leg of this dialog.
+func (d *dialog) nextOrigin(toward plane) (id, version uint64) {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
-	return d.origin.next()
+	return d.origin[toward].next()
 }
 
-// lastAnswer is the answer body already sent to the near side, or nil if
-// none has been.
-func (d *dialog) lastAnswer() []byte {
+// fork returns the early dialog for a To tag, creating it on first sight.
+func (d *dialog) fork(tag string) *earlyFork {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
-	return d.answer
+	f, ok := d.forks[tag]
+	if !ok {
+		// A fresh o= identity per fork: each is a separate dialog, and so a
+		// separate session, as far as the caller can tell.
+		f = &earlyFork{origin: newSDPOrigin()}
+		d.forks[tag] = f
+	}
+	return f
 }
 
-// setLastAnswer records the answer body just sent to the near side.
-func (d *dialog) setLastAnswer(b []byte) {
+// forkAnswer is the answer already built for a fork, or nil.
+func (d *dialog) forkAnswer(f *earlyFork) []byte {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
-	d.answer = b
+	return f.answer
+}
+
+// setForkAnswer records a fork's negotiated answer.
+func (d *dialog) setForkAnswer(f *earlyFork, body []byte, codecs []sdp.Codec, remote, rtcp netip.AddrPort) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	f.answer, f.codecs, f.remote, f.rtcp = body, codecs, remote, rtcp
+}
+
+// forkMedia is what a fork's answer signalled and agreed.
+func (d *dialog) forkMedia(f *earlyFork) (remote, rtcp netip.AddrPort, codecs []sdp.Codec) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return f.remote, f.rtcp, f.codecs
+}
+
+// nextForkOrigin is the o= identity for a body built for the caller on
+// behalf of one fork.
+func (d *dialog) nextForkOrigin(f *earlyFork) (id, version uint64) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return f.origin.next()
+}
+
+// lastApplied is the fork whose answer the media currently follows, or nil.
+func (d *dialog) lastApplied() *earlyFork {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.applied
+}
+
+// setApplied records the fork whose answer the media now follows.
+func (d *dialog) setApplied(f *earlyFork) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	d.applied = f
+}
+
+// relayed2xx is the 2xx relayed to the caller when calleeTag is the
+// dialog's own, or nil.
+func (d *dialog) relayed2xx(calleeTag string) *sip.Response {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.state != dialogConfirmed || d.calleeTag != calleeTag || d.ok == nil {
+		return nil
+	}
+	return d.ok
+}
+
+// setRelayed2xx records the 2xx as relayed, for its retransmissions.
+func (d *dialog) setRelayed2xx(res *sip.Response) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	d.ok = res
+}
+
+// reject2xx records a 2xx FreeSBC refuses to relay and reports whether it
+// is the first time: the first sighting is ACKed and BYEd, a
+// retransmission only re-ACKed.
+func (d *dialog) reject2xx(calleeTag string) (first bool) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.rejected == nil {
+		d.rejected = map[string]bool{}
+	}
+	if d.rejected[calleeTag] {
+		return false
+	}
+	d.rejected[calleeTag] = true
+	return true
 }
 
 // track points the CANCEL bridge at the INVITE now in flight. A failover
@@ -296,38 +448,47 @@ func (d *dialog) untrack() {
 }
 
 // takeAttempt removes and returns the in-flight INVITE, so exactly one
-// caller ever cancels it. fromTag must be the From tag of the cancelling
-// request: a mismatch leaves the attempt in place and reports none, so the
-// caller treats it exactly like a CANCEL for a call it does not know.
-func (d *dialog) takeAttempt(fromTag string) (*inviteAttempt, bool) {
+// caller ever cancels it.
+func (d *dialog) takeAttempt() (*inviteAttempt, bool) {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
 	a := d.inFlight
-	if a == nil || a.fromTag != fromTag {
+	if a == nil {
 		return nil, false
 	}
 	d.inFlight = nil
 	return a, true
 }
 
-// confirm promotes an early dialog to a confirmed one: the 2xx has been
-// relayed, so the media session is committed and its lifetime is tied to
-// the dialog's — whichever ends first, a BYE or the media watchdog
-// noticing silence, tears the other down.
+// confirm promotes an early dialog to a confirmed one: a 2xx from the fork
+// tagged calleeTag was accepted, so the record now names exactly that
+// dialog, the fork's state becomes the dialog's, and the media session's
+// lifetime is tied to the dialog's — whichever ends first, a BYE or the
+// media watchdog noticing silence, tears the other down.
 //
-// A dialog that has already ended (shutdown racing the answer) is left
-// ended: its media is closed and nothing may be committed on top of it.
-func (d *dialog) confirm(r dialogRoute) {
+// It runs BEFORE the 2xx is relayed, so the ACK the caller sends the
+// moment it sees the 2xx always finds the record.
+//
+// It reports false for a dialog that has already ended (shutdown racing
+// the answer) or has no media: nothing may be committed on top of either.
+func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	t := d.tab
 	t.mu.Lock()
 	if d.state != dialogEarly || d.media == nil {
-		// Already ended, or no media was ever anchored: there is nothing
-		// to commit on top of either.
 		t.mu.Unlock()
-		return
+		return false
 	}
 	d.state = dialogConfirmed
+	d.calleeTag = calleeTag
 	d.route = r
+	if f := d.forks[calleeTag]; f != nil && f.answer != nil {
+		// The caller has seen this fork's bodies, so its o= identity is the
+		// caller leg's from now on.
+		d.origin[d.callerPlane] = f.origin
+	} else if d.applied != nil {
+		d.origin[d.callerPlane] = d.applied.origin
+	}
+	d.forks, d.applied = nil, nil
 	sess := d.media
 	t.mu.Unlock()
 
@@ -341,6 +502,7 @@ func (d *dialog) confirm(r dialogRoute) {
 		<-sess.Done()
 		d.end()
 	}()
+	return true
 }
 
 // endUnlessUp ends a dialog whose INVITE never connected. It is what every
@@ -355,9 +517,9 @@ func (d *dialog) endUnlessUp() {
 }
 
 // end is the single exit every teardown path goes through — a BYE, the
-// media watchdog, shutdown, a failed INVITE, and a new call taking over
-// the Call-ID. It closes the media session, drops the record and, for a
-// call that was up, reports the dialog's end exactly once.
+// media watchdog, shutdown and a failed INVITE. It closes the media
+// session, drops the record and, for a call that was up, reports the
+// dialog's end exactly once.
 //
 // Idempotent, and safe to race: the state transition under the table's
 // mutex is what elects the one caller that does the work.
@@ -372,11 +534,7 @@ func (d *dialog) end() {
 	d.state = dialogEnded
 	d.inFlight = nil
 	sess := d.media
-	// Only if this record still owns the key: a later call on the same
-	// Call-ID has its own record, which this teardown must not evict.
-	if t.byCallID[d.callID] == d {
-		delete(t.byCallID, d.callID)
-	}
+	t.removeLocked(d)
 	t.mu.Unlock()
 
 	if sess == nil {

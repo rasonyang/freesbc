@@ -38,7 +38,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
   2. An upstream source with a Request-URI equal to `sip.pstn.match` goes to a PSTN gateway.
   3. Arrival on the private socket goes to a registered client. The client is found by the `fsbc=` token that FreeSWITCH copies from the stored Contact into the Request-URI.
   4. Anything else goes to an upstream chosen by an FNV-1a hash of the user.
-- Edge handlers return after the final response. From then on `dialogTable`, keyed by Call-ID alone, owns the dialog and its media.
+- Edge handlers return after the final response. From then on `dialogTable` owns the dialog and its media; a dialog is matched on Call-ID plus both tags, and it is confirmed before its 2xx is relayed.
 - SDP: the edge builds every body from scratch with `internal/sip/sdp` (`Build`) and never copies the other leg's body. That is what guarantees topology hiding. The trunk edits the peer's body in place with `pion/sdp` directly (not the bounded `sdp` parser) and strips inbound `a=crypto`.
 
 ### Config model
