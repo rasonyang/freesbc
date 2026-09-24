@@ -35,7 +35,7 @@ routes:
 // transport-layer read filter drops it before parsing. Before T-01, the 400
 // comes back and this test fails.
 func TestPreParseFilterDropsNonPeerBytes(t *testing.T) {
-	const port = 45600
+	const port = 11600
 	startServerAt(t, port, "127.0.0.2", preparseCfg(port), nil)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -88,7 +88,7 @@ func TestPreParseFilterDropsNonPeerBytes(t *testing.T) {
 // OPTIONS from an allowed source (127.0.0.9) still gets its 200 — guarding
 // against a filter that drops everything instead of only non-peer bytes.
 func TestPreParseFilterAllowsPeerBytes(t *testing.T) {
-	const port = 45601
+	const port = 11601
 	startServerAt(t, port, "127.0.0.2", preparseCfg(port), nil)
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 9)})

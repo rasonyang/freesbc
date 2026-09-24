@@ -79,11 +79,11 @@ func TestTLSListenerUsesConfiguredCert(t *testing.T) {
 
 	cfg := `
 listen:
-  sip: [tls://127.0.0.1:45780]
+  sip: [tls://127.0.0.1:11780]
   tls_cert: ` + certPath + `
   tls_key: ` + keyPath + `
   media:
-    port_range: 46780-46783
+    port_range: 12780-12783
     public_ip: 127.0.0.1
 peers:
   p:
@@ -94,7 +94,7 @@ routes:
     from: p
     to: [p]
 `
-	srv := startServer(t, 45780, cfg)
+	srv := startServer(t, 11780, cfg)
 
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM(certPEM)
@@ -106,7 +106,7 @@ routes:
 	var conn *tls.Conn
 	var err error
 	for {
-		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", "127.0.0.1:45780",
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", "127.0.0.1:11780",
 			&tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots})
 		if err == nil || time.Now().After(deadline) {
 			break

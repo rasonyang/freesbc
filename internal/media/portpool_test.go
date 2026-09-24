@@ -18,7 +18,7 @@ func testPool(minPort, maxPort int) *PlanePool {
 }
 
 func TestPoolAllocateReleaseCycle(t *testing.T) {
-	p := testPool(40000, 40007) // room for 4 pairs
+	p := testPool(22000, 22007) // room for 4 pairs
 	var pairs []*portPair
 	for i := 0; i < 4; i++ {
 		pair, err := p.allocatePair()
@@ -47,24 +47,24 @@ func TestPoolAllocateReleaseCycle(t *testing.T) {
 
 func TestPoolSkipsForeignBoundPort(t *testing.T) {
 	// Occupy the first RTP port outside the pool; allocation must skip it.
-	held, err := net.ListenUDP("udp", &net.UDPAddr{Port: 40100})
+	held, err := net.ListenUDP("udp", &net.UDPAddr{Port: 22100})
 	if err != nil {
 		t.Skipf("cannot bind fixture port: %v", err)
 	}
 	defer held.Close()
-	p := testPool(40100, 40103)
+	p := testPool(22100, 22103)
 	pair, err := p.allocatePair()
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
 	defer pair.Close()
-	if got := pair.RTPPort(); got != 40102 {
-		t.Errorf("got port %d, want 40102 (40100 is occupied)", got)
+	if got := pair.RTPPort(); got != 22102 {
+		t.Errorf("got port %d, want 22102 (22100 is occupied)", got)
 	}
 }
 
 func TestPoolStats(t *testing.T) {
-	p := testPool(41000, 41007) // 8 ports → 4 pairs
+	p := testPool(23000, 23007) // 8 ports → 4 pairs
 	inUse, total := p.Stats()
 	if inUse != 0 || total != 4 {
 		t.Fatalf("empty pool: inUse=%d total=%d, want 0/4", inUse, total)
@@ -81,7 +81,7 @@ func TestPoolStats(t *testing.T) {
 }
 
 func TestPoolConcurrentAllocate(t *testing.T) {
-	p := testPool(40200, 40263) // 32 pairs
+	p := testPool(22200, 22263) // 32 pairs
 	var wg sync.WaitGroup
 	got := make(chan *portPair, 32)
 	for i := 0; i < 32; i++ {
@@ -118,7 +118,7 @@ func TestPoolConcurrentAllocate(t *testing.T) {
 func TestPoolBindsRTPBindIP(t *testing.T) {
 	bind := netip.MustParseAddr("127.0.0.1")
 	p := NewPlanePool("test", func() PlaneParams {
-		return PlaneParams{MinPort: 40300, MaxPort: 40303, BindIP: bind, Timeout: 5 * time.Minute}
+		return PlaneParams{MinPort: 22300, MaxPort: 22303, BindIP: bind, Timeout: 5 * time.Minute}
 	})
 	pair, err := p.allocatePair()
 	if err != nil {

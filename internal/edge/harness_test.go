@@ -7,9 +7,9 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,56 +25,106 @@ import (
 // SIP/WS. Nothing is mocked below the socket — the tests exercise the same
 // sipgo transports, transactions and media sockets a production run uses.
 
-// Ports for these tests are drawn from a fixed, deliberately chosen band
-// rather than from the kernel's ephemeral range.
+// Ports for these tests come from this package's slice of the test port
+// map (CLAUDE.md, "Test ports"), not from the kernel's ephemeral range.
 //
 // Asking the kernel for a port (bind :0, read it, close) and then binding
 // it again is racy in two ways that both bite here: another test can win
 // the second bind, and — more often — the kernel hands out the same
 // ephemeral port to one of sipgo's own outbound client sockets. Since the
 // harness needs a port it will hold for the whole test anyway, taking it
-// from a band outside the ephemeral range removes both races entirely.
+// from a band below the ephemeral range removes both races.
 //
-// 24000-44999 is above the privileged range, below macOS's and Linux's
-// ephemeral defaults, and disjoint from the media band below.
-var portCursor atomic.Int32
+// Every package's band sits below 32768, where Linux's ephemeral range
+// starts (macOS's starts at 49152), and no two packages' bands overlap, so
+// `go test ./...` can run the packages in parallel. Within a band the
+// cursor wraps, so -count=N never runs out, and every port is probed
+// before it is handed out, so a port still held by an earlier test or by
+// another process on the machine is skipped rather than failed on.
+var (
+	sipPorts   = &portBand{min: 25000, max: 27999}
+	mediaPorts = &portBand{min: 28000, max: 32399}
+)
 
-func nextPort(t *testing.T) int {
+// mediaWindow is how many ports each harness gets: 200 for the public RTP
+// range and 200 for the private one.
+const mediaWindow = 400
+
+// portBand hands out runs of free ports from [min, max], wrapping around.
+type portBand struct {
+	mu       sync.Mutex
+	min, max int
+	next     int // 0 until first use
+}
+
+// take returns the first port of n consecutive ports that probe free,
+// advancing the cursor past them. It gives up after one full lap.
+func (b *portBand) take(t *testing.T, n int, free func(port int) bool) int {
 	t.Helper()
-	for i := 0; i < 200; i++ {
-		p := 24000 + int(portCursor.Add(1))
-		if p > 44999 {
-			t.Fatal("test port band exhausted")
-		}
-		// Confirm it is actually free before handing it out: another
-		// process on the developer's machine may hold it.
-		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p})
-		if err != nil {
-			continue
-		}
-		_ = c.Close()
-		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
-		if err != nil {
-			continue
-		}
-		_ = l.Close()
-		return p
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.next == 0 {
+		b.next = b.min
 	}
-	t.Fatal("could not find a free port in the test band")
+	for scanned := 0; scanned <= b.max-b.min+1; {
+		if b.next+n-1 > b.max {
+			scanned += b.max - b.next + 1
+			b.next = b.min
+			continue
+		}
+		base, ok := b.next, true
+		for p := base; p < base+n; p++ {
+			if !free(p) {
+				// Resume after the busy port: no run through it can be free.
+				scanned += p - b.next + 1
+				b.next = p + 1
+				ok = false
+				break
+			}
+		}
+		if ok {
+			b.next = base + n
+			return base
+		}
+	}
+	t.Fatalf("test port band %d-%d has no %d free consecutive ports", b.min, b.max, n)
 	return 0
 }
+
+// udpFree probes a UDP port on the wildcard address, which fails if the
+// port is bound on any local address.
+func udpFree(port int) bool {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// sipFree probes both transports: a harness port may carry UDP or a
+// WebSocket listener.
+func sipFree(port int) bool {
+	if !udpFree(port) {
+		return false
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+func nextPort(t *testing.T) int { return sipPorts.take(t, 1, sipFree) }
 
 func freePort(t *testing.T) int    { return nextPort(t) }
 func freeTCPPort(t *testing.T) int { return nextPort(t) }
 
-// nextMediaBase hands each harness its own disjoint media port window, so
-// no two tests contend for the same RTP ports.
-var mediaCursor atomic.Int32
-
-func nextMediaBase() int {
-	// 400 ports per harness (200 public + 200 private).
-	return 45000 + int(mediaCursor.Add(1)-1)*400
-}
+// nextMediaBase hands each harness its own media port window. Windows are
+// reused once the cursor wraps, but only after every port in the window
+// probes free again.
+func nextMediaBase(t *testing.T) int { return mediaPorts.take(t, mediaWindow, udpFree) }
 
 // harness is one running proxy plus the addresses everything talks to.
 type harness struct {
@@ -137,7 +187,7 @@ func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, ps
 	priv := freePort(t)
 	up := freePort(t)
 	// Media ranges are per-harness so no two tests contend for a port.
-	mediaBase := nextMediaBase()
+	mediaBase := nextMediaBase(t)
 
 	pstnBlock := ""
 	if pstn != nil {
@@ -212,6 +262,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
+	waitProxyServing(t, srv, net.JoinHostPort(pubBindIP, strconv.Itoa(pubUDP)), h.privateSIP)
 	return h
 }
 
@@ -321,7 +372,7 @@ func startHarnessUpstreams(t *testing.T, algorithm, cooldown string, nodes map[s
 	pubWS := freeTCPPort(t)
 	priv := freePort(t)
 	// Media ranges are per-harness so no two tests contend for a port.
-	mediaBase := nextMediaBase()
+	mediaBase := nextMediaBase(t)
 
 	// Deterministic config: sort the names so neither the YAML nor the
 	// topology it produces ever depends on map iteration order.
@@ -419,6 +470,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
+	waitProxyServing(t, srv, h.publicUDP, h.privateSIP)
 	return h, switches
 }
 
@@ -466,6 +518,10 @@ type fakeSwitch struct {
 	requests []*sip.Request
 	// challenge, when true, makes the next REGISTER get a 401.
 	challenge bool
+	// registerStatus, when non-zero, is the final status every REGISTER
+	// gets instead of the challenge-then-200 exchange — a registrar that
+	// refuses the AoR outright.
+	registerStatus int
 	// answerSDP is what the switch answers an INVITE with; %d is its RTP
 	// port.
 	rtpPort int
@@ -536,7 +592,59 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 		defer close(f.done)
 		_ = srv.TransportLayer().ServeUDP(conn)
 	}()
+	waitUDPServing(t, srv.TransportLayer(), conn)
 	return f
+}
+
+// waitProxyServing returns once the proxy's UDP listeners at udpAddrs are
+// in its sipgo transport's connection pool.
+//
+// Ready closes when every socket is bound, but each listener is added to
+// the pool by the goroutine that serves it, possibly later. Until then a
+// request the proxy sends from that listener's address — forwarding
+// upstream from the private bind — misses the pool and fails with "bind:
+// address already in use", which a test sees as a 503. Waiting here keeps
+// that startup window out of the tests; the window itself is a production
+// issue, not something the harness should paper over silently, hence this
+// comment.
+func waitProxyServing(t *testing.T, srv *Server, udpAddrs ...string) {
+	t.Helper()
+	tl := srv.srv.TransportLayer() // written before Ready closed
+	deadline := time.Now().Add(2 * time.Second)
+	for _, addr := range udpAddrs {
+		for {
+			if c, err := tl.GetConnection("udp", addr); err == nil && c != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("proxy never started serving udp %s", addr)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// waitUDPServing returns once sipgo has put conn in its transport's
+// connection pool.
+//
+// ServeUDP adds the listener to the pool from the goroutine that serves
+// it. A request sent from the listener's own address (req.Laddr, as the
+// fake switch does so the proxy sees the upstream address) before that has
+// happened misses the pool, and sipgo tries to bind a second socket on the
+// same address: "listen udp ...: bind: address already in use".
+func waitUDPServing(t *testing.T, tl *sip.TransportLayer, conn *net.UDPConn) {
+	t.Helper()
+	addr := conn.LocalAddr().String()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c, err := tl.GetConnection("udp", addr); err == nil && c != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sipgo never started serving %s", addr)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (f *fakeSwitch) stop() {
@@ -706,7 +814,12 @@ func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 	f.record(req)
 	f.mu.Lock()
 	challenge := f.challenge && req.GetHeader("Authorization") == nil
+	status := f.registerStatus
 	f.mu.Unlock()
+	if status != 0 {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, status, "", nil))
+		return
+	}
 	if challenge {
 		res := sip.NewResponseFromRequest(req, 401, "Unauthorized", nil)
 		res.AppendHeader(sip.NewHeader("WWW-Authenticate",

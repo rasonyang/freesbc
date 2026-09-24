@@ -72,7 +72,7 @@ func startFSHarness(t *testing.T, upstream, localIP string) *fsHarness {
 	t.Helper()
 	pubPort := nextPort(t)
 	privPort := nextPort(t)
-	mediaBase := nextMediaBase()
+	mediaBase := nextMediaBase(t)
 
 	yaml := fmt.Sprintf(`
 network:

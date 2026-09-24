@@ -10,7 +10,7 @@ import (
 
 const auditTCPCapCfg = `
 listen:
-  sip: [tcp://127.0.0.1:47760]
+  sip: [tcp://127.0.0.1:13760]
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -61,8 +61,8 @@ func auditTCPOptions(t *testing.T, addr, callID string) string {
 // test-only hook; the attacker connects from 127.0.0.2 (not in any
 // allowed_ips) and sends nothing.
 func TestAuditTCPCapExhaustedByNonPeers(t *testing.T) {
-	const addr = "127.0.0.1:47760"
-	startServerConfigured(t, 47760, auditTCPCapCfg, func(s *Server) { s.tcpMaxConns = 4 })
+	const addr = "127.0.0.1:13760"
+	startServerConfigured(t, 13760, auditTCPCapCfg, func(s *Server) { s.tcpMaxConns = 4 })
 
 	if got := auditTCPOptions(t, addr, "cap-control"); !strings.HasPrefix(got, "SIP/2.0 ") {
 		t.Fatalf("control: peer OPTIONS over TCP got %q, want a SIP response", got)
@@ -97,7 +97,7 @@ func TestAuditTCPCapExhaustedByNonPeers(t *testing.T) {
 const auditMinSECfg = `
 min_se: 90s
 listen:
-  sip: [udp://127.0.0.1:47770]
+  sip: [udp://127.0.0.1:13770]
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -112,12 +112,12 @@ routes:
 // RFC 4028 §4: "x" is the compact form of Session-Expires. An INVITE with
 // "x: 30" under min_se 90s must get 422 exactly like the long form does.
 func TestAuditCompactSessionExpiresBypassesMinSE(t *testing.T) {
-	startServer(t, 47770, auditMinSECfg)
-	long := roundTripWithHeaders(t, 47770, "INVITE", "minse-long", 3*time.Second, "SIP/2.0 422", "Session-Expires: 30")
+	startServer(t, 13770, auditMinSECfg)
+	long := roundTripWithHeaders(t, 13770, "INVITE", "minse-long", 3*time.Second, "SIP/2.0 422", "Session-Expires: 30")
 	if !strings.Contains(long, "SIP/2.0 422") {
 		t.Fatalf("control: long-form Session-Expires: 30 got:\n%s\nwant 422", long)
 	}
-	compact := roundTripWithHeaders(t, 47770, "INVITE", "minse-compact", 3*time.Second, "SIP/2.0 422", "x: 30")
+	compact := roundTripWithHeaders(t, 13770, "INVITE", "minse-compact", 3*time.Second, "SIP/2.0 422", "x: 30")
 	if !strings.Contains(compact, "SIP/2.0 422") {
 		first := compact
 		if i := strings.Index(first, "\r\n"); i >= 0 {

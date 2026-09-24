@@ -68,11 +68,17 @@ One process and one YAML file run two independent SIP planes, either or both. `i
   - edge: 16 of the 17 `TestPSTN*` tests, whose fake FreeSWITCH binds 127.0.0.2 (`TestPSTNUnconfiguredFallsBackTo404` is unaffected).
 
   Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.25.7 go test -race -count=1 ./...`.
-- Test ports are fixed, not ephemeral:
-  - Trunk tests hard-code SIP/RTP ports in 45xxx–46xxx (for example 45070). `TestKillCallTearsDownBothLegs` also binds `127.0.0.1:5070`, the port `test/interop/sbc.yaml` listens on.
-  - Media tests use fixed pools in 20000–20100, 40000–40517 and 41xxx.
-  - The edge harness probes SIP ports in 24000–44999 and skips busy ones (`nextPort`), but its media windows are unprobed: 400 ports per harness on 127.0.0.1 starting at 45000, which overlaps trunk's 45xxx–46xxx.
+- Test ports: each package owns a disjoint band, all below 32768 (the start of Linux's ephemeral range, so the kernel never hands a test's fixed port to a client socket; macOS's starts at 49152). Keep new test ports inside the package's band:
 
-  As a result, packages running in parallel inside one `go test ./...` can collide (edge media vs trunk ports), two concurrent runs (for example from two checkouts) collide, and `go test ./internal/edge -count=2` always fails in its second pass (`rtp.*.port_max: must be 1024-65535`).
+  | Band | Package | How ports are chosen |
+  |---|---|---|
+  | 10000–10099 | app | kernel-assigned SIP ports with retry on a bind collision; `appMediaPortMin..Max` for the media range |
+  | 10100–10199 | admin | fixed (`TestAdminServesTLS`); other admin tests listen on `:0` |
+  | 11000–15199 | trunk | fixed per test; no two tests share a port. `TestKillCallTearsDownBothLegs` also binds `127.0.0.1:5070`, the port `test/interop/sbc.yaml` listens on |
+  | 20000–24999 | media | fixed per test |
+  | 25000–27999 | edge SIP | `nextPort`: probed free, cursor wraps |
+  | 28000–32399 | edge media | `nextMediaBase`: a 400-port window per harness, every port probed free, cursor wraps |
+
+  Packages can therefore run in parallel inside one `go test ./...`, and `-count=N` works. Two concurrent runs of the same package (for example from two checkouts) still collide on the fixed trunk and media ports.
 - Most trunk call tests use a 4-port `port_range`, which fits exactly one call. A session released late can show up as `media: RTP port range exhausted`, a 503 from `pool.Allocate`, or "carrier dialog never ended". Many of these tests carry the comment "Timing-based over real UDP loopback: re-run once before treating a flake as failure". Before calling a failure a regression, re-run the single test with `-run '^TestName$' -count=1` and compare against a baseline checkout run sequentially, not concurrently.
 - `WARN UDP ref went negative on try close` lines come from sipgo v1.4.3 (`sip/transport_udp.go`, logged without returning an error) and are not test failures.

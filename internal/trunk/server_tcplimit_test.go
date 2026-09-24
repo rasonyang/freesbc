@@ -15,7 +15,7 @@ import (
 // on a port no other test uses.
 const tcpLimitCfg = `
 listen:
-  sip: [tcp://127.0.0.1:45710]
+  sip: [tcp://127.0.0.1:11710]
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -56,17 +56,17 @@ func TestTCPIdleTimeoutClosesConn(t *testing.T) {
 	// goroutine spawns (so the write happens-before bindListener's read, and
 	// -race stays clean).
 	const idle = 300 * time.Millisecond
-	startServerConfigured(t, 45710, tcpLimitCfg, func(s *Server) {
+	startServerConfigured(t, 11710, tcpLimitCfg, func(s *Server) {
 		s.tcpIdleTimeout = idle
 	})
 
-	conn := dialTCPWithRetry(t, "127.0.0.1:45710")
+	conn := dialTCPWithRetry(t, "127.0.0.1:11710")
 	defer conn.Close()
 
 	// Half a request line, deliberately unterminated: the parser accepts the
 	// bytes and waits for more, leaving the connection silent — exactly the
 	// case the idle timeout must reclaim.
-	if _, err := conn.Write([]byte("INVITE sip:5551234@127.0.0.1:45710 SIP/2.0\r\n")); err != nil {
+	if _, err := conn.Write([]byte("INVITE sip:5551234@127.0.0.1:11710 SIP/2.0\r\n")); err != nil {
 		t.Fatalf("write partial request: %v", err)
 	}
 

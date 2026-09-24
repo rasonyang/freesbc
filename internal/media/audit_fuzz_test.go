@@ -196,7 +196,7 @@ func FuzzAuditSRTPRoundTrip(f *testing.F) {
 // from an unknown remote. The leg must neither crash nor fail.
 func FuzzAuditWebRTCLegPreICE(f *testing.F) {
 	auditSeedPackets(f)
-	pool := newAuditPool("public", 47400, 47499, "127.0.0.1")
+	pool := newAuditPool("public", 24400, 24499, "127.0.0.1")
 	id, err := ProcessDTLSIdentity()
 	if err != nil {
 		f.Fatal(err)
@@ -234,7 +234,7 @@ func FuzzAuditWebRTCLegPreICE(f *testing.F) {
 // datagram must not end the call.
 func FuzzAuditWebRTCEstablished(f *testing.F) {
 	auditSeedPackets(f)
-	c := auditEstablishBrowserCall(f, 47500, 47599, 47600, 47699)
+	c := auditEstablishBrowserCall(f, 24500, 24599, 24600, 24699)
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > 1500 {
 			b = b[:1500]

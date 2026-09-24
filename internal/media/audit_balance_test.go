@@ -17,9 +17,9 @@ import (
 // and WebRTCSession Close while Start waits on the leg. After every path
 // both pools must be empty and the goroutine count back to baseline.
 func TestAuditMediaPortPoolAndGoroutineBalance(t *testing.T) {
-	pub := newAuditPool("public", 47300, 47339, "127.0.0.1")
-	priv := newAuditPool("private", 47340, 47379, "127.0.0.1")
-	tiny := newAuditPool("tiny", 47380, 47381, "127.0.0.1") // exactly one pair
+	pub := newAuditPool("public", 24300, 24339, "127.0.0.1")
+	priv := newAuditPool("private", 24340, 24379, "127.0.0.1")
+	tiny := newAuditPool("tiny", 24380, 24381, "127.0.0.1") // exactly one pair
 	id, err := ProcessDTLSIdentity()
 	if err != nil {
 		t.Fatal(err)
