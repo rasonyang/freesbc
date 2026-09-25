@@ -125,6 +125,12 @@ type Server struct {
 	// zero value is usable; it needs no Run-time wiring.
 	quota callQuota
 
+	// gate admits initial INVITEs and drains them at shutdown (see
+	// shutdown.go); shutdownGrace bounds that drain. Set by NewServer;
+	// only tests override the grace, before Run.
+	gate          callGate
+	shutdownGrace time.Duration
+
 	// onListening, when non-nil, is called once per listener immediately
 	// after its socket is bound and before it is handed to the transport
 	// layer. Only tests set it (from startServerAt, before the Run
@@ -153,6 +159,7 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		// connections and a 120s idle read deadline per connection.
 		tcpMaxConns:    1024,
 		tcpIdleTimeout: 120 * time.Second,
+		shutdownGrace:  defaultShutdownGrace,
 	}
 }
 
@@ -349,8 +356,12 @@ func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("sip server listening", "listeners", len(listeners))
 
 	<-stopCh
-	// Registrar first: every un-REGISTER attempt completes (success or its
-	// own bounded 2s timeout) while listener sockets are still open.
+	// Calls first: every bridged call is BYEd on both legs and its media
+	// released while the listeners (whose sockets the BYEs and their
+	// responses use) are still open (audit P2-TRK-017).
+	s.drainCalls(s.shutdownGrace)
+	// Then the registrar: every un-REGISTER attempt completes (success or
+	// its own bounded 2s timeout) while listener sockets are still open.
 	regCancel()
 	<-regDone
 	// Only now is it safe to close the listener sockets.

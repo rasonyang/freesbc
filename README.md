@@ -62,6 +62,8 @@ Then validate and run:
 
 The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC), the edge media planes (`rtp.public`/`rtp.private`), which planes run and the `admin` listener are read once at startup and need a restart; a reload that edits them is logged as a warning listing the keys, and the running process keeps its startup values.
 
+On SIGINT/SIGTERM the trunk plane refuses new calls (503), sends a BYE on both legs of every live call and waits up to 12 s for them before it un-registers and closes its listeners; edge-proxy calls are dropped with their media released. A second SIGINT/SIGTERM exits at once.
+
 ## Keep FreeSWITCH off the public internet
 
 The edge plane exists so that FreeSBC is the only element with a public address. FreeSWITCH is a literal private `IP:port` upstream and never needs a public IP, a port forward, or NAT handling of its own.

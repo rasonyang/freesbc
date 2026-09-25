@@ -271,6 +271,23 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer doneInvite()
 
+	// Shutdown gate: once Run has begun draining, no new call is placed
+	// (503 + Retry-After, so the caller tries another SBC or later); a
+	// bridged one is BYEd and waited for, bounded, before the listeners
+	// close (shutdown.go).
+	if !s.gate.admit() {
+		s.reject(req, tx, 503, "Service Unavailable", sip.NewHeader("Retry-After", "30"))
+		return
+	}
+	// Deferred here, before any resource is taken, so it runs after every
+	// release below: drainCalls waits for it (registerCall counts the call).
+	bridged := false
+	defer func() {
+		if bridged {
+			s.gate.unbridge()
+		}
+	}()
+
 	// Call-quota gate for initial INVITEs (the in-dialog
 	// re-INVITE branch above already returned — a refresh never consumes a
 	// new slot): an INVITE past either the peer's or the global
@@ -517,6 +534,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	defer killCancel()
 	c.cancel = killCancel
 	s.registerCall(c)
+	bridged = true
 	defer s.endCall(c)
 	if s.onBridged != nil {
 		s.onBridged(c)

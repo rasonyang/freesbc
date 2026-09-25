@@ -354,20 +354,25 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
-	case err := <-errs:
-		listenCancel()
-		wg.Wait()
-		s.dialogs.closeAll()
-		return err
+	case runErr = <-errs:
 	}
+	// Shutdown. First close the dialog table, while the listeners are
+	// still up: an INVITE handler still in flight can then open no dialog
+	// and attach no media (it answers 503, and a session it already
+	// allocated is closed by attach), so nothing is allocated after this
+	// point or outlives Run (audit P2-EDG-027). Then close the listeners
+	// and wait for them, and end every dialog: every media session is torn
+	// down explicitly, so no socket, port reservation or relay goroutine
+	// outlives Run. There is no BYE on this plane's shutdown: the calls
+	// are dropped (docs/design.md §4.5).
+	s.dialogs.close()
 	listenCancel()
 	wg.Wait()
-	// Every media session is torn down explicitly at shutdown: no socket,
-	// port reservation or relay goroutine outlives Run.
 	s.dialogs.closeAll()
-	return nil
+	return runErr
 }
 
 // udpServingTimeout bounds how long Run waits for sipgo to pool its UDP

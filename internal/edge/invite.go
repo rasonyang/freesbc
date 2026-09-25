@@ -148,6 +148,10 @@ func (s *Server) isPSTNBridgeInvite(req *sip.Request, src netip.AddrPort) bool {
 func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane) (*dialog, bool) {
 	d, ok := s.dialogs.begin(req, callerPlane)
 	if !ok {
+		if s.dialogs.isClosed() { // closed never reopens, so this is exact
+			s.reject(req, tx, 503, "Service Unavailable")
+			return nil, false
+		}
 		s.reject(req, tx, 482, "Loop Detected")
 		return nil, false
 	}
@@ -856,6 +860,8 @@ func (s *Server) rejectMedia(req *sip.Request, tx sip.ServerTransaction, err err
 	case errors.Is(err, errNoUsableCodec), errors.Is(err, errRenumbered):
 		s.log.Info("rejecting call: media not negotiable", "err", err, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 488, "Not Acceptable Here")
+	case errors.Is(err, errShuttingDown):
+		s.reject(req, tx, 503, "Service Unavailable")
 	case errors.Is(err, media.ErrPortsExhausted):
 		s.metrics.PortAllocationFailed()
 		s.log.Error("rejecting call: media ports exhausted", "err", err, "sip_call_id", fsip.CallID(req))

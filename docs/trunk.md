@@ -96,6 +96,7 @@ See [`docs/design.md`](design.md) §6.14 for how the selection works and its lim
   plain RTP, and only browser legs get DTLS-SRTP), SRTP↔RTP interworking in
   both directions, NAT traversal via hardened first-packet latching;
   **no transcoding** (left to the softswitch behind)
+- **Graceful shutdown** — on SIGINT/SIGTERM new INVITEs get `503` with `Retry-After`, every live call is BYEd on both legs (bounded to 12 s) while the listeners are still open, then peers are un-registered and the listeners close (see `docs/design.md` §4.5)
 - **Carrier interop baseline** — OPTIONS answering and session-timer
   negotiation (RFC 4028), including the 422/Min-SE exchange on both legs;
   the SBC refreshes a leg whose far end names it refresher, and answers

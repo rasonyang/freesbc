@@ -20,12 +20,12 @@ alone or both together in one process:
 
 | Plane | Package | Role | Enabled when |
 |---|---|---|---|
-| Trunk | `internal/trunk` | **B2BUA** between carriers and a PBX/softswitch | `len(cfg.Peers) > 0` (`internal/app/app.go:69`) |
-| Edge | `internal/edge` | **Stateful SIP proxy** between public endpoints (SIP phones, browsers) and FreeSWITCH, plus a PSTN trunk side | `cfg.ProxyEnabled()`, i.e. `sip.upstream.address` or `sip.upstreams.nodes` is set (`internal/config/proxy.go:271`) |
+| Trunk | `internal/trunk` | **B2BUA** between carriers and a PBX/softswitch | `len(cfg.Peers) > 0` (`internal/app/app.go:68`) |
+| Edge | `internal/edge` | **Stateful SIP proxy** between public endpoints (SIP phones, browsers) and FreeSWITCH, plus a PSTN trunk side | `cfg.ProxyEnabled()`, i.e. `sip.upstream.address` or `sip.upstreams.nodes` is set (`internal/config/proxy.go:272`) |
 
 If neither is enabled, `app.Run` refuses to start:
 `"nothing to run: configure trunk peers, sip.upstream.address (or sip.upstreams.nodes), or both"`
-(`internal/app/app.go:85`).
+(`internal/app/app.go:84`).
 
 ### 1.1 Boundaries
 
@@ -117,11 +117,11 @@ Consequences that hold by construction:
   read-only after publication.
 
 One deliberate exception to the clean separation: `edge.New` calls
-`raiseUDPSendLimit()` (`internal/edge/edge.go:94-100`), a `sync.Once`
+`raiseUDPSendLimit()` (`internal/edge/edge.go:101-107`), a `sync.Once`
 process-wide raise of **sipgo's** `sip.UDPMTUSize` to 8192, applied only when
 it is currently lower. Constructing an edge server
 therefore changes the trunk plane's UDP send ceiling too; the code documents
-this as intentional (`internal/edge/edge.go:90-93`).
+this as intentional (`internal/edge/edge.go:97-100`).
 
 ---
 
@@ -133,22 +133,22 @@ Created once, alive for the process lifetime:
 
 | Object | Package | Created at | Notes |
 |---|---|---|---|
-| `config.Store` | config | `app.Run` (`app.go:53`) | `atomic.Pointer[Config]` + subscriber list |
-| trunk `media.PlanePool` (name `"trunk"`) | media | `trunk.NewMediaPool(store)` (`app.go:55`) | one pool; both sides of a trunk call allocate from it |
+| `config.Store` | config | `app.Run` (`app.go:57`) | `atomic.Pointer[Config]` + subscriber list |
+| trunk `media.PlanePool` (name `"trunk"`) | media | `trunk.NewMediaPool(store)` (`app.go:59`) | one pool; both sides of a trunk call allocate from it |
 | edge `pubPool` / `privPool` | media | `edge.New` → `newMediaPools` | two pools with disjoint validated ranges |
-| `trunk.Server` | trunk | `app.go:68-71` | binds nothing until `Run` |
-| `edge.Server` | edge | `app.go:77-83` | binds nothing until `Run` |
-| `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:285`) | one goroutine per `register: true` peer |
+| `trunk.Server` | trunk | `app.go:67-70` | binds nothing until `Run` |
+| `edge.Server` | edge | `app.go:76-82` | binds nothing until `Run` |
+| `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:322`) | one goroutine per `register: true` peer |
 | `trunk.Resolver` | trunk | `NewServer` | SRV cache + singleflight + seeded `rand` |
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
-| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:269`) | immutable snapshot afterwards |
+| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:299`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
-| `edge.dialogTable` | edge | `edge.New` (`edge.go:143`) | grouped by Call-ID, matched on Call-ID + both tags |
-| `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:136-137`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
+| `edge.dialogTable` | edge | `edge.New` (`edge.go:151`) | grouped by Call-ID, matched on Call-ID + both tags |
+| `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:144-145`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
 | `edge.privateSources` | edge | `edge.New` | 256-entry, 10-minute TTL map of private-listener sources |
 | `media.DTLSIdentity` | media | `edge.New` when `webrtc.enabled` | one per process, shared by every WebRTC leg |
 | `shield.Shield` ×(0..2) | shield | trunk `Run` (`shield.New`), edge `Run` (`shield.NewNoKernel`) | separate instances; both ban in process memory only |
-| `admin.Server` | admin | `app.go:120-122` | only when an `admin:` section exists at startup |
+| `admin.Server` | admin | `app.go:123-125` | only when an `admin:` section exists at startup |
 
 ### 3.2 Per-unit-of-work objects
 
@@ -170,10 +170,10 @@ Created once, alive for the process lifetime:
 
 ### 3.3 Goroutine inventory
 
-**Process-level (errgroup members, `app.go:91-129`)**
+**Process-level (errgroup members, `app.go:91-132`)**
 
 1. `config.Watch` — always; never fatal (`app.Run`'s wrapper logs whatever
-   `Watch` returns and returns nil itself, `app.go:93-99`).
+   `Watch` returns and returns nil itself, `app.go:93-102`).
 2. `trunk.Server.Run` — if the trunk plane is on; its error is fatal.
 3. `edge.Server.Run` — if the edge plane is on; fatal.
 4. `admin.Server.Run` — if `admin:` exists at startup; fatal.
@@ -182,12 +182,12 @@ Created once, alive for the process lifetime:
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: `bindListener` + serve | `Run` (`server.go:291-303`) | socket close / serve error |
+| per listener: `bindListener` + serve | `Run` (`server.go:328-341`) | socket close / serve error |
 | per listener: close-watcher (`<-ctx.Done(); ln.Close()`) | `bindListener` | `listenCtx` cancel |
-| registrar driver (`Registrar.Run`) | `Run` (`server.go:287`) | `regCtx` cancel |
+| registrar driver (`Registrar.Run`) | `Run` (`server.go:324`) | `regCtx` cancel |
 | per `register: true` peer: `registration.run` | `Registrar.reconcile` | peer removed/changed, or `stopAll` |
 | per request: sipgo handler goroutine | sipgo | handler return — for `onInvite`, the whole call |
-| per dial attempt: B-leg waiter | `dialTarget` (`b2bua.go:956`) | `WaitAnswer` returns; may outlive the attempt to sipgo Timer_B (~32 s) |
+| per dial attempt: B-leg waiter | `dialTarget` (`b2bua.go:970`) | `WaitAnswer` returns; may outlive the attempt to sipgo Timer_B (~32 s) |
 | per forked B-leg 2xx: ACK + BYE | `forkWatch.handleLocked` (`forks.go`) | the BYE's final response or its 5 s `byeContext` |
 | per session-timer leg the SBC refreshes: `refreshLoop` | `startRefreshers` (`sessiontimer.go`) | the call's kick context, cancelled by `endCall` |
 | shield prune loop | `shield.New` | `Shield.Close` |
@@ -196,10 +196,10 @@ Created once, alive for the process lifetime:
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: closer, and `ln.Serve` | `Run` (`edge.go:273-283`) | `listenCtx` cancel / serve error |
-| `Location.Prune` ticker (30 s) | `Run` (`edge.go:310-325`) | `listenCtx` cancel |
-| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
-| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:261`) | `WebRTCSession.Start` returns |
+| per listener: closer, and `ln.Serve` | `Run` (`edge.go:303-313`) | `listenCtx` cancel / serve error |
+| `Location.Prune` ticker (30 s) | `Run` (`edge.go:340-355`) | `listenCtx` cancel |
+| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:745`) | session `Done` closed |
+| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:266`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
@@ -284,17 +284,17 @@ every member, so `Run` returns nil and the process exits 0.
 
 ### 4.3 Listener binding
 
-**Trunk** (`bindListener`, `server.go:349-402`) implements exactly three
+**Trunk** (`bindListener`, `server.go:391-444`) implements exactly three
 transports: `tcp`, `tls`, and `udp` (the `default:` case). There is no
 ws/wss listener on the trunk plane. TCP and TLS listeners are wrapped in
 `newTCPLimitListener`; UDP is not. `tls` uses the configured
 `listen.tls_cert`/`tls_key` if present, otherwise mints a self-signed
 certificate and logs `"TLS listener using self-signed certificate"`.
 
-**Edge** (`edge.go:224-306`) binds **every socket synchronously before
+**Edge** (`edge.go:254-336`) binds **every socket synchronously before
 serving any of them**; on any failure every already-opened listener is closed
 and `Run` returns. It then starts one serving goroutine per socket and waits
-(`awaitUDPServing`, `edge.go:353-380`, bounded by 5 s) until every UDP
+(`awaitUDPServing`, `edge.go:388-415`, bounded by 5 s) until every UDP
 listener is in sipgo's connection pool: sipgo pools a UDP listener only
 inside `ServeUDP`, on that goroutine, and a request pinned to the listener's
 address before then (every forward, §7.8) misses the pool, so sipgo binds a
@@ -318,7 +318,7 @@ unsynchronised variable, which the race detector flags on every graceful
 shutdown.
 
 After binding, the edge plane replaces its topology with
-`s.topo = s.topo.pinned(opened)` (`edge.go:269`). A wildcard bind does not
+`s.topo = s.topo.pinned(opened)` (`edge.go:299`). A wildcard bind does not
 come up as the address it was written with — on a dual-stack host `0.0.0.0`
 yields a socket whose local address is `[::]:port` — and sipgo keys its
 connection pool by the socket's real local address. Without pinning, an
@@ -357,7 +357,7 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go`, `Watch` an
   `Watch` itself can still fail before the loop starts — `filepath.Abs`,
   `fsnotify.NewWatcher`, `w.Add` of the config's directory. Failing to watch
   a symlink target's other directory is only a warning. `app.Run`'s wrapper
-  goroutine logs that error and returns nil anyway (`app.go:93-99`), so a
+  goroutine logs that error and returns nil anyway (`app.go:93-102`), so a
   watcher that never started silently disables reload for the process's life.
 
 `Store.Replace` stores the new pointer atomically, then does a non-blocking
@@ -400,33 +400,71 @@ unsubscribe.
 The admin credential path has a deliberate fallback: if the reloaded config
 has **no** `admin:` section at all, `adminAuth()` returns the
 construction-time credentials rather than denying everyone
-(`admin/server.go:255-260`).
+(`admin/server.go:259-264`).
 
 ### 4.5 Shutdown
 
 SIGINT/SIGTERM cancels the root context; `app.Run` unblocks at
-`<-gctx.Done()` and calls `g.Wait()`. **There is no overall shutdown
-deadline at the app level.**
+`<-gctx.Done()` and calls `g.Wait()`. `cmd/freesbc` (`withSignals`) stops
+capturing signals the moment the first one arrives, so a **second**
+SIGINT/SIGTERM gets Go's default action and ends the process even when the
+graceful shutdown hangs (audit P2-APP-008). There is no single deadline at
+the app level; each plane bounds its own steps as below.
 
-**Trunk** uses two root contexts deliberately (`server.go:266-313`).
-`regCtx` and `listenCtx` are both derived from `context.Background()`, not
-from the caller's context, and a `stopCh` + `sync.Once` fires on either a
-caller cancel or a fatal bind failure. The stop sequence is:
+**Trunk** uses two root contexts deliberately (`Server.Run` in
+`server.go`). `regCtx` and `listenCtx` are both derived from
+`context.Background()`, not from the caller's context, and a `stopCh` +
+`sync.Once` fires on either a caller cancel or a fatal bind failure. The
+stop sequence is:
 
 ```
-regCancel()  →  <-regDone  →  listenCancel()  →  wg.Wait()  →  first bind error or nil
+drainCalls(shutdownGrace)  →  regCancel()  →  <-regDone  →  listenCancel()  →  wg.Wait()  →  first bind error or nil
 ```
 
-The registrar must finish its `Expires: 0` un-REGISTERs **while the listener
-sockets are still open**, because sipgo reuses a pooled UDP listener
-connection for outbound requests; closing listeners concurrently made the
-un-REGISTER fail with `net.ErrClosed`. Each un-REGISTER has its own ~2 s
-budget from `context.Background()`, independent of the already-cancelled run
-context. `defer sh.Close()` on the shield fires after all of this.
+`drainCalls` (`shutdown.go`, audit P2-TRK-017) runs first, while every
+listener is still open, because the BYEs and their responses use those
+sockets:
 
-**Edge**: `listenCancel()` → each listener's watcher closes its socket →
-`wg.Wait()` → `s.dialogs.closeAll()`, which ends every dialog and therefore
-closes every media session. There is no BYE-on-shutdown; calls are dropped.
+1. The call gate closes: an initial INVITE that arrives from now on is
+   answered **503** with `Retry-After: 30` before routing or allocating.
+2. Every bridged call is ended exactly like an admin kick (`c.cancel()` →
+   `byeBoth`): a BYE to **both** legs, each bounded by its own 5 s
+   `byeContext`. Its `onInvite` goroutine then returns, and the deferred
+   `endCall`, `bLeg.Close`, `sess.Close` and `aLeg.Close` release the call
+   record, the media session and its ports.
+3. A call still being dialled when shutdown began keeps its attempt; if it
+   is answered, `registerCall` sees the gate draining and ends it the same
+   way the moment it is published.
+4. `drainCalls` waits until every bridged call's `onInvite` has returned
+   (the gate counts a call from `registerCall` until its last release),
+   bounded by `shutdownGrace` (**12 s**, `defaultShutdownGrace`: two
+   sequential 5 s BYEs plus margin). Calls still up after that are logged
+   (`"shutdown: calls still up after the grace period"`) and dropped when
+   the listeners close. INVITEs that were never bridged — still dialling,
+   or already answered with an error and waiting for its ACK — hold no
+   call record and are not waited for; a dialling call answered after the
+   wait finished is still BYEd, best effort, as the listeners close.
+
+The registrar must then finish its `Expires: 0` un-REGISTERs **while the
+listener sockets are still open**, because sipgo reuses a pooled UDP
+listener connection for outbound requests; closing listeners concurrently
+made the un-REGISTER fail with `net.ErrClosed`. Each un-REGISTER has its own
+~2 s budget from `context.Background()`, independent of the
+already-cancelled run context. `defer sh.Close()` on the shield fires after
+all of this. The trunk's worst-case shutdown is therefore about
+12 s + 2 s per registered peer.
+
+**Edge**: `s.dialogs.close()` → `listenCancel()` → each listener's watcher
+closes its socket → `wg.Wait()` → `s.dialogs.closeAll()`, which ends every
+dialog and therefore closes every media session. Closing the dialog table
+first is what keeps an INVITE handler that is still in flight (sipgo runs
+handlers on their own goroutines, which `Run` does not wait for) from
+allocating media after shutdown began or leaking it (audit P2-EDG-027):
+`begin` refuses a new dialog (the INVITE is answered 503), the allocation
+paths check `dialog.open()` first, and `attach` closes a session it can no
+longer hand to a live dialog. There is no BYE-on-shutdown on this plane;
+calls are dropped, and the phones and FreeSWITCH find out from their own
+session timers or media timeouts.
 
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout.
 In-flight HTTP requests are drained up to that budget.
@@ -572,7 +610,7 @@ durations beyond "> 0".
 | `network.public.{bind_ip,advertised_ip}` | advertised defaults to bind only when the bind is a *specific* address; a wildcard bind makes `advertised_ip` mandatory |
 | `network.private.{bind_ip,advertised_ip}` | same |
 | `sip.public.udp` / `ws` / `wss` | `{enabled, bind, cert_file, key_file}`; default binds are `:5060` / `:5066` / `:5061` on `network.public.bind_ip` (else `0.0.0.0`) |
-| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`listenerDefaults`, `proxy.go:444-450`) — always defaulted while the proxy is on, so validation has no "required" check. With both network binds unset, the default public UDP bind collides with it and validation says so |
+| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`listenerDefaults`, `proxy.go:445-451`) — always defaulted while the proxy is on, so validation has no "required" check. With both network binds unset, the default public UDP bind collides with it and validation says so |
 | `sip.private.advertised_ip` / `advertised_port` | port defaults to the bind port |
 | `sip.upstream.address` / `transport` | v1 single-node alias; transport must be `udp` |
 | `sip.upstreams.nodes.<n>.{address,transport}` | multi-node pool; addresses must be literal `IP:port`, transport `udp` |
@@ -628,7 +666,7 @@ wrapped in `idleTimeoutConn`, which refreshes a `SetReadDeadline(now + 120s)`
 before **every** read; writes are deliberately left deadline-free. `Close`
 is CAS-guarded so a double close cannot double-decrement the counter. These
 limits are per-`Server` fields assigned in `NewServer` (1024 / 120 s,
-`server.go:84-86`, `:117-118`), not config keys; only tests override them,
+`server.go:101-103`, `:140-141`), not config keys; only tests override them,
 and only before `Run` spawns any goroutine.
 
 **Read filter (pre-parse).** `sip.WithTransportLayerReadFilter(s.preParseFilter())`
@@ -660,21 +698,21 @@ only the peer-rate-limit branch of `Check` is exercised on this plane.
 
 ### 6.2 Method dispatch
 
-Handlers registered in `Run` (`server.go:236-240`): `OPTIONS`, `INVITE`,
+Handlers registered in `Run` (`server.go:273-277`): `OPTIONS`, `INVITE`,
 `ACK`, `BYE`, and `OnNoRoute`. There is no CANCEL, UPDATE, INFO, PRACK,
 REGISTER, SUBSCRIBE, NOTIFY, MESSAGE or REFER handler.
 
 | Method / event | Handling |
 |---|---|
 | **INVITE, no To-tag** | full bridge (§6.3) |
-| **INVITE, no To-tag, same Call-ID + From-tag + CSeq as an INVITE still being handled** | merged request (RFC 3261 §8.2.2.2): **482 Loop Detected**, before quota or routing (`beginInvite`, `calls.go:269-284`) |
-| **INVITE, To-tag present** | in-dialog branch, matched on Call-ID + both tags (`lookupDialog`, `calls.go:237-246`): the caller's own dialog whose INVITE is still being handled (ACKed but not yet published by `registerCall`; `settingUp`) → **500** + `Retry-After: 1` (RFC 3261 §14.2), so the UA retries instead of ending the dialog; otherwise no live dialog (an unknown Call-ID, or a live Call-ID with other tags) → **481** (RFC 3261 §12.2.2); session-timer refresh → **200 + the SBC's own established answer**; any other re-INVITE on a live dialog (hold/resume, a media change) → **488 Not Acceptable Here** (RFC 3261 §14.2), and the call stays up |
+| **INVITE, no To-tag, same Call-ID + From-tag + CSeq as an INVITE still being handled** | merged request (RFC 3261 §8.2.2.2): **482 Loop Detected**, before quota or routing (`beginInvite`, `calls.go:274-289`) |
+| **INVITE, To-tag present** | in-dialog branch, matched on Call-ID + both tags (`lookupDialog`, `calls.go:242-251`): the caller's own dialog whose INVITE is still being handled (ACKed but not yet published by `registerCall`; `settingUp`) → **500** + `Retry-After: 1` (RFC 3261 §14.2), so the UA retries instead of ending the dialog; otherwise no live dialog (an unknown Call-ID, or a live Call-ID with other tags) → **481** (RFC 3261 §12.2.2); session-timer refresh → **200 + the SBC's own established answer**; any other re-INVITE on a live dialog (hold/resume, a media change) → **488 Not Acceptable Here** (RFC 3261 §14.2), and the call stays up |
 | **ACK** | `dialogSrv.ReadAck`; "no such dialog" is expected for rejected INVITEs and only Debug-logged |
 | **BYE** | `dialogSrv.ReadBye`, then `dialogCli.ReadBye`; **481** only if both report no matching dialog; any other error is Debug-logged |
 | **OPTIONS** | identified peers get an unconditional **200 OK**, in or out of dialog, with no Allow/Accept/Supported header and no body |
 | **CANCEL matching a live INVITE transaction** | handled entirely inside sipgo: 200 to the CANCEL, the INVITE transaction FSM drives 487, and `tx.OnCancel` ends the dialog with `ErrTransactionCanceled`, cancelling `aLeg.Context()` |
 | **CANCEL matching nothing** | `onNoRoute`: identify first (unknown source → silence), then **481 Call/Transaction Does Not Exist** (RFC 3261 §9.2) |
-| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:645-666`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
+| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:701-722`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
 | **`Require: 100rel`** | **420 Bad Extension** + `Unsupported: 100rel`, before routing or dialog creation |
 | **`Session-Expires` below `min_se`** | **422 Session Interval Too Small** + `Min-SE`, before routing or dialog creation |
 
@@ -682,7 +720,7 @@ Every handler identifies first — not only INVITE and `onNoRoute` but also
 `onOptions`, `onAck` and `onBye` — and an unidentified source is dropped
 silently: the handler returns without a response. On udp/tcp/tls that
 branch is unreachable in practice: the pre-parse read filter already dropped
-every byte from a source matching no peer (`server.go:443-446`,
+every byte from a source matching no peer (`server.go:491-494`,
 `readfilter.go:24-45`).
 
 `onNoRoute` is overridden precisely so sipgo's default 405 cannot confirm the
@@ -712,7 +750,7 @@ RFC 3261's core compact names. Delta-seconds above 2^32-1 are clamped to it
 
 ### 6.3 Initial INVITE — control flow
 
-`onInvite` (`b2bua.go:135-537`) runs on sipgo's per-request goroutine and
+`onInvite` (`b2bua.go:135-554`) runs on sipgo's per-request goroutine and
 **blocks there for the entire call**.
 
 ```
@@ -749,8 +787,8 @@ Defer unwind on return, LIFO: `endCall` → `killCancel` → `bLeg.Close` →
 `sess.Close` → `aLeg.Close` → quota `release` → merged-request `done` →
 `recoverCall`.
 
-`recoverCall` (`b2bua.go:1822-1828`) logs a panic and then finishes the call
-on the wire (`cleanupAfterPanic`, `b2bua.go:1835-1857`): every response on
+`recoverCall` (`b2bua.go:1836-1842`) logs a panic and then finishes the call
+on the wire (`cleanupAfterPanic`, `b2bua.go:1849-1871`): every response on
 the INVITE, raw or through the A-leg dialog, goes through `finalTx`, so an
 INVITE that got no final response is answered **500**; an A-leg that was
 answered 2xx gets a BYE; and a B-leg the carrier answered (`c.bLeg` is set
@@ -780,7 +818,7 @@ teardown), so `max_concurrent_calls` is in practice a concurrent-call cap.
 
 ### 6.4 Target expansion, failover and final-code precedence
 
-`expandTargets` (`b2bua.go:579-602`) turns the route's ordered peer list into
+`expandTargets` (`b2bua.go:596-619`) turns the route's ordered peer list into
 an ordered endpoint list:
 
 ```
@@ -795,7 +833,7 @@ Cooldown is **skip-if-alternatives**, never a hard block: when every endpoint
 is cooling, every endpoint is dialled anyway. `expandTargets` reads
 `srv_cache_ttl` from the call's snapshot, like the rest of the call.
 
-`placeCall` (`b2bua.go:649-716`) validates the offer once
+`placeCall` (`b2bua.go:665-732`) validates the offer once
 (`validAudioSDP`, target-independent → 488), then walks the endpoint list:
 
 - `res.ok` → `health.Recover(ep)` and return the dialled leg.
@@ -815,14 +853,14 @@ The failure taxonomy, and which failures cool an endpoint down:
 | Kind | Meaning | Penalizes the endpoint? |
 |---|---|---|
 | `failDial` | transport/dial error, caller gone, carrier 401/407, SRTP-required mismatch after answer | only when there was no response at all and the caller is still present |
-| `failRing` | `ring_timeout` expired | only when nothing at all was heard from the target inside the ring budget (`!responded`: `OnResponse` sets it for **any** response, provisional or final, and never once the attempt's gate is closed — `b2bua.go:986-1004`) |
+| `failRing` | `ring_timeout` expired | only when nothing at all was heard from the target inside the ring budget (`!responded`: `OnResponse` sets it for **any** response, provisional or final, and never once the attempt's gate is closed — `b2bua.go:1000-1018`) |
 | `failReal` | a final ≥ 300 that is not 401/407 — including 486 Busy | no |
 
-There is no fourth kind (`b2bua.go:518-524` defines exactly these three). An
+There is no fourth kind (`b2bua.go:535-541` defines exactly these three). An
 answered call whose answer cannot be used is either `errSRTPRequiredMismatch`,
 which becomes `failDial` + `ackThenBye` and is retried on the next target
-(`b2bua.go:1220-1233`), or a terminal `attemptResult{}` after the caller has
-already been answered 502 (`b2bua.go:1238-1241`, `:1268-1282`, `:1307-1320`).
+(`b2bua.go:1234-1247`), or a terminal `attemptResult{}` after the caller has
+already been answered 502 (`b2bua.go:1252-1255`, `:1282-1296`, `:1321-1334`).
 
 Only a genuine connectivity failure cools an endpoint. A 486 or 503 from a
 live endpoint does not. Cooldown is keyed per **endpoint**
@@ -859,7 +897,7 @@ The dial loop runs at most twice, bounded by a `retried422` flag:
   and `attemptCtx` are passed as **arguments, not captured**, to keep the
   compiler from sharing the captured cell with `dialTarget`'s return slot
   (a real `-race` finding). Its `OnResponse` callback runs entirely inside
-  the attempt's `relayGate` (`b2bua.go:1435`): it does nothing once the gate
+  the attempt's `relayGate` (`b2bua.go:1449`): it does nothing once the gate
   is closed, and otherwise enforces digest-realm pinning, records
   `responded`, and relays provisionals.
 - The main `select` races `waited` against `attemptCtx.Done()`. On the ring
@@ -886,10 +924,10 @@ The dial loop runs at most twice, bounded by a `retried422` flag:
   carrier's floor and retries the **same** target exactly once. The caller
   never sees the 422.
 - A 2xx that races the attempt is torn down with `ackThenBye` at two sites
-  that must agree on `carrierAnswered` (`b2bua.go:1332`): the waiter goroutine
+  that must agree on `carrierAnswered` (`b2bua.go:1346`): the waiter goroutine
   does it for an attempt whose gate is already closed, because `dialTarget` has
-  returned on that path (`b2bua.go:1015-1017`), and the main path does it
-  unconditionally **above** the classification switch (`b2bua.go:1144-1146`) —
+  returned on that path (`b2bua.go:1029-1031`), and the main path does it
+  unconditionally **above** the classification switch (`b2bua.go:1158-1160`) —
   above, because the caller-CANCEL case would otherwise win the switch and
   skip teardown, leaving a live carrier call standing.
 
@@ -931,7 +969,7 @@ Because `Session.Start` is a one-shot CompareAndSwap, an early-media body
 from a target that later loses failover starts the relay; a later winner can
 only re-point the latches, not restart it. For the same reason a plaintext
 outcome **explicitly installs `nil/nil`** SRTP contexts rather than leaving
-whatever an earlier target's early media put there (`b2bua.go:1499-1507`,
+whatever an earlier target's early media put there (`b2bua.go:1513-1521`,
 `:1534-1535`, `:1561`); otherwise the winner's plain RTP would be run through
 a losing target's stale contexts and the call would go silent.
 
@@ -1001,7 +1039,7 @@ policy, so all four A/B combinations are reachable:
 
 What happens when the carrier's *answer* carries no usable `a=crypto` depends
 on both the policy and the answer's proto (`processAnswerSDP`,
-`b2bua.go:1528-1567`): `required` never downgrades — `errSRTPRequiredMismatch`
+`b2bua.go:1542-1581`): `required` never downgrades — `errSRTPRequiredMismatch`
 → `ackThenBye` → next target; `optional` downgrades to plaintext **only** when
 the peer actually answered `RTP/AVP`; an `optional` peer that answered
 `RTP/SAVP` with an unusable or non-matching suite fails over exactly like
@@ -1123,12 +1161,12 @@ stateDiagram-v2
 
 Transitions, with the function that performs each:
 `callDialing` is set inline when the `call` literal is built in `onInvite`
-(`b2bua.go:450`); the call exists only as that function's local variable and
+(`b2bua.go:467`); the call exists only as that function's local variable and
 is in no map, so `/api/calls` cannot list it and `KillCall` cannot find it.
 `callBridged` is set **only** by `registerCall` (`calls.go:176`), under the
 lock that mints the call's admin ID and inserts the call into
 `calls[adminID]` and into the `legs` lists under its A-leg and B-leg
-Call-IDs. `callEnded` is set **only** by `endCall` (`calls.go:198`), under the
+Call-IDs. `callEnded` is set **only** by `endCall` (`calls.go:203`), under the
 same lock that removes exactly this call's entries.
 
 The store is keyed by dialog, not by Call-ID. `calls` is keyed by a random
@@ -1155,8 +1193,8 @@ stateDiagram-v2
     ByeBoth2 --> [*]
 ```
 
-Each arm is one case of the `select` at `b2bua.go:524-536`; `byeBoth`
-(`b2bua.go:544-547`) sends both BYEs. Every outbound BYE gets its own
+Each arm is one case of the `select` at `b2bua.go:541-553`; `byeBoth`
+(`b2bua.go:561-564`) sends both BYEs. Every outbound BYE gets its own
 **5 s** `byeContext`.
 
 ### 6.12 KillCall
@@ -1435,7 +1473,7 @@ Credentials, challenges and nonces are never logged.
 **Failover rule**: the next node is tried whenever the attempt produced **no
 final response** (`register.go:145-162`). A node that answered only
 provisionally and then died is still failed over — unlike the INVITE path,
-where `responded` alone stops the series (`invite.go:326`). The cooldown
+where `responded` alone stops the series (`invite.go:330`). The cooldown
 penalty, by contrast, is applied only when the attempt produced **zero**
 responses. **Any** final response — accept, challenge, or rejection — is a
 real judgement and ends the series. A 401/407 from a node reached after failover is expected,
@@ -1548,16 +1586,16 @@ A dialog is identified the RFC 3261 §12 way: **Call-ID + the caller's tag +
 the callee's tag**. `dialogTable` groups records by Call-ID
 (`byCallID map[string][]*dialog`) and every lookup then matches tags:
 
-- `lookup(callID, fromTag, toTag)` (`dialog.go:286-304`) finds a
+- `lookup(callID, fromTag, toTag)` (`dialog.go:300-318`) finds a
   **confirmed** record whose tags the request names in either orientation;
   From = caller's tag and To = callee's tag means the request is from the
   caller, the reverse means it is from the callee. A request missing either
   tag names no dialog.
-- `early(callID, fromTag)` (`dialog.go:271-280`) finds the **in-flight**
+- `early(callID, fromTag)` (`dialog.go:285-294`) finds the **in-flight**
   record a CANCEL applies to: same Call-ID and the INVITE's From tag
   (RFC 3261 §9.1), so a CANCEL that merely guessed a live Call-ID cannot end
   someone else's call.
-- `begin(callID, callerTag, callerPlane)` (`dialog.go:239-265`) refuses —
+- `begin(callID, callerTag, callerPlane)` (`dialog.go:250-279`) refuses —
   the handler answers **482 Loop Detected** — when an **early** record with
   the same Call-ID and caller tag exists (a merged request, §8.2.2.2). A
   confirmed record with the same identifiers is left alone: the new INVITE
@@ -1578,7 +1616,7 @@ mutex (`media.go`).
 
 **Forks (early dialogs).** While the record is early, every response of the
 forwarded INVITE is attributed to a fork by its To tag (`fork`,
-`dialog.go:384-395`). An `earlyFork` holds that fork's own answer body, the
+`dialog.go:469-480`). An `earlyFork` holds that fork's own answer body, the
 codecs it agreed, the media address it signalled and its own `o=` identity.
 The first body a fork sends is negotiated against the **original** offer
 (`negotiateFork`, `media.go`); a later body on the same fork is answered with
@@ -1601,14 +1639,14 @@ stateDiagram-v2
     dialogEnded --> [*]
 ```
 
-Transitions: `confirm` (`dialog.go:632-669`) runs **before the 2xx is
+Transitions: `confirm` (`dialog.go:717-755`) runs **before the 2xx is
 relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:142-169,575-597`),
 so the ACK the caller sends the instant it sees the 2xx always finds the
 record. It records the callee's tag and the route, adopts the confirming
 fork's `o=` identity for the caller's leg, drops the fork table, and refuses
 when the state is not early **or no media was ever anchored**. `endUnlessUp`
-(`dialog.go:673-680`) ends only a still-early dialog and is deferred by every
-INVITE path; `end` (`dialog.go:690-719`) is the single exit for a BYE, the
+(`dialog.go:759-766`) ends only a still-early dialog and is deferred by every
+INVITE path; `end` (`dialog.go:776-805`) is the single exit for a BYE, the
 media watchdog, shutdown and a failed INVITE. `end` is idempotent — the state
 transition under the table mutex elects the one caller that does the work —
 and removes exactly this record from its Call-ID's list.
@@ -1630,7 +1668,7 @@ retransmissions (`reject2xx` remembers the tag). The same applies to a 2xx
 FreeSBC cannot anchor and to one that races a CANCEL.
 
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
-(`edge.go:171`). `freesbc_active_sip_dialogs` is a separate mechanism over the
+(`edge.go:179`). `freesbc_active_sip_dialogs` is a separate mechanism over the
 same set: the `Metrics.dialogs` gauge moved by `DialogStarted`/`DialogEnded`
 in `confirm`/`end` (`edge/metrics.go:119-120`), sampled through
 `Snapshot().ActiveDialogs` (`admin/metrics.go:57,129`).
@@ -1704,12 +1742,12 @@ routed is dropped with no response.
 
 **CANCEL.** When sipgo matches a CANCEL to a live INVITE server transaction
 it answers 200 to the CANCEL, fires the `OnCancel` hook
-(`invite.go:214-227`, `:465-471`, `:606-619`) **while holding the server
+(`invite.go:218-231`, `:469-475`, `:608-621`) **while holding the server
 transaction's lock**, and only after the hook returns finalises the INVITE
 server transaction with **487** toward the requester itself. The hook
 therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
 (`invite_leg.go:617-628`), which **synchronously** marks the record
-cancelled (`cancelSeries`, `dialog.go:528-547`) — from that instant
+cancelled (`cancelSeries`, `dialog.go:613-632`) — from that instant
 `confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
 relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
 to a goroutine (`sendCancel`, `invite_leg.go:642-658`). `sendCancel` builds
@@ -1719,10 +1757,10 @@ the wire (which is what releases the media promptly instead of waiting on
 the forwarded INVITE's transaction timer).
 
 An attempt is **tracked before its INVITE is sent** (`track`,
-`dialog.go:479-487`), so no CANCEL can fall between the send and the
+`dialog.go:564-572`), so no CANCEL can fall between the send and the
 bookkeeping. A CANCEL that takes an attempt whose INVITE is not on the wire
 yet does not send its CANCEL (it would overtake the INVITE, be answered 481,
-and leave the INVITE ringing); `markSent` (`dialog.go:492-497`) tells the
+and leave the INVITE ringing); `markSent` (`dialog.go:577-582`) tells the
 sender, which CANCELs the moment the INVITE is out. `track` refuses once
 the series is cancelled, so no later attempt starts.
 
@@ -1761,7 +1799,7 @@ arrived (`TestTeardownLeavesByPublicListenerOnWildcardBind`).
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
 (`invite_leg.go:663-668`): it CANCELs the pending branch (RFC 3261 §16.8)
-and drains for its 487, and `giveUp` (`invite.go:348-359`) then sends the
+and drains for its 487, and `giveUp` (`invite.go:352-363`) then sends the
 caller **408 Request Timeout** (§16.7 step 6). `giveUp` is the one place a
 caller's missing final is synthesised: nothing when its own CANCEL already
 got it a 487 from sipgo, **408** at the backstop, **487** when an orphan
@@ -1863,7 +1901,7 @@ any gateway**.
 
 Per call: the public side must be `udp` (else 503); the gateway list is
 `orderByAvailability`'s **available** half against `pstnCooldown`
-(`invite.go:595` discards the cooled half), so a cooling gateway is dropped
+(`invite.go:597` discards the cooled half), so a cooling gateway is dropped
 rather than tried at the tail as an upstream node would be (§7.6) — unless
 every candidate is cooling, in which case the route's own order is dialled
 unchanged (`topology.go:559-561`); the whole call is
@@ -2028,7 +2066,7 @@ stateDiagram-v2
 Transitions: `Start` (`relay.go:19-22`) is a single
 `CompareAndSwap(sessAllocated, sessRunning)` and returns whether *this* call
 started it, so the relay starts at most once whichever path wins; `Close`
-(`session.go:374-385`) is a single `Swap(sessClosed)` that closes both pairs,
+(`session.go:394-405`) is a single `Swap(sessClosed)` that closes both pairs,
 releases both port reservations and closes `done`, making it idempotent and
 safe from any goroutine. Transitions only ever move forward.
 
@@ -2196,7 +2234,7 @@ The watchdog is the backstop for a half-dead call whose BYE was lost. On the
 trunk plane it fires `sess.Done()`, which the `onInvite` select turns into
 BYEs on both legs; on the edge plane it fires the per-dialog media watcher
 goroutine, which calls `dialog.end()` and then sends a BYE to both
-endpoints (§7.7). That watcher is launched by `confirm` (`dialog.go:659-667`),
+endpoints (§7.7). That watcher is launched by `confirm` (`dialog.go:745-753`),
 so it exists only for a **confirmed** dialog; an early one is reclaimed by
 `endUnlessUp` and the 5-minute `inviteTimeout` (which CANCELs the branch and
 answers 408) instead.
@@ -2234,7 +2272,7 @@ decrypts what is received *from* that side, `outbound` encrypts what is sent
 failover target's answer replacing an earlier target's early-media contexts
 needs. A plaintext outcome always installs `(nil, nil)` so a previous
 target's contexts cannot linger. On a **closed** session it is a silent no-op
-(`session.go:361-367`): keys are never installed on a relay that no longer
+(`session.go:381-387`): keys are never installed on a relay that no longer
 exists.
 
 On any protect/unprotect failure the packet is dropped with a bare
@@ -2449,7 +2487,7 @@ ICE candidates can never reach FreeSWITCH.
 | DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` |
 | codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:575`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1) |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:585`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1) |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 
@@ -2526,7 +2564,7 @@ length after inbound decryption; Tx counts the bytes actually written after
 outbound encryption, and **only when the `WriteToUDP` itself succeeded**
 (`relay.go:97-101`), so the two differ by the SRTP overhead on a mixed session.
 On a `WebRTCSession` the private-side rx is the raw plaintext length read off
-the socket before `protectRTPInto` (`webrtcsession.go:279`), so the public-side tx
+the socket before `protectRTPInto` (`webrtcsession.go:280`), so the public-side tx
 exceeds it by the SRTP overhead.
 
 ---
@@ -2806,7 +2844,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 
 | Entity | Owner | Created where | Transitions | Invariants | Who may mutate | Cleanup trigger | Concurrency protection |
 |---|---|---|---|---|---|---|---|
-| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls` (by admin ID) and `legs` (per leg, by Call-ID + tags) | `b2bua.go:443-451` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:513-514`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
+| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls` (by admin ID) and `legs` (per leg, by Call-ID + tags) | `b2bua.go:460-468` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:530-531`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
 | **trunk leg** (`aLeg *DialogServerSession`, `bLeg *DialogClientSession`) | same `onInvite` goroutine | `dialogSrv.ReadInvite` / `dialogCli.Invite` | sipgo-internal dialog FSM; contexts cancel on BYE/CANCEL/error | sipgo objects are **single-use**: `ReadInvite` must not be re-entered for the same dialog | `onInvite`, plus the B-leg waiter until the attempt's `relayGate` closes | `defer aLeg.Close()` / `defer bLeg.Close()` | no lock; the `relayGate` fences the waiter, and `bLeg`/`attemptCtx` are passed as goroutine arguments |
 | **trunk upstream registration** | `Registrar`; one goroutine per peer | `reconcile` (`register.go:309-372`) | unregistered ⇄ registered, with backoff; terminal `unregister` on cancel | `setRegisteredGen` writes only when the generation still matches, so a superseded goroutine cannot clobber the replacement | its own goroutine; the registrar under `mu` | config publication (peer removed/changed) or `stopAll` at shutdown | `Registrar.mu` (RWMutex) over `state`, `running`, `epoch`; the old goroutine is awaited **outside** the lock |
 | **endpoint health / cooldown (trunk)** | `endpointHealth` | `NewServer` | absent ⇄ `until[key]` | lazy expiry, no sweeper; skip-if-alternatives, never a hard block; keyed per `host:port/transport` | `Penalize` (dial failure), `Recover` (bridged success) | only `Recover`; entries are otherwise never removed | `endpointHealth.mu` |
@@ -2971,11 +3009,11 @@ own Contact, so that default surfaces only where none is appended.
 **Edge plane.** Advertised addresses come from the topology snapshot:
 `network.public.advertised_ip`, `network.private.advertised_ip` (overridden
 for private **signalling** by `sip.private.advertised_ip`,
-`proxy.go:306-311`), and the two RTP planes' advertised IPs. A wildcard bind
+`proxy.go:307-312`), and the two RTP planes' advertised IPs. A wildcard bind
 makes the corresponding `advertised_ip` mandatory. **Public** listeners
 advertise the port they bind — there is deliberately no port-translation field
 on the public side. The private side has one: `sip.private.advertised_port`
-(`proxy.go:342-347`) overrides the private bind port in Via, Contact and
+(`proxy.go:343-348`) overrides the private bind port in Via, Contact and
 Record-Route (`topology.go:325`), defaulting to the bind port.
 
 ### 12.2 NAT assumptions
@@ -3109,7 +3147,7 @@ Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`), so in a deployed system `freesbc_shield_drops_total`
 reports only `reason="rate"`. The ban and scanner branches run on the
-**edge** shield (`edge.go:617`), which `internal/app` never wires into
+**edge** shield (`edge.go:652`), which `internal/app` never wires into
 `admin.Deps` (`Deps.Shield` is set only when the trunk server exists), so
 edge bans and drops do not reach `/metrics`. The ban gauges
 (`freesbc_shield_banned_current`, `freesbc_shield_ban_adds_rejected_total`)
@@ -3451,6 +3489,7 @@ read an environment variable.
 | `ring_timeout` | 60 s (config) | one trunk dial attempt |
 | grace after the ring deadline | 250 ms | abandoning a trunk attempt |
 | `byeContext` | 5 s | every trunk teardown BYE and `ackThenBye` ACK |
+| `defaultShutdownGrace` | 12 s | trunk shutdown: waiting for every live call's BYEs and teardown before un-REGISTER and listener close (§4.5) |
 | trunk session refresh | every ½ interval (¼ after a rejected refresh) | a leg whose session timer names the SBC as refresher |
 | trunk refresh re-INVITE | 64·T1 (32 s) | one refresh the SBC sends |
 | trunk refresh 200 retransmission | T1 doubling to T2, for up to 64·T1 | a locally answered refresh, until its ACK |

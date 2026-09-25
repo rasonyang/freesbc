@@ -67,14 +67,13 @@ func run(args []string) int {
 		fmt.Printf("%s: config OK\n", *cfgPath)
 		return 0
 	case "run":
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
 		opts := app.Options{
 			ConfigPath: *cfgPath,
 			Log:        slog.New(slog.NewTextHandler(os.Stderr, nil)),
 			Version:    version,
 		}
-		if err := app.Run(ctx, opts); err != nil {
+		err := withSignals(func(ctx context.Context) error { return app.Run(ctx, opts) })
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "freesbc: %v\n", err)
 			return 1
 		}
@@ -83,4 +82,18 @@ func run(args []string) int {
 		fmt.Fprint(os.Stderr, usage)
 		return 2
 	}
+}
+
+// withSignals runs fn under a context cancelled by the first SIGINT or
+// SIGTERM, which starts a graceful shutdown. Signal capture is released
+// the moment that happens, so a second signal gets Go's default action and
+// ends the process even when the shutdown hangs (audit P2-APP-008).
+func withSignals(fn func(context.Context) error) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return fn(ctx)
 }
