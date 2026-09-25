@@ -1,11 +1,11 @@
 package shield
 
 import (
-	"context"
+	"io"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/freesbc/freesbc/internal/config"
 )
@@ -21,42 +21,7 @@ func testShield(t *testing.T, yaml string) *Shield {
 	return s
 }
 
-// testShieldWithRecordingNFT builds a Shield exactly like New does, but
-// replaces the nft backend's exec with a recorder — T-02's kernel-sync
-// tests must observe whether an element add was actually enqueued, which
-// the real backend (availability-gated, real exec) can't show.
-func testShieldWithRecordingNFT(t *testing.T, yaml string) (*Shield, *recordedCmds) {
-	t.Helper()
-	cfg, err := config.Parse([]byte(yaml))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	rec := &recordedCmds{}
-	bl := newBanList()
-	bl.nft = &nftBackend{
-		log:     discard(),
-		listens: cfg.Listen.SIP,
-		run: func(ctx context.Context, args ...string) error {
-			rec.add(strings.Join(args, " "))
-			return nil
-		},
-	}
-	bl.nft.start()
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Shield{
-		store:       config.NewStore(cfg),
-		log:         discard(),
-		limiter:     newRateLimiter(),
-		peerLimiter: newRateLimiter(),
-		bans:        bl,
-		counter:     newFailCounter(),
-		stop:        cancel,
-		done:        make(chan struct{}),
-	}
-	go s.pruneLoop(ctx)
-	t.Cleanup(func() { s.Close() })
-	return s, rec
-}
+func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 const shieldCfg = `
 listen:
@@ -66,8 +31,7 @@ listen:
     public_ip: 127.0.0.1
 shield:
   rate_limit: 2/s per_ip
-  auto_ban: { failures: 3, window: 60s, duration: 1h }
-  nftables: off
+  auto_ban: { duration: 1h }
 peers:
   trunk:
     address: 203.0.113.10:5060
@@ -181,7 +145,7 @@ func TestCheckRateLimitDropsButDoesNotBan(t *testing.T) {
 }
 
 func TestShieldStatsCountsDrops(t *testing.T) {
-	s := testShield(t, shieldCfg) // rate 2/s, nftables off; from earlier tasks
+	s := testShield(t, shieldCfg) // rate 2/s
 	bad := netip.MustParseAddr("198.51.100.20")
 	s.Check(bad, "sipvicious", "udp") // scanner drop (+ ban)
 	s.Check(bad, "", "udp")           // now banned → banned drop
@@ -195,47 +159,4 @@ func TestShieldStatsCountsDrops(t *testing.T) {
 	if st.BannedCurrent < 1 {
 		t.Errorf("banned current = %d, want >=1", st.BannedCurrent)
 	}
-}
-
-func TestRecordUnidentifiedBansAtThreshold(t *testing.T) {
-	s := testShield(t, shieldCfg)
-	bad := netip.MustParseAddr("198.51.100.7")
-	// failures: 3 → the 3rd unidentified request bans the source.
-	s.RecordUnidentified(bad)
-	s.RecordUnidentified(bad)
-	if s.Check(bad, "", "udp") != Allow {
-		t.Fatal("under threshold: still allowed")
-	}
-	s.RecordUnidentified(bad) // 3rd
-	if s.Check(bad, "", "udp") != Drop {
-		t.Fatal("at threshold: banned → drop")
-	}
-}
-
-// TestUDPScannerSinglePacketMemoryOnly is the T-02 (F-04) red test: the
-// single-packet scanner verdict over UDP (a forgable source) bans in memory
-// only — no kernel sync. The TCP positive control proves the same verdict
-// over a connection-based transport still reaches nft.
-func TestUDPScannerSinglePacketMemoryOnly(t *testing.T) {
-	s, rec := testShieldWithRecordingNFT(t, shieldCfg) // rate 2/s per_ip
-	bad := netip.MustParseAddr("198.51.100.40")
-	if s.Check(bad, "sipvicious", "udp") != Drop {
-		t.Fatal("scanner UA must be dropped")
-	}
-	if !s.bans.banned(bad) {
-		t.Fatal("UDP scanner must still be banned in memory")
-	}
-	// Give the worker a beat to run any stray enqueue, then assert the
-	// kernel never heard about it.
-	time.Sleep(100 * time.Millisecond)
-	if got := rec.count(); got != 0 {
-		t.Fatalf("nft execs = %d, want 0 (UDP single-packet scanner ban is memory-only)", got)
-	}
-
-	// Positive control: the same verdict over TCP does sync to the kernel.
-	badTCP := netip.MustParseAddr("198.51.100.41")
-	if s.Check(badTCP, "sipvicious", "tcp") != Drop {
-		t.Fatal("TCP scanner must be dropped")
-	}
-	waitForRecords(t, rec, 1)
 }

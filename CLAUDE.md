@@ -44,14 +44,14 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 ### Config model
 - `config.Parse` runs in this order: strict YAML (unknown keys are errors), `${VAR}` expansion, defaults, then `validate`, which joins all errors. Expansion runs after unmarshal, so parse errors never echo a secret, and expanded values are never written back. Validation rules are in `validate.go` (trunk, shield, admin) and `validate_proxy.go` (edge).
 - `config.Store` publishes immutable `*Config` snapshots through an atomic pointer. Code reads `store.Current()` at the point of use (the trunk takes one snapshot per call; media pools read it per allocation) and never mutates a snapshot. `config.Watch` (fsnotify on the parent directory, 200 ms debounce) is the only caller of `Store.Replace`, and a bad file keeps the previous snapshot. Admin `PUT /api/config` only writes the file atomically and lets the watcher reload it.
-- Hot vs restart-only settings are tabulated in `docs/design.md:337-345`. Restart-only includes the listener set, TLS certificates and outbound per-peer TLS material, the edge topology (upstreams, PSTN, `webrtc`), the trunk dialog-cache Contact, the nftables mode, `admin.listen`/`tls_cert`/`tls_key` and whether an `admin:` section exists (`admin.auth` itself hot-reloads).
+- Hot vs restart-only settings are tabulated in `docs/design.md:337-345`. Restart-only includes the listener set, TLS certificates and outbound per-peer TLS material, the edge topology (upstreams, PSTN, `webrtc`), the trunk dialog-cache Contact, `admin.listen`/`tls_cert`/`tls_key` and whether an `admin:` section exists (`admin.auth` itself hot-reloads).
 - `check` is weaker than `run` for edge addresses: validation accepts any `host:port` for upstreams and PSTN gateways (`checkHostPort`, `validate_proxy.go:366-379`), but `run` rejects a hostname (`parseEndpoint`, `edge/topology.go:126-134`). Use literal `IP:port`.
 - A trunk listener (`listen.sip` or `sip.bind_ip`) with no `peers` is a validation error (`validate_proxy.go:41-43`), so edge-only configs must omit it.
 
 ### Security boundaries
 - Both planes install a sipgo transport read filter (`internal/sip/readfilter.go`) that runs before parsing. The trunk filter admits only peer IPs. The edge filter caps reads at 64 KiB and, on the private bind, admits only upstream IPs. A filter must never return an error, because sipgo treats that as fatal to the read loop; reject by returning `nil, nil`.
 - Shield denials are silent drops. The trunk overrides `onNoRoute` so that non-peer sources get silence instead of a 405.
-- The edge private plane is trusted and exempt from the shield. Only the trunk shield manages nftables (the edge uses `shield.NewNoKernel`). The admin call list, kick, unban and shield metrics are wired to the trunk plane only.
+- The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, kick, unban and shield metrics are wired to the trunk plane only.
 - Admin uses bcrypt Basic Auth (cost ≥ 10) and is loopback-only unless `admin.allow_remote: true` is set. `GET /api/config/raw` is unredacted on purpose.
 
 ### sipgo v1.4.3 workarounds (re-check when upgrading sipgo)

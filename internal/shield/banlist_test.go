@@ -15,7 +15,7 @@ func TestBanListBanAndExpiry(t *testing.T) {
 	if bl.banned(ip) {
 		t.Fatal("fresh ip not banned")
 	}
-	bl.ban(ip, time.Hour, true)
+	bl.ban(ip, time.Hour)
 	if !bl.banned(ip) {
 		t.Fatal("banned within the window")
 	}
@@ -34,7 +34,7 @@ func TestBanListPruneDropsExpired(t *testing.T) {
 	now := time.Unix(1000, 0)
 	bl.now = func() time.Time { return now }
 	ip := netip.MustParseAddr("198.51.100.9")
-	bl.ban(ip, time.Minute, true)
+	bl.ban(ip, time.Minute)
 	now = now.Add(2 * time.Minute)
 	bl.prune()
 	if len(bl.until) != 0 {
@@ -58,7 +58,7 @@ func TestBanListCap(t *testing.T) {
 	bl.now = func() time.Time { return now }
 
 	for i := 0; i < banCap; i++ {
-		if !bl.ban(capIP(i), time.Hour, true) {
+		if !bl.ban(capIP(i), time.Hour) {
 			t.Fatalf("ban %d below the cap was refused", i)
 		}
 	}
@@ -67,7 +67,7 @@ func TestBanListCap(t *testing.T) {
 	}
 
 	// One more unique source: refused, counted, and the table does not grow.
-	if bl.ban(capIP(banCap), time.Hour, true) {
+	if bl.ban(capIP(banCap), time.Hour) {
 		t.Fatal("ban at the hard cap must be refused")
 	}
 	if got := bl.overflowed(); got == 0 {
@@ -79,14 +79,14 @@ func TestBanListCap(t *testing.T) {
 
 	// Re-banning an already-tracked source is an extension, not a new entry:
 	// it must still succeed at the cap.
-	if !bl.ban(capIP(0), time.Hour, true) {
+	if !bl.ban(capIP(0), time.Hour) {
 		t.Fatal("extending an existing ban at the cap must not be refused")
 	}
 
 	// Once every entry expires, the lazy sweep frees room: the previously
 	// refused source is now accepted, and the table holds only it.
 	now = now.Add(2 * time.Hour)
-	if !bl.ban(capIP(banCap), time.Hour, true) {
+	if !bl.ban(capIP(banCap), time.Hour) {
 		t.Fatal("ban after expiry sweep must succeed")
 	}
 	if len(bl.until) != 1 {

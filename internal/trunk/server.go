@@ -68,8 +68,7 @@ type Server struct {
 	// shield is the front-door security plane: consulted before
 	// identify() on every inbound request (see withShield). Built in Run,
 	// so it is nil on a *Server constructed directly by unit tests (e.g.
-	// NewServer without Run) — withShield and dropUnidentified nil-guard
-	// against that. Stored via atomic.Pointer (rather than a plain field)
+	// NewServer without Run) — withShield nil-guards against that. Stored via atomic.Pointer (rather than a plain field)
 	// because integration tests deliberately reach into it from the test
 	// goroutine (srv.shield.Load().Check(...)) after Run has started on its
 	// own goroutine — a plain field there would be an unsynchronized
@@ -165,8 +164,7 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
-// Unban removes any shield ban on ip (in-memory table + kernel set) and
-// reports whether one existed. Nil-safe: false before Run builds the
+// Unban removes any shield ban on ip and reports whether one existed. Nil-safe: false before Run builds the
 // shield. Wired to the admin API's DELETE /api/bans/{ip}.
 func (s *Server) Unban(ip netip.Addr) bool {
 	sh := s.shield.Load()
@@ -246,13 +244,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// s.shield is built here (not in NewServer) so unit tests that
 	// construct a *Server directly (without Run) exercise handlers with a
-	// nil shield — see the nil guards in withShield/dropUnidentified.
-	// Close is deferred immediately: Run's body only returns after the
-	// synchronous shutdown tail below (registrar drained, then listener
-	// sockets closed, then their goroutines joined via wg.Wait()), so this
-	// defer necessarily fires after every listener has stopped accepting
-	// requests — never while an in-flight Check/RecordUnidentified could
-	// still race the nftables teardown.
+	// nil shield — see the nil guard in withShield. Close (which stops the
+	// prune loop) is deferred immediately: Run's body only returns after
+	// the synchronous shutdown tail below, so it fires after every
+	// listener has stopped accepting requests.
 	sh := shield.New(s.store, s.log)
 	defer sh.Close()
 	s.shield.Store(sh)
@@ -443,8 +438,9 @@ func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
 
 // withShield wraps a request handler so every inbound request passes the
 // security plane before identification. A Drop verdict silently discards the
-// request (no response); sipgo terminates the unfinalized transaction when the
-// handler returns (see dropUnidentified). Non-peer source bytes
+// request (no response); sipgo calls tx.TerminateGracefully() right after the
+// handler returns, which ends the unfinalized transaction and its auto-100
+// timer, so the drop stays silent. Non-peer source bytes
 // are dropped by the transport-layer read filter before they can become a
 // request (see preParseFilter), so the shield here only ever sees requests
 // from allowed sources — configured-peer exemptions apply. s.shield is nil on
@@ -474,31 +470,6 @@ func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func
 			return // silent
 		}
 		next(req, tx)
-	}
-}
-
-// dropUnidentified is the shield seam: a request from a source that
-// matches no peer is silently dropped (spec §6 step 2). No response is
-// sent; sipgo calls tx.TerminateGracefully() immediately after the handler
-// returns (server.go handleRequest), which terminates the unfinalized
-// transaction right away — stopping its auto-100 timer and keeping the
-// drop silent instead of merely letting the transaction age out.
-//
-// This handler never runs for udp/tcp/tls traffic: the
-// pre-parse read filter drops non-peer bytes before parsing, so no such
-// request can reach identify() over the wire. It remains as the guard for
-// any future transport path that bypasses the filter, and for *Server
-// instances unit tests build directly.
-func (s *Server) dropUnidentified(req *sip.Request) {
-	s.log.Info("dropping request from unidentified source",
-		"method", req.Method.String(), "source", req.Source())
-	// Feed the shield's auto-ban failure counter so repeated unidentified
-	// traffic from the same source eventually bans it (spec §3). Nil-guarded:
-	// unit tests build a *Server directly (without Run), where s.shield is nil.
-	if sh := s.shield.Load(); sh != nil {
-		if src, ok := fsip.ParseHostPortAddr(req.Source()); ok {
-			sh.RecordUnidentified(src)
-		}
 	}
 }
 
@@ -586,8 +557,7 @@ func (s *Server) ourSigPort(cfg *config.Config, transport string) int {
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 	name, _, ok := s.identify(req)
 	if !ok {
-		s.dropUnidentified(req)
-		return
+		return // unidentified source: silent drop
 	}
 	if err := tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil)); err != nil {
 		s.log.Error("respond OPTIONS", "peer", name, "err", err)
@@ -600,8 +570,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 // ReadAck's "no such dialog" case is expected and merely logged.
 func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 	if _, _, ok := s.identify(req); !ok {
-		s.dropUnidentified(req)
-		return
+		return // unidentified source: silent drop
 	}
 	// The ACK for a 2xx to a locally answered refresh re-INVITE stops that
 	// 2xx's retransmission; it belongs to no dialog-cache transaction.
@@ -630,8 +599,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 // that no dialog exists when one actually does.
 func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
 	if _, _, ok := s.identify(req); !ok {
-		s.dropUnidentified(req)
-		return
+		return // unidentified source: silent drop
 	}
 	srvErr := s.dialogSrv.ReadBye(req, tx)
 	if srvErr == nil {
@@ -677,8 +645,7 @@ func noMatchingDialog(err error) bool {
 func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction) {
 	name, _, ok := s.identify(req)
 	if !ok {
-		s.dropUnidentified(req)
-		return
+		return // unidentified source: silent drop
 	}
 	// A CANCEL only reaches a handler when sipgo's transaction layer found
 	// no INVITE transaction for it to cancel: that is 481 (RFC 3261 §9.2),

@@ -243,21 +243,10 @@ func (c *Config) validate() error {
 	if _, err := ParseRateLimit(c.Shield.PeerRateLimit); err != nil {
 		fail("shield.peer_rate_limit: %v", err)
 	}
-	switch c.Shield.NFTables {
-	case "auto", "on", "off":
-	default:
-		fail("shield.nftables: must be auto, on, or off, got %q", c.Shield.NFTables)
-	}
-	// withDefaults fills zero values before validate normally runs, so these
-	// only trip on an explicitly negative/non-positive value reaching here
-	// (e.g. a Config built directly without withDefaults). Checked
-	// defensively regardless.
-	if c.Shield.AutoBan.Failures < 1 {
-		fail("shield.auto_ban.failures: must be >= 1, got %d", c.Shield.AutoBan.Failures)
-	}
-	if c.Shield.AutoBan.Window <= 0 {
-		fail("shield.auto_ban.window: must be > 0, got %s", c.Shield.AutoBan.Window.Std())
-	}
+	// withDefaults fills a zero value before validate normally runs, so this
+	// only trips on an explicitly negative value reaching here (e.g. a
+	// Config built directly without withDefaults). Checked defensively
+	// regardless.
 	if c.Shield.AutoBan.Duration <= 0 {
 		fail("shield.auto_ban.duration: must be > 0, got %s", c.Shield.AutoBan.Duration.Std())
 	}

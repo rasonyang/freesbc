@@ -143,8 +143,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	name, fromPeer, ok := s.identify(req)
 	if !ok {
-		s.dropUnidentified(req)
-		return
+		return // unidentified source: silent drop
 	}
 
 	// Refuse it explicitly with 400 (RFC 3261 §8.1.1 mandates all three on

@@ -20,15 +20,12 @@ const banCap = 65536
 // pruneLoop keeps clearing expired entries regardless.
 const sweepEvery = time.Second
 
-// banList is the authoritative, always-on in-memory ban table: a source IP
-// mapped to the instant its ban expires, with lazy expiry on read.
-// Adds an optional nftables backend field so bans are ALSO dropped at the
-// kernel; the in-memory table alone is sufficient and cross-platform.
+// banList is the in-memory ban table: a source IP mapped to the instant its
+// ban expires, with lazy expiry on read.
 type banList struct {
 	mu    sync.Mutex
 	until map[netip.Addr]time.Time
 	now   func() time.Time
-	nft   *nftBackend // nil = in-process only
 
 	// lastSweep is the (b.now-based) instant of the most recent full sweep
 	// at the cap; zero value means "never", so the first refusal always
@@ -44,16 +41,11 @@ func newBanList() *banList {
 	return &banList{until: make(map[netip.Addr]time.Time), now: time.Now}
 }
 
-// ban blocks ip for dur (extending any existing ban), then, if kernel is
-// set and an nftables backend is attached, also installs a matching kernel
-// drop. kernel is false for bans the caller wants memory-only (a
-// single-packet scanner verdict over UDP — a forgable source — must never
-// reach the kernel). It reports whether the ban was recorded: when the
-// table is at banCap and ip is not already banned, expired entries are
-// swept lazily first, and if the table is still full the addition is
-// refused (the overflow counter increments) and no kernel drop is installed
-// — the in-memory table stays the authoritative copy.
-func (b *banList) ban(ip netip.Addr, dur time.Duration, kernel bool) bool {
+// ban blocks ip for dur (extending any existing ban). It reports whether
+// the ban was recorded: when the table is at banCap and ip is not already
+// banned, expired entries are swept lazily first, and if the table is still
+// full the addition is refused (the overflow counter increments).
+func (b *banList) ban(ip netip.Addr, dur time.Duration) bool {
 	b.mu.Lock()
 	_, tracked := b.until[ip]
 	if !tracked && len(b.until) >= banCap {
@@ -74,14 +66,10 @@ func (b *banList) ban(ip netip.Addr, dur time.Duration, kernel bool) bool {
 	}
 	b.until[ip] = b.now().Add(dur)
 	b.mu.Unlock()
-	if kernel && b.nft != nil {
-		b.nft.ban(ip, dur)
-	}
 	return true
 }
 
-// unban removes any ban on ip and reports whether one existed. The kernel
-// element (if any) is removed by the caller — see Shield.Unban.
+// unban removes any ban on ip and reports whether one existed.
 func (b *banList) unban(ip netip.Addr) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -119,8 +107,7 @@ func (b *banList) size() int {
 	return len(b.until)
 }
 
-// prune drops expired entries (the kernel handles nftables element timeouts
-// on its own).
+// prune drops expired entries.
 func (b *banList) prune() {
 	b.mu.Lock()
 	defer b.mu.Unlock()

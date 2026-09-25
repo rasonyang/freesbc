@@ -60,8 +60,7 @@ routes:
 
 shield:
   rate_limit: 200/s per_ip
-  auto_ban: { failures: 10, window: 60s, duration: 1h }
-  nftables: off                    # no kernel ban table on this test host
+  auto_ban: { duration: 1h }
 
 admin:
   listen: 192.168.31.5:8080       # LAN-reachable WebUI on the test host

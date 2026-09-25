@@ -77,7 +77,7 @@ The edge plane exists so that FreeSBC is the only element with a public address.
 What the SBC absorbs, so FreeSWITCH never sees it:
 
 - **Public traffic itself.** Every request FreeSWITCH receives is sent from FreeSBC's private socket (`sip.private.bind`), so its sofia profile only has to accept that one address. In the other direction the edge's pre-parse read filter drops anything arriving on the private bind whose source is not a configured upstream.
-- **Scanners and floods.** Per-IP rate limiting and the scanner User-Agent signature list (instant ban) run on every public request; the private plane is exempt from the shield entirely, and every denial is a silent drop rather than a response that confirms the SBC exists. Edge-plane bans are in-memory — the optional nftables backend is wired to the trunk plane only.
+- **Scanners and floods.** Per-IP rate limiting and the scanner User-Agent signature list (instant ban) run on every public request; the private plane is exempt from the shield entirely, and every denial is a silent drop rather than a response that confirms the SBC exists. Bans are in-memory only; FreeSBC touches no kernel firewall state.
 - **Its own addresses.** Every SDP body the edge plane emits is constructed, never derived from the other leg, so a public client is never given FreeSWITCH's address and FreeSWITCH is never given the client's; the REGISTER Contact is rewritten toward the SBC and restored on the way back, and all media is anchored on FreeSBC ports. The Via stack is ordinary proxy behaviour, not hidden: FreeSBC annotates the sender's Via with `received=`, so FreeSWITCH does see the public client's address there.
 - **Transport and NAT variety.** WS/WSS and WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) are terminated at the edge and relayed to FreeSWITCH as plain SIP over UDP and plain RTP. `received=`/`rport` handling and symmetric-RTP latching happen at the SBC.
 
@@ -100,7 +100,7 @@ Details: [`docs/edge.md`](docs/edge.md) (topology, behaviour table, known limita
 - **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution with RFC 3263 priority/weight ordering, cached
 - **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy on the trunk plane, SRTP↔RTP interworking in both directions, and NAT traversal via hardened first-packet latching
 - **Edge proxy plane** — the only public-facing element in front of a FreeSWITCH that stays on the private LAN: registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover
-- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures with an instant ban, and optional nftables integration: auto-detected, degrades to in-memory bans, never a hard dependency
+- **Built-in security** — per-IP rate limiting, scanner fingerprinting against known-tool User-Agent signatures with an instant in-memory ban; no kernel firewall integration and no extra capabilities needed
 - **Embedded WebUI + REST API** — a live dashboard and an editor for the same YAML file, with validated atomic write-back, hot reload, Prometheus metrics and bcrypt Basic Auth
 - **Carrier interop baseline** — OPTIONS answering and session-timer negotiation (RFC 4028), including the 422/Min-SE exchange on both legs
 
@@ -129,7 +129,6 @@ FreeSBC targets small/medium businesses and ITSPs running a single node; hundred
 Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its own right — the edge proxy PROXIES registrations to FreeSWITCH rather than owning users or credentials. See the [design doc](docs/design.md).
 
 - **No transcoding**, on either plane — left to the softswitch behind.
-- The multi-failure auto-ban counter (`shield.auto_ban`) is implemented but not yet wired — nothing in the shipped planes feeds it.
 - Session timers are negotiated, but no timer tears a call down on session expiry.
 - The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
 - The call list and teardown in the admin API cover trunk-plane calls only; edge-proxy dialogs are not listed.
@@ -164,7 +163,7 @@ internal/
   trunk/              trunk plane: B2BUA between carriers and a PBX
   edge/               edge plane: SIP/RTP/WebRTC proxy in front of FreeSWITCH
   media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
-  shield/             per-IP rate limiting, scanner fingerprinting, auto-ban
+  shield/             per-IP rate limiting, scanner fingerprinting, in-memory bans
   admin/              operator HTTP API, Prometheus metrics, embedded WebUI
 test/interop/         SIPp scenarios and config for manual interop runs
 ```
