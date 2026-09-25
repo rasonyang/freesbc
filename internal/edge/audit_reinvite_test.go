@@ -10,7 +10,6 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	fsip "github.com/freesbc/freesbc/internal/sip"
-	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // audit: P2-EDG-024
@@ -53,8 +52,8 @@ func TestAuditReInviteGlareKeepsEachAnswer(t *testing.T) {
 	fsTag := <-tags
 	waitForDialog(t, h, fsip.CallID(invite))
 	upInv := h.fs.waitFor(sip.INVITE, 1, 3*time.Second)
-	first, _ := sdp.Parse(res.Body())
-	up, _ := sdp.Parse(upInv[0].Body())
+	first, _ := parseLabSDP(res.Body())
+	up, _ := parseLabSDP(upInv[0].Body())
 	publicPort, privatePort := first.Audio.Port, up.Audio.Port
 
 	phone.setAnswer(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -102,11 +101,11 @@ func TestAuditReInviteGlareKeepsEachAnswer(t *testing.T) {
 	if phoneRes.StatusCode != 200 || fsRes.StatusCode != 200 {
 		t.Fatalf("re-INVITEs: phone got %d, FreeSWITCH got %d", phoneRes.StatusCode, fsRes.StatusCode)
 	}
-	toPhone, err := sdp.Parse(phoneRes.Body())
+	toPhone, err := parseLabSDP(phoneRes.Body())
 	if err != nil {
 		t.Fatalf("answer to the phone: %v", err)
 	}
-	toFS, err := sdp.Parse(fsRes.Body())
+	toFS, err := parseLabSDP(fsRes.Body())
 	if err != nil {
 		t.Fatalf("answer to FreeSWITCH: %v", err)
 	}

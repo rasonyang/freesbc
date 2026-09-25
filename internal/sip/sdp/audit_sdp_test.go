@@ -210,7 +210,9 @@ func FuzzAuditParseBuild(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if sess.Audio == nil || len(sess.Audio.Codecs) == 0 || !sess.Audio.Address.IsValid() {
+		// A c=0.0.0.0 body is valid and has no destination (RFC 3264 §8.4:
+		// an agent MUST be capable of receiving it); it reports Hold.
+		if sess.Audio == nil || len(sess.Audio.Codecs) == 0 || (!sess.Audio.Address.IsValid() && !sess.Audio.Hold) {
 			t.Fatalf("Parse returned an unusable session without error: %+v", sess)
 		}
 		for _, c := range sess.Audio.Codecs {
