@@ -141,7 +141,7 @@ Created once, alive for the process lifetime:
 | `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:285`) | one goroutine per `register: true` peer |
 | `trunk.Resolver` | trunk | `NewServer` | SRV cache + singleflight + seeded `rand` |
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
-| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:268`) | immutable snapshot afterwards |
+| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:269`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
 | `edge.dialogTable` | edge | `edge.New` (`edge.go:143`) | grouped by Call-ID, matched on Call-ID + both tags |
 | `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:136-137`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
@@ -196,8 +196,8 @@ Created once, alive for the process lifetime:
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: closer, and `ln.Serve` | `Run` (`edge.go:272-283`) | `listenCtx` cancel / serve error |
-| `Location.Prune` ticker (30 s) | `Run` (`edge.go:297-312`) | `listenCtx` cancel |
+| per listener: closer, and `ln.Serve` | `Run` (`edge.go:273-283`) | `listenCtx` cancel / serve error |
+| `Location.Prune` ticker (30 s) | `Run` (`edge.go:310-325`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
 | WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:261`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
@@ -280,11 +280,22 @@ ws/wss listener on the trunk plane. TCP and TLS listeners are wrapped in
 `listen.tls_cert`/`tls_key` if present, otherwise mints a self-signed
 certificate and logs `"TLS listener using self-signed certificate"`.
 
-**Edge** (`edge.go:223-283`) binds **every socket synchronously before
+**Edge** (`edge.go:224-306`) binds **every socket synchronously before
 serving any of them**; on any failure every already-opened listener is closed
-and `Run` returns. The unexported `ready` channel closes once every socket
-is open; nothing in production waits on it (the exported `Ready()` was dead
-code and was removed) — it is the happens-before edge the test harness uses.
+and `Run` returns. It then starts one serving goroutine per socket and waits
+(`awaitUDPServing`, `edge.go:353-380`, bounded by 5 s) until every UDP
+listener is in sipgo's connection pool: sipgo pools a UDP listener only
+inside `ServeUDP`, on that goroutine, and a request pinned to the listener's
+address before then (every forward, §7.8) misses the pool, so sipgo binds a
+second socket on the same address and fails with "address already in use" —
+a 503 to the first callers after a restart. WS/WSS listeners need no wait,
+since nothing is sent pinned to them. A serve error or the timeout during
+that wait makes `Run` return it. Only then does the unexported `ready`
+channel close, so `ready` means every socket can both receive and send.
+Nothing in production waits on it (the exported `Ready()` was dead code and
+was removed); it is the happens-before edge the test harness uses, and the
+harness asserts, without waiting, that each UDP listener is pooled when it
+closes (`assertProxyServing`).
 The listener list is
 every enabled `cfg.PublicSIPListeners()` entry (`udp`, `ws`, `wss`) plus one
 synthetic `"udp-private"` entry for `sip.private.bind`.
@@ -296,7 +307,7 @@ unsynchronised variable, which the race detector flags on every graceful
 shutdown.
 
 After binding, the edge plane replaces its topology with
-`s.topo = s.topo.pinned(opened)` (`edge.go:268`). A wildcard bind does not
+`s.topo = s.topo.pinned(opened)` (`edge.go:269`). A wildcard bind does not
 come up as the address it was written with — on a dual-stack host `0.0.0.0`
 yields a socket whose local address is `[::]:port` — and sipgo keys its
 connection pool by the socket's real local address. Without pinning, an
@@ -3068,7 +3079,7 @@ Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`), so in a deployed system `freesbc_shield_drops_total`
 reports only `reason="rate"`. The ban and scanner branches run on the
-**edge** shield (`edge.go:565`), which `internal/app` never wires into
+**edge** shield (`edge.go:617`), which `internal/app` never wires into
 `admin.Deps` (`Deps.Shield` is set only when the trunk server exists), so
 edge bans and drops do not reach `/metrics`. The ban gauges
 (`freesbc_shield_banned_current`, `freesbc_shield_ban_adds_rejected_total`)
@@ -3419,6 +3430,7 @@ read an environment variable.
 | SRV lookup | 3 s | one DNS query |
 | negative SRV cache | `min(srv_cache_ttl, 10 s)` | failed/empty lookup |
 | trunk TCP idle | 120 s | per stream connection read |
+| `udpServingTimeout` | 5 s | edge startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
 | `registerTimeout` | 32 s | one whole edge REGISTER series |
 | `inviteTimeout` | 5 min | one whole edge call (all three paths and re-INVITE) |
 | `sip.pstn.attempt_timeout` | 32 s (config) | one PSTN gateway attempt |
@@ -3426,6 +3438,7 @@ read an environment variable.
 | edge CANCEL / `ackThenBye` BYE | 5 s each | one transaction |
 | edge in-dialog (BYE/INFO) | 32 s | `forwardAndRelay` |
 | `listen.media.rtp_timeout` | 5 min (config) | media silence, both planes |
+| `media.LearnDelay` | 3 s | a loose latch keeps sending to a plausible SDP address before switching to another learned port (§8.4) |
 | WebRTC establishment | 30 s | ICE **and** DTLS together |
 | config reload debounce | 200 ms | fsnotify coalescing |
 | admin read-header / read / write / idle | 5 / 30 / 30 / 30 s | HTTP |

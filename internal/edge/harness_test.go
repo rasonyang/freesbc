@@ -263,7 +263,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
-	waitProxyServing(t, srv, net.JoinHostPort(pubBindIP, strconv.Itoa(pubUDP)), h.privateSIP)
+	assertProxyServing(t, srv, net.JoinHostPort(pubBindIP, strconv.Itoa(pubUDP)), h.privateSIP)
 	return h
 }
 
@@ -471,7 +471,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
-	waitProxyServing(t, srv, h.publicUDP, h.privateSIP)
+	assertProxyServing(t, srv, h.publicUDP, h.privateSIP)
 	return h, switches
 }
 
@@ -597,30 +597,24 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 	return f
 }
 
-// waitProxyServing returns once the proxy's UDP listeners at udpAddrs are
-// in its sipgo transport's connection pool.
+// assertProxyServing fails the test unless every proxy UDP listener at
+// udpAddrs is already in its sipgo transport's connection pool the moment
+// Ready has closed — without waiting.
 //
-// Ready closes when every socket is bound, but each listener is added to
-// the pool by the goroutine that serves it, possibly later. Until then a
-// request the proxy sends from that listener's address — forwarding
-// upstream from the private bind — misses the pool and fails with "bind:
-// address already in use", which a test sees as a 503. Waiting here keeps
-// that startup window out of the tests; the window itself is a production
-// issue, not something the harness should paper over silently, hence this
-// comment.
-func waitProxyServing(t *testing.T, srv *Server, udpAddrs ...string) {
+// sipgo adds a UDP listener to the pool only from the goroutine serving
+// it. A request the proxy sends from that listener's address before then
+// (forwarding upstream from the private bind) misses the pool, sipgo binds
+// a second socket on the same address, and the caller gets a 503. Run
+// closes Ready only once every UDP listener is pooled; the harnesses check
+// that here, on every start, rather than wait the window out.
+//
+// regression: edge startup race
+func assertProxyServing(t *testing.T, srv *Server, udpAddrs ...string) {
 	t.Helper()
 	tl := srv.srv.TransportLayer() // written before Ready closed
-	deadline := time.Now().Add(2 * time.Second)
 	for _, addr := range udpAddrs {
-		for {
-			if c, err := tl.GetConnection("udp", addr); err == nil && c != nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("proxy never started serving udp %s", addr)
-			}
-			time.Sleep(time.Millisecond)
+		if c, err := tl.GetConnection("udp", addr); err != nil || c == nil {
+			t.Errorf("Ready closed before the proxy's udp listener %s was serving (err=%v)", addr, err)
 		}
 	}
 }

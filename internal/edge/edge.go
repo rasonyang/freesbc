@@ -65,9 +65,10 @@ type Server struct {
 	// otherwise untestable.
 	inviteBackstop atomic.Int64
 
-	// ready is closed once every listener is bound and handed to its
-	// serving goroutine. Nothing in production waits on it; it is the
-	// happens-before edge the tests use to read srv and client safely.
+	// ready is closed once every listener is bound and served, and every
+	// UDP listener is in sipgo's connection pool (see awaitUDPServing).
+	// Nothing in production waits on it; it is the happens-before edge the
+	// tests use to read srv and client safely.
 	ready chan struct{}
 
 	// early counts, per public source IP, the INVITEs this proxy has taken
@@ -280,6 +281,18 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}()
 	}
+	// Ready must mean "a request can be sent from every socket". sipgo
+	// adds a UDP listener to its connection pool only inside ServeUDP, on
+	// the goroutine just started; until then a request pinned to that
+	// listener's address (every forward: see prepareForward) misses the
+	// pool, and sipgo binds a second socket there — "address already in
+	// use", a 503 to the first callers after a restart.
+	if err := s.awaitUDPServing(ctx, opened, errs); err != nil {
+		listenCancel()
+		wg.Wait()
+		s.dialogs.closeAll()
+		return err
+	}
 	s.log.Info("edge proxy listening",
 		"public_listeners", len(s.topo.public),
 		"private", s.topo.private.laddr.String(),
@@ -324,6 +337,45 @@ func (s *Server) Run(ctx context.Context) error {
 	// Every media session is torn down explicitly at shutdown: no socket,
 	// port reservation or relay goroutine outlives Run.
 	s.dialogs.closeAll()
+	return nil
+}
+
+// udpServingTimeout bounds how long Run waits for sipgo to pool its UDP
+// listeners. It takes microseconds; the bound only turns a wedged serving
+// goroutine into a startup error instead of a proxy that never gets ready.
+const udpServingTimeout = 5 * time.Second
+
+// awaitUDPServing returns once every UDP listener in opened is in the sipgo
+// transport's connection pool, keyed by the socket's real local address as
+// ServeUDP keys it. WS/WSS listeners need no wait: nothing is ever sent
+// pinned to their address. It returns early with a listener's serve error,
+// or nil when ctx ends (Run then shuts down as usual).
+func (s *Server) awaitUDPServing(ctx context.Context, opened []listener, errs <-chan error) error {
+	tl := s.srv.TransportLayer()
+	deadline := time.NewTimer(udpServingTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for _, ln := range opened {
+		if ln.packet == nil {
+			continue
+		}
+		addr := ln.packet.LocalAddr().String()
+		for {
+			if c, err := tl.GetConnection("udp", addr); err == nil && c != nil {
+				break
+			}
+			select {
+			case <-tick.C:
+			case err := <-errs:
+				return err
+			case <-ctx.Done():
+				return nil
+			case <-deadline.C:
+				return fmt.Errorf("proxy serve %s: not serving after %s", ln.Describe(), udpServingTimeout)
+			}
+		}
+	}
 	return nil
 }
 
