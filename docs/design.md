@@ -165,7 +165,7 @@ Created once, alive for the process lifetime:
 | `media.WebRTCLeg` + `media.WebRTCSession` | one browser leg | 1 muxed public socket + 1 private pair |
 | `media.SRTPContext` | one direction of one leg | `atomic.Pointer` slots on the session |
 | port reservation (`PlanePool.inUse`) | one RTP even port | released by `Session.Close` / `WebRTCLeg.Close` |
-| shield ban entry, rate-limit bucket, fail-counter slice | one source IP | the owning `Shield` |
+| shield ban entry, rate-limit bucket | one source IP (a UDP socket ban: one IP:port) | the owning `Shield` |
 | `*config.Config` snapshot | one publication | immutable once stored |
 
 ### 3.3 Goroutine inventory
@@ -2483,7 +2483,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
-| **shield ban entry** | `banList` | `ban(ip, dur)` from `Check`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** with an overflow counter | `ban`, `unban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, `Unban`, or process exit | `banList.mu` |
+| **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `unban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, `Unban`, or process exit | `banList.mu` |
 | **rate-limit bucket** | `rateLimiter` (two per `Shield`) | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops per-IP buckets idle ≥ 1 minute; the global bucket is never pruned; **no cap on the map** | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; compiled regexps and prefixes are populated before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot; `Store.mu` only for the subscriber slice |
 
@@ -2769,7 +2769,7 @@ shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`). In a deployed system `freesbc_shield_banned_current`
 and `freesbc_shield_ban_adds_rejected_total` therefore stay at 0 and
 `freesbc_shield_drops_total` reports only `reason="rate"`. The ban and scanner
-branches run on the **edge** shield (`edge.go:559`), which `internal/app`
+branches run on the **edge** shield (`edge.go:560`), which `internal/app`
 never wires into `admin.Deps` — `Deps.Shield` and `Deps.Unban` are set only
 when the trunk server exists (`app.go:166-193`) — so edge bans reach neither
 `/metrics` nor `DELETE /api/bans/{ip}`.
@@ -2887,8 +2887,9 @@ any log. The trunk's filter accepts only bytes whose source IP matches a
 configured peer's `allowed_ips` (no size cap). The edge's filter enforces a
 **64 KiB** size cap on every read; for reads arriving on the private bind it
 requires an upstream source IP, and for public reads it drops a source the
-edge shield has banned (so a ban stays silent even for what sipgo would
-answer before any handler). Neither filter ever returns an error,
+edge shield has banned — its IP, or on UDP its exact socket
+(`Shield.BannedFrom`) — so a ban stays silent even for what sipgo would
+answer before any handler. Neither filter ever returns an error,
 because sipgo treats a filter error as fatal to the whole read loop.
 
 **Peer allowlist (trunk).** Identification is the transport source IP and
@@ -2900,7 +2901,8 @@ connections across all stream listeners and a 120 s idle read deadline per
 connection.
 
 **Shield.** Every request that is not from the edge's private plane runs
-through `Check`:
+through `Check` (trunk) or `CheckFrom` (edge, which also knows the source
+port):
 
 1. A **configured peer** skips the ban table and the scanner check entirely
    but is still subject to the looser `shield.peer_rate_limit`
@@ -2908,10 +2910,18 @@ through `Check`:
 2. A banned source is dropped.
 3. `shield.rate_limit` (default `20/s per_ip`) — a token bucket whose
    capacity equals the rate, per source IP.
-4. A **scanner User-Agent** is dropped **and** instantly banned — but only
-   after the rate limiter has had its say, because the User-Agent is a
-   client-controlled "ban me" signal that must not be allowed to skip the
-   limiter.
+4. A **scanner User-Agent** is dropped — but only after the rate limiter
+   has had its say, because the User-Agent is a client-controlled "ban me"
+   signal that must not be allowed to skip the limiter. What else happens
+   depends on the transport (P2-SHD-001):
+   - **tcp, tls, ws, wss**: the source IP is banned for
+     `shield.auto_ban.duration`. A handshake proved the source address.
+   - **udp**: only the exact source socket (IP:port) is banned, in a
+     separate table, for at most **1 minute** (`socketBanMax`). One forged
+     datagram therefore cannot lock out a victim's IP, and a forged flood
+     that fills the socket table cannot stop real scanners' IPs from being
+     banned.
+   - **unknown transport, or `Check` without a port**: drop only.
 
 Signatures are 11 exact substrings (`friendly-scanner`, `sipvicious`,
 `sipcli`, `sip-scan`, `sundayddr`, `vaxsipuseragent`, `sipsak`, `iwar`,
@@ -3030,7 +3040,7 @@ cannot echo a secret because expansion runs after the unmarshal.
 | Edge binding | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker | the registrar's granted lifetime |
 | Edge upstream/PSTN cooldown | `Recover`, or lazy expiry | the configured cooldown (default 30 s) |
 | WebRTC leg | `WebRTCSession.Close`, establishment failure, fingerprint mismatch | the establishment deadline (30 s default) |
-| Shield ban | lazy expiry on lookup, the 1-minute prune tick, `Unban`, process exit | `auto_ban.duration` (default 1 h) |
+| Shield ban | lazy expiry on lookup, the 1-minute prune tick, `Unban` (which also lifts the IP's socket bans), process exit | `auto_ban.duration` (default 1 h); a UDP socket ban at most 1 min |
 | Rate-limit bucket | prune of buckets idle ≥ 1 minute | — |
 | `privateSources` entry | 10-minute TTL, pruned on insert pressure | — |
 

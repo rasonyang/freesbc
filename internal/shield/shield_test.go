@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/freesbc/freesbc/internal/config"
 )
@@ -85,12 +86,38 @@ func TestShieldCheckAppliesPeerRateLimit(t *testing.T) {
 func TestCheckScannerInstantBan(t *testing.T) {
 	s := testShield(t, shieldCfg)
 	bad := netip.MustParseAddr("198.51.100.5")
-	if s.Check(bad, "sipvicious", "udp") != Drop {
+	if s.Check(bad, "sipvicious", "tcp") != Drop {
 		t.Fatal("scanner UA must be dropped")
 	}
 	// now banned: even a benign UA from that IP drops.
-	if s.Check(bad, "Zoiper", "udp") != Drop {
+	if s.Check(bad, "Zoiper", "tcp") != Drop {
 		t.Fatal("scanner source must be banned after the first hit")
+	}
+}
+
+// audit: P2-SHD-001
+// A scanner verdict bans only on a connection-oriented transport. Over UDP,
+// or with no transport known, the request is dropped and counted, but the
+// forgeable source address is not banned.
+func TestCheckScannerBanNeedsConnection(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	for i, tc := range []struct {
+		transport string
+		ban       bool
+	}{
+		{"udp", false}, {"", false}, {"UDP", false},
+		{"tcp", true}, {"tls", true}, {"ws", true}, {"wss", true}, {"WSS", true},
+	} {
+		src := netip.AddrFrom4([4]byte{198, 51, 100, byte(100 + i)})
+		if s.Check(src, "friendly-scanner", tc.transport) != Drop {
+			t.Fatalf("%q: scanner UA must be dropped", tc.transport)
+		}
+		if got := s.bans.banned(src); got != tc.ban {
+			t.Errorf("%q: banned = %v, want %v", tc.transport, got, tc.ban)
+		}
+	}
+	if got := s.Stats().DropsByReason["scanner"]; got != 8 {
+		t.Errorf("scanner drops = %d, want 8 (UDP drops count too)", got)
 	}
 }
 
@@ -147,8 +174,8 @@ func TestCheckRateLimitDropsButDoesNotBan(t *testing.T) {
 func TestShieldStatsCountsDrops(t *testing.T) {
 	s := testShield(t, shieldCfg) // rate 2/s
 	bad := netip.MustParseAddr("198.51.100.20")
-	s.Check(bad, "sipvicious", "udp") // scanner drop (+ ban)
-	s.Check(bad, "", "udp")           // now banned → banned drop
+	s.Check(bad, "sipvicious", "tcp") // scanner drop (+ ban)
+	s.Check(bad, "", "tcp")           // now banned → banned drop
 	st := s.Stats()
 	if st.DropsByReason["scanner"] < 1 {
 		t.Errorf("scanner drops = %d, want >=1", st.DropsByReason["scanner"])
@@ -158,5 +185,63 @@ func TestShieldStatsCountsDrops(t *testing.T) {
 	}
 	if st.BannedCurrent < 1 {
 		t.Errorf("banned current = %d, want >=1", st.BannedCurrent)
+	}
+}
+
+// audit: P2-SHD-001
+// With the source port known (CheckFrom, the edge plane's path), a UDP
+// scanner verdict bans only that socket, and only briefly: another socket
+// on the same IP is untouched, the IP table stays empty, the ban lapses
+// after socketBanMax, and Unban(ip) lifts it early.
+func TestCheckFromUDPScannerBansSocketOnly(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	clock := time.Unix(1_700_000_000, 0)
+	s.socketBans.now = func() time.Time { return clock }
+	s.limiter.now = func() time.Time { return clock }
+	scan := netip.MustParseAddrPort("198.51.100.60:5060")
+	other := netip.MustParseAddrPort("198.51.100.60:5062")
+	if s.CheckFrom(scan, "friendly-scanner", "udp") != Drop {
+		t.Fatal("scanner UA must be dropped")
+	}
+	if !s.BannedFrom(scan, "udp") {
+		t.Fatal("the scanner's UDP socket must be banned")
+	}
+	if s.BannedFrom(scan, "tcp") || s.bans.banned(scan.Addr()) {
+		t.Fatal("a UDP verdict must not ban the IP or its TCP side")
+	}
+	if s.CheckFrom(other, "Yealink", "udp") != Allow {
+		t.Fatal("another socket on the same IP must not be banned")
+	}
+	clock = clock.Add(socketBanMax)
+	if s.BannedFrom(scan, "udp") {
+		t.Fatalf("a socket ban must lapse after %v", socketBanMax)
+	}
+	s.CheckFrom(scan, "friendly-scanner", "udp")
+	if !s.Unban(scan.Addr()) || s.BannedFrom(scan, "udp") {
+		t.Fatal("Unban(ip) must lift the IP's socket bans")
+	}
+}
+
+// audit: P2-SHD-001
+// A forged-datagram flood fills at most the socket table; a real scanner
+// over TCP still gets its IP banned.
+func TestSocketBanFloodLeavesIPTableFree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("fills a 64k table")
+	}
+	s := testShield(t, shieldCfg)
+	base := netip.MustParseAddr("2001:db8::").As16()
+	for i := 0; i <= banCap; i++ {
+		a := base
+		a[12], a[13], a[14], a[15] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
+		s.CheckFrom(netip.AddrPortFrom(netip.AddrFrom16(a), 5060), "friendly-scanner", "udp")
+	}
+	if s.socketBans.overflowed() == 0 {
+		t.Fatal("the flood should have filled the socket table")
+	}
+	real := netip.MustParseAddrPort("192.0.2.66:40000")
+	s.CheckFrom(real, "sipvicious", "tcp")
+	if !s.bans.banned(real.Addr()) {
+		t.Error("a real TCP scanner could not be banned after a UDP flood")
 	}
 }

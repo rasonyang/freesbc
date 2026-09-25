@@ -502,8 +502,9 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 			// the private socket), since its PSTN INVITEs arrive here on the
 			// public one.
 			if sh := s.shield; sh != nil && info.RemoteAddr != nil {
-				if ip, ok := fsip.AddrOf(info.RemoteAddr); ok &&
-					sh.Banned(ip.Unmap()) && !s.privSources.has(info.RemoteAddr.String()) {
+				if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil &&
+					sh.BannedFrom(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), info.Transport) &&
+					!s.privSources.has(info.RemoteAddr.String()) {
 					return false
 				}
 			}
@@ -556,7 +557,7 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		// element the proxy exists to serve, and rate-limiting it would
 		// turn a busy switch into a dropped call.
 		if !s.arrivedOnPrivate(req) {
-			if s.shield.Check(src.Addr(), fsip.UserAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
+			if s.shield.CheckFrom(src, fsip.UserAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
 				return // silent
 			}
 		}

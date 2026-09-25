@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,9 +28,10 @@ const (
 type Shield struct {
 	store       *config.Store
 	log         *slog.Logger
-	limiter     *rateLimiter // non-peer sources (shield.rate_limit)
-	peerLimiter *rateLimiter // configured peers (shield.peer_rate_limit)
-	bans        *banList
+	limiter     *rateLimiter             // non-peer sources (shield.rate_limit)
+	peerLimiter *rateLimiter             // configured peers (shield.peer_rate_limit)
+	bans        *banList[netip.Addr]     // source IPs (connection-oriented verdicts)
+	socketBans  *banList[netip.AddrPort] // UDP source sockets (see CheckFrom)
 
 	// Cumulative drop counters by reason, for the admin API's metrics
 	// snapshot (Stats). Incremented in Check at each of its three drop
@@ -73,6 +75,7 @@ func newShield(store *config.Store, log *slog.Logger) *Shield {
 		limiter:     newRateLimiter(),
 		peerLimiter: newRateLimiter(),
 		bans:        newBanList(),
+		socketBans:  newBanTable[netip.AddrPort](),
 		stop:        cancel,
 		done:        make(chan struct{}),
 	}
@@ -86,13 +89,33 @@ func newShield(store *config.Store, log *slog.Logger) *Shield {
 // spoofed peer source would otherwise have no rate ceiling at all (a real
 // peer's legitimate load stays far below the threshold, so it never sees
 // the limiter). For non-peers: a banned source and a rate-limit violation
-// Drop; otherwise a scanner UA is dropped AND instantly banned — but only
-// AFTER the rate limiter has had its say (the UA is a
+// Drop; otherwise a scanner UA is dropped, and instantly banned when it
+// arrived over a connection-oriented transport (see bannableTransport) — but
+// only AFTER the rate limiter has had its say (the UA is a
 // client-controlled "ban me" signal, so it must first burn through the
 // source's rate budget like any other traffic, never skip the limiter).
-// transport is the lowercased request transport ("udp"/"tcp"/"tls"/"ws"/
-// "wss"/"").
+// transport is the request transport ("udp"/"tcp"/"tls"/"ws"/"wss"/"";
+// case-insensitive).
+//
+// Check knows only the source IP, so a scanner datagram is dropped without
+// any ban; CheckFrom, which also knows the source port, bans the socket.
 func (s *Shield) Check(src netip.Addr, userAgent string, transport string) Verdict {
+	return s.CheckFrom(netip.AddrPortFrom(src, 0), userAgent, transport)
+}
+
+// socketBanMax caps how long a UDP scanner verdict bans its source socket.
+// The verdict rests on one forgeable datagram, so the ban is kept short: a
+// real scanner that keeps sending from the socket re-arms it, while a
+// forged datagram naming a victim's socket silences that socket briefly
+// and never the rest of its IP.
+const socketBanMax = time.Minute
+
+// CheckFrom is Check with the source port. A scanner verdict on UDP bans
+// only the exact source socket (IP and port), for at most socketBanMax, in
+// a table separate from the IP bans; a port of 0 means unknown and bans
+// nothing.
+func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport string) Verdict {
+	src := srcAP.Addr()
 	cfg := s.store.Current()
 	if isConfiguredPeer(cfg, src) {
 		rl := s.peerRateLimit(cfg)
@@ -103,7 +126,7 @@ func (s *Shield) Check(src netip.Addr, userAgent string, transport string) Verdi
 		}
 		return Allow
 	}
-	if s.bans.banned(src) {
+	if s.BannedFrom(srcAP, transport) {
 		s.dropsBanned.Add(1)
 		return Drop
 	}
@@ -114,15 +137,48 @@ func (s *Shield) Check(src netip.Addr, userAgent string, transport string) Verdi
 		return Drop
 	}
 	if isScanner(userAgent) {
+		s.dropsScanner.Add(1)
+		if !bannableTransport(transport) {
+			// A datagram's source address is forgeable: an IP ban would let
+			// one spoofed packet lock a third party out, and a spoofed flood
+			// fill the IP table. Ban the socket instead, briefly.
+			if isUDP(transport) && srcAP.Port() != 0 {
+				s.socketBans.ban(srcAP, min(cfg.Shield.AutoBan.Duration.Std(), socketBanMax))
+			}
+			s.log.Debug("shield dropped scanner datagram", "source", srcAP, "ua", userAgent)
+			return Drop
+		}
 		if !s.bans.ban(src, cfg.Shield.AutoBan.Duration.Std()) {
 			s.log.Debug("shield ban table at hard cap; scanner ban refused", "source", src, "ua", userAgent)
 		} else {
 			s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
 		}
-		s.dropsScanner.Add(1)
 		return Drop
 	}
 	return Allow
+}
+
+// bannableTransport reports whether a scanner verdict on this transport may
+// ban its source. Only connection-oriented transports qualify: their source
+// address survived a handshake, so it is not forged. UDP, and an unknown or
+// empty transport, get a drop without a ban.
+func bannableTransport(transport string) bool {
+	switch strings.ToLower(transport) {
+	case "tcp", "tls", "ws", "wss":
+		return true
+	}
+	return false
+}
+
+func isUDP(transport string) bool { return strings.EqualFold(transport, "udp") }
+
+// BannedFrom reports whether the source is banned: its IP, or on UDP its
+// exact socket. Like Banned it counts nothing, so a read filter can call it.
+func (s *Shield) BannedFrom(src netip.AddrPort, transport string) bool {
+	if s.bans.banned(src.Addr()) {
+		return true
+	}
+	return isUDP(transport) && src.Port() != 0 && s.socketBans.banned(src)
 }
 
 // Stats is a snapshot of shield activity for metrics.
@@ -137,8 +193,8 @@ type Stats struct {
 // Stats returns a snapshot of current bans and cumulative drops by reason.
 func (s *Shield) Stats() Stats {
 	return Stats{
-		BannedCurrent:   s.bans.size(),
-		BanAddsRejected: s.bans.overflowed(),
+		BannedCurrent:   s.bans.size() + s.socketBans.size(),
+		BanAddsRejected: s.bans.overflowed() + s.socketBans.overflowed(),
 		DropsByReason: map[string]int64{
 			"banned":  s.dropsBanned.Load(),
 			"scanner": s.dropsScanner.Load(),
@@ -147,10 +203,15 @@ func (s *Shield) Stats() Stats {
 	}
 }
 
-// Unban removes any ban on ip and reports whether a ban existed (the admin
-// API's DELETE /api/bans/{ip} calls this).
+// Unban removes any ban on ip, including every socket ban on it, and
+// reports whether a ban existed (the admin API's DELETE /api/bans/{ip}
+// calls this).
 func (s *Shield) Unban(ip netip.Addr) bool {
-	return s.bans.unban(ip)
+	existed := s.bans.unban(ip)
+	if s.socketBans.unbanWhere(func(ap netip.AddrPort) bool { return ap.Addr() == ip }) > 0 {
+		existed = true
+	}
+	return existed
 }
 
 // Close stops the prune loop.
@@ -197,6 +258,7 @@ func (s *Shield) pruneLoop(ctx context.Context) {
 			s.limiter.prune()
 			s.peerLimiter.prune()
 			s.bans.prune()
+			s.socketBans.prune()
 		}
 	}
 }

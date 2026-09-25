@@ -20,11 +20,15 @@ const banCap = 65536
 // pruneLoop keeps clearing expired entries regardless.
 const sweepEvery = time.Second
 
-// banList is the in-memory ban table: a source IP mapped to the instant its
-// ban expires, with lazy expiry on read.
-type banList struct {
+// banList is an in-memory ban table: a source key mapped to the instant
+// its ban expires, with lazy expiry on read. The Shield keeps two: source
+// IPs (a verdict on a connection-oriented transport) and UDP source sockets
+// (see Shield.CheckFrom). Separate tables mean a forged-datagram flood that
+// fills the socket table can never keep a real scanner's IP out of the IP
+// table.
+type banList[K comparable] struct {
 	mu    sync.Mutex
-	until map[netip.Addr]time.Time
+	until map[K]time.Time
 	now   func() time.Time
 
 	// lastSweep is the (b.now-based) instant of the most recent full sweep
@@ -37,17 +41,19 @@ type banList struct {
 	overflow atomic.Int64
 }
 
-func newBanList() *banList {
-	return &banList{until: make(map[netip.Addr]time.Time), now: time.Now}
+func newBanList() *banList[netip.Addr] { return newBanTable[netip.Addr]() }
+
+func newBanTable[K comparable]() *banList[K] {
+	return &banList[K]{until: make(map[K]time.Time), now: time.Now}
 }
 
-// ban blocks ip for dur (extending any existing ban). It reports whether
-// the ban was recorded: when the table is at banCap and ip is not already
+// ban blocks key for dur (extending any existing ban). It reports whether
+// the ban was recorded: when the table is at banCap and key is not already
 // banned, expired entries are swept lazily first, and if the table is still
 // full the addition is refused (the overflow counter increments).
-func (b *banList) ban(ip netip.Addr, dur time.Duration) bool {
+func (b *banList[K]) ban(key K, dur time.Duration) bool {
 	b.mu.Lock()
-	_, tracked := b.until[ip]
+	_, tracked := b.until[key]
 	if !tracked && len(b.until) >= banCap {
 		if b.now().Sub(b.lastSweep) >= sweepEvery {
 			now := b.now()
@@ -64,57 +70,72 @@ func (b *banList) ban(ip netip.Addr, dur time.Duration) bool {
 			return false
 		}
 	}
-	b.until[ip] = b.now().Add(dur)
+	b.until[key] = b.now().Add(dur)
 	b.mu.Unlock()
 	return true
 }
 
-// unban removes any ban on ip and reports whether one existed.
-func (b *banList) unban(ip netip.Addr) bool {
+// unban removes any ban on key and reports whether one existed.
+func (b *banList[K]) unban(key K) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, ok := b.until[ip]; !ok {
+	if _, ok := b.until[key]; !ok {
 		return false
 	}
-	delete(b.until, ip)
+	delete(b.until, key)
 	return true
 }
 
 // overflowed returns the cumulative number of ban additions refused at the
 // hard cap.
-func (b *banList) overflowed() int64 { return b.overflow.Load() }
+func (b *banList[K]) overflowed() int64 { return b.overflow.Load() }
 
-// banned reports whether ip is currently banned, deleting the entry once its
+// banned reports whether key is currently banned, deleting the entry once its
 // ban has expired (lazy expiry).
-func (b *banList) banned(ip netip.Addr) bool {
+func (b *banList[K]) banned(key K) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.until[ip]
+	t, ok := b.until[key]
 	if !ok {
 		return false
 	}
 	if !b.now().Before(t) { // now >= expiry
-		delete(b.until, ip)
+		delete(b.until, key)
 		return false
 	}
 	return true
 }
 
 // size returns the number of currently-tracked (possibly expired) ban entries.
-func (b *banList) size() int {
+func (b *banList[K]) size() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.until)
 }
 
 // prune drops expired entries.
-func (b *banList) prune() {
+func (b *banList[K]) prune() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
-	for ip, t := range b.until {
+	for key, t := range b.until {
 		if !now.Before(t) {
-			delete(b.until, ip)
+			delete(b.until, key)
 		}
 	}
+}
+
+// unbanWhere removes every ban whose key matches and reports how many
+// existed.
+func (b *banList[K]) unbanWhere(match func(K) bool) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for key := range b.until {
+		if match(key) {
+			delete(b.until, key)
+			n++
+		}
+	}
+	return n
 }
