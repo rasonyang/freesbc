@@ -61,3 +61,38 @@ func TestCallUsesOneConfigSnapshot(t *testing.T) {
 			got, stray)
 	}
 }
+
+// audit: P2-APP-002
+// The admin goroutine asks IsRegistered (peer view, metrics) while Run is
+// still starting up and building the registrar. Under -race, that read
+// must be synchronised with Run's write.
+//
+// Ports: SIP 13790.
+func TestIsRegisteredDuringStartupIsRaceFree(t *testing.T) {
+	cfg, err := config.Parse([]byte(auditTrunkCfg(13790, 13791, 14790, 14793, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := config.NewStore(cfg)
+	srv := NewServer(store, NewMediaPool(store), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	bound := make(chan struct{}, 1)
+	srv.onListening = func(config.SIPListen) { bound <- struct{}{} }
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-runErr
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		_ = srv.IsRegistered("carrier") // the admin goroutine's read
+		select {
+		case <-bound:
+			return
+		case <-deadline:
+			t.Fatal("server did not bind within 5s")
+		default:
+		}
+	}
+}

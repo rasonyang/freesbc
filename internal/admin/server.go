@@ -58,6 +58,10 @@ type Deps struct {
 	ActiveCalls func() int
 	KillCall    func(id string) bool
 	Version     string
+	// Listeners lists the SIP listeners the running planes bound, as
+	// transport://host:port. They are restart-only, so this comes from the
+	// startup snapshot, never the hot-reloaded config. Nil lists none.
+	Listeners func() []string
 	// Proxy reports the edge-proxy plane's counters, or is nil when that
 	// plane is not running (a trunk-only deployment).
 	Proxy func() ProxyStats

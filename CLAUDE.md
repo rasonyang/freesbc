@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Vet: `go vet ./...`. There is no linter config, Makefile or CI; `gofmt -l .` is currently clean.
 - Tests (as the README runs them): `go test ./... -race`. One package: `go test -race ./internal/config`. One test: `go test ./internal/app -run '^TestCheckExamples$' -count=1 -v`.
 - No build tags. The trunk and edge suites are mostly integration tests over real loopback sockets (real sipgo transports and RTP sockets), not mocks.
-- CLI: `freesbc run|check [-c file]`. `-c` defaults to `sbc.yaml` and positional arguments are ignored, so always pass `-c`.
+- CLI: `freesbc run|check [-c file]`. `-c` defaults to `sbc.yaml`; a positional argument is a usage error (exit 2), so always pass `-c`.
 - Example configs: `CARRIER_A_PASS=x ./freesbc check -c sbc.example.yaml` and `./freesbc check -c edge.example.yaml` both pass (`TestCheckExamples` guards this; without `CARRIER_A_PASS` the trunk example fails with "undefined environment variable(s)").
 - `check` only parses and validates; it does not open cert files or bind sockets. `run -c edge.example.yaml` exits 1 on the missing `/etc/freesbc/wss-cert.pem`, so adapt addresses and cert paths before `run`. Of the config copies, only `/sbc.yaml` is gitignored; `edge.yaml` (the README's name for the edge copy) is not.
 - Opt-in live FreeSWITCH interop. It skips unless `FREESBC_FS_INTEROP=1` and shells out to `/usr/local/freeswitch/bin/fs_cli`, so run it on the FreeSWITCH host:
@@ -52,7 +52,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 ### Security boundaries
 - Both planes install a sipgo transport read filter (`internal/sip/readfilter.go`) that runs before parsing. The trunk filter admits only peer IPs. The edge filter caps reads at 64 KiB and, on the private bind, admits only upstream IPs. A filter must never return an error, because sipgo treats that as fatal to the read loop; reject by returning `nil, nil`.
 - Shield denials are silent drops. The trunk overrides `onNoRoute` so that non-peer sources get silence instead of a 405.
-- The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, kick and shield drop metrics are wired to the trunk plane only. There is no unban API (`DELETE /api/bans/{ip}` was removed).
+- The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, call count, port usage and listeners cover both planes; kick and the shield drop metrics are wired to the trunk plane only. There is no unban API (`DELETE /api/bans/{ip}` was removed).
 - Admin uses bcrypt Basic Auth (cost ≥ 10) and is loopback-only unless `admin.allow_remote: true` is set. `GET /api/config/raw` is unredacted on purpose.
 
 ### sipgo v1.4.3 workarounds (re-check when upgrading sipgo)

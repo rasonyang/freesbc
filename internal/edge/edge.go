@@ -179,6 +179,28 @@ func (s *Server) Metrics() *Metrics { return s.metrics }
 // ActiveCalls is the number of proxied dialogs currently tracked.
 func (s *Server) ActiveCalls() int { return s.dialogs.count() }
 
+// Calls lists the confirmed dialogs ActiveCalls counts, for the admin call
+// list.
+func (s *Server) Calls() []CallRecord { return s.dialogs.calls() }
+
+// PortStats is the RTP port usage of the public and private media pools
+// together: pairs allocated and pairs the two ranges hold.
+func (s *Server) PortStats() (inUse, total int) {
+	pu, pt := s.pubPool.Stats()
+	qu, qt := s.privPool.Stats()
+	return pu + qu, pt + qt
+}
+
+// Listeners is the listener set Run binds, as transport://host:port, from
+// the startup snapshot (the set is restart-only).
+func (s *Server) Listeners() []string {
+	var out []string
+	for _, l := range s.boot.PublicSIPListeners() {
+		out = append(out, l.Transport+"://"+l.Bind.String())
+	}
+	return append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
+}
+
 // Run binds every listener and blocks until ctx is cancelled. It returns
 // the first fatal bind error, or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {

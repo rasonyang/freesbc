@@ -56,7 +56,10 @@ type Server struct {
 
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
-	registrar *Registrar
+	// registrar is built in Run and read by IsRegistered from the admin
+	// goroutine (peer view, metrics), so it is published atomically, like
+	// shield below (audit P2-APP-002).
+	registrar atomic.Pointer[Registrar]
 
 	// client is the plane's sipgo client, set once in Run; forkWatch uses
 	// it to ACK and BYE forked B-leg answers. forks holds the live
@@ -163,10 +166,21 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 // before Run has built the registrar at all: no registrar means no
 // registration gating, not "every peer is down".
 func (s *Server) IsRegistered(name string) bool {
-	if s.registrar == nil {
+	reg := s.registrar.Load()
+	if reg == nil {
 		return true
 	}
-	return s.registrar.IsRegistered(name)
+	return reg.IsRegistered(name)
+}
+
+// Listeners is the listener set Run binds, as transport://host:port, from
+// the startup snapshot (the set is restart-only).
+func (s *Server) Listeners() []string {
+	var out []string
+	for _, l := range s.boot.Listeners() {
+		out = append(out, fmt.Sprintf("%s://%s", l.Transport, net.JoinHostPort(l.Host, strconv.Itoa(l.Port))))
+	}
+	return out
 }
 
 // ShieldStats returns the current shield activity snapshot (nil-safe: zero
@@ -307,10 +321,11 @@ func (s *Server) Run(ctx context.Context) error {
 	listenCtx, listenCancel := context.WithCancel(context.Background())
 	defer listenCancel()
 
-	s.registrar = NewRegistrar(s.store, client, s, s.log)
+	registrar := NewRegistrar(s.store, client, s, s.log)
+	s.registrar.Store(registrar)
 	regDone := make(chan struct{})
 	go func() {
-		if err := s.registrar.Run(regCtx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := registrar.Run(regCtx); err != nil && !errors.Is(err, context.Canceled) {
 			s.log.Debug("registrar stopped", "err", err)
 		}
 		close(regDone)

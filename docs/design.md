@@ -225,12 +225,15 @@ closer — about **6** excluding pion's internal goroutines.
 | `-h` / `--help` / `help` | usage to stdout | 0 |
 | `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"`. It parses and validates only: it opens no certificate or key file and binds no socket, so a missing cert file or a port another process holds is found by `run` alone. Everything validation can decide from the file — literal edge addresses, socket collisions between listeners — `check` rejects exactly as `run` would | 0 / 1 |
 | `run [-c path]` | `app.Run` under `signal.NotifyContext(SIGINT, SIGTERM)` | 0 / 1 |
-| `check`/`run` with an unrecognised flag | Go's own flag usage to stderr; the flag set is `flag.ExitOnError` (`main.go:37`), so `app.Run` is never reached | 2 |
+| `check`/`run` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
+| `check`/`run` with a positional argument (`freesbc run edge.yaml`) | `unexpected argument "edge.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
 | anything else | usage to stderr | 2 |
 
-`-c` defaults to `sbc.yaml`. Positional arguments are ignored, so
-`freesbc check sbc.yaml` checks the default path, not the named one
-(`main.go:39`). The logger is a `slog.TextHandler` on stderr at the default
+`-c` defaults to `sbc.yaml`. A positional argument is a usage error rather
+than silently ignored, because the only thing an operator means by one is a
+config path, and running `./sbc.yaml` instead could serve the wrong plane.
+`main` is a thin `os.Exit(run(os.Args[1:]))`, so the argument handling is
+unit-tested. The logger is a `slog.TextHandler` on stderr at the default
 level; there is no log-level flag. `version` is a link-time variable
 (`-X main.version=…`), default `"dev"`.
 
@@ -243,28 +246,36 @@ fsnotify-driven exclusively.
    `load config: %w` and the process exits 1. Nothing has bound.
 2. `config.NewStore(cfg)`.
 3. `trunk.NewMediaPool(store)` — a `*media.PlanePool` whose `PlaneParams`
-   closure re-reads `store.Current()` on every allocation. No sockets bind.
-4. Log `"media plane ready"` with the trunk port range and RTP timeout.
-5. If `len(Peers) > 0`: `trunk.NewServer(store, pool, log)`. Allocates maps,
+   closure reads `store.Current()` (a trunk call passes its own snapshot's
+   params instead, §6.3). No sockets bind.
+4. If `len(Peers) > 0`: `trunk.NewServer(store, pool, log)`. Allocates maps,
    the resolver, endpoint health, `tcpMaxConns = 1024`,
-   `tcpIdleTimeout = 120s`. **Binds nothing.** Dialog caches, the registrar
-   and the shield are `Run`-only, which is why the accessors
-   (`IsRegistered`, `ShieldStats`) all nil-guard.
-6. If `ProxyEnabled()`: `edge.New(store, log)`. Builds the topology, raises
+   `tcpIdleTimeout = 120s`, and keeps `store.Current()` as the plane's
+   startup snapshot (`boot`, §4.4). **Binds nothing.** Dialog caches, the
+   registrar and the shield are `Run`-only and published through
+   `atomic.Pointer`, which is why the accessors (`IsRegistered`,
+   `ShieldStats`) all nil-guard and are race-free from the admin goroutine
+   (audit P2-APP-002).
+5. If `ProxyEnabled()`: `edge.New(store, log)`. Builds the topology, raises
    the process-wide UDP MTU, builds two media pools, `Location`, `Metrics`,
    two cooldown tables, the dialog table, and the DTLS identity when
    `webrtc.enabled`. **Binds nothing.** Failure → `edge proxy: %w` before any
    goroutine starts.
-7. Both nil → error (see §1).
+6. Both nil → error (see §1).
+7. Log `"media plane ready"` once per running plane (`logMediaPlanes`): the
+   trunk's effective range (`rtp.port_min/max` or `listen.media.port_range`)
+   and the edge's public and private ranges, each with the RTP timeout.
 8. `errgroup.WithContext(ctx)`.
 9. Start the errgroup members for the config watcher, the trunk plane and
-   the edge plane (`app.go:93-118`).
-10. If `admin:` is present in `store.Current()` — read **after** those three
-    members are already running, so a reload landing in that window is what
-    admin is built from — build `admin.Deps`, call `admin.New`, and start the
-    admin member (`app.go:120-130`).
+   the edge plane.
+10. If `admin:` is present in the loaded `cfg`, build `admin.Deps`, call
+    `admin.New`, and start the admin member.
 11. Log `"freesbc started"`, block on `<-gctx.Done()`, log
     `"shutting down"`, return `g.Wait()`.
+
+Every decision above reads the `cfg` step 1 loaded, never `store.Current()`:
+the watcher is already running by step 10, and a reload landing then must
+not give one startup two configurations (audit P2-APP-004).
 
 The first non-nil error from a fatal goroutine cancels `gctx`; the other
 goroutines see `gctx.Err() != nil` and suppress their own errors, so
@@ -2995,8 +3006,8 @@ Record-Route (`topology.go:325`), defaulting to the bind port.
   is validated (`≥ 1024`, `min < max`, ranges pairwise disjoint where their
   binds can collide). Nothing checks reachability.
 - Sizing is 2 ports per call per plane; `freesbc_media_ports_in_use` and
-  `_total` expose the trunk pool's occupancy, and nothing sizes a pool for
-  you.
+  `_total` expose the running planes' pools' occupancy together, and
+  nothing sizes a pool for you.
 - SIP over UDP is sent above the RFC 3261 §18.1.1 guidance: the process-wide
   `sip.UDPMTUSize` is raised to **8 KiB**, relying on IP fragmentation to
   survive the path. A realistic FreeSWITCH INVITE plus proxy headers clears
@@ -3074,8 +3085,8 @@ permanent series per call."
 | Metric | Type | Labels | Fed by |
 |---|---|---|---|
 | `freesbc_active_calls` | Gauge | — | trunk `ActiveCalls()` + edge `ActiveCalls()` |
-| `freesbc_media_ports_in_use` | Gauge | — | the **trunk** pool's `Stats()` |
-| `freesbc_media_ports_total` | Gauge | — | the **trunk** pool's `Stats()` |
+| `freesbc_media_ports_in_use` | Gauge | — | the running planes' pools' `Stats()`, summed: the trunk pool when the trunk runs, the edge public + private pools when the edge runs |
+| `freesbc_media_ports_total` | Gauge | — | same pools, summed capacity |
 | `freesbc_peer_registered` | Gauge | `peer` | trunk `IsRegistered`, only for `register: true` peers |
 | `freesbc_shield_drops_total` | Counter | `reason` ∈ {`banned`, `scanner`, `rate`} | trunk shield drop counters |
 | `freesbc_build_info` | Gauge (always 1) | `version` | `Deps.Version` |
@@ -3135,9 +3146,9 @@ All routes are on one `http.ServeMux` behind `recoverMW`, which also sets
 |---|---|---|---|
 | `/healthz` | any | **none** | `{"status":"ok"}` |
 | `/metrics` | any | Basic | Prometheus text |
-| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}` |
-| `/api/calls` | any | Basic | array of `{"id" (admin call ID),"call_id" (A-leg Call-ID),"from","to","started" (RFC 3339),"duration_seconds"}`; always an array |
-| `DELETE /api/calls/{id}` | DELETE | Basic | `id` is the admin call ID, or an A-leg Call-ID (kills every call carrying it); **204** killed / **404** `no such active call` |
+| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the running planes bound, from their startup snapshots (`Deps.Listeners`), never the hot-reloaded config's |
+| `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Trunk calls: `id` is the admin call ID, `call_id` the A-leg Call-ID, `from`/`to` peer names. Edge dialogs (confirmed only, the set `active_calls` counts): `id` is `edge:<Call-ID>;<caller tag>`, `from`/`to` are `edge:public` / `edge:private` |
+| `DELETE /api/calls/{id}` | DELETE | Basic | trunk only: `id` is the admin call ID, or an A-leg Call-ID (kills every call carrying it); **204** killed / **404** `no such active call` (also for an edge dialog) |
 | `/api/peers` | any | Basic | array of `{Name,Address,Transport,SRTP,Register,Registered}` — Go field names, no JSON tags |
 | `/api/config` | GET, PUT (else 405 + `Allow: GET, PUT`) | Basic | GET: the **redacted** view; PUT: write-back |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml`, with an `ETag` = quoted SHA-256 hex |
@@ -3230,10 +3241,11 @@ everything else. Two tabs: a **Dashboard** polling `/api/status`,
 expired" banner), and a **Config** editor that loads `/api/config/raw`,
 keeps its ETag, and PUTs to `/api/config` with `If-Match`.
 
-Because the call table, kick and shield accessors are **trunk-only**,
-a proxy-only deployment shows an empty call list, a no-op kick, zeroed
-shield drop counters, and the trunk pool's (unused, defaulted)
-port capacity. This gap is recorded in `internal/app/app.go:146-150`.
+The call list, the call count, the port usage and the listeners cover
+whichever planes run (`adminDeps`, audit P2-APP-005). Kick and the shield
+accessors are still **trunk-only**: a proxy-only deployment has a kick that
+answers 404 for an edge dialog and zeroed shield drop counters. This gap is
+recorded in `adminDeps`'s doc comment.
 
 ---
 

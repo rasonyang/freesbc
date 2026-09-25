@@ -62,3 +62,32 @@ func TestReloadRTPBindIPKeepsAdvertisedSocket(t *testing.T) {
 		t.Errorf("BYE: %d", r.StatusCode)
 	}
 }
+
+// audit: P2-APP-005
+// The admin call list and the active-call count describe the same set: a
+// confirmed edge dialog is listed, not only counted.
+func TestCallsListsWhatActiveCallsCounts(t *testing.T) {
+	h := startHarness(t, false)
+	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
+	settle()
+
+	phone := newUDPClient(t)
+	invite, res, _ := auditPhoneCall(t, h, phone)
+	waitForDialog(t, h, fsip.CallID(invite))
+
+	calls := h.srv.Calls()
+	if n := h.srv.ActiveCalls(); n != 1 || len(calls) != 1 {
+		t.Fatalf("ActiveCalls = %d, Calls lists %d; want 1 and 1", n, len(calls))
+	}
+	c := calls[0]
+	if c.CallID != fsip.CallID(invite) || c.From != "edge:public" || c.To != "edge:private" || c.StartUnixNano == 0 {
+		t.Errorf("call record = %+v, want the phone's Call-ID, edge:public → edge:private and a start time", c)
+	}
+	if r := phone.do(t, buildBye(phone, invite, res), h.publicUDP); r.StatusCode != 200 {
+		t.Errorf("BYE: %d", r.StatusCode)
+	}
+	waitForRelease(t, h)
+	if n := len(h.srv.Calls()); n != 0 {
+		t.Errorf("after BYE Calls lists %d, want 0", n)
+	}
+}

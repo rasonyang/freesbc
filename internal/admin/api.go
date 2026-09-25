@@ -2,7 +2,6 @@ package admin
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 )
@@ -14,12 +13,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // handleStatus reports process/service-level status: version, uptime, active
-// call count, media port usage, and configured SIP listeners.
+// call count, media port usage, and the SIP listeners the running planes
+// bound (not the hot-reloaded config's, which may name sockets nothing is
+// bound to: the listener set is restart-only).
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	inUse, total := s.deps.Ports()
 	listeners := []string{}
-	for _, l := range s.store.Current().Listeners() {
-		listeners = append(listeners, fmt.Sprintf("%s://%s:%d", l.Transport, l.Host, l.Port))
+	if s.deps.Listeners != nil {
+		listeners = append(listeners, s.deps.Listeners()...)
 	}
 	writeJSON(w, map[string]any{
 		"version":        s.deps.Version,

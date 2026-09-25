@@ -176,6 +176,10 @@ type dialog struct {
 	callerURI, calleeURI sip.Uri
 	cseq                 [2]uint32
 
+	// confirmedAt is when the record was confirmed (the admin call list's
+	// start time). Written under tab.mu in confirm.
+	confirmedAt time.Time
+
 	// media is the anchored session. It is attached once, right after the
 	// record is created, and then only closed — never replaced.
 	media *mediaSession
@@ -317,6 +321,39 @@ func (t *dialogTable) count() int {
 		}
 	}
 	return n
+}
+
+// CallRecord is one confirmed dialog as the admin API lists it.
+type CallRecord struct {
+	// ID identifies the dialog: "edge:" + Call-ID + ";" + caller tag.
+	ID     string
+	CallID string
+	// From/To are the planes the caller and the callee are on.
+	From, To      string
+	StartUnixNano int64
+}
+
+// calls lists the confirmed dialogs: the same set count counts.
+func (t *dialogTable) calls() []CallRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []CallRecord
+	for _, ds := range t.byCallID {
+		for _, d := range ds {
+			if d.state != dialogConfirmed {
+				continue
+			}
+			from, to := "edge:public", "edge:private"
+			if d.callerPlane != planePublic {
+				from, to = to, from
+			}
+			out = append(out, CallRecord{
+				ID: "edge:" + d.callID + ";" + d.callerTag, CallID: d.callID,
+				From: from, To: to, StartUnixNano: d.confirmedAt.UnixNano(),
+			})
+		}
+	}
+	return out
 }
 
 // closeAll ends every dialog. Called at shutdown so no socket, port
@@ -638,6 +675,7 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	}
 	d.state = dialogConfirmed
 	d.calleeTag = calleeTag
+	d.confirmedAt = time.Now()
 	d.route = r
 	if f := d.forks[calleeTag]; f != nil && f.answer != nil {
 		// The caller has seen this fork's bodies, so its o= identity is the

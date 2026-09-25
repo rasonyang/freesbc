@@ -131,7 +131,7 @@ Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its o
 - **No transcoding**, on either plane — left to the softswitch behind.
 - Session timers are negotiated, but no timer tears a call down on session expiry.
 - The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
-- The call list and teardown in the admin API cover trunk-plane calls only; edge-proxy dialogs are not listed.
+- The admin API lists edge-proxy dialogs alongside trunk calls, but teardown (`DELETE /api/calls/{id}`) covers trunk-plane calls only.
 - The edge proxy has further structural limits — inbound calls to browsers, offerless INVITE, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
 
 ## Roadmap

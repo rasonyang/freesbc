@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -25,26 +26,46 @@ Usage:
 var version = "dev"
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(run(os.Args[1:]))
+}
+
+// run is main without the process exit, so the argument handling can be
+// tested: it returns the exit code.
+func run(args []string) int {
+	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	}
-	cmd := os.Args[1]
+	cmd := args[0]
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
 		fmt.Print(usage)
-		return
+		return 0
 	}
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "sbc.yaml", "path to config file")
-	_ = fs.Parse(os.Args[2:])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	// A positional argument is almost certainly a config path given
+	// without -c (`freesbc run edge.yaml`). Ignoring it would run
+	// ./sbc.yaml instead — possibly a different, valid config serving the
+	// wrong plane — so it is a usage error (audit P2-APP-007).
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "freesbc %s: unexpected argument %q (the config file is given with -c)\n\n%s", cmd, fs.Arg(0), usage)
+		return 2
+	}
 
 	switch cmd {
 	case "check":
 		if err := app.Check(*cfgPath); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		fmt.Printf("%s: config OK\n", *cfgPath)
+		return 0
 	case "run":
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
@@ -55,10 +76,11 @@ func main() {
 		}
 		if err := app.Run(ctx, opts); err != nil {
 			fmt.Fprintf(os.Stderr, "freesbc: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
+		return 0
 	default:
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	}
 }
