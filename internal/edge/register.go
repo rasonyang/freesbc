@@ -45,6 +45,13 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, src neti
 	}
 	clientContact, hasContact := fsip.ContactURI(req)
 	expires, unregister := requestedExpires(req)
+	wildcard := hasWildcardContact(req)
+	if wildcard && (!unregister || len(req.GetHeaders("Contact")) != 1) {
+		// RFC 3261 §10.3 step 6: "*" is only valid alone and with an
+		// expires of 0.
+		s.reject(req, tx, 400, "Bad Request")
+		return
+	}
 
 	// The token must be stable across a registration's whole lifetime:
 	// FreeSWITCH stores the Contact we send now and uses it as the
@@ -62,6 +69,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, src neti
 		transport: from.transport, source: src,
 		requested: expires, unregister: unregister,
 		clientContact: clientContact, hasContact: hasContact,
+		wildcard: wildcard,
 	}
 
 	// ONE budget for the whole attempt series, not one per node (D2): on
@@ -104,7 +112,12 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, src neti
 		// An un-REGISTER is rewritten the same way and for the same reason: it
 		// must name the contact that was registered, or the registrar will not
 		// match it and the binding would linger upstream.
-		if hasContact {
+		//
+		// A wildcard un-REGISTER ("Contact: *", RFC 3261 §10.2.2) is the
+		// exception: it names every binding of the AoR, including the ones
+		// other devices registered through FreeSBC under their own tokens,
+		// so it goes upstream as "*" and is not narrowed to one token.
+		if hasContact && !wildcard {
 			fsip.SetContact(out, s.registeredContact(user, token))
 		}
 		// The Request-URI is NOT rewritten. It is part of the digest
@@ -197,7 +210,13 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 					// against the one it sent; sip.js treats a mismatch as
 					// a failed registration. Put its own contact back,
 					// carrying the expiry the registrar actually granted.
-					if in.hasContact {
+					// After a wildcard un-REGISTER the AoR has no binding
+					// left to list, and the Contacts upstream are
+					// FreeSBC's private ones, so none is relayed.
+					switch {
+					case in.wildcard:
+						fsip.RemoveHeaders(relayed, "Contact")
+					case in.hasContact:
 						restoreContact(relayed, in.clientContact, granted)
 					}
 				}
@@ -249,6 +268,8 @@ type bindingInput struct {
 	// carried so pumpRegister can put it back in the 200 OK.
 	clientContact sip.Uri
 	hasContact    bool
+	// wildcard is a "Contact: *" un-REGISTER: every binding of the AoR.
+	wildcard bool
 }
 
 // recordBinding installs or removes the binding after a successful
@@ -258,8 +279,23 @@ type bindingInput struct {
 // §10.2.4 lets a registrar grant less than was asked for, and a binding
 // that outlived the registrar's own would make FreeSBC accept calls
 // FreeSWITCH no longer routes.
+//
+// The registrar's 200 lists every binding of the AoR, so the expiry read is
+// the one on the Contact carrying this binding's token, not whichever
+// Contact comes first. A wildcard un-REGISTER removes every binding of the
+// AoR, from every device, as it did upstream.
 func (s *Server) recordBinding(res *sip.Response, in bindingInput) int {
-	granted := fsip.GrantedExpires(res, in.requested)
+	if in.wildcard {
+		for _, b := range s.loc.ByAOR(in.aor) {
+			s.loc.Remove(in.aor, b.CallID)
+		}
+		s.metrics.SetRegistrations(s.loc.Count())
+		return 0
+	}
+	granted := fsip.GrantedExpires(res, in.requested, func(u sip.Uri) bool {
+		t, ok := u.UriParams.Get(contactTokenParam)
+		return ok && t == in.token
+	})
 	if in.unregister || granted <= 0 {
 		s.loc.Remove(in.aor, in.callID)
 		s.metrics.SetRegistrations(s.loc.Count())
@@ -347,22 +383,33 @@ func aorOf(req *sip.Request) (aor, user string, ok bool) {
 	return strings.ToLower(u + "@" + host), u, true
 }
 
+// hasWildcardContact reports whether any Contact of req is "*".
+func hasWildcardContact(req *sip.Request) bool {
+	for _, h := range req.GetHeaders("Contact") {
+		if c, ok := h.(*sip.ContactHeader); ok && c.Address.Wildcard {
+			return true
+		}
+	}
+	return false
+}
+
 // requestedExpires reads the lifetime the client asked for, from the
 // Contact's expires parameter (which wins, RFC 3261 §10.2.1) or the
-// Expires header. A zero value is an un-REGISTER.
+// Expires header, as delta-seconds (fsip.DeltaSeconds: a negative or
+// malformed value is ignored). A zero value is an un-REGISTER.
 func requestedExpires(req *sip.Request) (time.Duration, bool) {
 	if hs := req.GetHeaders("Contact"); len(hs) > 0 {
 		if c, ok := hs[0].(*sip.ContactHeader); ok && c.Params != nil {
 			if v, ok := c.Params.Get("expires"); ok {
-				if n, err := strconv.Atoi(v); err == nil {
-					return time.Duration(n) * time.Second, n == 0
+				if d, ok := fsip.DeltaSeconds(v); ok {
+					return d, d == 0
 				}
 			}
 		}
 	}
 	if h := req.GetHeader("Expires"); h != nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(h.Value())); err == nil {
-			return time.Duration(n) * time.Second, n == 0
+		if d, ok := fsip.DeltaSeconds(h.Value()); ok {
+			return d, d == 0
 		}
 	}
 	// No Expires at all: the registrar decides. Treat it as a

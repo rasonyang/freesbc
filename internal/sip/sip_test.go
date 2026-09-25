@@ -493,3 +493,52 @@ func TestTeardownRequestRouteSet(t *testing.T) {
 		t.Errorf("no route set: Route %q, destination %s", routes(b), b.Destination())
 	}
 }
+
+// audit: P2-SIP-001
+// A 2xx to REGISTER lists every binding of the AoR. With a matcher, only
+// this binding's Contact is read; values are delta-seconds, so a negative
+// or malformed one is skipped and an oversized one clamped to 2**32-1.
+func TestGrantedExpiresPerBinding(t *testing.T) {
+	const base = "SIP/2.0 200 OK\r\n" +
+		"Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bK-r2\r\n" +
+		"From: <sip:u@example.com>;tag=a\r\nTo: <sip:u@example.com>;tag=b\r\n" +
+		"Call-ID: reg-2\r\nCSeq: 1 REGISTER\r\n"
+	ours := func(u sip.Uri) bool { v, _ := u.UriParams.Get("fsbc"); return v == "MINE" }
+	for _, tc := range []struct {
+		name, extra string
+		want        time.Duration
+	}{
+		{"other device first", "Contact: <sip:u@10.0.0.1;fsbc=THEIRS>;expires=3000, <sip:u@10.0.0.1;fsbc=MINE>;expires=60\r\n", 60 * time.Second},
+		{"ours absent: Expires header", "Contact: <sip:u@10.0.0.1;fsbc=THEIRS>;expires=3000\r\nExpires: 90\r\n", 90 * time.Second},
+		{"ours absent, no header: requested", "Contact: <sip:u@10.0.0.1;fsbc=THEIRS>;expires=3000\r\n", time.Hour},
+		{"negative skipped", "Contact: <sip:u@10.0.0.1;fsbc=MINE>;expires=-1\r\nExpires: 30\r\n", 30 * time.Second},
+		{"signed skipped", "Contact: <sip:u@10.0.0.1;fsbc=MINE>;expires=+5\r\n", time.Hour},
+		{"overflow clamped", "Contact: <sip:u@10.0.0.1;fsbc=MINE>;expires=99999999999999999999999\r\n", maxDeltaSeconds * time.Second},
+		{"header clamped", "Expires: 9223372037\r\n", maxDeltaSeconds * time.Second},
+		{"zero is removal", "Contact: <sip:u@10.0.0.1;fsbc=MINE>;expires=0\r\n", 0},
+	} {
+		res := parseResponse(t, base+tc.extra+"Content-Length: 0\r\n\r\n")
+		if got := GrantedExpires(res, time.Hour, ours); got != tc.want {
+			t.Errorf("%s: GrantedExpires = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// A negative fallback is never handed back either.
+	res := parseResponse(t, base+"Content-Length: 0\r\n\r\n")
+	if got := GrantedExpires(res, -time.Second); got != 0 {
+		t.Errorf("negative requested: GrantedExpires = %v, want 0", got)
+	}
+}
+
+// audit: P2-SIP-001
+func TestDeltaSeconds(t *testing.T) {
+	for v, want := range map[string]time.Duration{"0": 0, "3600": time.Hour, " 60 ": time.Minute, "4294967296": maxDeltaSeconds * time.Second} {
+		if got, ok := DeltaSeconds(v); !ok || got != want {
+			t.Errorf("DeltaSeconds(%q) = %v, %v; want %v", v, got, ok, want)
+		}
+	}
+	for _, v := range []string{"", "-1", "+1", "1.5", "1 2", "0x10"} {
+		if _, ok := DeltaSeconds(v); ok {
+			t.Errorf("DeltaSeconds(%q) accepted", v)
+		}
+	}
+}
