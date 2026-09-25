@@ -21,9 +21,10 @@ const (
 )
 
 // Shield is FreeSBC's front-door security plane. It is consulted before peer
-// identification on every inbound request; configured peers are exempt from
-// the ban/scanner plane but still rate-limited (loosely), and
-// every denial is a silent Drop. Params (rate limit, auto_ban) hot-reload from
+// identification on every inbound request. On the trunk plane configured
+// peers are exempt from the ban/scanner plane but still rate-limited
+// (loosely); the edge plane has no peers and exempts nobody. Every denial is
+// a silent Drop. Params (rate limit, auto_ban) hot-reload from
 // the config store per call. Bans live in process memory only.
 type Shield struct {
 	store       *config.Store
@@ -32,6 +33,12 @@ type Shield struct {
 	peerLimiter *rateLimiter             // configured peers (shield.peer_rate_limit)
 	bans        *banList[netip.Addr]     // source IPs (connection-oriented verdicts)
 	socketBans  *banList[netip.AddrPort] // UDP source sockets (see CheckFrom)
+
+	// exemptPeers is the plane's exemption predicate: true on the trunk
+	// plane, whose peers are the config's peers; false on the edge plane,
+	// where a source inside a trunk peer's allowed_ips is an ordinary
+	// public client (P2-SHD-005).
+	exemptPeers bool
 
 	// Cumulative drop counters by reason, for the admin API's metrics
 	// snapshot (Stats). Incremented in Check at each of its three drop
@@ -55,19 +62,20 @@ type Shield struct {
 }
 
 // New builds the trunk plane's Shield over store and starts a background
-// prune loop.
+// prune loop. Configured peers are exempt from its ban and scanner checks.
 func New(store *config.Store, log *slog.Logger) *Shield {
-	return newShield(store, log)
+	return newShield(store, log, true)
 }
 
-// NewNoKernel builds the edge plane's Shield. The name predates the removal
-// of the nftables backend (every Shield now bans in process memory only);
-// it is kept as the edge plane's constructor.
+// NewNoKernel builds the edge plane's Shield: no source is exempt (the
+// edge's trusted private plane bypasses the shield before calling it). The
+// name predates the removal of the nftables backend (every Shield now bans
+// in process memory only); it is kept as the edge plane's constructor.
 func NewNoKernel(store *config.Store, log *slog.Logger) *Shield {
-	return newShield(store, log)
+	return newShield(store, log, false)
 }
 
-func newShield(store *config.Store, log *slog.Logger) *Shield {
+func newShield(store *config.Store, log *slog.Logger, exemptPeers bool) *Shield {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Shield{
 		store:       store,
@@ -76,6 +84,7 @@ func newShield(store *config.Store, log *slog.Logger) *Shield {
 		peerLimiter: newRateLimiter(),
 		bans:        newBanList(),
 		socketBans:  newBanTable[netip.AddrPort](),
+		exemptPeers: exemptPeers,
 		stop:        cancel,
 		done:        make(chan struct{}),
 	}
@@ -83,8 +92,8 @@ func newShield(store *config.Store, log *slog.Logger) *Shield {
 	return s
 }
 
-// Check is the per-request gate (spec §3): configured peers are exempt from
-// the ban/scanner plane but not from rate limiting — a separate, looser
+// Check is the per-request gate (spec §3): on the trunk plane, configured
+// peers are exempt from the ban/scanner plane but not from rate limiting — a separate, looser
 // per-IP limit (shield.peer_rate_limit) caps them, since a
 // spoofed peer source would otherwise have no rate ceiling at all (a real
 // peer's legitimate load stays far below the threshold, so it never sees
@@ -115,9 +124,10 @@ const socketBanMax = time.Minute
 // a table separate from the IP bans; a port of 0 means unknown and bans
 // nothing.
 func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport string) Verdict {
+	srcAP = netip.AddrPortFrom(srcAP.Addr().Unmap(), srcAP.Port())
 	src := srcAP.Addr()
 	cfg := s.store.Current()
-	if isConfiguredPeer(cfg, src) {
+	if s.exemptPeers && isConfiguredPeer(cfg, src) {
 		rl := s.peerRateLimit(cfg)
 		if !s.peerLimiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
 			s.log.Debug("shield peer rate-limited", "source", src)
@@ -175,6 +185,7 @@ func isUDP(transport string) bool { return strings.EqualFold(transport, "udp") }
 // BannedFrom reports whether the source is banned: its IP, or on UDP its
 // exact socket. Like Banned it counts nothing, so a read filter can call it.
 func (s *Shield) BannedFrom(src netip.AddrPort, transport string) bool {
+	src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 	if s.bans.banned(src.Addr()) {
 		return true
 	}
@@ -205,8 +216,10 @@ func (s *Shield) Stats() Stats {
 
 // Unban removes any ban on ip, including every socket ban on it, and
 // reports whether a ban existed (the admin API's DELETE /api/bans/{ip}
-// calls this).
+// calls this). Ban keys are unmapped, so ip is too: the 4in6 form of an
+// IPv4 address lifts that address's ban (P2-SHD-009).
 func (s *Shield) Unban(ip netip.Addr) bool {
+	ip = ip.Unmap()
 	existed := s.bans.unban(ip)
 	if s.socketBans.unbanWhere(func(ap netip.AddrPort) bool { return ap.Addr() == ip }) > 0 {
 		existed = true

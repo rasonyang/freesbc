@@ -47,7 +47,8 @@ func newBanTable[K comparable]() *banList[K] {
 	return &banList[K]{until: make(map[K]time.Time), now: time.Now}
 }
 
-// ban blocks key for dur (extending any existing ban). It reports whether
+// ban blocks key for dur. An existing ban is extended, never shortened: the
+// expiry becomes the later of the two (P2-SHD-008). It reports whether
 // the ban was recorded: when the table is at banCap and key is not already
 // banned, expired entries are swept lazily first, and if the table is still
 // full the addition is refused (the overflow counter increments).
@@ -70,7 +71,9 @@ func (b *banList[K]) ban(key K, dur time.Duration) bool {
 			return false
 		}
 	}
-	b.until[key] = b.now().Add(dur)
+	if until := b.now().Add(dur); !tracked || until.After(b.until[key]) {
+		b.until[key] = until
+	}
 	b.mu.Unlock()
 	return true
 }

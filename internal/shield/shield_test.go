@@ -245,3 +245,43 @@ func TestSocketBanFloodLeavesIPTableFree(t *testing.T) {
 		t.Error("a real TCP scanner could not be banned after a UDP flood")
 	}
 }
+
+// audit: P2-SHD-005
+// Trunk peers are exempt only on the trunk plane. On the edge shield a
+// source inside a trunk peer's allowed_ips is an ordinary public client:
+// a scanner verdict bans it.
+func TestEdgeShieldDoesNotExemptTrunkPeers(t *testing.T) {
+	cfg, err := config.Parse([]byte(shieldCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	edge := NewNoKernel(config.NewStore(cfg), discard())
+	t.Cleanup(func() { edge.Close() })
+	peer := netip.MustParseAddr("203.0.113.10") // shieldCfg's trunk peer
+	if edge.Check(peer, "friendly-scanner", "tcp") != Drop {
+		t.Fatal("scanner UA must be dropped")
+	}
+	if edge.Check(peer, "Yealink", "tcp") != Drop {
+		t.Error("the edge shield exempted a trunk peer from its scanner ban")
+	}
+
+	trunk := testShield(t, shieldCfg)
+	if trunk.Check(peer, "friendly-scanner", "tcp") != Allow {
+		t.Error("the trunk shield must still exempt its peers from the scanner check")
+	}
+}
+
+// audit: P2-SHD-009
+// Ban keys are unmapped, so an admin unban given the 4in6 form of an IPv4
+// address must still find the ban.
+func TestUnbanUnmaps4in6(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	ip := netip.MustParseAddr("198.51.100.70")
+	s.Check(ip, "friendly-scanner", "tcp")
+	if !s.Unban(netip.MustParseAddr("::ffff:198.51.100.70")) {
+		t.Fatal("Unban of the 4in6 form missed the ban")
+	}
+	if s.Banned(ip) {
+		t.Error("the ban survived the unban")
+	}
+}

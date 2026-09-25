@@ -503,8 +503,11 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 			// public one.
 			if sh := s.shield; sh != nil && info.RemoteAddr != nil {
 				if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil &&
-					sh.BannedFrom(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), info.Transport) &&
+					sh.BannedFrom(ap, info.Transport) &&
 					!s.privSources.has(info.RemoteAddr.String()) {
+					// A stream from a banned source is closed on its next
+					// read, so a ban also ends connections opened before it.
+					s.closeStream(info.Transport, info.RemoteAddr.String())
 					return false
 				}
 			}
@@ -557,11 +560,31 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		// element the proxy exists to serve, and rate-limiting it would
 		// turn a busy switch into a dropped call.
 		if !s.arrivedOnPrivate(req) {
-			if s.shield.CheckFrom(src, fsip.UserAgent(req), sip.NetworkToLower(req.Transport())) == shield.Drop {
+			network := sip.NetworkToLower(req.Transport())
+			if s.shield.CheckFrom(src, fsip.UserAgent(req), network) == shield.Drop {
+				if s.shield.BannedFrom(src, network) {
+					s.closeStream(network, req.Source())
+				}
 				return // silent
 			}
 		}
 		next(req, tx, src)
+	}
+}
+
+// closeStream hard-closes the tcp/tls/ws/wss connection from raddr, if
+// there is one, when its source is banned (P2-SHD-006): a verdict alone
+// would leave the client a socket whose every later message is still read
+// and parsed. sipgo's read loop then sees the error and drops the
+// connection from its pool. Closing sends nothing, so the ban stays silent.
+// UDP has no connection and is left alone.
+func (s *Server) closeStream(network, raddr string) {
+	network = sip.NetworkToLower(network)
+	if s.srv == nil || network == "udp" {
+		return
+	}
+	if c, err := s.srv.TransportLayer().GetConnection(network, raddr); err == nil {
+		_ = c.Close()
 	}
 }
 

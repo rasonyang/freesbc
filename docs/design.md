@@ -2769,7 +2769,7 @@ shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`). In a deployed system `freesbc_shield_banned_current`
 and `freesbc_shield_ban_adds_rejected_total` therefore stay at 0 and
 `freesbc_shield_drops_total` reports only `reason="rate"`. The ban and scanner
-branches run on the **edge** shield (`edge.go:560`), which `internal/app`
+branches run on the **edge** shield (`edge.go:564`), which `internal/app`
 never wires into `admin.Deps` — `Deps.Shield` and `Deps.Unban` are set only
 when the trunk server exists (`app.go:166-193`) — so edge bans reach neither
 `/metrics` nor `DELETE /api/bans/{ip}`.
@@ -2904,9 +2904,11 @@ connection.
 through `Check` (trunk) or `CheckFrom` (edge, which also knows the source
 port):
 
-1. A **configured peer** skips the ban table and the scanner check entirely
-   but is still subject to the looser `shield.peer_rate_limit`
-   (default `200/s per_ip`).
+1. On the **trunk** shield only, a **configured peer** skips the ban table
+   and the scanner check entirely but is still subject to the looser
+   `shield.peer_rate_limit` (default `200/s per_ip`). The edge shield
+   (`NewNoKernel`) exempts nobody: a source inside a trunk peer's
+   `allowed_ips` is an ordinary public client there (P2-SHD-005).
 2. A banned source is dropped.
 3. `shield.rate_limit` (default `20/s per_ip`) — a token bucket whose
    capacity equals the rate, per source: an IPv4 address (4in6 unmapped)
@@ -2932,7 +2934,14 @@ product. **Scanner heuristics are User-Agent only.**
 
 **Bans.** A scanner ban lasts `shield.auto_ban.duration` (default 1 h) and
 lives only in the shield's in-memory table, which is capped at **65536**
-entries with an overflow counter. There is no failure-count auto-ban and no
+entries with an overflow counter. A re-ban extends an existing ban to the
+later of the two expiries and never shortens it (P2-SHD-008). Ban keys are
+unmapped IPs, and `Unban` unmaps its argument, so `DELETE
+/api/bans/::ffff:192.0.2.1` lifts the ban on `192.0.2.1` (P2-SHD-009). On
+the edge a ban also closes the banned source's tcp/tls/ws/wss connection:
+`guard` closes the one the banning request came on, and the read filter
+closes any other on its next read (`closeStream`, P2-SHD-006). An idle
+connection opened before the ban stays open until it next sends. There is no failure-count auto-ban and no
 kernel enforcement: both were removed with P2-SHD-004 (the counter was fed
 only by the trunk's unidentified-source handler, which the pre-parse read
 filter makes unreachable, `readfilter.go:22-33`). The ban and scanner
