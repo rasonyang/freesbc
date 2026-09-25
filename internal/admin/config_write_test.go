@@ -296,3 +296,42 @@ func TestConfigWritePreservesFileMode(t *testing.T) {
 		t.Fatalf("mode = %v, want 0640", after.Mode().Perm())
 	}
 }
+
+// audit: P2-ADM-005
+// A config symlinked into another directory is written there, in place of
+// the target, and the link survives. A dangling link is refused rather than
+// replaced by a regular file.
+func TestWriteFileAtomicFollowsSymlinkAcrossDirs(t *testing.T) {
+	linkDir, targetDir := t.TempDir(), t.TempDir()
+	target := filepath.Join(targetDir, "real.yaml")
+	link := filepath.Join(linkDir, "sbc.yaml")
+	if err := os.WriteFile(target, []byte("old\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := writeFileAtomic(link, []byte("new\n"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("link replaced: %v %v", fi, err)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "new\n" {
+		t.Errorf("target = %q, want new content", got)
+	}
+	if entries, _ := os.ReadDir(targetDir); len(entries) != 1 {
+		t.Errorf("temp file left behind in %s: %v", targetDir, entries)
+	}
+
+	dangling := filepath.Join(linkDir, "dangling.yaml")
+	if err := os.Symlink(filepath.Join(targetDir, "missing.yaml"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(dangling, []byte("x\n"), 0o600); err == nil {
+		t.Error("a dangling symlink was written through")
+	}
+	if fi, err := os.Lstat(dangling); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("dangling link replaced: %v %v", fi, err)
+	}
+}

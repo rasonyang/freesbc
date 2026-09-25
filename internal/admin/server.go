@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -103,6 +104,10 @@ type Server struct {
 
 	limiter  authLimiter   // per-source auth-failure rate limit
 	verified verifiedCreds // credentials already verified by bcrypt
+
+	// writeMu serialises PUT /api/config's If-Match check with its write,
+	// so two writers holding the same ETag cannot both succeed.
+	writeMu sync.Mutex
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -518,7 +523,8 @@ func remoteIP(r *http.Request) string {
 	return host
 }
 
-// recoverMW turns a handler panic into a 500 without leaking a stack trace.
+// recoverMW turns a handler panic into a 500 without leaking a stack trace
+// to the client; the stack is logged.
 // It also injects Cache-Control: no-store on every response:
 // the API serves live state and, on /api/config/raw, the FULL config —
 // every peer credential in plaintext — none of which belongs in a
@@ -539,7 +545,8 @@ func (s *Server) recoverMW(next http.Handler) http.Handler {
 				if rec == http.ErrAbortHandler {
 					panic(rec)
 				}
-				s.log.Error("admin handler panic", "err", rec, "path", r.URL.Path)
+				// The stack goes to the log only, never to the client.
+				s.log.Error("admin handler panic", "err", rec, "path", r.URL.Path, "stack", string(debug.Stack()))
 				http.Error(w, "internal error", http.StatusInternalServerError)
 			}
 		}()

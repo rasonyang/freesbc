@@ -2740,6 +2740,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
 | `admin.authLimiter.mu` | the per-source auth-failure window, including reservations |
 | `admin.verifiedCreds.mu` | the verified-credential digests |
+| `admin.Server.writeMu` | `PUT /api/config`'s If-Match check plus atomic write |
 | `config.Store.mu` | the subscriber slice only |
 
 ### 11.3 Atomics, channels, CAS
@@ -2797,7 +2798,7 @@ spin.
 | `trunk.recoverBWaiter` | the orphan B-leg waiter goroutine |
 | `edge.guard` | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` | every relay goroutine; closes **that session only** |
-| `admin.recoverMW` | every HTTP handler; re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `admin.recoverMW` | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
@@ -2986,7 +2987,7 @@ port-exhaustion metric and no config-reload metric.
 
 | Level | Examples |
 |---|---|
-| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic |
+| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic; `"admin handler panic"` (+ stack) |
 | `Warn` | `"TLS listener using self-signed certificate"`; the one-shot `"no advertised address configured"` fallback; `"SDES key negotiated over non-TLS signaling transport"` (once per secure leg); `"register failed"`; edge upstream/PSTN failover warnings; `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"config written via admin API"`; the plaintext-admin startup warning; `shield banned scanner` |
 | `Info` | `"sip server listening"`, `"edge proxy listening"`, `"freesbc started"`, `"shutting down"`, `"media plane ready"`, `"config reloaded"`; `"registered"` with granted and refresh interval; `"rejected invite"` with code/reason/source; `"declined Require: 100rel"`; `"rejected low Session-Expires"`; `"b-leg not answered"`; edge `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"dialing pstn gateway"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"call ended"` with media stats |
 | `Debug` | dialog ACK/BYE bookkeeping; `"method not implemented"`; `"skipping unregistered target"`; `"b-leg auth challenge unsatisfied"`; `"tcp connection limit reached"`; `"un-register failed"`; `"registration challenged"`; dropped unroutable responses; `"in-dialog request without a dialog record; hashing upstream"`; shield rate-limit drops |
@@ -3026,14 +3027,23 @@ because it is the round-trip source for the editor; redaction would break the
 write-back.
 
 `PUT /api/config`, in order: read at most **1 MiB** + 1 (413 above that);
-optional `If-Match` re-reads the file and returns **409** on a mismatch;
 `config.Parse(body)` on a throwaway config (400 on failure, with the
-validation text, in which expanded `${ENV}` values are redacted — §5); then `writeFileAtomic` — `CreateTemp` in the **same
-directory**, write, `Sync`, `Close`, `Chmod` (0600, or the existing file's
-mode when it exists), `Rename`. Every failure path removes the temp file and
-leaves the original untouched. The submitted bytes are written **verbatim**,
-which is why comments and `${ENV}` references survive; there is no AST
-patching. A 200 carries the new body's ETag.
+validation text, in which expanded `${ENV}` values are redacted — §5); then,
+under `Server.writeMu`, the optional `If-Match` check (re-read the file,
+**409** on a mismatch) and `writeFileAtomic`. The check and the write are
+one critical section, so of several writers holding the same ETag exactly
+one succeeds and the rest get 409 (audit P2-ADM-004); a PUT without
+`If-Match` is last-writer-wins. `writeFileAtomic` first resolves the path
+with `filepath.EvalSymlinks`, so a symlinked config is written at its target
+and the link survives (a dangling link is refused), then: `CreateTemp` in
+the **target's directory**, write, `Sync`, `Close`, `Chmod` (0600, or the
+existing file's mode when it exists), `Rename`, and an `fsync` of the
+directory so the rename is durable (audit P2-ADM-005). A failed directory
+sync is logged as a warning; the new file is already in place. Every other
+failure path removes the temp file and leaves the original untouched. The
+submitted bytes are written **verbatim**, which is why comments and `${ENV}`
+references survive; there is no AST patching. A 200 carries the new body's
+ETag.
 
 The write-back does **not** call `Store.Replace`. Reload happens only because
 `config.Watch` sees the rename in the parent directory, debounces 200 ms, and
