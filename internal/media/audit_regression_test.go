@@ -89,6 +89,13 @@ func TestAuditMED012StartIsOneShot(t *testing.T) {
 // leg in legEstablished, no SRTP keys, and no relay. Before the fix the
 // handshake accepted any certificate and the check ran only afterwards.
 func TestAuditMED002HandshakeRejectsMismatchedFingerprint(t *testing.T) {
+	// actpass: FreeSBC is the DTLS server; passive: FreeSBC is the client.
+	for _, setup := range []string{"actpass", "passive"} {
+		t.Run(setup, func(t *testing.T) { auditMismatchedHandshake(t, setup) })
+	}
+}
+
+func auditMismatchedHandshake(t *testing.T, setup string) {
 	pub := newAuditPool("public", 24740, 24779, "127.0.0.1")
 	priv := newAuditPool("private", 24780, 24819, "127.0.0.1")
 	id, err := ProcessDTLSIdentity()
@@ -109,7 +116,7 @@ func TestAuditMED002HandshakeRejectsMismatchedFingerprint(t *testing.T) {
 	leg, err := NewWebRTCLeg(pub.PlanePool, WebRTCLegConfig{
 		AdvertisedIP: netip.MustParseAddr("127.0.0.1"),
 		RemoteUfrag:  bUfrag, RemotePwd: bPwd,
-		RemoteSetup: "actpass", Identity: id,
+		RemoteSetup: setup, Identity: id,
 		RemoteFingerprintHash:  "sha-256",
 		RemoteFingerprintValue: fingerprintOf(signalled),
 	})
@@ -124,11 +131,22 @@ func TestAuditMED002HandshakeRejectsMismatchedFingerprint(t *testing.T) {
 	defer sess.Close()
 	leg.Start(context.Background(), 15*time.Second)
 	bDemux := auditBrowserICE(ctx, t, browser, leg)
-	bDTLS, err := dtls.ClientWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
-		dtls.WithCertificates(browserCert),
-		dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
-		dtls.WithInsecureSkipVerify(true),
-	)
+	var bDTLS *dtls.Conn
+	if setup == "passive" {
+		// The browser is the DTLS server and presents browserCert.
+		bDTLS, err = dtls.ServerWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
+			dtls.WithCertificates(browserCert),
+			dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
+			dtls.WithInsecureSkipVerify(true),
+			dtls.WithClientAuth(dtls.RequireAnyClientCert),
+		)
+	} else {
+		bDTLS, err = dtls.ClientWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
+			dtls.WithCertificates(browserCert),
+			dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
+			dtls.WithInsecureSkipVerify(true),
+		)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

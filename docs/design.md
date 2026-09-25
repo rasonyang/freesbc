@@ -2058,7 +2058,7 @@ zero value `legAllocated`; `Start` (`webrtcleg.go:273-300`) claims
 `Start`, or a `Start` after `Close`, is a no-op, so no second ICE agent can
 be built over the same socket; that goroutine sets `legFailed` and
 immediately calls `Close` on error (`webrtcleg.go:293-294`) or
-`legEstablished` on success (`:297`); `Close` (`webrtcleg.go:680`) sets
+`legEstablished` on success (`:297`); `Close` (`webrtcleg.go:693`) sets
 `legClosed`, which `set` (`:124-126`) treats as terminal. The first error
 recorded wins, and a leg closed before it was established is retroactively
 stamped with `"webrtc leg closed before it was established"`.
@@ -2105,7 +2105,9 @@ handshake no longer leaks it.
    plane always sets from the offer), `WithVerifyPeerCertificate` checks the
    leaf certificate against it during the handshake, and a mismatch fails
    the handshake with `ErrFingerprintMismatch` — before any key is derived
-   or any packet relayed.
+   or any packet relayed. Because pion calls that hook only when the peer
+   sent a certificate, the leaf the handshake ended with is re-matched from
+   `ConnectionState` before keying as well, in either DTLS role.
 6. `HandshakeContext(ctx)` is run **explicitly** under the establishment
    deadline, so a peer that opens the flow and then goes quiet cannot pin the
    port past the timeout.
@@ -2179,7 +2181,7 @@ all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:726-733`) — with a
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with a
 length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
 accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.

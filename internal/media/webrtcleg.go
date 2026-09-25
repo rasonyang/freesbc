@@ -451,6 +451,19 @@ func (l *WebRTCLeg) establish(ctx context.Context) error {
 	if !l.keep(func() { l.peerCerts = dtlsConn.ConnectionState }) {
 		return errLegClosed
 	}
+	// Defence in depth: pion only calls VerifyPeerCertificate when the
+	// peer sent a certificate, so re-match the one the handshake actually
+	// ended with before anything is keyed. A certificate-less handshake
+	// cannot pass this.
+	if l.remoteFingerprint.Value != "" {
+		state, ok := dtlsConn.ConnectionState()
+		if !ok {
+			return fmt.Errorf("%w: connection state unavailable", ErrFingerprintMismatch)
+		}
+		if err := l.remoteFingerprint.match(state.PeerCertificates); err != nil {
+			return err
+		}
+	}
 
 	// --- SRTP keying (RFC 5764 §4.2) ---
 	if err := l.deriveSRTP(dtlsConn); err != nil {
