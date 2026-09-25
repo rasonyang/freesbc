@@ -16,11 +16,16 @@ func NewMediaPool(store *config.Store) *media.PlanePool {
 	return media.NewPlanePool("trunk", func() media.PlaneParams {
 		cfg := store.Current()
 		r := cfg.RTPPortRange()
+		bind := fsip.ParseBindIP(cfg.RTP.BindIP)
 		return media.PlaneParams{
 			MinPort: r.Min,
 			MaxPort: r.Max,
-			BindIP:  fsip.ParseBindIP(cfg.RTP.BindIP),
+			BindIP:  bind,
 			Timeout: cfg.Listen.Media.RTPTimeout.Std(),
+			// Loopback peers only when the relay itself is on loopback (a
+			// single-host lab): an answer's c= must never point the
+			// relay at a service on the SBC host.
+			AllowLoopback: bind.IsLoopback(),
 		}
 	})
 }

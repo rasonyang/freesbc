@@ -811,7 +811,8 @@ The dial loop runs at most twice, bounded by a `retried422` flag:
 Post-answer (2xx), every path is non-retryable except one:
 
 - `processAnswerSDP(sess, answer, SideB, bSRTP)` installs SRTP contexts,
-  `Relatch`es side B to the answered address and calls `sess.Start()`.
+  `Relatch`es side B to the answered `c=`/`m=` address (re-seeding its
+  destination) and calls `sess.Start()`.
   `errSRTPRequiredMismatch` is the single retryable post-answer case: log,
   `ackThenBye`, `failDial`. Any other error answers the caller **502 Bad
   Gateway** and *then* tears the carrier down.
@@ -1875,19 +1876,38 @@ stateDiagram-v2
     Seeded --> Latched: accept(src) succeeds
     Armed --> Latched: accept(src) succeeds
     Unarmed --> Latched: accept(src) succeeds (loose mode only)
-    Latched --> Armed: relatch (re-INVITE authorised)
-    Seeded --> Armed: relatch
+    Latched --> Seeded: relatch (re-INVITE / new answer authorised)
+    Seeded --> Seeded: relatch
+    Armed --> Seeded: relatch
 ```
 
-Transitions: `setExpected` (`session.go:48-52`) records the expected source
-IP; `seed` (`session.go:91-102`) sets the expected IP **and** a provisional
+Transitions: `setExpected` (`session.go:52-56`) records the expected source
+IP; `seed` (`session.go:110-128`) sets the expected IP **and** a provisional
 send-to destination from SDP, returning without touching `remote` if the
-latch is already latched; `accept` (`session.go:106-128`) is the gate the
+latch is already latched; `accept` (`session.go:146-168`) is the gate the
 relay calls per packet and is what sets `latched`; `relatch`
-(`session.go:68-74`) sets a new expected IP and clears both `remote` and
-`latched` — unconditionally, so it reaches `Armed` from **any** state,
-including a `Seeded` latch that a re-INVITE re-points before the first packet
-ever arrived.
+(`session.go:79-86`) takes the newly signalled address (IP **and** port),
+sets the expected IP, clears both `remote` and `latched` — unconditionally,
+from **any** state — and then seeds the new address, so the side keeps
+receiving media after an authorised move even if it never sends first (a
+recvonly peer, an IVR waiting to hear audio). An address with no usable
+port only re-arms the source check (`Armed`).
+
+**What `seed` will send to** (`unicastMediaAddr`, `session.go:133`): the
+unspecified address (RFC 3264 §8.4 hold), multicast, the IPv4 broadcast
+address and link-local addresses are never installed, nor do they change
+the expected source. A loopback address arms the source check but becomes
+a destination only when the side's pool allows it
+(`PlaneParams.AllowLoopback`): the edge sets it for a media plane whose bind
+or advertised address is loopback, and the trunk for a loopback
+`rtp.bind_ip` — a single-host lab or the test suites. Anywhere else a
+client's SDP could point the SBC's media socket at a service on its own
+host. The policy is read once per session, at allocation. `internal/sip/sdp`
+enforces the same classes one step earlier: `Parse` refuses multicast,
+broadcast, link-local and (unless `ParseOptions.AllowLoopback`, which the
+edge derives from its advertised media addresses) loopback `c=` addresses
+with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
+`Address`.
 
 Acceptance rules in `accept`:
 
@@ -1917,9 +1937,11 @@ Plane defaults:
 | WebRTC public leg | none — ICE fixed the peer and SRTP authenticates every packet | — |
 | WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` |
 
-The trunk plane calls `SetExpectedRemote` and `Relatch` but **never**
-`SetRemote`, i.e. it never seeds a provisional destination; the edge plane
-seeds both sides from the signalled address.
+The trunk plane calls `SetExpectedRemote` for side A and never `SetRemote`;
+side B is seeded by `Relatch` from the answer's `c=`/`m=` in
+`processAnswerSDP`, so the answering carrier hears the caller before it
+sends anything. Side A is not seeded, so media toward the caller flows once
+it sends. The edge plane seeds both sides from the signalled address.
 
 ### 8.5 Silence watchdog
 

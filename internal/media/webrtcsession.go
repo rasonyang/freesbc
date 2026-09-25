@@ -85,8 +85,8 @@ func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConf
 		leg:      leg,
 		priv:     priv,
 		privPool: privPool,
-		privRTP:  &latch{mode: cfg.PrivateLatch},
-		privRTCP: &latch{mode: cfg.PrivateLatch},
+		privRTP:  &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
+		privRTCP: &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
 		timeout:  timeout,
 		log:      cfg.Log,
 		done:     make(chan struct{}),
@@ -116,14 +116,18 @@ func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
 	}
 }
 
-// RelatchPrivate re-arms the private side's latches to ip, for an
+// RelatchPrivate re-arms the private side's latches to addr, for an
 // authorised change of FreeSWITCH's media address signalled in SDP (a
 // re-INVITE, or an answer from another fork). Once latched, a latch only
-// moves this way; follow it with SetPrivateRemote to give the relay the
-// new destination.
-func (s *WebRTCSession) RelatchPrivate(ip netip.Addr) {
-	s.privRTP.relatch(ip)
-	s.privRTCP.relatch(ip)
+// moves this way. It re-seeds the destinations too (RTCP at port+1), as
+// Session.Relatch does.
+func (s *WebRTCSession) RelatchPrivate(addr netip.AddrPort) {
+	s.privRTP.relatch(addr)
+	rtcp, ok := rtcpAddr(addr)
+	if !ok {
+		rtcp = netip.AddrPortFrom(addr.Addr(), 0)
+	}
+	s.privRTCP.relatch(rtcp)
 }
 
 // Done is closed when the session ends (Close or silence timeout).
@@ -251,11 +255,15 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 		if err != nil {
 			return // socket closed (session teardown)
 		}
-		if !s.leg.mediaVerified() {
-			continue // never send media to an unverified DTLS peer
-		}
 		if !lat.accept(src) {
 			continue // pre-latch source mismatch, or post-latch hijack
+		}
+		if !s.leg.mediaVerified() {
+			// Never send media to an unverified DTLS peer. Latching the
+			// private side above is harmless: it is FreeSWITCH, on the
+			// trusted plane, and only tells the reverse direction where
+			// to send once the browser is verified.
+			continue
 		}
 		pkt := buf[:n]
 		rtcp := !rtpKind

@@ -15,7 +15,6 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/internal/config"
-	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // This file drives FreeSBC against a REAL FreeSWITCH. It is opt-in:
@@ -327,7 +326,7 @@ func TestFreeSWITCHInboundCallAndHangup(t *testing.T) {
 		t.Errorf("Request-URI user = %q, want %q", inbound.Recipient.User, user)
 	}
 	// And its media must be the SBC's, not FreeSWITCH's.
-	offer, err := sdp.Parse(inbound.Body())
+	offer, err := parseLabSDP(inbound.Body())
 	if err != nil {
 		t.Fatalf("inbound offer unparseable: %v\n%s", err, inbound.Body())
 	}
@@ -418,7 +417,7 @@ func TestFreeSWITCHMediaEcho(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the INVITE never reached the phone")
 	}
-	offer, err := sdp.Parse(inbound.Body())
+	offer, err := parseLabSDP(inbound.Body())
 	if err != nil {
 		t.Fatalf("offer unparseable: %v", err)
 	}

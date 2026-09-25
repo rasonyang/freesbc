@@ -47,6 +47,15 @@ type PlaneParams struct {
 	// Timeout is the default media-silence teardown for sessions built
 	// from this pool.
 	Timeout time.Duration
+	// AllowLoopback lets a session side allocated from this pool send to
+	// a loopback address learned from SDP (SetRemote, Relatch). Off, a
+	// loopback c= only arms the source check. It is meant for a plane
+	// that is itself on loopback (an all-on-one-host lab, the test
+	// suites); a pool facing real clients must leave it off, or a
+	// client's SDP could point the SBC's media socket at a local service.
+	// Unspecified, multicast, broadcast and link-local destinations are
+	// refused regardless.
+	AllowLoopback bool
 }
 
 // PlanePool allocates RTP/RTCP port pairs from one network plane's range.
@@ -178,6 +187,10 @@ func (p *PlanePool) release(rtpPort int) {
 
 // timeout is the pool's default silence teardown.
 func (p *PlanePool) timeout() time.Duration { return p.params().Timeout }
+
+// allowLoopback is the pool's loopback-destination policy, read once per
+// session at allocation.
+func (p *PlanePool) allowLoopback() bool { return p.params().AllowLoopback }
 
 func bindPair(port int, bind netip.Addr) (*portPair, error) {
 	rtp, err := net.ListenUDP("udp", udpAddr(port, bind))

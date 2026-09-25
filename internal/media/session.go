@@ -43,6 +43,10 @@ type latch struct {
 	// being corrected by the first genuine packet, which is what makes
 	// symmetric RTP work through NAT.
 	latched bool
+	// allowLoopback lets seed install a loopback destination. It comes
+	// from the pool the side was allocated from (PlaneParams.AllowLoopback)
+	// and is fixed for the latch's lifetime.
+	allowLoopback bool
 }
 
 func (l *latch) setExpected(ip netip.Addr) {
@@ -61,16 +65,24 @@ func (l *latch) setMode(m LatchMode) {
 	l.mu.Unlock()
 }
 
-// relatch re-arms the latch to a new expected IP and forgets the current
-// remote, so the next packet from the new expected address re-latches. Used
-// only for authorized media-address changes (re-INVITE); unsolicited packets
+// relatch re-arms the latch to a new signalled media address: the
+// expected source becomes addr's IP, the current remote is forgotten, and
+// addr is seeded as the provisional destination — so media keeps flowing
+// to the new address before (or without) its first packet, as it must for
+// a recvonly peer or an IVR that waits to hear audio. The next packet from
+// the new expected IP re-latches as usual. Used only for authorized
+// media-address changes (re-INVITE, a new answer); unsolicited packets
 // still cannot move a latch.
-func (l *latch) relatch(ip netip.Addr) {
+//
+// An addr with no usable port re-arms the source check only; one whose
+// IP is invalid (an FQDN the caller did not resolve) clears it.
+func (l *latch) relatch(addr netip.AddrPort) {
 	l.mu.Lock()
-	l.expected = ip
+	l.expected = addr.Addr()
 	l.remote = nil
 	l.latched = false
 	l.mu.Unlock()
+	l.seed(addr)
 }
 
 // seed sets both the expected source IP and a PROVISIONAL send-to address
@@ -88,17 +100,45 @@ func (l *latch) relatch(ip netip.Addr) {
 // accepts inbound packets only from the expected IP, and once a real
 // packet has latched it, nothing moves it again short of an authorized
 // re-INVITE.
+//
+// Only a unicast address is ever installed as a destination (see
+// seedableDestination): the unspecified address (RFC 3264 §8.4 hold),
+// multicast, broadcast and link-local addresses are ignored outright, and
+// a loopback address only arms the source check unless the pool allows
+// loopback — otherwise a public client's SDP could make the SBC's media
+// socket send to a service on the SBC host itself.
 func (l *latch) seed(addr netip.AddrPort) {
 	if !addr.IsValid() || addr.Port() == 0 {
 		return
 	}
+	ip := addr.Addr().Unmap()
+	if !unicastMediaAddr(ip) {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.expected = addr.Addr()
+	l.expected = ip
 	if l.latched {
 		return // a real packet already fixed this; SDP does not override it
 	}
-	l.remote = &net.UDPAddr{IP: net.IP(addr.Addr().AsSlice()), Port: int(addr.Port())}
+	if ip.IsLoopback() && !l.allowLoopback {
+		return // arm the source check, but never send to it
+	}
+	l.remote = &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(addr.Port())}
+}
+
+// unicastMediaAddr reports whether ip can be a unicast RTP peer at all:
+// not unspecified, multicast, the IPv4 limited broadcast, or link-local.
+// Loopback passes here; whether it may be SENT to is the pool's policy.
+func unicastMediaAddr(ip netip.Addr) bool {
+	switch {
+	case !ip.IsValid(), ip.IsUnspecified(), ip.IsMulticast(),
+		ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(), ip.IsInterfaceLocalMulticast():
+		return false
+	case ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
+		return false
+	}
+	return true
 }
 
 // accept reports whether a packet from src may be processed, latching the
@@ -229,9 +269,10 @@ func AllocateAcross(poolA, poolB *PlanePool, cfg SessionConfig) (*Session, error
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
 	}
+	allowLoopback := [2]bool{poolA.allowLoopback(), poolB.allowLoopback()}
 	for side := range s.pairs {
-		s.rtp[side] = &latch{mode: cfg.Latch[side]}
-		s.rtcp[side] = &latch{mode: cfg.Latch[side]}
+		s.rtp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}
+		s.rtcp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}
 	}
 	return s, nil
 }
@@ -274,11 +315,19 @@ func (s *Session) SetRTCPRemote(side Side, addr netip.AddrPort) {
 	s.rtcp[side].seed(addr)
 }
 
-// Relatch re-arms both the RTP and RTCP latches of one side to ip, for an
-// authorized media-address change signalled by a re-INVITE.
-func (s *Session) Relatch(side Side, ip netip.Addr) {
-	s.rtp[side].relatch(ip)
-	s.rtcp[side].relatch(ip)
+// Relatch re-arms both the RTP and RTCP latches of one side to the newly
+// signalled media address, for an authorized change (a re-INVITE, or an
+// answer from another fork or failover target). It re-seeds the send-to
+// addresses too — RTP to addr, RTCP to addr's port+1 — so the side keeps
+// receiving media even if it never sends first; follow it with
+// SetRTCPRemote for an explicit a=rtcp port.
+func (s *Session) Relatch(side Side, addr netip.AddrPort) {
+	s.rtp[side].relatch(addr)
+	rtcp, ok := rtcpAddr(addr)
+	if !ok {
+		rtcp = netip.AddrPortFrom(addr.Addr(), 0) // re-arm the source check only
+	}
+	s.rtcp[side].relatch(rtcp)
 }
 
 // SetLatchMode changes both the RTP and RTCP latch policy of one side at

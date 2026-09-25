@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -154,6 +155,13 @@ func TestAuditMED002HandshakeRejectsMismatchedFingerprint(t *testing.T) {
 // media until VerifyFingerprint succeeds; after that, audio flows.
 func TestAuditMED002MediaFlowsOnlyAfterVerify(t *testing.T) {
 	c := auditEstablishBrowserCall(t, 24820, 24859, 24860, 24899)
+	// FreeSWITCH speaks first, so the private side is latched and the
+	// only thing left to stop browser audio is the fingerprint gate.
+	priv := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: c.sess.PrivateRTPPort()}
+	if _, err := c.fsConn.WriteToUDP(rtpPacket(0, 100, 160), priv); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
 	send := func(seq uint16) bool {
 		pkt := rtpPacket(0, seq, 160)
 		prot, ok := c.browserOut.protectRTP(pkt)
@@ -270,4 +278,80 @@ func auditBrowserICE(ctx context.Context, tb testing.TB, browser *ice.Agent, leg
 	dm := newDemux(conn)
 	tb.Cleanup(func() { _ = dm.Close() })
 	return dm
+}
+
+// audit: P2-MED-005
+//
+// Relatch used to take only an IP and forget the destination, so after an
+// authorised media-address change the side received nothing until it sent
+// first — never, for a recvonly peer or an IVR waiting to hear audio. It
+// now re-seeds the send-to address from the signalled c=/m=.
+func TestAuditMED005RelatchKeepsSendingToNewAddress(t *testing.T) {
+	// A loopback lab: the pool allows loopback destinations.
+	pool := NewPlanePool("audit", func() PlaneParams {
+		return PlaneParams{
+			MinPort: 24900, MaxPort: 24919, BindIP: netip.MustParseAddr("127.0.0.1"),
+			Timeout: 30 * time.Second, AllowLoopback: true,
+		}
+	})
+	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchStrict, LatchStrict}, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a := auditUDP(t, "127.0.0.1")
+	oldB := auditUDP(t, "127.0.0.1")
+	newB := auditUDP(t, "127.0.0.1") // recvonly: never sends
+	s.SetRemote(SideA, auditAddrPort(a))
+	s.SetRemote(SideB, auditAddrPort(oldB))
+	s.Start()
+	// The original B latches by sending, as a live peer does.
+	pubB := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: s.RTPPort(SideB)}
+	if _, err := oldB.WriteToUDP([]byte("b-audio"), pubB); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// A re-INVITE (or a new answer) moves B's media to newB.
+	s.Relatch(SideB, auditAddrPort(newB))
+
+	pubA := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: s.RTPPort(SideA)}
+	buf := make([]byte, 1500)
+	got := false
+	for i := 0; i < 10 && !got; i++ {
+		if _, err := a.WriteToUDP([]byte("a-audio"), pubA); err != nil {
+			t.Fatal(err)
+		}
+		_ = newB.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if n, _, err := newB.ReadFromUDP(buf); err == nil && string(buf[:n]) == "a-audio" {
+			got = true
+		}
+	}
+	if !got {
+		t.Error("P2-MED-005: after Relatch to a new address, the side never receives media until it sends first")
+	}
+}
+
+// audit: P2-MED-003
+//
+// The loopback policy is the pool's: a pool that does not allow loopback
+// arms the source check from a loopback c= but never sends to it, and one
+// that does (a loopback lab) seeds it as usual.
+func TestAuditMED003LoopbackSeedFollowsPoolPolicy(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		l := &latch{mode: LatchStrict, allowLoopback: allow}
+		l.seed(netip.MustParseAddrPort("127.0.0.1:4000"))
+		if got := l.target() != nil; got != allow {
+			t.Errorf("allowLoopback=%v: destination installed = %v", allow, got)
+		}
+		if !l.accept(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4000}) {
+			t.Errorf("allowLoopback=%v: a packet from the signalled loopback source was not accepted", allow)
+		}
+	}
+	// A public address is seeded either way.
+	l := &latch{mode: LatchStrict}
+	l.seed(netip.MustParseAddrPort("198.51.100.7:4000"))
+	if l.target() == nil {
+		t.Error("a unicast public address was not seeded")
+	}
 }

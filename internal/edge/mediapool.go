@@ -1,6 +1,8 @@
 package edge
 
 import (
+	"net/netip"
+
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
 	fsip "github.com/freesbc/freesbc/internal/sip"
@@ -13,19 +15,23 @@ import (
 // the live config on every allocation, so a hot reload applies to new
 // sessions only.
 func newMediaPools(store *config.Store) (public, private *media.PlanePool) {
-	plane := func(name string, get func(*config.Config) config.RTPPlaneConfig) *media.PlanePool {
+	plane := func(name string, get func(*config.Config) config.RTPPlaneConfig, advertised func(*config.Config) netip.Addr) *media.PlanePool {
 		return media.NewPlanePool(name, func() media.PlaneParams {
 			cfg := store.Current()
 			p := get(cfg)
 			r := p.Range()
+			bind := fsip.ParseBindIP(p.BindIP)
 			return media.PlaneParams{
 				MinPort: r.Min,
 				MaxPort: r.Max,
-				BindIP:  fsip.ParseBindIP(p.BindIP),
+				BindIP:  bind,
 				Timeout: cfg.Listen.Media.RTPTimeout.Std(),
+				// A plane that is itself on loopback (a single-host lab)
+				// may send to loopback peers; any other plane never does.
+				AllowLoopback: bind.IsLoopback() || advertised(cfg).IsLoopback(),
 			}
 		})
 	}
-	return plane("public", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Public }),
-		plane("private", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Private })
+	return plane("public", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Public }, (*config.Config).PublicRTPAdvertisedIP),
+		plane("private", func(c *config.Config) config.RTPPlaneConfig { return c.RTP.Private }, (*config.Config).PrivateRTPAdvertisedIP)
 }

@@ -1721,7 +1721,11 @@ func processAnswerSDP(sess *media.Session, answer []byte, side media.Side, bsrtp
 	if !remote.IsValid() {
 		looseForFQDN(sess, side)
 	}
-	sess.Relatch(side, remote)
+	// Re-arm the latch AND re-seed the destination from the answer's
+	// c=/m=, so the answering side hears media before (or without) sending
+	// any — a recvonly carrier or an IVR waiting for audio. The first
+	// packet it does send still corrects the port (symmetric RTP).
+	sess.Relatch(side, netip.AddrPortFrom(remote, uint16(remoteMediaPort(answer))))
 	sess.Start()
 	return nil
 }

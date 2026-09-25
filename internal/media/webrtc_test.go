@@ -23,6 +23,8 @@ func testPlanePool(t *testing.T, name string, lo, hi int) *PlanePool {
 			MaxPort: uint16(hi),
 			BindIP:  netip.MustParseAddr("127.0.0.1"),
 			Timeout: 30 * time.Second,
+			// A loopback-bound plane in a lab: loopback peers are legit.
+			AllowLoopback: true,
 		}
 	})
 }
