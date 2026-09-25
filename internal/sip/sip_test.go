@@ -486,6 +486,14 @@ func TestTeardownRequestRouteSet(t *testing.T) {
 		t.Errorf("strict routing destination = %s over %s, want 198.51.100.8:5060 over TCP", bye.Destination(), bye.Transport())
 	}
 
+	// A hostname route is not resolved: the request goes to the 2xx's
+	// source, the nearest hop, and the Route header still names it.
+	named := parseResponse(t, strings.Replace(rr200, "<sip:203.0.113.3;lr>", "<sip:edge.example.net;lr>", 1))
+	named.SetSource("198.51.100.1:5070")
+	if b := TeardownRequest(sip.BYE, named, via, 2); b.Destination() != "198.51.100.1:5070" || !strings.HasPrefix(routes(b), "<sip:edge.example.net;lr>") {
+		t.Errorf("hostname route: destination %s, Route %s", b.Destination(), routes(b))
+	}
+
 	// No Record-Route: the remote target at the 2xx's source, as before.
 	plain := parseResponse(t, test200)
 	plain.SetSource("192.0.2.10:5060")

@@ -1599,7 +1599,9 @@ the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
 carried them. A loose router first means `Route` headers and the Request-URI
 is the remote target; a strict router first becomes the Request-URI with the
 target appended as the last `Route` (§12.2.1.1). The request is sent to the
-first route, else to the 2xx's transport source. `FromListener(side.laddr)`
+first route when it names an IP literal, else to the 2xx's transport source
+(the nearest hop): a hostname route is never resolved, keeping the edge free
+of DNS. `FromListener(side.laddr)`
 pins the socket it leaves by, as `forward` pins a relayed request; without
 the pin an ACK toward a carrier behind a wildcard-bound public listener never
 arrived (`TestTeardownLeavesByPublicListenerOnWildcardBind`).
