@@ -1546,11 +1546,11 @@ it answers 200 to the CANCEL, fires the `OnCancel` hook
 transaction's lock**, and only after the hook returns finalises the INVITE
 server transaction with **487** toward the requester itself. The hook
 therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
-(`invite_leg.go:609-620`), which **synchronously** marks the record
+(`invite_leg.go:617-628`), which **synchronously** marks the record
 cancelled (`cancelSeries`, `dialog.go:528-547`) — from that instant
 `confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
 relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
-to a goroutine (`sendCancel`, `invite_leg.go:634-650`). `sendCancel` builds
+to a goroutine (`sendCancel`, `invite_leg.go:642-658`). `sendCancel` builds
 the CANCEL from the **forwarded** request so it carries that branch, sends
 it on a **5 s** context, and cancels the series context as soon as it is on
 the wire (which is what releases the media promptly instead of waiting on
@@ -1582,9 +1582,21 @@ layer (RFC 3261 §17.1.1.3, `invite_leg.go:497-535`). The same helper serves
 all three call paths, not only PSTN. A 2xx that arrives after the caller
 cancelled is never relayed or confirmed: it is ACKed and BYEd.
 
+**FreeSBC's own ACK/BYE.** `ackThenBye` builds both with
+`fsip.TeardownRequest` (`request.go`), which follows the dialog's route set:
+the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
+`OwnRecordRoute(topo.isSelf)` at FreeSBC's own entries, since the INVITE
+carried them. A loose router first means `Route` headers and the Request-URI
+is the remote target; a strict router first becomes the Request-URI with the
+target appended as the last `Route` (§12.2.1.1). The request is sent to the
+first route, else to the 2xx's transport source. `FromListener(side.laddr)`
+pins the socket it leaves by, as `forward` pins a relayed request; without
+the pin an ACK toward a carrier behind a wildcard-bound public listener never
+arrived (`TestTeardownLeavesByPublicListenerOnWildcardBind`).
+
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
-(`invite_leg.go:655-660`): it CANCELs the pending branch (RFC 3261 §16.8)
+(`invite_leg.go:663-668`): it CANCELs the pending branch (RFC 3261 §16.8)
 and drains for its 487, and `giveUp` (`invite.go:348-359`) then sends the
 caller **408 Request Timeout** (§16.7 step 6). `giveUp` is the one place a
 caller's missing final is synthesised: nothing when its own CANCEL already

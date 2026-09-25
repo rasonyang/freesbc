@@ -3,6 +3,7 @@ package sip
 import (
 	"net"
 	"strconv"
+	"strings"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -62,13 +63,46 @@ func CSeqNumber(msg sip.Message) uint32 {
 // Via of the element sending it, and seq the CSeq number this request
 // takes — the INVITE's own for the ACK, the next one for the BYE.
 //
+// The request follows the dialog's route set: the response's Record-Route
+// list reversed (§12.1.2), sent per §12.2.1.1. With a loose router first
+// (lr) the Request-URI is the remote target and every route is a Route
+// header; with a strict router first the Request-URI is that route and the
+// remote target goes last in the Route list. Either way the request is
+// sent to the first route. With no route set it goes to the remote target,
+// addressed to the transport source of res, where the far end
+// demonstrably is.
+//
+// opts adjust it for the element sending it: OwnRecordRoute to leave out
+// the Record-Route entries that element added itself, FromListener to pin
+// the socket it leaves by.
+//
 // It is for a dialog the element tracks itself. Where a dialog is owned by
 // sipgo's DialogClientSession, its Ack and Bye methods must be used
-// instead: they hold the route set and the remote target this function
-// does not see.
-func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header, seq uint32) *sip.Request {
-	req := sip.NewRequest(method, contactOrSource(res))
+// instead.
+func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header, seq uint32, opts ...TeardownOption) *sip.Request {
+	var o teardownOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	target := contactOrSource(res)
+	routes := routeSet(res, o.isSelf)
+
+	ruri := target
+	var routeHdrs []sip.Uri
+	if len(routes) > 0 {
+		if _, lr := routes[0].UriParams.Get("lr"); lr {
+			routeHdrs = routes
+		} else {
+			ruri = routes[0]
+			routeHdrs = append(append([]sip.Uri(nil), routes[1:]...), target)
+		}
+	}
+
+	req := sip.NewRequest(method, ruri)
 	req.PrependHeader(via)
+	for _, u := range routeHdrs {
+		req.AppendHeader(&sip.RouteHeader{Address: u})
+	}
 	sip.CopyHeaders("From", res, req)
 	sip.CopyHeaders("To", res, req)
 	sip.CopyHeaders("Call-ID", res, req)
@@ -76,8 +110,74 @@ func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
 	req.SetTransport(res.Transport())
-	req.SetDestination(res.Source())
+	if len(routes) > 0 {
+		if t, ok := routes[0].UriParams.Get("transport"); ok && t != "" {
+			req.SetTransport(strings.ToUpper(t))
+		}
+		req.SetDestination(uriHostPort(routes[0], req.Transport()))
+	} else {
+		req.SetDestination(res.Source())
+	}
+	req.Laddr = o.laddr
 	return req
+}
+
+// TeardownOption adjusts a TeardownRequest for the element sending it.
+type TeardownOption func(*teardownOptions)
+
+type teardownOptions struct {
+	isSelf func(sip.Uri) bool
+	laddr  sip.Addr
+}
+
+// OwnRecordRoute names the Record-Route entries the sending element added
+// itself. A proxy that record-routed the INVITE sits in the response's
+// Record-Route list; when it then sends the ACK/BYE itself, its route set
+// is only the part of the list beyond it (the entries above its own), so
+// every entry from its first own one down is left out.
+func OwnRecordRoute(isSelf func(sip.Uri) bool) TeardownOption {
+	return func(o *teardownOptions) { o.isSelf = isSelf }
+}
+
+// FromListener pins the socket the request leaves by: sipgo's transport
+// layer reuses the listener bound at laddr (TransportLayer.
+// ClientRequestConnection), so the ACK/BYE comes from the address the far
+// end already talks to instead of a fresh ephemeral socket. A zero laddr
+// leaves the choice to sipgo, which is right for a WebSocket client, whose
+// one connection is found by its remote address.
+func FromListener(laddr sip.Addr) TeardownOption {
+	return func(o *teardownOptions) { o.laddr = laddr }
+}
+
+// routeSet is the UAC route set a 2xx establishes (RFC 3261 §12.1.2): its
+// Record-Route list in reverse. With isSelf, the list is cut at the first
+// entry isSelf claims, keeping only the entries above it.
+func routeSet(res *sip.Response, isSelf func(sip.Uri) bool) []sip.Uri {
+	var rr []sip.Uri
+	for _, h := range res.GetHeaders("Record-Route") {
+		r, ok := h.(*sip.RecordRouteHeader)
+		if !ok {
+			continue
+		}
+		if isSelf != nil && isSelf(r.Address) {
+			break
+		}
+		rr = append(rr, *r.Address.Clone())
+	}
+	for i, j := 0, len(rr)-1; i < j; i, j = i+1, j-1 {
+		rr[i], rr[j] = rr[j], rr[i]
+	}
+	return rr
+}
+
+// uriHostPort is where a request routed by u over transport is sent: its
+// host and port, the port defaulting by transport.
+func uriHostPort(u sip.Uri, transport string) string {
+	port := u.Port
+	if port == 0 {
+		port = DefaultPort(transport)
+	}
+	return net.JoinHostPort(strings.Trim(u.Host, "[]"), strconv.Itoa(port))
 }
 
 // contactOrSource is the request target for an in-dialog request built

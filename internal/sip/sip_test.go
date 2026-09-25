@@ -427,3 +427,69 @@ func TestTeardownRequestAndContactOrSource(t *testing.T) {
 		t.Errorf("contactOrSource(bad source) = %s", u.String())
 	}
 }
+
+// audit: P2-SIP-005
+// The teardown follows the route set: loose routers become Route headers
+// and the request goes to the first of them; a strict router becomes the
+// Request-URI with the remote target appended as the last Route; the
+// element's own Record-Route entries and everything below them are left
+// out; FromListener pins the local socket.
+func TestTeardownRequestRouteSet(t *testing.T) {
+	const rr200 = "SIP/2.0 200 OK\r\n" +
+		"Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-rr\r\n" +
+		"Record-Route: <sip:198.51.100.7:5080;lr>\r\n" +
+		"Record-Route: <sip:198.51.100.8;lr>, <sip:192.0.2.1:5060;lr>\r\n" +
+		"Record-Route: <sip:192.0.2.1:5062;lr>\r\n" +
+		"Record-Route: <sip:203.0.113.3;lr>\r\n" +
+		"From: <sip:a@x>;tag=a\r\nTo: <sip:b@y>;tag=b\r\nCall-ID: rr-1\r\nCSeq: 1 INVITE\r\n" +
+		"Contact: <sip:b@198.51.100.1:5070>\r\nContent-Length: 0\r\n\r\n"
+	via := sip.NewHeader("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-t")
+	routes := func(r *sip.Request) string {
+		var out []string
+		for _, h := range r.GetHeaders("Route") {
+			out = append(out, h.Value())
+		}
+		return strings.Join(out, ",")
+	}
+
+	res := parseResponse(t, rr200)
+	res.SetSource("198.51.100.1:5070")
+	ack := TeardownRequest(sip.ACK, res, via, 1)
+	if got, want := routes(ack), "<sip:203.0.113.3;lr>,<sip:192.0.2.1:5062;lr>,<sip:192.0.2.1:5060;lr>,<sip:198.51.100.8;lr>,<sip:198.51.100.7:5080;lr>"; got != want {
+		t.Errorf("full route set = %s, want %s", got, want)
+	}
+	if ack.Recipient.Host != "198.51.100.1" || ack.Destination() != "203.0.113.3:5060" {
+		t.Errorf("loose routing: R-URI %s, destination %s", ack.Recipient.String(), ack.Destination())
+	}
+
+	self := func(u sip.Uri) bool { return u.Host == "192.0.2.1" }
+	laddr := sip.Addr{IP: net.ParseIP("192.0.2.1"), Port: 5060}
+	bye := TeardownRequest(sip.BYE, res, via, 2, OwnRecordRoute(self), FromListener(laddr))
+	if got, want := routes(bye), "<sip:198.51.100.8;lr>,<sip:198.51.100.7:5080;lr>"; got != want {
+		t.Errorf("route set beyond own entries = %s, want %s", got, want)
+	}
+	if bye.Destination() != "198.51.100.8:5060" {
+		t.Errorf("destination = %s, want the first route beyond self", bye.Destination())
+	}
+	if bye.Laddr.String() != laddr.String() {
+		t.Errorf("Laddr = %v, want %v", bye.Laddr, laddr)
+	}
+
+	strict := parseResponse(t, strings.Replace(rr200, "Record-Route: <sip:198.51.100.7:5080;lr>\r\n", "", 1))
+	strict = parseResponse(t, strings.Replace(strict.String(), "<sip:198.51.100.8;lr>", "<sip:198.51.100.8;transport=tcp>", 1))
+	strict.SetSource("198.51.100.1:5070")
+	bye = TeardownRequest(sip.BYE, strict, via, 2, OwnRecordRoute(self))
+	if bye.Recipient.Host != "198.51.100.8" || routes(bye) != "<sip:b@198.51.100.1:5070>" {
+		t.Errorf("strict routing: R-URI %s, Route %s", bye.Recipient.String(), routes(bye))
+	}
+	if bye.Destination() != "198.51.100.8:5060" || bye.Transport() != "TCP" {
+		t.Errorf("strict routing destination = %s over %s, want 198.51.100.8:5060 over TCP", bye.Destination(), bye.Transport())
+	}
+
+	// No Record-Route: the remote target at the 2xx's source, as before.
+	plain := parseResponse(t, test200)
+	plain.SetSource("192.0.2.10:5060")
+	if b := TeardownRequest(sip.BYE, plain, via, 2, OwnRecordRoute(self)); routes(b) != "" || b.Destination() != "192.0.2.10:5060" {
+		t.Errorf("no route set: Route %q, destination %s", routes(b), b.Destination())
+	}
+}
