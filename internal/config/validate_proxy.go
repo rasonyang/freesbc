@@ -346,12 +346,33 @@ func (c *Config) validateSockets(fail failFunc) {
 	for i := 1; i < len(socks); i++ {
 		for _, prev := range socks[:i] {
 			s := socks[i]
-			if s.proto == prev.proto && s.port == prev.port && bindsCanCollide(s.host, prev.host) {
+			if s.proto == prev.proto && s.port == prev.port && hostsCollide(s.host, prev.host) {
 				fail("%s: %s/%s already bound by %s", s.label, s.proto, net.JoinHostPort(s.host, strconv.Itoa(s.port)), prev.label)
 				break
 			}
 		}
 	}
+}
+
+// hostsCollide reports whether two listeners on one protocol and port bind
+// overlapping addresses: an empty or unspecified host is every interface
+// and collides with anything; two IPs collide only when equal. A hostname
+// (legal in listen.sip) binds whatever it resolves to at startup, which
+// validation cannot know, so it collides only with the same name.
+func hostsCollide(a, b string) bool {
+	wildcard := func(h string) bool {
+		ip, err := netip.ParseAddr(h)
+		return h == "" || (err == nil && ip.IsUnspecified())
+	}
+	if wildcard(a) || wildcard(b) {
+		return true
+	}
+	ia, errA := netip.ParseAddr(a)
+	ib, errB := netip.ParseAddr(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return ia == ib
 }
 
 // sockProto maps a SIP transport to the socket protocol it listens on.

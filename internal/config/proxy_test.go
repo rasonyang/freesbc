@@ -851,3 +851,26 @@ func TestProxyRTPPlaneHoldsOnePair(t *testing.T) {
 		t.Errorf("a pair-less range validated: %v", err)
 	}
 }
+
+// audit: P2-CFG-004
+// The socket check does not guess what a hostname resolves to: a listen.sip
+// hostname collides only with the same name (or a wildcard).
+func TestHostsCollide(t *testing.T) {
+	for _, tt := range []struct {
+		a, b string
+		want bool
+	}{
+		{"0.0.0.0", "10.0.0.1", true},
+		{"", "10.0.0.1", true},
+		{"::", "10.0.0.1", true},
+		{"10.0.0.1", "10.0.0.1", true},
+		{"10.0.0.1", "10.0.0.2", false},
+		{"sbc.example.com", "10.0.0.1", false},
+		{"sbc.example.com", "sbc.example.com", true},
+		{"sbc.example.com", "0.0.0.0", true},
+	} {
+		if got := hostsCollide(tt.a, tt.b); got != tt.want {
+			t.Errorf("hostsCollide(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}

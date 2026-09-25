@@ -84,10 +84,12 @@ func (r envRedaction) tainted(value string) bool {
 	return ok
 }
 
-// args returns a copy of fmt args with every string, error and Stringer
-// redacted by apply. Validation formats come from this package and never
-// contain a value; only their arguments can carry an expanded one, so
-// redacting the arguments leaves the rest of each message intact.
+// args returns a copy of fmt args with every string and error redacted by
+// apply. Validation formats come from this package and never contain a
+// value; only their arguments can carry an expanded one, so redacting the
+// arguments leaves the rest of each message intact. Other types (numbers,
+// durations) are passed through unchanged: only string fields are
+// expanded, and converting them would break verbs such as %d.
 func (r envRedaction) args(args []any) []any {
 	if len(r.fields) == 0 {
 		return args
@@ -99,8 +101,6 @@ func (r envRedaction) args(args []any) []any {
 			out[i] = r.apply(v)
 		case error:
 			out[i] = r.apply(v.Error())
-		case fmt.Stringer:
-			out[i] = r.apply(v.String())
 		default:
 			out[i] = a
 		}
