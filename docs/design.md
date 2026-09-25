@@ -223,7 +223,7 @@ closer — about **6** excluding pion's internal goroutines.
 |---|---|---|
 | no args | usage to stderr | 2 |
 | `-h` / `--help` / `help` | usage to stdout | 0 |
-| `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"` | 0 / 1 |
+| `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"`. It parses and validates only: it opens no certificate or key file and binds no socket, so a missing cert file or a port another process holds is found by `run` alone. Everything validation can decide from the file — literal edge addresses, socket collisions between listeners — `check` rejects exactly as `run` would | 0 / 1 |
 | `run [-c path]` | `app.Run` under `signal.NotifyContext(SIGINT, SIGTERM)` | 0 / 1 |
 | `check`/`run` with an unrecognised flag | Go's own flag usage to stderr; the flag set is `flag.ExitOnError` (`main.go:37`), so `app.Run` is never reached | 2 |
 | anything else | usage to stderr | 2 |
@@ -308,12 +308,19 @@ the process's life.
 
 ### 4.4 Reload
 
-Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
+Reload is driven only by `config.Watch` (`internal/config/reload.go`, `Watch` and `linkTracker`):
 
 - `fsnotify` watches **the parent directory**, not the file, so atomic-rename
   saves are seen.
-- Events are filtered by base name and by
-  `Op & (Write|Create|Rename) != 0`; `Chmod` and `Remove` are ignored.
+- Events are filtered by `Op & (Write|Create|Rename) != 0` (`Chmod` and
+  `Remove` are ignored) and by `linkTracker.affects`: an event on the config
+  path itself, or on the file it resolves to, reloads; any other entry in the
+  directory reloads only if `filepath.EvalSymlinks(path)` now resolves
+  somewhere new. That catches a Kubernetes ConfigMap update, which renames a
+  new `..data` link into place and never touches the visible file, and any
+  other symlink swap on the way (audit P2-CFG-011). When the path resolves
+  into another directory, that directory is watched too, so an in-place edit
+  of the target reloads.
 - **Debounce: 200 ms** (`reloadDebounce`), implemented as a `time.AfterFunc`
   that does a non-blocking send into a buffer-1 `fire` channel.
 - On fire: `loadNoPanic(abs)`, which is `Load` behind a last-resort
@@ -326,7 +333,8 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
   `"config reloaded"`.
 - Event-loop errors are logged, never fatal, and the loop always returns nil.
   `Watch` itself can still fail before the loop starts — `filepath.Abs`,
-  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,25,30`). `app.Run`'s wrapper
+  `fsnotify.NewWatcher`, `w.Add` of the config's directory. Failing to watch
+  a symlink target's other directory is only a warning. `app.Run`'s wrapper
   goroutine logs that error and returns nil anyway (`app.go:93-99`), so a
   watcher that never started silently disables reload for the process's life.
 
@@ -450,9 +458,9 @@ plane). Only the relationships that shape deployment are summarised here.
 
 | Mode | Requires | Skipped requirements |
 |---|---|---|
-| Trunk-only | ≥1 SIP listener (`listen.sip` or `sip.bind_ip`) and ≥1 peer | the entire edge block must be absent — configuring any of `sip.public`/`sip.private`/`sip.pstn`/`rtp.public`/`rtp.private`/`webrtc` without an upstream is rejected (`validate_proxy.go:28-30`) |
+| Trunk-only | ≥1 SIP listener (`listen.sip` or `sip.bind_ip`) and ≥1 peer | the entire edge block must be absent — configuring any of `sip.public`/`sip.private`/`sip.pstn`/`rtp.public`/`rtp.private`/`webrtc` without an upstream is rejected (`validate_proxy.go:21-26`) |
 | Edge-only | `sip.upstream.address` or `sip.upstreams.nodes`; ≥1 public listener; `sip.private.bind`; both `rtp.public` and `rtp.private` ranges; advertised IPs for both planes | "at least one SIP listener" and "at least one peer" are skipped when `ProxyEnabled()` |
-| Both | all of the above, and a trunk listener must have peers (`validate_proxy.go:41-43`); all three media ranges must be pairwise disjoint where their binds can collide (`validate_proxy.go:266-292`) | — |
+| Both | all of the above, and a trunk listener must have peers (`validate_proxy.go:34-36`); all three media ranges must be pairwise disjoint where their binds can collide (`validatePoolOverlap`, `validate_proxy.go:270-295`); no two listeners on either plane or the admin API may bind the same socket (`validateSockets`, `validate_proxy.go:326-355`) | — |
 
 Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 `TestTrunkOnlyConfigUnaffected` (`internal/config/proxy_test.go`).
@@ -462,7 +470,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | Key | Type | Default |
 |---|---|---|
 | `listen.sip[]` | `udp\|tcp\|tls://host:port` | none |
-| `listen.media.port_range` | `"min-max"` | `16384-32768`, applied only when neither `rtp.port_min` nor `rtp.port_max` is set |
+| `listen.media.port_range` | `"min-max"` | `16384-32768`, applied only when neither `rtp.port_min` nor `rtp.port_max` is set. With peers configured the range must hold one trunk call: two RTP/RTCP pairs, RTP on an even port (so at least 4 ports from an even start) |
 | `listen.media.public_ip` | IP or `"auto"` | `"auto"` |
 | `listen.media.rtp_timeout` | duration | `5m` |
 | `listen.tls_cert` / `tls_key` / `tls_client_ca` | path | "" |
@@ -475,7 +483,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `max_concurrent_calls` | int | 0 = unlimited |
 | `peers.<n>.address` | `host[:port]` or hostname | required |
 | `peers.<n>.transport` | `udp\|tcp\|tls` | `udp` |
-| `peers.<n>.allowed_ips[]` | CIDR or IP | **≥1 required**, canonicalised with `.Masked()`, no wider than IPv4 /8 or IPv6 /32 |
+| `peers.<n>.allowed_ips[]` | CIDR or IP | **≥1 required**, canonicalised with `.Masked()`, no wider than IPv4 /8 or IPv6 /32. An IPv4-mapped entry (`::ffff:10.0.0.1`, `::ffff:10.0.0.0/104`) is stored as the IPv4 prefix it maps, because sources are unmapped before matching; one shorter than /96 is rejected |
 | `peers.<n>.auth.{username,password,realm}` | | `realm: ""` accepts any challenge realm |
 | `peers.<n>.register` | bool | false; `true` requires `auth` |
 | `peers.<n>.media_latch` | `strict\|loose` | `strict` |
@@ -491,7 +499,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:297-299`) |
 | `rtp.bind_ip` | IP | `""` = every interface |
 | `rtp.advertised_ip` | IP | `""` = the `advertisedIP` chain of §12.1 |
-| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:55-108`) |
+| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max`, and room for one trunk call (`validateTrunkMediaRange`) |
 
 Key relationships: `sip.bind_ip` and `listen.sip` are mutually exclusive
 (`sip.bind_ip` *replaces* the listener list); `rtp.port_min/max` and
@@ -532,7 +540,7 @@ durations beyond "> 0".
 | `network.public.{bind_ip,advertised_ip}` | advertised defaults to bind only when the bind is a *specific* address; a wildcard bind makes `advertised_ip` mandatory |
 | `network.private.{bind_ip,advertised_ip}` | same |
 | `sip.public.udp` / `ws` / `wss` | `{enabled, bind, cert_file, key_file}`; default binds are `:5060` / `:5066` / `:5061` on `network.public.bind_ip` (else `0.0.0.0`) |
-| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`proxy.go:418-424`) — always defaulted while the proxy is on, so the `required` check at `validate_proxy.go:236` cannot fire |
+| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`listenerDefaults`, `proxy.go:444-450`) — always defaulted while the proxy is on, so validation has no "required" check. With both network binds unset, the default public UDP bind collides with it and validation says so |
 | `sip.private.advertised_ip` / `advertised_port` | port defaults to the bind port |
 | `sip.upstream.address` / `transport` | v1 single-node alias; transport must be `udp` |
 | `sip.upstreams.nodes.<n>.{address,transport}` | multi-node pool; addresses must be literal `IP:port`, transport `udp` |
@@ -542,7 +550,7 @@ durations beyond "> 0".
 | `sip.pstn.match` | required; must name neither the private SIP socket nor any upstream |
 | `sip.pstn.attempt_timeout` | `32s` |
 | `sip.pstn.cooldown` | `30s` |
-| `rtp.public` / `rtp.private` `{bind_ip,advertised_ip,port_min,port_max}` | both planes' ranges are required when the proxy is on, and must be disjoint from each other and from the trunk range |
+| `rtp.public` / `rtp.private` `{bind_ip,advertised_ip,port_min,port_max}` | both planes' ranges are required when the proxy is on, must each hold at least one RTP/RTCP pair, and must be disjoint from each other and from the trunk range |
 | `webrtc.enabled` | false |
 | `webrtc.ice_mode` | `"lite"` — the only supported value |
 | `webrtc.rtcp_mux` | `*bool`, nil = true; an explicit `false` is rejected |
@@ -552,8 +560,14 @@ Notable cross-key rules: `sip.upstream.address` and `sip.upstreams.nodes` are
 mutually exclusive; `sip.pstn.address` and `sip.pstn.gateways`/`routes` are
 mutually exclusive; `sip.pstn` requires `sip.public.udp.enabled` because the
 carrier leg rides the public UDP side; `webrtc.enabled` requires `ws` or
-`wss`; and upstream/gateway addresses must be **literal IP:port** — there is
-no DNS on the edge plane.
+`wss`; and upstream/gateway addresses must be **literal IP:port** and
+`sip.pstn.match` a literal IP — there is no DNS on the edge plane. Validation
+enforces this (`checkIPPort`, `validatePSTNMatch`), so `check` rejects a
+hostname exactly as `run`'s `parseEndpoint` does. Every listener — trunk
+`listen.sip`/`sip.bind_ip`, edge `sip.public.*` and `sip.private.bind`, and
+`admin.listen` — is also checked for socket collisions: tcp, tls, ws and wss
+all listen on TCP, udp on UDP, and a wildcard bind collides with every
+address on its port.
 
 ### 5.6 Custom scalar types
 
@@ -2724,7 +2738,9 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
 | `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
-| `admin.authLimiter.mu` | the per-IP auth-failure window |
+| `admin.authLimiter.mu` | the per-source auth-failure window, including reservations |
+| `admin.verifiedCreds.mu` | the verified-credential digests |
+| `admin.Server.writeMu` | `PUT /api/config`'s If-Match check plus atomic write |
 | `config.Store.mu` | the subscriber slice only |
 
 ### 11.3 Atomics, channels, CAS
@@ -2782,7 +2798,7 @@ spin.
 | `trunk.recoverBWaiter` | the orphan B-leg waiter goroutine |
 | `edge.guard` | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` | every relay goroutine; closes **that session only** |
-| `admin.recoverMW` | every HTTP handler; re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `admin.recoverMW` | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
@@ -2903,9 +2919,9 @@ IP verification rejects it.
 | A single routable media address (no TURN) | **Assumed**; the fallback is the first specific `listen.sip` host, else 127.0.0.1 + WARN |
 | Advertised addresses are routable from their own side | **Enforced when the bind is a wildcard** |
 | Media pools do not overlap | **Enforced** across `rtp.public`, `rtp.private` and the trunk range |
-| Upstreams are UDP FreeSWITCHes at literal IPs | **Enforced** |
+| Upstreams are UDP FreeSWITCHes at literal IPs | **Enforced** by validation (`check` and `run`) and again at topology build |
 | Upstream pool members share one FreeSWITCH registration database | **Assumed.** After a failover the new node re-challenges and the phone's answer is valid there too — one extra round trip, not a broken registration. The pool is modulo-hashed, so changing the node set reshuffles users; with a shared database that is a re-registration, not an outage |
-| PSTN gateways are literal IPs, UDP only, never registered and never probed | **Enforced / by design**; the only traffic a gateway sees is the call it is answering |
+| PSTN gateways are literal IPs, UDP only, never registered and never probed | **Enforced** by validation and at topology build **/ by design**; the only traffic a gateway sees is the call it is answering |
 | RTP/RTCP ranges reachable end to end | **Assumed** |
 | IP fragmentation survives the path | **Assumed** |
 | Edge ws/wss listeners are resource-capped | **Not enforced** — the connection cap and idle timeout exist only on the trunk plane |
@@ -2971,7 +2987,7 @@ port-exhaustion metric and no config-reload metric.
 
 | Level | Examples |
 |---|---|
-| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic |
+| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic; `"admin handler panic"` (+ stack) |
 | `Warn` | `"TLS listener using self-signed certificate"`; the one-shot `"no advertised address configured"` fallback; `"SDES key negotiated over non-TLS signaling transport"` (once per secure leg); `"register failed"`; edge upstream/PSTN failover warnings; `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"config written via admin API"`; the plaintext-admin startup warning; `shield banned scanner` |
 | `Info` | `"sip server listening"`, `"edge proxy listening"`, `"freesbc started"`, `"shutting down"`, `"media plane ready"`, `"config reloaded"`; `"registered"` with granted and refresh interval; `"rejected invite"` with code/reason/source; `"declined Require: 100rel"`; `"rejected low Session-Expires"`; `"b-leg not answered"`; edge `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"dialing pstn gateway"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"call ended"` with media stats |
 | `Debug` | dialog ACK/BYE bookkeeping; `"method not implemented"`; `"skipping unregistered target"`; `"b-leg auth challenge unsatisfied"`; `"tcp connection limit reached"`; `"un-register failed"`; `"registration challenged"`; dropped unroutable responses; `"in-dialog request without a dialog record; hashing upstream"`; shield rate-limit drops |
@@ -3011,14 +3027,23 @@ because it is the round-trip source for the editor; redaction would break the
 write-back.
 
 `PUT /api/config`, in order: read at most **1 MiB** + 1 (413 above that);
-optional `If-Match` re-reads the file and returns **409** on a mismatch;
 `config.Parse(body)` on a throwaway config (400 on failure, with the
-validation text, in which expanded `${ENV}` values are redacted — §5); then `writeFileAtomic` — `CreateTemp` in the **same
-directory**, write, `Sync`, `Close`, `Chmod` (0600, or the existing file's
-mode when it exists), `Rename`. Every failure path removes the temp file and
-leaves the original untouched. The submitted bytes are written **verbatim**,
-which is why comments and `${ENV}` references survive; there is no AST
-patching. A 200 carries the new body's ETag.
+validation text, in which expanded `${ENV}` values are redacted — §5); then,
+under `Server.writeMu`, the optional `If-Match` check (re-read the file,
+**409** on a mismatch) and `writeFileAtomic`. The check and the write are
+one critical section, so of several writers holding the same ETag exactly
+one succeeds and the rest get 409 (audit P2-ADM-004); a PUT without
+`If-Match` is last-writer-wins. `writeFileAtomic` first resolves the path
+with `filepath.EvalSymlinks`, so a symlinked config is written at its target
+and the link survives (a dangling link is refused), then: `CreateTemp` in
+the **target's directory**, write, `Sync`, `Close`, `Chmod` (0600, or the
+existing file's mode when it exists), `Rename`, and an `fsync` of the
+directory so the rename is durable (audit P2-ADM-005). A failed directory
+sync is logged as a warning; the new file is already in place. Every other
+failure path removes the temp file and leaves the original untouched. The
+submitted bytes are written **verbatim**, which is why comments and `${ENV}`
+references survive; there is no AST patching. A 200 carries the new body's
+ETag.
 
 The write-back does **not** call `Store.Replace`. Reload happens only because
 `config.Watch` sees the rename in the parent directory, debounces 200 ms, and
@@ -3028,23 +3053,43 @@ re-`Load`s.
 
 `requireAuth` runs per request:
 
-1. `remoteIP(r)` from `RemoteAddr` — **`X-Forwarded-For` is never
-   consulted**.
-2. If the IP is over budget → **429** `too many failed attempts`, with no
-   state change and without checking credentials.
-3. A request with **no `Authorization` header at all** gets a failure record,
+1. A request with **no (parseable) Basic `Authorization` header** gets
    `WWW-Authenticate: Basic realm="freesbc"` and **401 — without running
-   bcrypt**.
-4. Otherwise `subtle.ConstantTimeCompare` on the username **and**
-   `bcrypt.CompareHashAndPassword` on the password are **both** evaluated
-   before deciding, with a generic 401 on either failure.
-5. Credentials come from `store.Current().Admin.Auth` per request, falling
+   bcrypt and without counting a failure**: it guesses nothing, and a
+   browser's first request to the dashboard always looks like this.
+2. Credentials come from `store.Current().Admin.Auth` per request, falling
    back to the construction-time credentials when the reloaded config has no
    `admin:` section.
+3. If the credentials match a **previously verified** entry
+   (`verifiedCreds`), the request is served with no bcrypt and no limiter
+   check. Entries are HMAC-SHA256 digests (per-process random key) over the
+   configured username and hash plus the presented username and password,
+   so a reload that changes either invalidates them all at once; at most
+   **16** are kept, each for **1 h** after its last use. This is what keeps
+   an operator or the Prometheus scrape working when a shared source
+   address (loopback, a reverse proxy) is locked out by someone else's
+   failures, and it saves a KDF per scrape. Only an exact header that
+   already passed bcrypt matches, so it gives a guesser nothing.
+4. `remoteIP(r)` from `RemoteAddr` — **`X-Forwarded-For` is never
+   consulted** — then `limiter.reserve`: under the limiter's lock, if the
+   source is over budget → **429** `too many failed attempts` with no
+   credential check; otherwise one failure is counted **in advance**. The
+   check and the count are one critical section, so concurrent requests can
+   never take more than the remaining budget (audit P2-ADM-002).
+5. `subtle.ConstantTimeCompare` on the username **and**
+   `bcrypt.CompareHashAndPassword` on the password are **both** evaluated
+   before deciding. On failure the reserved count stays and the answer is a
+   generic 401; on success the reservation is refunded and the credentials
+   are remembered (step 3).
 
-Limiter constants: **10** failures per **1 minute** per IP, tracking at most
-**4096** IPs; when the table reaches that size, `recordFail` sweeps expired
-entries and, if it is still full, clears every count.
+Limiter constants: **10** failures per **1 minute** per source, tracking at
+most **4096** sources. A source is an IPv4 address (IPv4-mapped addresses
+are unmapped) or an IPv6 **/64**, so one host cannot mint fresh budgets from
+its own prefix. Expired windows are swept when a new window starts; when the
+table is still full, the entry with the **fewest failures** (oldest on a tie)
+is evicted, so a flood of fresh sources cannot reset an exhausted
+attacker's budget (audit P2-ADM-003). A client whose credentials were never
+verified still gets 429 while its source is over budget.
 
 `http.Server` timeouts: `ReadHeaderTimeout` 5 s, `ReadTimeout` 30 s,
 `WriteTimeout` 30 s, `IdleTimeout` 30 s. Shutdown gets a 5 s drain.
@@ -3150,7 +3195,10 @@ are capped at 64 characters; ICE tokens are sanitised to the ice-char set.
 **Admin.** One bcrypt Basic-Auth realm over the WebUI, `/metrics` and every
 `/api/*` route, with `/healthz` the only unauthenticated route. bcrypt cost
 ≥ 10 is enforced at config load. A missing `Authorization` header is refused
-before any bcrypt work. Per-IP failure limiting is 10/minute. A non-loopback
+before any bcrypt work and not counted as a failure. Failure limiting is
+10/minute per IPv4 address or IPv6 /64, reserved before bcrypt so
+concurrency cannot exceed it; credentials already verified keep working
+while their source is locked out (§13.4). A non-loopback
 `admin.listen` is a **hard validation error** unless `admin.allow_remote:
 true`, and binding remote without TLS logs a prominent startup warning.
 `Cache-Control: no-store` on every response but `/healthz`.

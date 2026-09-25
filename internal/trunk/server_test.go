@@ -317,7 +317,7 @@ func TestServerAdvertisedIPResolution(t *testing.T) {
 		srv, cfg, _ := newSrvForResolution(t, `
 listen:
   sip: [udp://198.51.100.1:5060]
-  media: { port_range: 40000-40001, public_ip: 203.0.113.10 }
+  media: { port_range: 40000-40003, public_ip: 203.0.113.10 }
 peers:
   p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
 routes:
@@ -334,7 +334,7 @@ routes:
 		srv, cfg, logBuf := newSrvForResolution(t, `
 listen:
   sip: [udp://0.0.0.0:5060, udp://198.51.100.5:5061]
-  media: { port_range: 40002-40003, public_ip: auto }
+  media: { port_range: 40004-40007, public_ip: auto }
 peers:
   p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
 routes:
@@ -354,7 +354,7 @@ routes:
 		srv, cfg, logBuf := newSrvForResolution(t, `
 listen:
   sip: [udp://0.0.0.0:5060, "udp://[::]:5061"]
-  media: { port_range: 40004-40005, public_ip: auto }
+  media: { port_range: 40008-40011, public_ip: auto }
 peers:
   p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
 routes:
@@ -419,7 +419,7 @@ func TestServerOurSigPortNo5060Fallback(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 listen:
   sip: [udp://127.0.0.1:11170]
-  media: { port_range: 40006-40007 }
+  media: { port_range: 40012-40015 }
 peers:
   p: { address: 10.0.0.1:5060, allowed_ips: [10.0.0.0/8] }
 routes:
