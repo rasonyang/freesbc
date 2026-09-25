@@ -89,6 +89,9 @@ type attemptResult struct {
 //	forward → on each fork's answer, negotiate codecs and build the
 //	near-side answer → on the 2xx, confirm the dialog → relay.
 func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort) {
+	if s.rejectRequired100rel(req, tx) {
+		return // PRACK cannot pass the proxy (extensions.go)
+	}
 	if isInDialog(req) {
 		s.onReInvite(req, tx)
 		return

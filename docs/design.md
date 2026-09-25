@@ -1306,6 +1306,7 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | Method | Handling |
 |---|---|
 | REGISTER | proxied to an upstream (§7.4); from the private plane → **403 Forbidden** |
+| INVITE with `Require: 100rel` | **420 Bad Extension** + `Unsupported: 100rel` (`rejectRequired100rel`, `extensions.go`), before any classification: a reliable 18x would need a PRACK the proxy refuses |
 | INVITE, no To-tag | dispatched by classification (§7.5) |
 | INVITE, To-tag present | `onReInvite` (§7.9) |
 | ACK | stateless forward (§7.8) |
@@ -1317,6 +1318,22 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 Every locally generated response and every relayed response is sent to
 `req.Source()` — symmetric response routing (RFC 3581), so a response reaches
 a phone behind NAT.
+
+**Advertised extensions** (`sanitizeExtensions`, `extensions.go`). Every
+request `prepareForward` builds and every response `relayResponse` relays
+has its `Allow` cut down to the methods above that the proxy carries
+(`allowedMethods`), and `100rel` removed from `Supported` (either spelling,
+`k` included); the headers are rewritten only when something is dropped, and
+one left empty is removed. Otherwise a callee that saw `Supported: 100rel`
+could send a reliable 18x whose PRACK gets 405 (RFC 3262 §3: the callee
+fails the call after 64·T1), and a session-timer refresher that saw
+`Allow: UPDATE` could refresh with UPDATE (RFC 4028 §9) and lose the call
+at expiry (P2-EDG-010). `Supported: timer` is kept: without UPDATE in
+`Allow` a refresher uses re-INVITE, which §7.9 proxies. PRACK and UPDATE
+are refused rather than proxied because both can carry SDP offers and
+answers inside a dialog, and the edge builds every SDP body itself (§8.8):
+proxying them would need a second offer/answer path beside the INVITE
+one.
 
 ### 7.4 REGISTER proxying and binding lifecycle
 
@@ -3525,8 +3542,9 @@ Stated because the code establishes them, not as future work.
   Bad Extension** + `Unsupported: 100rel` and never advertises it; there is no
   PRACK handler on either plane. A carrier that merely *offers* 100rel works;
   one that *mandates* it does not complete.
-- **No UPDATE** on either plane; the edge plane does not advertise it in
-  `Allow`.
+- **No UPDATE** on either plane. The edge plane also strips `UPDATE` and
+  `PRACK` from the `Allow`, and `100rel` from the `Supported`, of everything
+  it forwards or relays, and answers `Require: 100rel` with 420 (§7.3).
 - **No session-expiry enforcement.** The trunk plane refreshes a leg whose
   session timer names the SBC as refresher, and answers refresh re-INVITEs
   on legs where the far end refreshes (§6.13), but **no timer fires on

@@ -902,7 +902,7 @@ func hostOf(addr string) string {
 // call places an INVITE from the fake switch toward the proxy's private
 // socket, the way FreeSWITCH calls a registered contact, and returns the
 // final response.
-func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string) *sip.Response {
+func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string, extra ...sip.Header) *sip.Response {
 	t.Helper()
 	req := sip.NewRequest(sip.INVITE, ruri)
 	from := &sip.FromHeader{Address: sip.Uri{User: "3003", Host: "example.com"}, Params: sip.NewParams()}
@@ -920,6 +920,9 @@ func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string) *sip.Re
 		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
+	for _, h := range extra {
+		req.AppendHeader(h)
+	}
 	req.SetBody([]byte(body))
 	req.SetTransport("UDP")
 	req.SetDestination(dest)

@@ -228,7 +228,14 @@ These are structural rather than scheduled.
 - **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
   reachable media address; a client that can only reach it via a relay is
   out of scope.
-- **SUBSCRIBE/NOTIFY (and UPDATE, MESSAGE, REFER, PUBLISH) are answered
+- **PRACK and UPDATE are answered 405, not proxied**, so FreeSBC never
+  lets either end advertise them: it removes `PRACK`, `UPDATE` (and every
+  other method it does not proxy) from `Allow` and `100rel` from
+  `Supported` on everything it forwards or relays, and answers an INVITE
+  with `Require: 100rel` with `420 Bad Extension`. Provisional responses
+  are therefore never reliable, and session timers (`Supported: timer`
+  still passes) are refreshed with re-INVITE.
+- **SUBSCRIBE/NOTIFY (and MESSAGE, REFER, PUBLISH) are answered
   405, not proxied.** FreeSWITCH sends a NOTIFY for message-waiting
   indication after a registration; MWI and BLF therefore do not reach
   phones through the proxy. The event framework is
