@@ -16,27 +16,38 @@ import (
 // its goroutines (no cross-goroutine write to a package var); the defaults
 // are set in NewServer. The values may move into config later (deferred).
 
-// tcpLimitListener wraps a TCP/TLS net.Listener with the global connection
-// cap and the per-connection idle read deadline. The cap is enforced with a
-// compare-and-swap on the shared counter, so concurrent Accept loops (one
-// per listener) can never both admit the last slot.
+// tcpLimitListener wraps a TCP/TLS net.Listener with the peer gate, the
+// global connection cap and the per-connection idle read deadline. The cap
+// is enforced with a compare-and-swap on the shared counter, so concurrent
+// Accept loops (one per listener) can never both admit the last slot.
 type tcpLimitListener struct {
 	net.Listener
 	max   int64
 	idle  time.Duration
 	count *atomic.Int64
 	log   *slog.Logger
+
+	// admit is the peer gate, checked before a connection takes a cap
+	// slot (P2-TRK-001): a connection from a source that matches no peer
+	// is closed at accept, before any TLS handshake, so non-peers can
+	// never hold the slots peers need. nil admits every source.
+	admit func(net.Addr) bool
 }
 
-// Accept returns the next admitted connection. A connection accepted over
-// the cap is closed immediately and the accept loop retries — it must never
-// be surfaced to sipgo, whose Serve treats a nil conn or an Accept error as
-// fatal to the listener.
+// Accept returns the next admitted connection. A connection from a
+// non-peer, or one accepted over the cap, is closed immediately and the
+// accept loop retries — it must never be surfaced to sipgo, whose Serve
+// treats a nil conn or an Accept error as fatal to the listener. A
+// non-peer is closed without a log line, like the read filter's drops.
 func (l *tcpLimitListener) Accept() (net.Conn, error) {
 	for {
 		c, err := l.Listener.Accept()
 		if err != nil {
 			return nil, err
+		}
+		if l.admit != nil && !l.admit(c.RemoteAddr()) {
+			c.Close()
+			continue
 		}
 		for {
 			cur := l.count.Load()
@@ -86,9 +97,10 @@ func (c *idleTimeoutConn) Close() error {
 	return err
 }
 
-// newTCPLimitListener wraps ln for s's TCP/TLS accept path: global
-// connection cap (shared counter across all of s's tcp/tls listeners) and
-// per-connection idle read timeout, both taken from s.
+// newTCPLimitListener wraps ln for s's TCP/TLS accept path: the peer gate
+// (the read filter's, fromPeer), global connection cap (shared counter
+// across all of s's tcp/tls listeners) and per-connection idle read
+// timeout, all taken from s.
 func newTCPLimitListener(ln net.Listener, s *Server) net.Listener {
 	return &tcpLimitListener{
 		Listener: ln,
@@ -96,5 +108,6 @@ func newTCPLimitListener(ln net.Listener, s *Server) net.Listener {
 		idle:     s.tcpIdleTimeout,
 		count:    &s.tcpConns,
 		log:      s.log,
+		admit:    s.fromPeer,
 	}
 }

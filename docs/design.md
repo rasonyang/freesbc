@@ -539,9 +539,13 @@ which trims whitespace and honours YAML quoting.
 
 ### 6.1 Ingress
 
-**Transports.** `udp`, `tcp`, `tls` only. TCP and TLS listeners share one
-`atomic.Int64` connection counter across *all* such listeners, capped at
-`tcpMaxConns = 1024`; an over-cap connection is closed and the accept loop
+**Transports.** `udp`, `tcp`, `tls` only. A TCP/TLS connection whose
+source IP matches no peer's `allowed_ips` is closed at accept, before any
+TLS handshake and before it is counted, by the same predicate the read
+filter uses (`fromPeer`, `readfilter.go:30-45`; P2-TRK-001). TCP and TLS
+listeners share one `atomic.Int64` connection counter across *all* such
+listeners, capped at `tcpMaxConns = 1024`, which therefore only peers can
+occupy; an over-cap connection is closed and the accept loop
 retries rather than surfacing an error to sipgo (whose `Serve` treats an
 Accept error as fatal to the listener). Every accepted stream connection is
 wrapped in `idleTimeoutConn`, which refreshes a `SetReadDeadline(now + 120s)`
@@ -603,7 +607,7 @@ Every handler identifies first — not only INVITE and `onNoRoute` but also
 silently: the handler returns without a response. On udp/tcp/tls that
 branch is unreachable in practice: the pre-parse read filter already dropped
 every byte from a source matching no peer (`server.go:443-446`,
-`readfilter.go:22-33`).
+`readfilter.go:24-45`).
 
 `onNoRoute` is overridden precisely so sipgo's default 405 cannot confirm the
 SBC's existence to an unauthorised source: known peers get 405, unknown
@@ -2898,7 +2902,8 @@ to be non-empty and no wider than IPv4 /8 or IPv6 /32.
 
 **TCP/TLS connection limits (trunk).** A shared cap of 1024 concurrent
 connections across all stream listeners and a 120 s idle read deadline per
-connection.
+connection. A connection from a non-peer is closed at accept and never
+counted, so non-peers cannot exhaust the cap (P2-TRK-001).
 
 **Shield.** Every request that is not from the edge's private plane runs
 through `Check` (trunk) or `CheckFrom` (edge, which also knows the source
@@ -2944,7 +2949,7 @@ closes any other on its next read (`closeStream`, P2-SHD-006). An idle
 connection opened before the ban stays open until it next sends. There is no failure-count auto-ban and no
 kernel enforcement: both were removed with P2-SHD-004 (the counter was fed
 only by the trunk's unidentified-source handler, which the pre-parse read
-filter makes unreachable, `readfilter.go:22-33`). The ban and scanner
+filter makes unreachable, `readfilter.go:24-45`). The ban and scanner
 branches of `Check` are therefore reachable only through the **edge**
 shield — whose bans are exported to neither `/metrics` nor the unban API.
 

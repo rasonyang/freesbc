@@ -190,3 +190,59 @@ func TestTCPLimitListenerCapsConnections(t *testing.T) {
 		t.Fatalf("connection admitted after slot release was unexpectedly closed (err=%v)", err)
 	}
 }
+
+// audit: P2-TRK-001
+// A connection the peer gate refuses is closed at accept and never takes a
+// cap slot: with a cap of 1, a refused connection first, then an admitted
+// one still gets the slot.
+func TestTCPLimitListenerRefusesNonPeersBeforeCounting(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	var count atomic.Int64
+	var calls atomic.Int64
+	limited := &tcpLimitListener{
+		Listener: ln,
+		max:      1,
+		idle:     time.Minute,
+		count:    &count,
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Refuse the first source to connect, admit the rest.
+		admit: func(net.Addr) bool { return calls.Add(1) > 1 },
+	}
+
+	refused, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial refused: %v", err)
+	}
+	defer refused.Close()
+	admitted, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial admitted: %v", err)
+	}
+	defer admitted.Close()
+
+	a, err := limited.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer a.Close()
+	if a.RemoteAddr().String() != admitted.LocalAddr().String() {
+		t.Fatalf("accepted %s, want the admitted client %s", a.RemoteAddr(), admitted.LocalAddr())
+	}
+	if got := count.Load(); got != 1 {
+		t.Fatalf("counter = %d, want 1 (the refused connection must not count)", got)
+	}
+	_ = refused.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := refused.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the refused connection got data instead of being closed")
+	} else {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			t.Fatal("the refused connection was left open")
+		}
+	}
+}
