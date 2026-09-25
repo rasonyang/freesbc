@@ -2,6 +2,8 @@ package trunk
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -632,6 +634,32 @@ func TestALegOriginStableAcrossFailover(t *testing.T) {
 		t.Fatalf("bye: %v", err)
 	}
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
+}
+
+// failingTx is a sip.ServerTransaction whose Respond always fails.
+type failingTx struct{ sip.ServerTransaction }
+
+func (failingTx) Respond(*sip.Response) error { return errors.New("transport gone") }
+
+// audit: P2-TRK-023
+// Failed response and teardown sends used to be discarded (`_ =`), which
+// hid lost final responses and lost BYEs. They are logged at Debug.
+func TestFailedSendsAreLogged(t *testing.T) {
+	s := auditBareServer(t)
+	var buf syncLogBuf
+	s.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	msg, err := sip.ParseMessage([]byte(sipRequest("INVITE", "5060", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5070}, "lost-sends-1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reject(msg.(*sip.Request), failingTx{}, 404, "Not Found")
+	s.byeLeg("a", func(context.Context) error { return errors.New("no route to caller") })
+	logs := buf.String()
+	for _, want := range []string{"respond failed", "transport gone", "teardown bye failed", "no route to caller"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log does not record the failed send (%q):\n%s", want, logs)
+		}
+	}
 }
 
 // audit: P2-TRK-013

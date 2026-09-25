@@ -291,7 +291,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		// same as the reject helper, since no dialog exists yet.
 		res := sip.NewResponseFromRequest(req, sip.StatusBadExtension, "Bad Extension", nil)
 		res.AppendHeader(sip.NewHeader("Unsupported", "100rel"))
-		_ = tx.Respond(res)
+		s.respondTx(tx, res)
 		s.log.Info("declined Require: 100rel", "source", req.Source())
 		return
 	}
@@ -304,7 +304,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			// with an acceptable value.
 			res := sip.NewResponseFromRequest(req, 422, "Session Interval Too Small", nil)
 			res.AppendHeader(sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds()))))
-			_ = tx.Respond(res)
+			s.respondTx(tx, res)
 			s.log.Info("rejected low Session-Expires", "requested", se, "min_se", minSE)
 			return
 		}
@@ -331,7 +331,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	remoteA, err := remoteMediaIP(req.Body())
 	if err != nil {
-		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+		s.respondA(aLeg, 488, "Not Acceptable Here")
 		return
 	}
 
@@ -349,7 +349,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	switch fromPeer.SRTP {
 	case "required":
 		if !aSecureOffer || len(aLines) == 0 {
-			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+			s.respondA(aLeg, 488, "Not Acceptable Here")
 			return
 		}
 		secureA = true
@@ -384,7 +384,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			// key rejected by NewSRTPContext) under a policy that requires
 			// SRTP: treat exactly like "not secure" — 488, never a silent
 			// plaintext fallback.
-			_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+			s.respondA(aLeg, 488, "Not Acceptable Here")
 			return
 		}
 		aSRTP = &legSRTP{
@@ -419,7 +419,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		},
 	})
 	if err != nil {
-		_ = aLeg.Respond(503, "Service Unavailable", nil)
+		s.respondA(aLeg, 503, "Service Unavailable")
 		return
 	}
 	defer sess.Close()
@@ -523,13 +523,9 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// silent, tearing down whatever is left.
 	select {
 	case <-c.aLeg.Context().Done():
-		byeCtx, cancel := byeContext()
-		_ = c.bLeg.Bye(byeCtx)
-		cancel()
+		s.byeLeg("b", c.bLeg.Bye)
 	case <-c.bLeg.Context().Done():
-		byeCtx, cancel := byeContext()
-		_ = c.aLeg.Bye(byeCtx)
-		cancel()
+		s.byeLeg("a", c.aLeg.Bye)
 	case <-c.sess.Done():
 		s.byeBoth(c)
 	case <-killCtx.Done():
@@ -546,12 +542,36 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 // (sess.Done) and the admin kick-call teardown (killCtx.Done) — the same
 // path, not a new one.
 func (s *Server) byeBoth(c *call) {
-	aByeCtx, aCancel := byeContext()
-	_ = c.aLeg.Bye(aByeCtx)
-	aCancel()
-	bByeCtx, bCancel := byeContext()
-	_ = c.bLeg.Bye(bByeCtx)
-	bCancel()
+	s.byeLeg("a", c.aLeg.Bye)
+	s.byeLeg("b", c.bLeg.Bye)
+}
+
+// byeLeg sends one teardown BYE bounded by its own byeContext. A failure
+// is logged at Debug: the call is ending either way, but a BYE that never
+// reached the far end leaves it holding a dead dialog, which should be
+// visible in the logs.
+func (s *Server) byeLeg(leg string, bye func(context.Context) error) {
+	ctx, cancel := byeContext()
+	defer cancel()
+	if err := bye(ctx); err != nil {
+		s.log.Debug("teardown bye failed", "leg", leg, "err", err)
+	}
+}
+
+// respondA sends a response with no body on the A-leg dialog. A failure
+// (typically the caller already gone) is logged at Debug, like byeLeg's.
+func (s *Server) respondA(aLeg *sipgo.DialogServerSession, code int, reason string) {
+	if err := aLeg.Respond(code, reason, nil); err != nil {
+		s.log.Debug("respond a-leg failed", "code", code, "err", err, "call_id", fsip.CallID(aLeg.InviteRequest))
+	}
+}
+
+// respondTx sends res on a raw server transaction, logging a failure at
+// Debug.
+func (s *Server) respondTx(tx sip.ServerTransaction, res *sip.Response) {
+	if err := tx.Respond(res); err != nil {
+		s.log.Debug("respond failed", "code", res.StatusCode, "err", err, "call_id", fsip.CallID(res))
+	}
 }
 
 // byeContext bounds a teardown BYE to 5s instead of inheriting a
@@ -703,7 +723,7 @@ func (s *Server) placeCall(c *call, targets []Target, outNumber string, offerBod
 	// here before any target is dialed rather than discovering the same
 	// failure (inside the SDP builder) on every attempt.
 	if err := validAudioSDP(offerBody); err != nil {
-		_ = aLeg.Respond(488, "Not Acceptable Here", nil)
+		s.respondA(aLeg, 488, "Not Acceptable Here")
 		return nil, Target{}, nil, nil, false
 	}
 
@@ -755,11 +775,11 @@ func (s *Server) placeCall(c *call, targets []Target, outNumber string, offerBod
 
 	switch {
 	case haveReal:
-		_ = aLeg.Respond(lastRealCode, lastRealReason, nil)
+		s.respondA(aLeg, lastRealCode, lastRealReason)
 	case haveRing:
-		_ = aLeg.Respond(408, "Request Timeout", nil)
+		s.respondA(aLeg, 408, "Request Timeout")
 	default:
-		_ = aLeg.Respond(503, "Service Unavailable", nil)
+		s.respondA(aLeg, 503, "Service Unavailable")
 	}
 	return nil, Target{}, nil, nil, false
 }
@@ -972,7 +992,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 		// network round trip bounded by its own 5s contexts, and
 		// there's no reason to hold the caller's final response hostage
 		// behind it.
-		_ = aLeg.Respond(502, "Bad Gateway", nil)
+		s.respondA(aLeg, 502, "Bad Gateway")
 		s.ackThenBye(bLeg, target)
 		return nil, attemptResult{}
 	}
@@ -993,7 +1013,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	// TestBridgeSRTPInterworksPlaintextAToSecureB).
 	aAnswer, err := c.aOrigin.build(answer, mediaIP, sess.RTPPort(media.SideA), aSRTP.sdpCrypto())
 	if err != nil {
-		_ = aLeg.Respond(502, "Bad Gateway", nil)
+		s.respondA(aLeg, 502, "Bad Gateway")
 		s.ackThenBye(bLeg, target)
 		return nil, attemptResult{}
 	}
@@ -1004,7 +1024,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 		// the A-leg the call failed.
 		s.log.Error("ack b-leg", "err", err, "target", target.Name)
 		_ = bLeg.Close()
-		_ = aLeg.Respond(502, "Bad Gateway", nil)
+		s.respondA(aLeg, 502, "Bad Gateway")
 		return nil, attemptResult{}
 	}
 	// The establishing 2xx carries a Contact built for the A-leg's actual
@@ -1035,9 +1055,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 		// caller CANCELed), so there is no A-leg response to send — only
 		// tear the carrier call down.
 		s.log.Error("respond a-leg", "err", err)
-		byeCtx, cancel := byeContext()
-		_ = bLeg.Bye(byeCtx)
-		cancel()
+		s.byeLeg("b", bLeg.Bye)
 		return nil, attemptResult{}
 	}
 
@@ -1765,7 +1783,7 @@ func (s *Server) reject(req *sip.Request, tx sip.ServerTransaction, code int, re
 	for _, h := range headers {
 		res.AppendHeader(h)
 	}
-	_ = tx.Respond(res)
+	s.respondTx(tx, res)
 	s.log.Info("rejected invite", "code", code, "reason", reason, "source", req.Source())
 }
 
@@ -1826,20 +1844,12 @@ func (s *Server) cleanupAfterPanic(req *sip.Request, g *callGuard) {
 		return
 	}
 	if code >= 200 && code < 300 && c.aLeg != nil {
-		ctx, cancel := byeContext()
-		if err := c.aLeg.Bye(ctx); err != nil {
-			s.log.Debug("bye a-leg after panic", "err", err, "call_id", fsip.CallID(req))
-		}
-		cancel()
+		s.byeLeg("a", c.aLeg.Bye)
 	}
 	if c.bLeg != nil {
 		switch c.bLeg.LoadState() {
 		case sip.DialogStateConfirmed:
-			ctx, cancel := byeContext()
-			if err := c.bLeg.Bye(ctx); err != nil {
-				s.log.Debug("bye b-leg after panic", "err", err, "call_id", fsip.CallID(req))
-			}
-			cancel()
+			s.byeLeg("b", c.bLeg.Bye)
 		case sip.DialogStateEstablished:
 			s.ackThenBye(c.bLeg, c.target)
 		}

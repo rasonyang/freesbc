@@ -308,7 +308,12 @@ func (s *Server) Run(ctx context.Context) error {
 
 	s.registrar = NewRegistrar(s.store, client, s, s.log)
 	regDone := make(chan struct{})
-	go func() { _ = s.registrar.Run(regCtx); close(regDone) }()
+	go func() {
+		if err := s.registrar.Run(regCtx); err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Debug("registrar stopped", "err", err)
+		}
+		close(regDone)
+	}()
 
 	errs := make(chan error, len(listeners))
 	var wg sync.WaitGroup
@@ -458,7 +463,9 @@ func (s *Server) withShield(next func(*sip.Request, sip.ServerTransaction)) func
 				s.log.Error("sip handler panic",
 					"panic", r, "stack", string(debug.Stack()), "method", req.Method.String())
 				// Best-effort 500 — the transaction may already be gone.
-				_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Internal Error", nil))
+				if err := tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Internal Error", nil)); err != nil {
+					s.log.Debug("respond 500 after panic", "err", err, "method", req.Method.String())
+				}
 			}
 		}()
 		sh := s.shield.Load()

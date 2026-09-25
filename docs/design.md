@@ -188,7 +188,8 @@ Created once, alive for the process lifetime:
 | per `register: true` peer: `registration.run` | `Registrar.reconcile` | peer removed/changed, or `stopAll` |
 | per request: sipgo handler goroutine | sipgo | handler return — for `onInvite`, the whole call |
 | per dial attempt: B-leg waiter | `dialTarget` (`b2bua.go:956`) | `WaitAnswer` returns; may outlive the attempt to sipgo Timer_B (~32 s) |
-| abandoned SRV lookup | `lookupSRVTimeout` (`resolve.go:90`) | when the DNS call finally returns |
+| per forked B-leg 2xx: ACK + BYE | `forkWatch.handleLocked` (`forks.go`) | the BYE's final response or its 5 s `byeContext` |
+| per session-timer leg the SBC refreshes: `refreshLoop` | `startRefreshers` (`sessiontimer.go`) | the call's kick context, cancelled by `endCall` |
 | shield prune loop | `shield.New` | `Shield.Close` |
 | nftables worker | `nftBackend.start` | backend close (drops queued bans) |
 
@@ -961,6 +962,10 @@ default 1 h).
 - `registerOnce` sends a REGISTER; a **423 Interval Too Brief** carrying a
   larger `Min-Expires` is retried **once**, non-recursively — at most two
   exchanges.
+- Every REGISTER of one registration — refreshes, digest retries and the
+  final un-REGISTER — reuses the registration's own Call-ID and increments
+  its CSeq (`regSeq`, RFC 3261 §10.2). A registration restarted by a
+  reconcile (changed peer parameters) starts a new Call-ID.
 - On 401/407, **realm pinning runs first** (`realmPinned`, `timers.go`): the
   first challenge header is parsed as RFC 2617 auth-params (case-insensitive
   names, quoted-string values) **and** with the parser sipgo digests with
@@ -1008,9 +1013,10 @@ peer registers on 5061 exactly as it INVITEs.
 lookup with the owner label chosen by transport (`_sips._tcp` for tls,
 `_sip._tcp` for tcp, `_sip._udp` otherwise).
 
-- Lookups run under a **3 s** timeout in a throwaway goroutine that is
-  abandoned on expiry; results are deduplicated with `singleflight` and
-  cached under `host/transport`.
+- Lookups run on the caller's goroutine through `net.Resolver.LookupSRV`
+  under a context with a **3 s** deadline (`lookupSRVTimeout`), so a lookup
+  that times out is cancelled rather than left running; results are
+  deduplicated with `singleflight` and cached under `host/transport`.
 - An error, zero records, or all records filtered unusable falls back to the
   bare host at the transport's default port, cached for
   `min(srv_cache_ttl, 10s)` — the short negative-cache TTL.
