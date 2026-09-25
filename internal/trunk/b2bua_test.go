@@ -4671,7 +4671,9 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
-	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	// The caller supports session timers: only then does the A-leg 2xx
+	// carry Session-Expires (RFC 4028 §9).
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)), sip.NewHeader("Supported", "timer"))
 	if err != nil {
 		t.Fatalf("uac invite: %v", err)
 	}
@@ -4730,6 +4732,9 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 	aSupported := sess.InviteResponse.GetHeaders("Supported")
 	if !hasToken(aSupported, "timer") {
 		t.Errorf("A-leg 200 Supported = %v, want to include timer", aSupported)
+	}
+	if aRequire := sess.InviteResponse.GetHeaders("Require"); !hasToken(aRequire, "timer") {
+		t.Errorf("A-leg 200 Require = %v, want timer (RFC 4028 §9)", aRequire)
 	}
 
 	// --- teardown ---

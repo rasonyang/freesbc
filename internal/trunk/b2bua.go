@@ -191,12 +191,9 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// entry.answer, which on a secure leg carries the SDES master key. A
 	// matching dialog is then held to the refresh test.
 	//
-	// Limitation: this bare-tx.Respond path does NOT retransmit the 2xx
-	// (sipgo's TU retransmit-until-ACK loop lives in
-	// DialogServerSession.WriteResponse, which we deliberately bypass). If
-	// the refresh 200 is lost, the refresher's re-INVITE transaction times
-	// out and per RFC 4028 §10 it may BYE at session expiry. Acceptable on a
-	// reliable link; a retransmit loop is deferred.
+	// The refresh 200 goes out on the raw transaction, bypassing sipgo's
+	// retransmit-until-ACK loop in DialogServerSession.WriteResponse, so
+	// respond2xxUntilAck retransmits it itself; onAck stops it.
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
 		entry, known := s.lookupDialog(fsip.CallID(req), fsip.FromTag(req), tag)
 		if !known {
@@ -204,22 +201,38 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			return
 		}
 		if isRefreshReInvite(req, entry.compare) {
+			cfg := s.store.Current()
+			se := headerSeconds(req, "Session-Expires")
+			if minSE := cfg.MinSE.Std(); se < minSE {
+				// RFC 4028 §9 applies to a refresh as to the initial
+				// INVITE: below our floor is 422, with the floor.
+				s.reject(req, tx, 422, "Session Interval Too Small",
+					sip.NewHeader("Min-SE", strconv.Itoa(int(minSE.Seconds()))))
+				return
+			}
 			// The refresh's 200 OK MUST carry a Contact (RFC 3261 §12.1.1:
 			// every 2xx to INVITE does), which
 			// sip.NewResponseFromRequest does not add on its own — build
 			// the same per-transport Contact the leg's original 200 used,
 			// from the current config and the re-INVITE's own transport
 			// (req.Transport(): whichever leg sent this refresh).
-			cfg := s.store.Current()
 			transport := sip.NetworkToLower(req.Transport())
 			contact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, transport), transport)
 
 			res := sip.NewResponseFromRequest(req, 200, "OK", entry.answer)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 			res.AppendHeader(contact)
-			res.AppendHeader(sessionExpiresHeader(headerSeconds(req, "Session-Expires"), refresherOf(req)))
-			if err := tx.Respond(res); err != nil {
-				s.log.Error("respond session-timer refresh", "err", err, "call_id", fsip.CallID(req))
+			res.AppendHeader(sessionExpiresHeader(se, refresherOf(req)))
+			res.AppendHeader(sip.NewHeader("Supported", "timer"))
+			if hasOptionTag(req, "Supported", "timer") {
+				// §9: a 2xx carrying Session-Expires to a UAC that
+				// supports the extension also carries Require: timer.
+				res.AppendHeader(sip.NewHeader("Require", "timer"))
+			}
+			// Retransmitted until the ACK (RFC 3261 §13.3.1.4): answering
+			// on the raw transaction bypasses sipgo's own 2xx loop.
+			if err := s.respond2xxUntilAck(req, tx, res); err != nil {
+				s.log.Info("session-timer refresh 200 not acknowledged", "err", err, "call_id", fsip.CallID(req))
 			}
 			return
 		}
@@ -494,6 +507,9 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	if s.onBridged != nil {
 		s.onBridged(c)
 	}
+	// Refresh whichever leg's session timer names the SBC as refresher
+	// (sessiontimer.go); the loops end with killCtx, which endCall cancels.
+	s.startRefreshers(killCtx, c, cfg, c.aTimer, bLegSessionTimer(bLeg.InviteResponse))
 
 	// Hold the call open until either leg ends the dialog or media goes
 	// silent, tearing down whatever is left.
@@ -1003,14 +1019,9 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
 	aContact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, aTransport), aTransport)
-	negotiatedSE := negotiateSE(
-		headerSeconds(aLeg.InviteRequest, "Session-Expires"),
-		headerSeconds(aLeg.InviteRequest, "Min-SE"),
-		cfg.SessionExpires.Std(), cfg.MinSE.Std())
-	if err := aLeg.Respond(200, "OK", aAnswer,
-		sip.NewHeader("Content-Type", "application/sdp"), aContact,
-		sessionExpiresHeader(negotiatedSE, "uac"),
-		sip.NewHeader("Supported", "timer")); err != nil {
+	timerHeaders, aTimer := aLegSessionTimer(aLeg.InviteRequest, cfg)
+	headers := append([]sip.Header{sip.NewHeader("Content-Type", "application/sdp"), aContact}, timerHeaders...)
+	if err := aLeg.Respond(200, "OK", aAnswer, headers...); err != nil {
 		// The B-leg is already Acked/Confirmed here, so it's a live carrier
 		// call; the A-leg answer attempt itself failed (typically the
 		// caller CANCELed), so there is no A-leg response to send — only
@@ -1022,6 +1033,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 		return nil, attemptResult{}
 	}
 
+	c.aTimer = aTimer
 	return bLeg, attemptResult{ok: true, aAnswer: aAnswer, bOffer: bOffer}
 }
 

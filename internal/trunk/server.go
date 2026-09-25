@@ -56,6 +56,10 @@ type Server struct {
 	forkMu sync.Mutex
 	forks  map[forkKey]*forkWatch
 
+	// refreshAckState tracks the 2xx to refresh re-INVITEs that are being
+	// retransmitted until their ACK (sessiontimer.go).
+	refreshAckState
+
 	// onBridged, when non-nil, runs right after registerCall publishes a
 	// call. Only tests set it (before Run), to exercise recoverCall on a
 	// bridged call.
@@ -590,6 +594,11 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction) {
 func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction) {
 	if _, _, ok := s.identify(req); !ok {
 		s.dropUnidentified(req)
+		return
+	}
+	// The ACK for a 2xx to a locally answered refresh re-INVITE stops that
+	// 2xx's retransmission; it belongs to no dialog-cache transaction.
+	if s.ackReceived(req) {
 		return
 	}
 	if err := s.dialogSrv.ReadAck(req, tx); err != nil {

@@ -74,8 +74,10 @@ The two sections are mutually independent: SIP can advertise one public address 
   both directions, NAT traversal via hardened first-packet latching;
   **no transcoding** (left to the softswitch behind)
 - **Carrier interop baseline** — OPTIONS answering and session-timer
-  negotiation (RFC 4028), including the 422/Min-SE exchange on both legs; no
-  timer tears a call down on session expiry
+  negotiation (RFC 4028), including the 422/Min-SE exchange on both legs;
+  the SBC refreshes a leg whose far end names it refresher, and answers
+  refreshes (retransmitting the 200 until ACKed) on the others; no timer
+  tears a call down on session expiry
 
 ## Roadmap (trunk plane)
 

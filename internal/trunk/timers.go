@@ -8,24 +8,66 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
+// compactNames maps a header's long name to its compact form, for the
+// headers the session-timer code reads (RFC 4028 §4: x = Session-Expires;
+// RFC 3261 §7.3.3 / §20: k = Supported). sipgo's parser expands only the
+// compact forms RFC 3261 core headers use, so a message carrying "x: 30"
+// keeps a header literally named "x".
+var compactNames = map[string]string{
+	"session-expires": "x",
+	"supported":       "k",
+}
+
+// headersNamed returns m's headers called name, in its long or compact
+// form.
+func headersNamed(m sip.Message, name string) []sip.Header {
+	hs := m.GetHeaders(name)
+	if c, ok := compactNames[strings.ToLower(name)]; ok {
+		hs = append(hs, m.GetHeaders(c)...)
+	}
+	return hs
+}
+
+// maxDeltaSeconds is the largest delta-seconds value honoured: RFC 3261
+// §25.1 (via RFC 4028 §4) says larger values are treated as 2^32-1.
+const maxDeltaSeconds = 1<<32 - 1
+
 // headerSeconds parses the leading delta-seconds value of a header (the
-// number before any ';' parameters), e.g. "1800;refresher=uac" → 1800s.
-// Returns 0 if the header is absent or unparseable.
+// number before any ';' parameters), e.g. "1800;refresher=uac" → 1800s,
+// accepting the header's compact form. Values above 2^32-1 are clamped to
+// it. Returns 0 if the header is absent or unparseable.
 func headerSeconds(m sip.Message, name string) time.Duration {
-	headers := m.GetHeaders(name)
+	headers := headersNamed(m, name)
 	if len(headers) == 0 {
 		return 0
 	}
-	h := headers[0]
-	v := h.Value()
+	v := headers[0].Value()
 	if i := strings.IndexByte(v, ';'); i >= 0 {
 		v = v[:i]
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || n < 0 {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.Trim(v, "0123456789") != "" {
 		return 0
 	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || n > maxDeltaSeconds {
+		// All digits, so the only possible error is overflow.
+		n = maxDeltaSeconds
+	}
 	return time.Duration(n) * time.Second
+}
+
+// hasOptionTag reports whether any of m's headers called name (long or
+// compact form) lists the option tag (case-insensitive).
+func hasOptionTag(m sip.Message, name, tag string) bool {
+	for _, h := range headersNamed(m, name) {
+		for _, t := range strings.Split(h.Value(), ",") {
+			if strings.EqualFold(strings.TrimSpace(t), tag) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // challengeRealm extracts the realm from a 401/407 digest challenge
@@ -67,14 +109,7 @@ func challengeRealm(res *sip.Response) string {
 // requires100rel reports whether any Require header lists the 100rel option
 // tag (reliable provisional responses, which we do not support).
 func requires100rel(req *sip.Request) bool {
-	for _, h := range req.GetHeaders("Require") {
-		for _, tag := range strings.Split(h.Value(), ",") {
-			if strings.EqualFold(strings.TrimSpace(tag), "100rel") {
-				return true
-			}
-		}
-	}
-	return false
+	return hasOptionTag(req, "Require", "100rel")
 }
 
 // negotiateSE picks the session interval to advertise: the smaller of the
@@ -147,31 +182,32 @@ func stripOriginLine(sdp []byte) string {
 	return strings.Join(kept, "\n")
 }
 
-// refresherOf returns the refresher parameter carried on req's own
-// Session-Expires header (e.g. "uac" from ";refresher=uac"), defaulting to
-// "uac" if the header is absent or carries no refresher param. We echo the
-// refresher the refreshing endpoint itself stated: a locally-answered refresh
-// re-INVITE can arrive from either leg (the caller on the A-leg, negotiated
-// refresher=uac; the carrier on the B-leg, requested refresher=uas), and
-// echoing the request's own value is correct for both without inspecting
-// which dialog matched.
-func refresherOf(req *sip.Request) string {
-	headers := req.GetHeaders("Session-Expires")
+// refresherParam returns the refresher parameter of m's Session-Expires
+// header ("uac" or "uas", lower-cased), or "" when the header or the
+// parameter is absent.
+func refresherParam(m sip.Message) string {
+	headers := headersNamed(m, "Session-Expires")
 	if len(headers) == 0 {
-		return "uac"
+		return ""
 	}
-	v := headers[0].Value()
-	i := strings.Index(v, "refresher=")
-	if i < 0 {
-		return "uac"
+	for _, p := range strings.Split(headers[0].Value(), ";")[1:] {
+		name, value, ok := strings.Cut(strings.TrimSpace(p), "=")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "refresher") {
+			return strings.ToLower(strings.TrimSpace(value))
+		}
 	}
-	v = v[i+len("refresher="):]
-	if j := strings.IndexByte(v, ';'); j >= 0 {
-		v = v[:j]
+	return ""
+}
+
+// refresherOf returns the refresher parameter carried on req's own
+// Session-Expires header, defaulting to "uac" if the header is absent or
+// carries no refresher param. A refresh re-INVITE answered locally can
+// arrive from either leg, and whichever endpoint sent it is the refresher
+// it names; echoing the request's own value is correct for both without
+// inspecting which dialog matched.
+func refresherOf(req *sip.Request) string {
+	if r := refresherParam(req); r != "" {
+		return r
 	}
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return "uac"
-	}
-	return v
+	return "uac"
 }

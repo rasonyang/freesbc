@@ -107,6 +107,9 @@ type call struct {
 	// failover). Each B-leg attempt gets its own, in dialTarget.
 	aOrigin *sdpOrigin
 
+	// aTimer is the session timer the A-leg 2xx set up (sessiontimer.go).
+	aTimer legTimer
+
 	// aSDP/bSDP are the established SDP bodies plus dialog tags for each
 	// leg; together with id/bID they are each leg's dialog ID.
 	aSDP legSDP

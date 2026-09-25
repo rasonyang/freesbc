@@ -617,15 +617,25 @@ SBC's existence to an unauthorised source: known peers get 405, unknown
 sources get silence.
 
 The in-dialog branch never touches `dialogSrv`: in sipgo v1.4.3 `ReadInvite`
-is single-use and re-entering it corrupts the dialog's To-tag. The refresh
-200 is sent on the raw transaction, which bypasses
-`DialogServerSession.WriteResponse`'s retransmit-until-ACK loop, so a lost
-refresh 200 is not retransmitted. The 200 echoes whatever `Session-Expires`
-the refresher asked for, unvalidated (the `min_se` floor applies only to the
-initial INVITE), with the refresher parameter echoed off the request
-(`refresherOf`, `timers.go:158-177`, defaulting to `uac`), a Contact rebuilt
-for the re-INVITE's own transport, and `Content-Type: application/sdp`
-(`b2bua.go:206-213`). A failed `tx.Respond` is logged; nothing else is sent.
+is single-use and re-entering it corrupts the dialog's To-tag. A refresh
+whose `Session-Expires` is below `min_se` gets **422** + `Min-SE`, as the
+initial INVITE does. Otherwise the 200 echoes the requested
+`Session-Expires` with the refresher parameter echoed off the request
+(`refresherOf`, `timers.go:208-213`, defaulting to `uac`), plus
+`Supported: timer`, `Require: timer` when the request said
+`Supported: timer` (RFC 4028 §9), a Contact rebuilt for the re-INVITE's own
+transport, and `Content-Type: application/sdp`. The 200 goes out on the raw
+transaction, which bypasses `DialogServerSession.WriteResponse`'s
+retransmit-until-ACK loop, so `respond2xxUntilAck`
+(`sessiontimer.go:267-293`) retransmits it itself at T1 doubling to T2 until
+the ACK arrives or 64·T1 pass (RFC 3261 §13.3.1.4); `onAck` stops it
+(`ackReceived`) before handing any other ACK to `dialogSrv`. The handler
+goroutine blocks for that time.
+
+Header names are matched in long and compact form (`x` = Session-Expires,
+`k` = Supported; `headersNamed`, `timers.go:23-29`), since sipgo expands only
+RFC 3261's core compact names. Delta-seconds above 2^32-1 are clamped to it
+(`headerSeconds`, RFC 3261 §25.1).
 
 ### 6.3 Initial INVITE — control flow
 
@@ -676,8 +686,10 @@ gone out yet. The `Close` defers only drop local dialog state, so without
 this the far ends would keep a confirmed dialog with dead media.
 
 The media session is allocated **once, before any target is dialled**, and is
-shared by every failover attempt. There is no per-call timer goroutine: no
-session-expiry enforcement and no call-duration cap. `ring_timeout` is a
+shared by every failover attempt. The only per-call timer goroutines are the
+session refreshers (§6.13), started only on a leg whose session timer names
+the SBC as refresher; there is no session-expiry enforcement for a leg the
+far end refreshes, and no call-duration cap. `ring_timeout` is a
 per-attempt `context.WithTimeout`, not a goroutine.
 
 The quota slot is held for the whole call (the `defer release()` runs at
@@ -810,11 +822,12 @@ Post-answer (2xx), every path is non-retryable except one:
   `sess.RTPPort(SideA)`; on error 502 + `ackThenBye`.
 - `bLeg.Ack(aLeg.Context())`; on error `bLeg.Close()` and 502.
 - The A-leg 200 OK carries `Content-Type: application/sdp`, a Contact built
-  for the **caller's actual transport**, `Session-Expires: <negotiated>;refresher=uac`
-  and `Supported: timer`. The advertised value is `negotiateSE`
-  (`timers.go:87-100`, applied at `b2bua.go:1303-1306`): the smaller of the
-  caller's requested `Session-Expires` and `session_expires`, floored at the
-  larger of `min_se` and the caller's own `Min-SE` (RFC 4028 §9). `Respond` blocks until the A-leg ACK arrives
+  for the **caller's actual transport**, `Supported: timer`, and — only when
+  the caller said `Supported: timer` — `Session-Expires: <negotiated>;refresher=<r>`
+  and `Require: timer` (`aLegSessionTimer`, `sessiontimer.go:46-64`; §6.13).
+  The negotiated value is `negotiateSE` (`timers.go:122-135`): the smaller
+  of the caller's requested `Session-Expires` and `session_expires`, floored
+  at the larger of `min_se` and the caller's own `Min-SE` (RFC 4028 §9). `Respond` blocks until the A-leg ACK arrives
   (sipgo retransmits the 2xx up to 64×T1).
 
 ### 6.6 Provisional relay
@@ -1058,6 +1071,33 @@ concurrently under `-race` by `TestKillCallRacesNaturalEnd`.
 
 Only a **bridged** call is killable; a call still dialling is invisible to
 the admin API.
+
+### 6.13 Session timers
+
+RFC 4028 is negotiated per leg (`sessiontimer.go`). The SBC is the UAS on the
+A-leg and the UAC on the B-leg.
+
+| Leg | What the SBC sends | Who refreshes |
+|---|---|---|
+| A (caller) | 2xx: `Session-Expires` + `Require: timer` only if the INVITE said `Supported: timer` (§9); none otherwise | the refresher the caller asked for; `uac` (the caller) when it named none. A caller without timer support gets no session timer |
+| B (carrier) | INVITE: `Supported: timer`, `Session-Expires: <session_expires>;refresher=uas`, `Min-SE` | whatever the carrier's 2xx says: no `Session-Expires` → no timer; `refresher=uac` → the SBC; `uas` → the carrier |
+
+When a leg names the SBC as refresher, `startRefreshers`
+(`sessiontimer.go:177-205`) runs `refreshLoop` for it, bound to the call's
+kick context (so it ends when `endCall` runs). Every half interval it sends a
+re-INVITE on that dialog through sipgo's dialog session (`Do`, which builds
+the in-dialog headers, CSeq and route set) carrying the SBC's established SDP
+for that leg and `Session-Expires: <interval>;refresher=uac`, and ACKs the
+2xx. A 2xx that moves the refresher to the far end stops the loop; a 422
+retries at once with the far end's `Min-SE`; a transaction timeout, **408**
+or **481** ends the call (`c.cancel`, so both legs get a BYE, §10); any other
+failure is retried after a quarter interval. A far end that is itself the
+refresher and stops refreshing is still not timed out: the call stays up
+until RTP silence trips the watchdog or a BYE arrives.
+
+The refreshers are the only goroutines besides `onInvite` that use a trunk
+call's sipgo dialog sessions. They only build and send requests through
+them, which read the dialog's immutable INVITE/response and its atomic CSeq.
 
 ---
 
@@ -3036,6 +3076,10 @@ cannot echo a secret because expansion runs after the unmarshal.
 | `ring_timeout` | 60 s (config) | one trunk dial attempt |
 | grace after the ring deadline | 250 ms | abandoning a trunk attempt |
 | `byeContext` | 5 s | every trunk teardown BYE and `ackThenBye` ACK |
+| trunk session refresh | every ½ interval (¼ after a rejected refresh) | a leg whose session timer names the SBC as refresher |
+| trunk refresh re-INVITE | 64·T1 (32 s) | one refresh the SBC sends |
+| trunk refresh 200 retransmission | T1 doubling to T2, for up to 64·T1 | a locally answered refresh, until its ACK |
+| forked-2xx watch | 64·T1 after the attempt settles | ACK+BYE of losing forks |
 | un-REGISTER | 2 s | per attempt, on its own root context |
 | registrar backoff | 5 s → ×2 → 60 s | failed registration retry |
 | registrar refresh | 0.9 × granted, floored at 10 s | successful registration |
@@ -3168,15 +3212,12 @@ Stated because the code establishes them, not as future work.
   one that *mandates* it does not complete.
 - **No UPDATE** on either plane; the edge plane does not advertise it in
   `Allow`.
-- **No session-timer enforcement.** Both planes negotiate or ignore
-  `Session-Expires`, but **no timer anywhere fires on expiry**: no goroutine,
-  no deadline field, no RFC 4028 §10 BYE. The trunk plane advertises
-  `refresher=uac` toward the caller and `refresher=uas` toward the carrier so
-  that every refresh arrives **at** the SBC, and it answers refresh
-  re-INVITEs; a carrier that forces `refresher=uac` on the B-leg is a known
-  limitation. The edge plane never reads or inserts `Session-Expires` at all.
-  A peer that stops refreshing keeps the call up until RTP silence trips the
-  watchdog or a BYE arrives.
+- **No session-expiry enforcement.** The trunk plane refreshes a leg whose
+  session timer names the SBC as refresher, and answers refresh re-INVITEs
+  on legs where the far end refreshes (§6.13), but **no timer fires on
+  expiry**: a far end that stops refreshing keeps the call up until RTP
+  silence trips the watchdog or a BYE arrives. The edge plane never reads or
+  inserts `Session-Expires` at all.
 - **No mid-call media re-INVITE on the trunk plane.** Anything that is not a
   session-timer refresh is answered **501**; per RFC 3261 §14.1 a failed
   re-INVITE does not terminate the dialog, so the call continues with its
