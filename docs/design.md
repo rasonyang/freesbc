@@ -593,7 +593,8 @@ REGISTER, SUBSCRIBE, NOTIFY, MESSAGE or REFER handler.
 | Method / event | Handling |
 |---|---|
 | **INVITE, no To-tag** | full bridge (§6.3) |
-| **INVITE, To-tag present** | in-dialog branch: tag mismatch → **481**; session-timer refresh → **200 + the SBC's own established answer**; anything else (including a genuine media re-INVITE, and an unknown Call-ID) → **501 Not Implemented** |
+| **INVITE, no To-tag, same Call-ID + From-tag + CSeq as an INVITE still being handled** | merged request (RFC 3261 §8.2.2.2): **482 Loop Detected**, before quota or routing (`beginInvite`, `calls.go:265-281`) |
+| **INVITE, To-tag present** | in-dialog branch, matched on Call-ID + both tags (`lookupDialog`, `calls.go:232-243`): a live Call-ID with other tags → **481**; session-timer refresh → **200 + the SBC's own established answer**; anything else (including a genuine media re-INVITE, and an unknown Call-ID) → **501 Not Implemented** |
 | **ACK** | `dialogSrv.ReadAck`; "no such dialog" is expected for rejected INVITEs and only Debug-logged |
 | **BYE** | `dialogSrv.ReadBye`, then `dialogCli.ReadBye`; **481** only if both report no matching dialog; any other error is Debug-logged |
 | **OPTIONS** | identified peers get an unconditional **200 OK**, in or out of dialog, with no Allow/Accept/Supported header and no body |
@@ -628,7 +629,7 @@ for the re-INVITE's own transport, and `Content-Type: application/sdp`
 
 ### 6.3 Initial INVITE — control flow
 
-`onInvite` (`b2bua.go:127-488`) runs on sipgo's per-request goroutine and
+`onInvite` (`b2bua.go:127-494`) runs on sipgo's per-request goroutine and
 **blocks there for the entire call**.
 
 ```
@@ -636,6 +637,7 @@ defer recoverCall(req)                        // per-call panic umbrella
 identify(req); !ok -> dropUnidentified, silent return
 From()/To()/CallID() nil -> 400
 [in-dialog branch, §6.2]
+beginInvite(Call-ID, From-tag, CSeq); dup -> 482; defer done
 cfg := store.Current()                        // per-call config snapshot
 quota.acquire(peer cap, global cap); !ok -> 503 Call Quota Exceeded + Retry-After: 30
 requires100rel -> 420 ; Session-Expires < min_se -> 422
@@ -951,12 +953,20 @@ stateDiagram-v2
 
 Transitions, with the function that performs each:
 `callDialing` is set inline when the `call` literal is built in `onInvite`
-(`b2bua.go:404`); the call exists only as that function's local variable and
+(`b2bua.go:410`); the call exists only as that function's local variable and
 is in no map, so `/api/calls` cannot list it and `KillCall` cannot find it.
-`callBridged` is set **only** by `registerCall` (`calls.go:119`), under the
-lock that inserts the call into `calls[id]`, `legs[id]` and `legs[bID]`.
-`callEnded` is set **only** by `endCall` (`calls.go:134`), under the same
-lock that removes those entries. No production branch reads `state`; the
+`callBridged` is set **only** by `registerCall` (`calls.go:168`), under the
+lock that mints the call's admin ID and inserts the call into
+`calls[adminID]` and into the `legs` lists under its A-leg and B-leg
+Call-IDs. `callEnded` is set **only** by `endCall` (`calls.go:190`), under the
+same lock that removes exactly this call's entries.
+
+The store is keyed by dialog, not by Call-ID. `calls` is keyed by a random
+admin ID; `legs` maps a Call-ID to a list of `legRef` (call, which leg, the
+leg's tags), so two live calls that share a Call-ID — a peer reusing one with
+a new From-tag, or an A-leg Call-ID equal to another call's B-leg Call-ID —
+coexist, and ending one never removes the other. An in-dialog request is
+matched on Call-ID plus both tags (`lookupDialog`). No production branch reads `state`; the
 invariant it records is enforced by map membership.
 
 Teardown entry points once bridged, all converging on `endCall` via
@@ -975,14 +985,17 @@ stateDiagram-v2
     ByeBoth2 --> [*]
 ```
 
-Each arm is one case of the `select` at `b2bua.go:471-487`; `byeBoth`
-(`b2bua.go:495-502`) sends both BYEs. Every outbound BYE gets its own
+Each arm is one case of the `select` at `b2bua.go:477-493`; `byeBoth`
+(`b2bua.go:501-508`) sends both BYEs. Every outbound BYE gets its own
 **5 s** `byeContext`.
 
 ### 6.12 KillCall
 
-`KillCall(id)` looks the call up in `calls` under `callMu`, releases the
-lock, and calls `c.cancel()`. It is idempotent because `endCall` has already
+`KillCall(id)` looks the call up in `calls` by admin ID under `callMu`,
+releases the lock, and calls `c.cancel()`. The admin ID is what `/api/calls`
+lists as `id`; the A-leg Call-ID is listed separately as `call_id`. An `id`
+that is no admin ID is tried as an A-leg Call-ID and kills **every** live call
+whose A-leg carries it, since a Call-ID alone does not name one dialog. It is idempotent because `endCall` has already
 removed the entry by the time a second kill arrives. `endCall` reads
 `c.cancel` under the lock and calls it outside. Both paths are exercised
 concurrently under `-race` by `TestKillCallRacesNaturalEnd`.
@@ -2351,7 +2364,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 
 | Entity | Owner | Created where | Transitions | Invariants | Who may mutate | Cleanup trigger | Concurrency protection |
 |---|---|---|---|---|---|---|---|
-| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls`/`legs` | `b2bua.go:398-405` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:466-467`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
+| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls` (by admin ID) and `legs` (per leg, by Call-ID + tags) | `b2bua.go:404-411` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:472-473`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
 | **trunk leg** (`aLeg *DialogServerSession`, `bLeg *DialogClientSession`) | same `onInvite` goroutine | `dialogSrv.ReadInvite` / `dialogCli.Invite` | sipgo-internal dialog FSM; contexts cancel on BYE/CANCEL/error | sipgo objects are **single-use**: `ReadInvite` must not be re-entered for the same dialog | `onInvite`, plus the B-leg waiter until `abandoned` is set | `defer aLeg.Close()` / `defer bLeg.Close()` | no lock; `abandoned atomic.Bool` fences the waiter, and `bLeg`/`attemptCtx` are passed as goroutine arguments |
 | **trunk upstream registration** | `Registrar`; one goroutine per peer | `reconcile` (`register.go:309-372`) | unregistered ⇄ registered, with backoff; terminal `unregister` on cancel | `setRegisteredGen` writes only when the generation still matches, so a superseded goroutine cannot clobber the replacement | its own goroutine; the registrar under `mu` | config publication (peer removed/changed) or `stopAll` at shutdown | `Registrar.mu` (RWMutex) over `state`, `running`, `epoch`; the old goroutine is awaited **outside** the lock |
 | **endpoint health / cooldown (trunk)** | `endpointHealth` | `NewServer` | absent ⇄ `until[key]` | lazy expiry, no sweeper; skip-if-alternatives, never a hard block; keyed per `host:port/transport` | `Penalize` (dial failure), `Recover` (bridged success) | only `Recover`; entries are otherwise never removed | `endpointHealth.mu` |
@@ -2712,8 +2725,8 @@ All routes are on one `http.ServeMux` behind `recoverMW`, which also sets
 | `/healthz` | any | **none** | `{"status":"ok"}` |
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}` |
-| `/api/calls` | any | Basic | array of `{"id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array |
-| `DELETE /api/calls/{id}` | DELETE | Basic | **204** killed / **404** `no such active call` |
+| `/api/calls` | any | Basic | array of `{"id" (admin call ID),"call_id" (A-leg Call-ID),"from","to","started" (RFC 3339),"duration_seconds"}`; always an array |
+| `DELETE /api/calls/{id}` | DELETE | Basic | `id` is the admin call ID, or an A-leg Call-ID (kills every call carrying it); **204** killed / **404** `no such active call` |
 | `/api/peers` | any | Basic | array of `{Name,Address,Transport,SRTP,Register,Registered}` — Go field names, no JSON tags |
 | `DELETE /api/bans/{ip}` | DELETE | Basic | **204** / **404** `no such ban` (an unparseable IP yields 404) |
 | `/api/config` | GET, PUT (else 405 + `Allow: GET, PUT`) | Basic | GET: the **redacted** view; PUT: write-back |
@@ -3020,13 +3033,12 @@ entry under the lock and cancels outside it. Cancelling an already-cancelled
 context is a no-op, and a second `KillCall` finds nothing and returns false.
 A call that is still dialling is invisible to `KillCall`.
 
-**Call-ID collision.** On the trunk plane, `registerCall` overwrites the map
-entry for a duplicate Call-ID, and the first call's `endCall` then deletes the
-second call's index entries, leaving the second call live but invisible to
-`/api/calls` and to in-dialog lookup. On the edge plane, `dialogTable.begin`
+**Call-ID collision.** On the trunk plane, calls are stored by admin ID and
+indexed per leg by dialog (Call-ID plus both tags), so calls sharing a Call-ID
+coexist, and an initial INVITE that repeats a Call-ID, From-tag and CSeq still
+being handled gets **482**. On the edge plane, `dialogTable.begin`
 unconditionally `end()`s any existing record for the Call-ID — tearing down
-that call's media — with no check on source, From tag or plane. Neither plane
-answers 482.
+that call's media — with no check on source, From tag or plane.
 
 **Expired bindings.** An expired `Binding` is invisible to `ByToken` and
 `ByAOR` immediately (the predicate is checked on lookup), so an inbound call
