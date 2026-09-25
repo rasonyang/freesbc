@@ -5,6 +5,8 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +27,19 @@ var numericGroupRef = regexp.MustCompile(`\$\{[0-9]+\}`)
 // nested structs/pointers — so fields added in later milestones are covered
 // automatically without touching this file again.
 //
+// Only fields whose Go type is string are expanded. Typed scalars (Duration,
+// PortRange, SIPListen, HostPort) and ints/bools are decoded by the strict
+// YAML step, before expansion runs, so `ring_timeout: ${RT}` is a parse error
+// ("invalid duration"), not an expanded value.
+//
+// A field tagged `env:"-"` is never expanded: routes[].transform.to is a
+// regexp replacement template, where ${name} names a capture group, not an
+// environment variable.
+//
+// Every substitution is recorded on c so validation errors can be redacted
+// (see envRedaction): a validation message must never echo an expanded
+// environment value.
+//
 // It must run after the strict YAML unmarshal (so syntax/unknown-key errors
 // report the user's real file, with no secrets in them) and before
 // withDefaults/validate (so validation sees the final, expanded values).
@@ -34,6 +49,7 @@ var numericGroupRef = regexp.MustCompile(`\$\{[0-9]+\}`)
 func expandEnv(c *Config) error {
 	e := &envExpander{seenMissing: map[string]bool{}}
 	e.walk(reflect.ValueOf(c), "config")
+	c.envRedact = e.redact
 	if len(e.malformed) > 0 {
 		return fmt.Errorf("malformed ${...} reference in config: %s", strings.Join(e.malformed, "; "))
 	}
@@ -47,6 +63,96 @@ type envExpander struct {
 	missing     []string
 	malformed   []string
 	seenMissing map[string]bool
+	redact      envRedaction
+}
+
+// envRedaction remembers what expansion put into the Config, so text built
+// from the expanded values (validation errors) can be mapped back to what the
+// operator wrote. The zero value redacts nothing.
+type envRedaction struct {
+	// fields maps each expanded field's final value to its template, e.g.
+	// "10.1.2.3:5060" -> "${FS_ADDR}:5060".
+	fields map[string]string
+	// values maps each substituted environment value to its variable name.
+	values map[string]string
+}
+
+// tainted reports whether value is the final value of a field that ${VAR}
+// expansion changed.
+func (r envRedaction) tainted(value string) bool {
+	_, ok := r.fields[value]
+	return ok
+}
+
+// args returns a copy of fmt args with every string, error and Stringer
+// redacted by apply. Validation formats come from this package and never
+// contain a value; only their arguments can carry an expanded one, so
+// redacting the arguments leaves the rest of each message intact.
+func (r envRedaction) args(args []any) []any {
+	if len(r.fields) == 0 {
+		return args
+	}
+	out := make([]any, len(args))
+	for i, a := range args {
+		switch v := a.(type) {
+		case string:
+			out[i] = r.apply(v)
+		case error:
+			out[i] = r.apply(v.Error())
+		case fmt.Stringer:
+			out[i] = r.apply(v.String())
+		default:
+			out[i] = a
+		}
+	}
+	return out
+}
+
+// detail returns err for display, unless value came from ${VAR} expansion.
+// Some errors quote only part of the value they reject (a regexp compile
+// error shows the offending fragment), which apply cannot recognise, so for
+// an expanded value the detail is withheld altogether.
+func (r envRedaction) detail(value string, err error) error {
+	if r.tainted(value) {
+		return fmt.Errorf("invalid value from %s (details withheld: it would echo the expanded environment value)", r.fields[value])
+	}
+	return err
+}
+
+// apply rewrites msg so it no longer contains any expanded value: each
+// expanded field value is replaced by its template, then any remaining
+// occurrence of a substituted environment value by ${NAME}. Longer strings
+// go first so a value that contains another is replaced whole. Both the raw
+// and the %q-escaped spellings are replaced.
+func (r envRedaction) apply(msg string) string {
+	if len(r.fields) == 0 {
+		return msg
+	}
+	msg = replaceLongestFirst(msg, r.fields, func(tmpl string) string { return tmpl })
+	return replaceLongestFirst(msg, r.values, func(name string) string { return "${" + name + "}" })
+}
+
+func replaceLongestFirst(msg string, m map[string]string, repl func(string) string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	for _, k := range keys {
+		r := repl(m[k])
+		msg = strings.ReplaceAll(msg, k, r)
+		if q := strconv.Quote(k); q[1:len(q)-1] != k {
+			msg = strings.ReplaceAll(msg, q[1:len(q)-1], r)
+		}
+	}
+	return msg
 }
 
 // walk recurses into v, expanding any string it finds. path is a
@@ -69,6 +175,9 @@ func (e *envExpander) walk(v reflect.Value, path string) {
 			sf := t.Field(i)
 			if sf.PkgPath != "" {
 				continue // unexported: not settable, and not user-facing data
+			}
+			if sf.Tag.Get("env") == "-" {
+				continue // opted out, e.g. a regexp replacement template
 			}
 			e.walk(v.Field(i), path+"."+fieldLabel(sf))
 		}
@@ -123,10 +232,24 @@ func (e *envExpander) walk(v reflect.Value, path string) {
 				}
 				return m
 			}
+			e.record(val, name)
 			return []byte(val)
 		})
-		v.SetString(string(expanded))
+		if out := string(expanded); out != orig {
+			if e.redact.fields == nil {
+				e.redact.fields = map[string]string{}
+			}
+			e.redact.fields[out] = orig
+			v.SetString(out)
+		}
 	}
+}
+
+func (e *envExpander) record(val, name string) {
+	if e.redact.values == nil {
+		e.redact.values = map[string]string{}
+	}
+	e.redact.values[val] = name
 }
 
 // fieldLabel returns the yaml tag name for a struct field, for readable

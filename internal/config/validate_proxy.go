@@ -158,7 +158,7 @@ func (c *Config) validateProxy(fail func(string, ...any)) {
 					// not a discovery on the first matching call.
 					re, err := regexp.Compile(r.Match)
 					if err != nil {
-						fail("%s: match: %v", label, err)
+						fail("%s: match: %v", label, c.envRedact.detail(r.Match, err))
 					} else {
 						r.matchTo = re
 					}

@@ -20,8 +20,12 @@ import (
 // described on Config.
 func (c *Config) validate() error {
 	var errs []string
+	// Messages may name a value, and validation runs after ${VAR}
+	// expansion, so every argument is redacted: an error must never echo
+	// an environment value (it reaches `freesbc check` output and the
+	// admin PUT response).
 	fail := func(format string, args ...any) {
-		errs = append(errs, fmt.Sprintf(format, args...))
+		errs = append(errs, fmt.Sprintf(format, c.envRedact.args(args)...))
 	}
 
 	// The trunk B2BUA plane needs a listener and at least one peer — but a
@@ -222,7 +226,7 @@ func (c *Config) validate() error {
 		if r.Match != nil && r.Match.To != "" {
 			re, err := regexp.Compile(r.Match.To)
 			if err != nil {
-				fail("routes.%s: match.to: %v", label, err)
+				fail("routes.%s: match.to: %v", label, c.envRedact.detail(r.Match.To, err))
 			} else {
 				r.matchTo = re
 			}
@@ -231,17 +235,29 @@ func (c *Config) validate() error {
 			fail("routes.%s: transform.to requires match.to (capture groups come from it)", label)
 		}
 		if r.Transform != nil && r.Transform.To != "" && r.matchTo != nil {
-			if g := maxGroupRef(r.Transform.To); g > r.matchTo.NumSubexp() {
+			g, names := groupRefs(r.Transform.To)
+			if g > r.matchTo.NumSubexp() {
 				fail("routes.%s: transform.to references capture group %d but match.to has %d group(s)", label, g, r.matchTo.NumSubexp())
+			}
+			// transform.to is not ${ENV}-expanded, so ${name} is always a
+			// group reference; one match.to does not define would expand
+			// to nothing at call time. Only env-shaped names are checked
+			// (the ones expansion used to substitute), so a config that
+			// relied on that fails loudly instead of losing the value;
+			// digit-led names such as $01 keep regexp.Expand's semantics.
+			for _, n := range names {
+				if envRef.MatchString("${"+n+"}") && r.matchTo.SubexpIndex(n) < 0 {
+					fail("routes.%s: transform.to references capture group %q but match.to has no group of that name (transform.to is a regexp template; ${ENV} is not expanded there)", label, n)
+				}
 			}
 		}
 	}
 
 	if _, err := ParseRateLimit(c.Shield.RateLimit); err != nil {
-		fail("shield.rate_limit: %v", err)
+		fail("shield.rate_limit: %v", c.envRedact.detail(c.Shield.RateLimit, err))
 	}
 	if _, err := ParseRateLimit(c.Shield.PeerRateLimit); err != nil {
-		fail("shield.peer_rate_limit: %v", err)
+		fail("shield.peer_rate_limit: %v", c.envRedact.detail(c.Shield.PeerRateLimit, err))
 	}
 	// withDefaults fills a zero value before validate normally runs, so this
 	// only trips on an explicitly negative value reaching here (e.g. a
@@ -267,7 +283,7 @@ func (c *Config) validate() error {
 		}
 		cost, cerr := bcrypt.Cost([]byte(c.Admin.Auth.PasswordHash))
 		if cerr != nil {
-			fail("admin.auth.password_hash: must be a bcrypt hash: %v", cerr)
+			fail("admin.auth.password_hash: must be a bcrypt hash: %v", c.envRedact.detail(c.Admin.Auth.PasswordHash, cerr))
 		} else if cost < 10 {
 			// Cost 4 (min) makes offline cracking ~50x cheaper;
 			// the hash travels in backups, logs, and the config itself.
@@ -296,13 +312,13 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// maxGroupRef returns the highest numeric capture-group index referenced by
-// a regexp replacement template, or -1 if it references none. It mirrors
-// regexp.Expand's parsing: $$ is a literal dollar; $name or ${name} is a
-// reference where name is a run of [A-Za-z0-9_]; a purely numeric name is a
-// group index ($0 = whole match). Named (non-numeric) refs are ignored here.
-func maxGroupRef(template string) int {
-	max := -1
+// groupRefs parses a regexp replacement template the way regexp.Expand
+// does: $$ is a literal dollar; $name or ${name} is a reference where name
+// is a run of [A-Za-z0-9_]; a purely numeric name without a leading zero is
+// a group index ($0 = whole match), anything else a group name. It returns
+// the highest index (-1 if none) and the names, in order of appearance.
+func groupRefs(template string) (max int, names []string) {
+	max = -1
 	for i := 0; i < len(template); {
 		if template[i] != '$' {
 			i++
@@ -335,11 +351,12 @@ func maxGroupRef(template string) int {
 		if braced && !closedBrace {
 			continue
 		}
-		if name == "" || !allDigits(name) {
+		if name == "" {
 			continue
 		}
 		// Leading zeros: $01, $012, $00 etc. are named refs in Go regexp, not group indices
-		if len(name) > 1 && name[0] == '0' {
+		if !allDigits(name) || (len(name) > 1 && name[0] == '0') {
+			names = append(names, name)
 			continue
 		}
 		n, err := strconv.Atoi(name)
@@ -350,7 +367,7 @@ func maxGroupRef(template string) int {
 			max = n
 		}
 	}
-	return max
+	return max, names
 }
 
 func isNameByte(b byte) bool {

@@ -417,9 +417,30 @@ config at startup, 2 on a usage error.
 Env expansion runs after the strict unmarshal and before defaults so that
 parse errors can never echo a secret. The only supported syntax is
 `${NAME}`; `${VAR:-default}` is rejected as malformed, and `${1}`-style
-numeric references are passed through verbatim so route transforms can use
-them. Expanded values are never re-scanned. Missing variables are reported
-once each.
+numeric references are passed through verbatim. Expanded values are never
+re-scanned. Missing variables are reported once each.
+
+- **Plain string fields only.** Expansion walks every exported field whose Go
+  type is `string` (including inside slices, maps and pointers). Typed scalars
+  — durations, `port_range`, `listen.sip` URLs, `host:port` keys such as
+  `sip.public.*.bind` and `sip.pstn.match`, and every int or bool — are
+  decoded in step 1, before expansion, so `ring_timeout: ${RT}` fails with
+  `invalid duration "${RT}"`. Keep secrets in string keys (`password`,
+  `username`, `password_hash`, `address`, file paths).
+- **`routes[].transform.to` is never expanded** (`env:"-"` on
+  `RouteTransform.To`). It is a regexp replacement template: `$1`, `${1}` and
+  `${name}` all refer to capture groups of `match.to`. An env-shaped
+  `${name}` that `match.to` does not define as a named group is a validation
+  error, so a config that used to rely on env expansion there fails loudly
+  instead of expanding to nothing.
+- **Validation errors never echo an expanded value.** `expandEnv` records each
+  substitution on the `Config` (`envRedaction`). `validate`'s `fail` collector
+  redacts every argument: an expanded field's value is shown as the template
+  the operator wrote (`"${FS_ADDR}:5060"`), and any leftover environment value
+  as `${NAME}`. Errors that quote only part of a value (regexp compile errors,
+  rate-limit and bcrypt errors) are withheld altogether when the value came
+  from expansion. This covers `freesbc check` output and the 400 body of
+  `PUT /api/config`.
 
 Validation rules are exhaustive in `internal/config/validate.go` (trunk,
 shield, admin, NAT topology) and `internal/config/validate_proxy.go` (edge
@@ -465,12 +486,12 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `routes[].{name,from,match.to,transform.to,to[]}` | | first match wins; `to` order is failover order |
 | `sip.bind_ip` | IP | none — when set it *replaces* the `listen.sip` list |
 | `sip.bind_port` | 1-65535 | required alongside any other `sip.*` topology key |
-| `sip.transport` | `udp\|tcp\|tls` | `udp` (`schema.go:286-288`) |
-| `sip.advertised_ip` | IP | `sip.bind_ip` (`schema.go:289-291`) |
-| `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:292-294`) |
+| `sip.transport` | `udp\|tcp\|tls` | `udp` (`schema.go:291-293`) |
+| `sip.advertised_ip` | IP | `sip.bind_ip` (`schema.go:294-296`) |
+| `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:297-299`) |
 | `rtp.bind_ip` | IP | `""` = every interface |
 | `rtp.advertised_ip` | IP | `""` = the `advertisedIP` chain of §12.1 |
-| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:51-104`) |
+| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:55-108`) |
 
 Key relationships: `sip.bind_ip` and `listen.sip` are mutually exclusive
 (`sip.bind_ip` *replaces* the listener list); `rtp.port_min/max` and
@@ -2992,7 +3013,7 @@ write-back.
 `PUT /api/config`, in order: read at most **1 MiB** + 1 (413 above that);
 optional `If-Match` re-reads the file and returns **409** on a mismatch;
 `config.Parse(body)` on a throwaway config (400 on failure, with the
-validation text); then `writeFileAtomic` — `CreateTemp` in the **same
+validation text, in which expanded `${ENV}` values are redacted — §5); then `writeFileAtomic` — `CreateTemp` in the **same
 directory**, write, `Sync`, `Close`, `Chmod` (0600, or the existing file's
 mode when it exists), `Rename`. Every failure path removes the temp file and
 leaves the original untouched. The submitted bytes are written **verbatim**,
@@ -3166,8 +3187,11 @@ inbound `a=crypto`, and clears all attributes on declined sections.
 **Credential handling.** The edge plane proxies REGISTER and its digest
 challenge verbatim and never holds a credential; `logRegister` never logs an
 Authorization header, a nonce or a password. `${ENV}` references in the
-config are expanded only in memory and never written back, and parse errors
-cannot echo a secret because expansion runs after the unmarshal.
+config are expanded only in memory and never written back. Parse errors
+cannot echo a secret because expansion runs after the unmarshal, and
+validation errors are redacted back to the `${ENV}` text (§5), so neither
+`freesbc check` nor the admin `PUT /api/config` response can be used to
+read an environment variable.
 
 ### 14.2 Deployment assumptions (not enforced by the code)
 

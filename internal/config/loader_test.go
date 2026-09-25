@@ -259,3 +259,71 @@ func TestParseRejectsNullUpstreamNode(t *testing.T) {
 		t.Fatalf("want a null-entry error for fs-a, got %v", err)
 	}
 }
+
+// audit: P2-CFG-003
+// Errors that quote only part of a value (a regexp compile error shows the
+// offending fragment) must not leak an expanded env value either.
+func TestParseRegexpErrorDoesNotEchoEnv(t *testing.T) {
+	const secret = "s3cr3t-(unclosed"
+	t.Setenv("AUDIT_RE", secret)
+	src := strings.Replace(minimalYAML, "    to: [pbx]\n",
+		"    match: { to: \"^${AUDIT_RE}\" }\n    to: [pbx]\n", 1)
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatal("expected a regexp compile error")
+	}
+	for _, frag := range []string{secret, "s3cr3t", "unclosed"} {
+		if strings.Contains(err.Error(), frag) {
+			t.Errorf("error echoes %q from the env value:\n%v", frag, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "routes.in: match.to") || !strings.Contains(err.Error(), "${AUDIT_RE}") {
+		t.Errorf("error should still name the key and the template: %v", err)
+	}
+}
+
+// audit: P2-CFG-003
+// A value with characters %q escapes is redacted in its escaped spelling too.
+func TestParseValidationErrorRedactsEscapedEnv(t *testing.T) {
+	t.Setenv("AUDIT_IP", "not\tan \"ip\"")
+	src := strings.Replace(minimalYAML, "listen:\n", "listen:\n  media:\n    public_ip: \"${AUDIT_IP}\"\n", 1)
+	_, err := Parse([]byte(src))
+	if err == nil {
+		t.Fatal("expected a validation error")
+	}
+	if msg := err.Error(); strings.Contains(msg, `not\tan`) || strings.Contains(msg, "not\tan") {
+		t.Errorf("error echoes the env value: %v", msg)
+	}
+	if !strings.Contains(err.Error(), `"${AUDIT_IP}"`) {
+		t.Errorf("error should show the template instead: %v", err)
+	}
+}
+
+// audit: P2-CFG-005
+// transform.to is never env-expanded, so an env-shaped ${name} that match.to
+// does not define as a group is an error, not a silent empty expansion.
+func TestParseTransformUnknownNamedGroupRejected(t *testing.T) {
+	t.Setenv("PREFIX", "+44")
+	src := strings.Replace(minimalYAML, "    to: [pbx]\n",
+		"    match: { to: \"^(?P<num>[0-9]+)$\" }\n    transform: { to: \"${PREFIX}${num}\" }\n    to: [pbx]\n", 1)
+	_, err := Parse([]byte(src))
+	if err == nil || !strings.Contains(err.Error(), `capture group "PREFIX"`) {
+		t.Fatalf("want an unknown-group error for PREFIX, got %v", err)
+	}
+	if strings.Contains(err.Error(), `"num"`) {
+		t.Errorf("num is a real group and must not be reported: %v", err)
+	}
+}
+
+// audit: P2-CFG-006
+// ${VAR} is expanded only in plain string fields. Typed scalars are decoded
+// by the strict YAML step before expansion, so a reference there is a parse
+// error that shows the literal text, never an expanded value.
+func TestParseEnvInTypedScalarIsParseError(t *testing.T) {
+	t.Setenv("RT", "30s")
+	src := minimalYAML + "ring_timeout: ${RT}\n"
+	_, err := Parse([]byte(src))
+	if err == nil || !strings.Contains(err.Error(), `invalid duration "${RT}"`) {
+		t.Fatalf("want a parse error naming the literal ${RT}, got %v", err)
+	}
+}

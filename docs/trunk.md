@@ -38,7 +38,7 @@ routes:
     to: [internal-pbx]
 ```
 
-`${ENV_VAR}` references are expanded at load time only — secrets are never written back to disk and never appear in error output. See [`sbc.example.yaml`](../sbc.example.yaml) for the full annotated example.
+`${ENV_VAR}` references are expanded at load time only — secrets are never written back to disk and never appear in error output. Expansion applies to plain string keys only (passwords, usernames, addresses, file paths); durations, port ranges, `listen.sip` URLs and numbers cannot use `${VAR}`. `routes[].transform.to` is never expanded: `${name}` there is a capture group of `match.to`. See [`sbc.example.yaml`](../sbc.example.yaml) for the full annotated example.
 
 For NAT/VPN deployments (private bind address, public advertised address), the optional `sip:`/`rtp:` sections replace `listen.sip` and split the bind and advertised planes independently:
 
