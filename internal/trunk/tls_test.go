@@ -1,6 +1,7 @@
 package trunk
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -128,68 +130,192 @@ routes:
 	_ = srv // server torn down by test cleanup
 }
 
-// TestBuildClientTLSConfig verifies the outbound TLS merge (T-17/F-13): a
-// peer's tls_ca is added to the system roots (its CA-signed certificate now
-// verifies), client cert/key pairs are loaded, MinVersion is pinned, and an
-// empty config returns nil (sipgo's default behavior preserved).
-func TestBuildClientTLSConfig(t *testing.T) {
-	// The carrier's self-signed certificate (its own anchor), written as the
-	// peer's tls_ca bundle.
-	carrierDER, carrierPEM, _ := genCertKey(t, "carrier", []string{"carrier.example"}, nil)
-	dir := t.TempDir()
-	caPath := filepath.Join(dir, "ca.pem")
-	if err := os.WriteFile(caPath, carrierPEM, 0o600); err != nil {
+// handshakeVia dials a loopback TLS server presenting serverCert with the
+// client config conf, setting ServerName to serverName exactly as sipgo
+// does per dial (the dialled host; Go leaves an IP out of SNI), under a
+// ctx that names peer (none when peer is ""). It returns the client's
+// handshake error and the client certificate CNs the server received.
+func handshakeVia(t *testing.T, conf *tls.Config, serverName, peer string, serverCert tls.Certificate) (error, []string) {
+	t.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequestClientCert,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	// No TLS material configured → nil config (sipgo default).
-	conf, err := buildClientTLSConfig(map[string]*config.Peer{"plain": {}})
-	if err != nil || conf != nil {
-		t.Fatalf("empty peers: got conf=%v err=%v, want nil,nil", conf, err)
-	}
-
-	conf, err = buildClientTLSConfig(map[string]*config.Peer{"carrier": {TLSCA: caPath}})
+	defer ln.Close()
+	got := make(chan []string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			got <- nil
+			return
+		}
+		defer c.Close()
+		tc := c.(*tls.Conn)
+		_ = tc.SetDeadline(time.Now().Add(5 * time.Second))
+		var cns []string
+		if tc.Handshake() == nil {
+			for _, pc := range tc.ConnectionState().PeerCertificates {
+				cns = append(cns, pc.Subject.CommonName)
+			}
+		}
+		got <- cns
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		t.Fatalf("build config: %v", err)
+		t.Fatal(err)
 	}
+	defer raw.Close()
+	c := conf.Clone()
+	c.ServerName = serverName
+	ctx := context.Background()
+	if peer != "" {
+		ctx = withTLSPeer(ctx, peer)
+	}
+	hsErr := tls.Client(raw, c).HandshakeContext(ctx)
+	if hsErr != nil {
+		raw.Close()
+		<-got
+		return hsErr, nil
+	}
+	return nil, <-got
+}
+
+func mustTLSPair(t *testing.T, certPEM, keyPEM []byte) tls.Certificate {
+	t.Helper()
+	c, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// TestClientTLSSelectsPeerByServerName covers the hostname path of the
+// per-peer outbound TLS selector (P2-TRK-016): the peer is matched by
+// cs.ServerName, its own tls_ca alone anchors it, and a certificate from
+// another peer's CA is refused.
+func TestClientTLSSelectsPeerByServerName(t *testing.T) {
+	_, aPEM, aKey := genCertKey(t, "a", []string{"a.example"}, nil)
+	_, bPEM, bKey := genCertKey(t, "b", []string{"b.example"}, nil)
+	// Issued by A's key/"CA" but naming B: what a mis-issuing or compromised
+	// peer-A CA could hand to someone sitting at B's address.
+	_, aForBPEM, aForBKey := genCertKey(t, "a-for-b", []string{"b.example", "a.example"}, nil)
+	aCA, _ := writeTLSCertKey(t, append(append([]byte{}, aPEM...), aForBPEM...), aKey)
+	bCA, _ := writeTLSCertKey(t, bPEM, bKey)
+	peers := map[string]*config.Peer{
+		"a": {Address: "a.example:5061", Transport: "tls", TLSCA: aCA},
+		"b": {Address: "b.example:5061", Transport: "tls", TLSCA: bCA},
+	}
+	sel, err := newClientTLS(peers, func() map[string]*config.Peer { return peers }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := sel.config()
 	if conf.MinVersion != tls.VersionTLS12 {
 		t.Errorf("MinVersion = %x, want TLS1.2", conf.MinVersion)
 	}
-	// The configured anchor must now verify its own certificate (pre-fix a
-	// self-signed carrier was simply undialable).
-	opts := x509.VerifyOptions{Roots: conf.RootCAs, DNSName: "carrier.example"}
-	carrierCert, err := x509.ParseCertificate(carrierDER)
-	if err != nil {
-		t.Fatalf("parse carrier cert: %v", err)
-	}
-	if _, err := carrierCert.Verify(opts); err != nil {
-		t.Errorf("peer tls_ca not added as trust anchor: %v", err)
-	}
-	// A cert outside the pool must NOT verify — the merged pool is strict,
-	// not verification-disabled.
-	outsiderDER, _, _ := genCertKey(t, "outsider", []string{"outsider.example"}, nil)
-	outsider, _ := x509.ParseCertificate(outsiderDER)
-	if _, err := outsider.Verify(opts); err == nil {
-		t.Error("certificate from an unconfigured CA must not verify")
-	}
 
-	// Client certificate pairs load into Certificates.
-	_, certPEM, keyPEM := genCertKey(t, "client", nil, nil)
-	certPath, keyPath := writeTLSCertKey(t, certPEM, keyPEM)
-	conf, err = buildClientTLSConfig(map[string]*config.Peer{
-		"mtls": {TLSClientCert: certPath, TLSClientKey: keyPath},
-	})
-	if err != nil {
-		t.Fatalf("build mtls config: %v", err)
+	if err, _ := handshakeVia(t, conf, "b.example", "b", mustTLSPair(t, bPEM, bKey)); err != nil {
+		t.Fatalf("b's own certificate refused: %v", err)
 	}
-	if len(conf.Certificates) != 1 {
-		t.Fatalf("Certificates = %d, want 1 loaded client pair", len(conf.Certificates))
+	if err, _ := handshakeVia(t, conf, "b.example", "b", mustTLSPair(t, aForBPEM, aForBKey)); err == nil {
+		t.Fatal("a certificate from peer a's CA was accepted when dialling peer b")
 	}
+	// Name check: b's certificate does not name a.example.
+	if err, _ := handshakeVia(t, conf, "a.example", "a", mustTLSPair(t, bPEM, bKey)); err == nil {
+		t.Fatal("certificate for b.example accepted when dialling a.example")
+	}
+	// No peer has this name: fail closed.
+	if err, _ := handshakeVia(t, conf, "c.example", "", mustTLSPair(t, bPEM, bKey)); err == nil {
+		t.Fatal("dial to a name no TLS peer owns must fail")
+	}
+}
 
-	// An unreadable CA file must fail startup-visible, not silently degrade.
-	if _, err := buildClientTLSConfig(map[string]*config.Peer{
-		"bad": {TLSCA: filepath.Join(dir, "does-not-exist.pem")},
-	}); err == nil {
+// TestClientTLSSRVTargetAndAmbiguity: a peer reached through SRV matches
+// its targets' ServerName, and a name that more than one peer can own fails
+// closed.
+func TestClientTLSSRVTargetAndAmbiguity(t *testing.T) {
+	_, tPEM, tKey := genCertKey(t, "sip1", []string{"sip1.carrier.example"}, nil)
+	ca, _ := writeTLSCertKey(t, tPEM, tKey)
+	peers := map[string]*config.Peer{
+		"carrier": {Address: "carrier.example", Transport: "tls", TLSCA: ca},
+	}
+	targets := map[string][]string{"carrier.example/tls": {"sip1.carrier.example"}}
+	srv := func(host, transport string) []string { return targets[host+"/"+transport] }
+	cur := peers
+	sel, err := newClientTLS(peers, func() map[string]*config.Peer { return cur }, srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, _ := handshakeVia(t, sel.config(), "sip1.carrier.example", "carrier", mustTLSPair(t, tPEM, tKey)); err != nil {
+		t.Fatalf("SRV target of the peer refused: %v", err)
+	}
+	// A second peer (added by reload) whose address is the SRV target
+	// itself: the name now belongs to two peers.
+	cur = map[string]*config.Peer{
+		"carrier": peers["carrier"],
+		"other":   {Address: "sip1.carrier.example:5061", Transport: "tls"},
+	}
+	if err, _ := handshakeVia(t, sel.config(), "sip1.carrier.example", "carrier", mustTLSPair(t, tPEM, tKey)); err == nil {
+		t.Fatal("a ServerName that two peers match must fail closed")
+	}
+}
+
+// TestClientTLSClientCertFromContext: GetClientCertificate returns only the
+// certificate of the peer the handshake ctx names, and none without one.
+func TestClientTLSClientCertFromContext(t *testing.T) {
+	_, sPEM, sKey := genCertKey(t, "b", []string{"b.example"}, nil)
+	ca, _ := writeTLSCertKey(t, sPEM, sKey)
+	_, caPEM, caKey := genCertKey(t, "client-a", nil, nil)
+	aCert, aKey := writeTLSCertKey(t, caPEM, caKey)
+	_, cbPEM, cbKey := genCertKey(t, "client-b", nil, nil)
+	bCert, bKey := writeTLSCertKey(t, cbPEM, cbKey)
+	peers := map[string]*config.Peer{
+		"a": {Address: "a.example:5061", Transport: "tls", TLSClientCert: aCert, TLSClientKey: aKey},
+		"b": {Address: "b.example:5061", Transport: "tls", TLSCA: ca, TLSClientCert: bCert, TLSClientKey: bKey},
+	}
+	sel, err := newClientTLS(peers, func() map[string]*config.Peer { return peers }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := mustTLSPair(t, sPEM, sKey)
+	for _, tc := range []struct {
+		peer string
+		want string
+	}{{"b", "[client-b]"}, {"", "[]"}} {
+		err, cns := handshakeVia(t, sel.config(), "b.example", tc.peer, server)
+		if err != nil {
+			t.Fatalf("ctx peer %q: handshake: %v", tc.peer, err)
+		}
+		if fmt.Sprint(cns) != tc.want {
+			t.Errorf("ctx peer %q: server received %v, want %s", tc.peer, cns, tc.want)
+		}
+	}
+}
+
+// TestClientTLSMaterialIsRestartOnly: material loads at startup (a bad file
+// aborts it), and a TLS peer added by reload that names material which was
+// never loaded fails closed instead of falling back to the system roots.
+func TestClientTLSMaterialIsRestartOnly(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := newClientTLS(map[string]*config.Peer{
+		"bad": {Address: "x.example", Transport: "tls", TLSCA: filepath.Join(dir, "missing.pem")},
+	}, nil, nil); err == nil {
 		t.Fatal("unreadable tls_ca must error")
+	}
+
+	_, sPEM, sKey := genCertKey(t, "new", []string{"new.example"}, nil)
+	ca, _ := writeTLSCertKey(t, sPEM, sKey)
+	cur := map[string]*config.Peer{
+		"new": {Address: "new.example:5061", Transport: "tls", TLSCA: ca},
+	}
+	sel, err := newClientTLS(map[string]*config.Peer{}, func() map[string]*config.Peer { return cur }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, _ := handshakeVia(t, sel.config(), "new.example", "new", mustTLSPair(t, sPEM, sKey)); err == nil {
+		t.Fatal("a reload-added peer's unloaded tls_ca must fail closed")
 	}
 }

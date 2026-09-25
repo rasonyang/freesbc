@@ -57,6 +57,29 @@ rtp:
 
 The two sections are mutually independent: SIP can advertise one public address and RTP another. `advertised_ip`/`advertised_port` default to their bind counterparts; when `sip.bind_ip` is set, `rtp.advertised_ip` is required unless `listen.media.public_ip` is a literal address (otherwise SDP would advertise `127.0.0.1`).
 
+### TLS peers
+
+A `transport: tls` peer is verified and identified on its own, never with another peer's material:
+
+```yaml
+peers:
+  carrier-b:
+    address: sip.carrier-b.net        # SRV (_sips._tcp) or host:port; an IP literal works too
+    transport: tls
+    tls_ca: /etc/freesbc/carrier-b-ca.pem         # the ONLY anchors for this peer; omit for the system roots
+    tls_client_cert: /etc/freesbc/sbc-for-b.pem  # sent to this peer only, when it asks (mTLS)
+    tls_client_key: /etc/freesbc/sbc-for-b-key.pem
+    allowed_ips: [198.51.100.0/24]
+```
+
+- `tls_ca` replaces the system roots for that peer, and a certificate from another peer's CA is refused.
+- The certificate must name the dialled host (the peer's host, or one of its SRV targets). A peer addressed by IP literal sends no SNI, so its certificate must carry that IP as an IP SAN.
+- Two TLS peers may not share an address host, whatever their ports. Validation rejects `a.example.net:5061` next to `a.example.net:5062`, and two TLS peers on `192.0.2.1`, because the SBC picks a peer's trust by the dialled host alone.
+- Our client certificate goes only to the peer it is configured on. A new connection opened outside a call setup or REGISTER (for example to a Contact on another host) matches no peer and fails.
+- Changes to the TLS files need a restart. A TLS peer added by hot reload with its own `tls_ca` or client certificate fails its handshakes until then.
+
+See [`docs/design.md`](design.md) §6.14 for how the selection works and its limits.
+
 ## What it does
 
 - **SIP trunk interconnect** — UDP, TCP and TLS transports (real certificate

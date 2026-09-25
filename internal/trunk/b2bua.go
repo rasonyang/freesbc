@@ -1099,7 +1099,9 @@ func (s *Server) dialAttempt(c *call, cfg *config.Config, target Target, mediaIP
 	headers := append(append(make([]sip.Header, 0, len(bHeaders)+1), bHeaders...), &callID)
 
 	var err error
-	bLeg, err = s.dialogCli.Invite(aLeg.Context(), bTarget, bOffer, headers...)
+	// The peer name rides the ctx into a TLS dial's handshake, where it
+	// selects the client certificate (see clientTLS.clientCert).
+	bLeg, err = s.dialogCli.Invite(withTLSPeer(aLeg.Context(), target.Name), bTarget, bOffer, headers...)
 	if err != nil {
 		fw.decide("")
 		s.log.Error("invite b-leg", "err", err, "target", target.Name)

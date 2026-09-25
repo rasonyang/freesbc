@@ -60,10 +60,11 @@ peers:
     #                              # for peers behind hard NAT
     # max_concurrent_calls: 50     # per-peer cap on concurrent calls from this peer (0 = unlimited, default); excess gets 503 + Retry-After
     srtp: disabled   # media encryption: disabled (default) | optional | required (RTP/SAVP + a=crypto)
-    # tls_ca: /etc/freesbc/carrier-ca.pem   # for transport: tls — ADD this CA bundle to the outbound trust
-    #                                       #   anchors, so a private-CA carrier verifies (still strict)
-    # tls_client_cert: /etc/freesbc/carrier-client.pem   # present OUR cert when the carrier wants
+    # tls_ca: /etc/freesbc/carrier-ca.pem   # for transport: tls — the ONLY trust anchors for THIS peer
+    #                                       #   (replaces the system roots for it; other peers never use it)
+    # tls_client_cert: /etc/freesbc/carrier-client.pem   # present OUR cert to THIS peer when it wants
     # tls_client_key:  /etc/freesbc/carrier-client-key.pem   # mTLS (both-or-neither)
+    # Two transport: tls peers may not share an address host (any port).
   internal-pbx:
     address: 10.0.0.10:5060
     allowed_ips: [10.0.0.0/8]
