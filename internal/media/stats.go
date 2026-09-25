@@ -2,23 +2,48 @@ package media
 
 import "sync/atomic"
 
-// Stats is one media session's packet counters (spec §12/§17). Counters
-// are per DIRECTION of the relay, named from the SBC's point of view:
-// "rx" is what the SBC received from that side, "tx" what it sent to it.
+// Stats is one media session's packet counters (spec §12/§17), per side
+// of the relay. Counters are named from the SBC's point of view: "rx" is
+// what the SBC received from that side, "tx" what it sent to it.
+//
+// The sides are SideA and SideB, not "public" and "private": that is only
+// the edge proxy's orientation. On the edge, A is the client-facing
+// (public) leg and B the FreeSWITCH-facing (private) one — the browser
+// and FreeSWITCH on a WebRTCSession. On the trunk B2BUA, A is the leg the
+// call arrived on and B the one it was placed on, and neither is public
+// or private.
 //
 // Deliberately not a full RTCP analytics engine: these are the numbers an
 // operator needs to answer "is media flowing, and which way isn't it",
 // nothing more.
 type Stats struct {
-	PublicRTPPacketsRx uint64
-	PublicRTPPacketsTx uint64
-	PublicRTPBytesRx   uint64
-	PublicRTPBytesTx   uint64
+	A, B LegStats
+}
 
-	PrivateRTPPacketsRx uint64
-	PrivateRTPPacketsTx uint64
-	PrivateRTPBytesRx   uint64
-	PrivateRTPBytesTx   uint64
+// LegStats is one side's RTP counters. RTCP is relayed but not counted.
+type LegStats struct {
+	RTPPacketsRx uint64
+	RTPPacketsTx uint64
+	RTPBytesRx   uint64
+	RTPBytesTx   uint64
+}
+
+// Side returns one side's counters.
+func (s Stats) Side(side Side) LegStats {
+	if side == SideB {
+		return s.B
+	}
+	return s.A
+}
+
+// Total sums both sides, for process-wide counters.
+func (s Stats) Total() LegStats {
+	return LegStats{
+		RTPPacketsRx: s.A.RTPPacketsRx + s.B.RTPPacketsRx,
+		RTPPacketsTx: s.A.RTPPacketsTx + s.B.RTPPacketsTx,
+		RTPBytesRx:   s.A.RTPBytesRx + s.B.RTPBytesRx,
+		RTPBytesTx:   s.A.RTPBytesTx + s.B.RTPBytesTx,
+	}
 }
 
 // counters is the atomic backing store for Stats. One instance per
@@ -48,20 +73,17 @@ func (c *counters) recordTx(side Side, rtp bool, n int) {
 	c.rtpBytesTx[side].Add(uint64(n))
 }
 
-// snapshot renders the counters, mapping side A to "public" and side B to
-// "private" — the orientation both the edge proxy and the trunk B2BUA use
-// (A is the leg the call arrived on).
+// snapshot renders the counters.
 func (c *counters) snapshot() Stats {
-	return Stats{
-		PublicRTPPacketsRx:  c.rtpPacketsRx[SideA].Load(),
-		PublicRTPPacketsTx:  c.rtpPacketsTx[SideA].Load(),
-		PublicRTPBytesRx:    c.rtpBytesRx[SideA].Load(),
-		PublicRTPBytesTx:    c.rtpBytesTx[SideA].Load(),
-		PrivateRTPPacketsRx: c.rtpPacketsRx[SideB].Load(),
-		PrivateRTPPacketsTx: c.rtpPacketsTx[SideB].Load(),
-		PrivateRTPBytesRx:   c.rtpBytesRx[SideB].Load(),
-		PrivateRTPBytesTx:   c.rtpBytesTx[SideB].Load(),
+	leg := func(side Side) LegStats {
+		return LegStats{
+			RTPPacketsRx: c.rtpPacketsRx[side].Load(),
+			RTPPacketsTx: c.rtpPacketsTx[side].Load(),
+			RTPBytesRx:   c.rtpBytesRx[side].Load(),
+			RTPBytesTx:   c.rtpBytesTx[side].Load(),
+		}
 	}
+	return Stats{A: leg(SideA), B: leg(SideB)}
 }
 
 // isRTCP reports whether a packet on an RTP/RTCP-multiplexed flow is RTCP,

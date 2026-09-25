@@ -10,7 +10,9 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -445,5 +447,113 @@ func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
 	}
 	if send.slab != nil || recv.slab != nil {
 		t.Error("P2-MED-007: the in-place path drew on the slab")
+	}
+}
+
+// audit: P2-MED-013
+//
+// Stats named side A "public" and side B "private", which is the edge
+// proxy's orientation only: on the trunk B2BUA both legs face carriers or
+// PBXs. The counters are now per side, with the orientation documented
+// per plane.
+func TestAuditMED013StatsAreSideNeutral(t *testing.T) {
+	var names []string
+	var walk func(reflect.Type)
+	walk = func(rt reflect.Type) {
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			names = append(names, f.Name)
+			if f.Type.Kind() == reflect.Struct {
+				walk(f.Type)
+			}
+		}
+	}
+	walk(reflect.TypeOf(Stats{}))
+	for _, n := range names {
+		if strings.Contains(n, "Public") || strings.Contains(n, "Private") {
+			t.Errorf("P2-MED-013: Stats field %q names an edge-only orientation", n)
+		}
+	}
+	var c counters
+	c.recordRx(SideA, true, 100)
+	c.recordTx(SideB, true, 40)
+	st := c.snapshot()
+	if st.Side(SideA).RTPBytesRx != 100 || st.Side(SideB).RTPBytesTx != 40 || st.Total().RTPPacketsRx != 1 {
+		t.Errorf("P2-MED-013: counters not reported per side: %+v", st)
+	}
+}
+
+// audit: P2-MED-010
+//
+// allocatePair held the pool mutex across the whole bind sweep, so one
+// slow sweep (a range full of ports other processes hold) stalled every
+// Stats, release and allocation on the plane. The mutex now covers only
+// the reservation; the bind runs outside it.
+func TestAuditMED010BindRunsOutsidePoolLock(t *testing.T) {
+	pool := newAuditPool("audit", 24940, 24959, "127.0.0.1")
+	entered := make(chan int, 1)
+	unblock := make(chan struct{})
+	orig := listenUDP
+	var once sync.Once
+	listenUDP = func(network string, laddr *net.UDPAddr) (*net.UDPConn, error) {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			entered <- laddr.Port
+			<-unblock
+		}
+		return orig(network, laddr)
+	}
+	defer func() { listenUDP = orig }()
+
+	type res struct {
+		pp  *portPair
+		err error
+	}
+	slow := make(chan res, 1)
+	go func() {
+		pp, err := pool.allocatePair()
+		slow <- res{pp, err}
+	}()
+	blockedPort := <-entered // the first allocation is now inside a bind
+
+	statsDone := make(chan struct{})
+	go func() {
+		_, _ = pool.Stats()
+		close(statsDone)
+	}()
+	fast := make(chan res, 1)
+	go func() {
+		pp, err := pool.allocatePair()
+		fast <- res{pp, err}
+	}()
+	select {
+	case <-statsDone:
+	case <-time.After(2 * time.Second):
+		t.Error("P2-MED-010: Stats blocked while another allocation was binding")
+	}
+	select {
+	case r := <-fast:
+		if r.err != nil {
+			t.Errorf("concurrent allocation failed: %v", r.err)
+		} else {
+			if r.pp.RTPPort() == blockedPort {
+				t.Errorf("concurrent allocation got the port still being bound (%d)", blockedPort)
+			}
+			r.pp.Close()
+			pool.release(r.pp.RTPPort())
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("P2-MED-010: an allocation blocked while another was binding")
+	}
+	close(unblock)
+	r := <-slow
+	if r.err != nil {
+		t.Fatalf("blocked allocation failed: %v", r.err)
+	}
+	r.pp.Close()
+	pool.release(r.pp.RTPPort())
+	if inUse, _ := pool.Stats(); inUse != 0 {
+		t.Errorf("pool in use after releasing both: %d", inUse)
 	}
 }

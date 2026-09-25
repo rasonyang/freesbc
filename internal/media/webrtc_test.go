@@ -522,10 +522,10 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 	}
 
 	st := sess.Stats()
-	if st.PublicRTPPacketsRx == 0 || st.PrivateRTPPacketsTx == 0 {
+	if st.A.RTPPacketsRx == 0 || st.B.RTPPacketsTx == 0 {
 		t.Errorf("public→private counters not moving: %+v", st)
 	}
-	if st.PrivateRTPPacketsRx == 0 || st.PublicRTPPacketsTx == 0 {
+	if st.B.RTPPacketsRx == 0 || st.A.RTPPacketsTx == 0 {
 		t.Errorf("private→public counters not moving: %+v", st)
 	}
 }

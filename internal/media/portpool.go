@@ -65,9 +65,11 @@ type PlaneParams struct {
 // plane runs a single pool and allocates both sides of a call from it
 // (Allocate).
 //
-// Safe for concurrent use; allocation is O(range) in the worst case and
-// holds one mutex for the whole sweep, which is what makes "no duplicate
-// allocation" true even under a burst of simultaneous calls.
+// Safe for concurrent use; allocation is O(range) in the worst case. A
+// candidate port is RESERVED under the mutex (so no two callers can ever
+// pick the same one) and bound with the mutex released, so a sweep past
+// ports other processes hold never blocks Stats, release or another
+// caller's allocation.
 type PlanePool struct {
 	name   string
 	params func() PlaneParams
@@ -91,34 +93,11 @@ func NewPlanePool(name string, params func() PlaneParams) *PlanePool {
 // is odd or lo is odd.
 func (p *PlanePool) allocatePair() (*portPair, error) {
 	par := p.params()
-	lo, hi := int(par.MinPort), int(par.MaxPort)
-	if lo%2 != 0 {
-		lo++ // RTP ports are even by convention
+	pair, err := sweep(p, par, func(port int) (*portPair, error) { return bindPair(port, par.BindIP) })
+	if err != nil {
+		return nil, fmt.Errorf("%w: no free pair in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cursor < lo || p.cursor+1 > hi {
-		p.cursor = lo
-	}
-	pairs := (hi - lo + 1) / 2
-	for tried := 0; tried < pairs; tried++ {
-		port := p.cursor
-		p.cursor += 2
-		if p.cursor+1 > hi {
-			p.cursor = lo
-		}
-		if _, used := p.inUse[port]; used {
-			continue
-		}
-		pair, err := bindPair(port, par.BindIP)
-		if err != nil {
-			continue // occupied by another process
-		}
-		p.inUse[port] = struct{}{}
-		return pair, nil
-	}
-	return nil, fmt.Errorf("%w: no free pair in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
+	return pair, nil
 }
 
 // allocateSingle binds ONE socket on an even port and reserves the
@@ -128,34 +107,63 @@ func (p *PlanePool) allocatePair() (*portPair, error) {
 // SRTCP all share a single socket.
 func (p *PlanePool) allocateSingle() (*net.UDPConn, error) {
 	par := p.params()
+	conn, err := sweep(p, par, func(port int) (*net.UDPConn, error) {
+		return listenUDP("udp", udpAddr(port, par.BindIP))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: no free port in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
+	}
+	return conn, nil
+}
+
+// errSweepExhausted ends a sweep that tried every pair in the range.
+var errSweepExhausted = errors.New("media: sweep exhausted")
+
+// sweep walks the range from the cursor, one even port per candidate.
+// Each candidate is reserved in inUse under mu, then bound with mu
+// released; a bind that fails (another process holds the port) drops the
+// reservation and moves on. At most one full lap is tried.
+func sweep[T any](p *PlanePool, par PlaneParams, bind func(port int) (T, error)) (T, error) {
 	lo, hi := int(par.MinPort), int(par.MaxPort)
 	if lo%2 != 0 {
-		lo++
+		lo++ // RTP ports are even by convention
 	}
+	pairs := (hi - lo + 1) / 2
+	var zero T
+	for tried := 0; tried < pairs; tried++ {
+		port, ok := p.reserveNext(lo, hi)
+		if !ok {
+			continue // this candidate is already in use
+		}
+		v, err := bind(port)
+		if err != nil {
+			p.release(port) // occupied by another process
+			continue
+		}
+		return v, nil
+	}
+	return zero, errSweepExhausted
+}
 
+// reserveNext takes the next candidate port from the cursor and, when it
+// is free in this pool, reserves it. ok=false means the candidate was
+// already reserved; the cursor has still moved on.
+func (p *PlanePool) reserveNext(lo, hi int) (port int, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cursor < lo || p.cursor+1 > hi {
 		p.cursor = lo
 	}
-	pairs := (hi - lo + 1) / 2
-	for tried := 0; tried < pairs; tried++ {
-		port := p.cursor
-		p.cursor += 2
-		if p.cursor+1 > hi {
-			p.cursor = lo
-		}
-		if _, used := p.inUse[port]; used {
-			continue
-		}
-		conn, err := net.ListenUDP("udp", udpAddr(port, par.BindIP))
-		if err != nil {
-			continue
-		}
-		p.inUse[port] = struct{}{}
-		return conn, nil
+	port = p.cursor
+	p.cursor += 2
+	if p.cursor+1 > hi {
+		p.cursor = lo
 	}
-	return nil, fmt.Errorf("%w: no free port in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
+	if _, used := p.inUse[port]; used {
+		return port, false
+	}
+	p.inUse[port] = struct{}{}
+	return port, true
 }
 
 // Stats returns the number of RTP port pairs currently allocated and the
@@ -172,8 +180,16 @@ func (p *PlanePool) Stats() (inUse, total int) {
 	if total < 0 {
 		total = 0
 	}
+	// Only reservations inside the CURRENT range count. After a reload
+	// that moves or shrinks the range, live calls keep their old ports
+	// until they end; counting those against the new capacity would
+	// report more in use than the range can hold (P2-MED-011).
 	p.mu.Lock()
-	inUse = len(p.inUse)
+	for port := range p.inUse {
+		if port >= lo && port+1 <= hi {
+			inUse++
+		}
+	}
 	p.mu.Unlock()
 	return inUse, total
 }
@@ -192,12 +208,16 @@ func (p *PlanePool) timeout() time.Duration { return p.params().Timeout }
 // session at allocation.
 func (p *PlanePool) allowLoopback() bool { return p.params().AllowLoopback }
 
+// listenUDP is net.ListenUDP; a variable only so a test can observe what
+// the pool holds while a bind is in progress.
+var listenUDP = net.ListenUDP
+
 func bindPair(port int, bind netip.Addr) (*portPair, error) {
-	rtp, err := net.ListenUDP("udp", udpAddr(port, bind))
+	rtp, err := listenUDP("udp", udpAddr(port, bind))
 	if err != nil {
 		return nil, err
 	}
-	rtcp, err := net.ListenUDP("udp", udpAddr(port+1, bind))
+	rtcp, err := listenUDP("udp", udpAddr(port+1, bind))
 	if err != nil {
 		_ = rtp.Close()
 		return nil, err

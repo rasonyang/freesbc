@@ -218,9 +218,9 @@ of the call ending.
 5. Check the browser-side facts listed under **Browser** above: the
    selected pair, the remote certificate fingerprint, and the cipher.
 6. Hang up from the browser.
-   **Expected:** the log shows `call ended` with non-zero public and
-   private RTP counts in `stats`. The gauges and sockets return to
-   baseline, and neither failure counter moved.
+   **Expected:** the log shows `call ended` with non-zero RTP counts for
+   both sides in `stats` (`A` is the browser, `B` FreeSWITCH). The gauges
+   and sockets return to baseline, and neither failure counter moved.
 
 Repeat step 3 with `9664` (music on hold): music must play continuously,
 with no gap after the first second (a gap would mean the relay started

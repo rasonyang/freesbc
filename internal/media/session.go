@@ -22,8 +22,9 @@ type LatchMode int
 
 const (
 	// LatchStrict (default) requires the first packet's source IP to match
-	// the address set via SetExpectedRemote; the port may differ (NAT).
-	// With no expectation set, the first packet is accepted from anywhere.
+	// the address set via SetExpectedRemote (or seeded by SetRemote); the
+	// port may differ (NAT). With no expectation set, every packet is
+	// rejected: a strict latch fails closed until signaling arms it.
 	LatchStrict LatchMode = iota
 	// LatchLoose accepts the first packet from any source (hard-NAT peers).
 	LatchLoose
@@ -229,8 +230,7 @@ const (
 	sessClosed
 )
 
-// Stats returns the session's packet counters (side A reported as
-// "public", side B as "private").
+// Stats returns the session's packet counters, per side.
 func (s *Session) Stats() Stats { return s.counters.snapshot() }
 
 // Allocate binds two port pairs (side A and side B) for one call from

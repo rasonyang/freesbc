@@ -85,10 +85,11 @@ func (m *Metrics) MediaEnded(webrtc bool, st media.Stats) {
 	if webrtc {
 		m.webrtcSessions.Add(-1)
 	}
-	m.rtpPacketsRx.Add(st.PublicRTPPacketsRx + st.PrivateRTPPacketsRx)
-	m.rtpPacketsTx.Add(st.PublicRTPPacketsTx + st.PrivateRTPPacketsTx)
-	m.rtpBytesRx.Add(st.PublicRTPBytesRx + st.PrivateRTPBytesRx)
-	m.rtpBytesTx.Add(st.PublicRTPBytesTx + st.PrivateRTPBytesTx)
+	t := st.Total()
+	m.rtpPacketsRx.Add(t.RTPPacketsRx)
+	m.rtpPacketsTx.Add(t.RTPPacketsTx)
+	m.rtpBytesRx.Add(t.RTPBytesRx)
+	m.rtpBytesTx.Add(t.RTPBytesTx)
 }
 
 // WebRTCFailure classifies a browser-leg failure as ICE or DTLS, so an
