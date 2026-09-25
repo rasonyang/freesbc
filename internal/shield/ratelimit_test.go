@@ -72,3 +72,65 @@ func TestRateLimiterPruneDropsIdle(t *testing.T) {
 		t.Fatalf("prune should drop the idle/full bucket, have %d", len(r.buckets))
 	}
 }
+
+// audit: P2-SHD-002
+// At bucketCap the least recently used bucket is evicted; the map never
+// grows past the cap.
+func TestRateLimiterLRUCap(t *testing.T) {
+	r := newRateLimiter()
+	now := time.Unix(1000, 0)
+	r.now = func() time.Time { return now }
+	for i := 0; i <= bucketCap; i++ {
+		r.allow(capIP(i), 1, time.Second, true)
+	}
+	if got := len(r.buckets); got != bucketCap {
+		t.Fatalf("buckets = %d, want the cap %d", got, bucketCap)
+	}
+	if _, ok := r.buckets[capIP(0)]; ok {
+		t.Error("the least recently used bucket was not the one evicted")
+	}
+	if _, ok := r.buckets[capIP(bucketCap)]; !ok {
+		t.Error("the newest bucket is missing")
+	}
+}
+
+// audit: P2-SHD-002
+// IPv6 sources share one bucket per /64; IPv4 and 4in6 share per address.
+func TestRateLimiterKeysIPv6By64(t *testing.T) {
+	r := newRateLimiter()
+	now := time.Unix(1000, 0)
+	r.now = func() time.Time { return now }
+	if !r.allow(netip.MustParseAddr("2001:db8:1:2::1"), 1, time.Second, true) {
+		t.Fatal("first token refused")
+	}
+	if r.allow(netip.MustParseAddr("2001:db8:1:2:ffff::9"), 1, time.Second, true) {
+		t.Error("another address in the same /64 got its own bucket")
+	}
+	if !r.allow(netip.MustParseAddr("2001:db8:1:3::1"), 1, time.Second, true) {
+		t.Error("a different /64 must have its own bucket")
+	}
+	r.allow(netip.MustParseAddr("192.0.2.1"), 1, time.Second, true)
+	if r.allow(netip.MustParseAddr("::ffff:192.0.2.1"), 1, time.Second, true) {
+		t.Error("a 4in6 source must share its IPv4 bucket")
+	}
+}
+
+// audit: P2-SHD-003
+// prune keeps a bucket until it has been idle for its own interval.
+func TestRateLimiterPruneHonoursInterval(t *testing.T) {
+	r := newRateLimiter()
+	now := time.Unix(1000, 0)
+	r.now = func() time.Time { return now }
+	ip := netip.MustParseAddr("203.0.113.8")
+	r.allow(ip, 10, time.Hour, true)
+	now = now.Add(59 * time.Minute)
+	r.prune()
+	if len(r.buckets) != 1 {
+		t.Fatal("a 10/h bucket was pruned before an hour of idleness")
+	}
+	now = now.Add(time.Minute)
+	r.prune()
+	if len(r.buckets) != 0 || r.lru.Len() != 0 {
+		t.Fatal("a bucket idle for its whole interval must be pruned")
+	}
+}

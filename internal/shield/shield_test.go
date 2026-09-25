@@ -232,8 +232,8 @@ func TestSocketBanFloodLeavesIPTableFree(t *testing.T) {
 	s := testShield(t, shieldCfg)
 	base := netip.MustParseAddr("2001:db8::").As16()
 	for i := 0; i <= banCap; i++ {
-		a := base
-		a[12], a[13], a[14], a[15] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
+		a := base // one source per /64, so the rate limiter admits each
+		a[4], a[5], a[6], a[7] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
 		s.CheckFrom(netip.AddrPortFrom(netip.AddrFrom16(a), 5060), "friendly-scanner", "udp")
 	}
 	if s.socketBans.overflowed() == 0 {
