@@ -82,7 +82,7 @@ The two sections are mutually independent: SIP can advertise one public address 
 Items not yet implemented.
 
 - **100rel/PRACK** — an INVITE carrying `Require: 100rel` is answered `420 Bad Extension` today, and the trunk plane neither advertises 100rel nor handles PRACK
-- **Mid-call re-INVITE on the trunk plane** — hold/resume and codec renegotiation are answered `501`; only session-timer refresh re-INVITEs are handled (the edge proxy does re-anchor re-INVITEs)
+- **Mid-call re-INVITE on the trunk plane** — hold/resume and codec renegotiation are answered `488`; only session-timer refresh re-INVITEs are handled (the edge proxy does re-anchor re-INVITEs)
 - **Inbound digest challenge** — the SBC answers challenges but never issues one; trunk peers are authenticated by source IP, plus TLS/mTLS where configured
 - **Active peer qualification** — outbound OPTIONS keepalives; peer liveness is passive cooldown today
 - **`listen.media.public_ip: auto`** — STUN-detected public address; a literal address is required for now

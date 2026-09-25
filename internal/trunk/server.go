@@ -49,6 +49,18 @@ type Server struct {
 	dialogCli *sipgo.DialogClientCache
 	registrar *Registrar
 
+	// client is the plane's sipgo client, set once in Run; forkWatch uses
+	// it to ACK and BYE forked B-leg answers. forks holds the live
+	// forkWatches by (Call-ID, From-tag), under forkMu (see forks.go).
+	client *sipgo.Client
+	forkMu sync.Mutex
+	forks  map[forkKey]*forkWatch
+
+	// onBridged, when non-nil, runs right after registerCall publishes a
+	// call. Only tests set it (before Run), to exercise recoverCall on a
+	// bridged call.
+	onBridged func(*call)
+
 	// shield is the front-door security plane: consulted before
 	// identify() on every inbound request (see withShield). Built in Run,
 	// so it is nil on a *Server constructed directly by unit tests (e.g.
@@ -223,6 +235,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.dialogSrv = sipgo.NewDialogServerCache(client, contact)
 	s.dialogCli = sipgo.NewDialogClientCache(client, contact)
+	s.client = client
+	// Forked B-leg 2xx never reach the dialog layer (see forks.go); see
+	// every parsed message alongside the transaction layer instead.
+	ua.TransportLayer().OnMessage(s.observeMessage)
 
 	// s.shield is built here (not in NewServer) so unit tests that
 	// construct a *Server directly (without Run) exercise handlers with a
@@ -648,8 +664,24 @@ func (s *Server) onNoRoute(req *sip.Request, tx sip.ServerTransaction) {
 		s.dropUnidentified(req)
 		return
 	}
+	// A CANCEL only reaches a handler when sipgo's transaction layer found
+	// no INVITE transaction for it to cancel: that is 481 (RFC 3261 §9.2),
+	// not 405 — CANCEL itself is supported.
+	if req.Method == sip.CANCEL {
+		if err := tx.Respond(sip.NewResponseFromRequest(req, 481, "Call/Transaction Does Not Exist", nil)); err != nil {
+			s.log.Error("respond 481 cancel", "peer", name, "err", err)
+		}
+		return
+	}
 	s.log.Debug("method not implemented", "peer", name, "method", req.Method.String())
-	if err := tx.Respond(sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)); err != nil {
+	// A 405 MUST list the methods we do support (RFC 3261 §21.4.6).
+	res := sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil)
+	res.AppendHeader(sip.NewHeader("Allow", allowedMethods))
+	if err := tx.Respond(res); err != nil {
 		s.log.Error("respond 405", "peer", name, "err", err)
 	}
 }
+
+// allowedMethods is the Allow list for this plane's 405s: the methods with a
+// handler, plus CANCEL, which sipgo's transaction layer answers.
+const allowedMethods = "INVITE, ACK, BYE, CANCEL, OPTIONS"

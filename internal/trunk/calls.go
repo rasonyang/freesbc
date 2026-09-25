@@ -226,19 +226,15 @@ func (s *Server) dropLegs(callID string, c *call) {
 // lookupDialog returns the established SDP record for the live leg whose
 // dialog ID is (callID, fromTag, toTag) as the REMOTE endpoint of that leg
 // sends them in an in-dialog request (see legSDP), RFC 3261 §12.2.2.
-// knownCallID reports whether any live leg has this Call-ID at all, so the
-// caller can tell a request for a dialog that does not exist from one that
-// merely replays a live Call-ID with the wrong tags.
-func (s *Server) lookupDialog(callID, fromTag, toTag string) (entry legSDP, ok, knownCallID bool) {
+func (s *Server) lookupDialog(callID, fromTag, toTag string) (legSDP, bool) {
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	refs := s.legs[callID]
-	for _, r := range refs {
+	for _, r := range s.legs[callID] {
 		if r.entry.fromTag == fromTag && r.entry.toTag == toTag {
-			return r.entry, true, true
+			return r.entry, true
 		}
 	}
-	return legSDP{}, false, len(refs) > 0
+	return legSDP{}, false
 }
 
 // lookupLeg reports whether any live leg has callID as its own Call-ID,
