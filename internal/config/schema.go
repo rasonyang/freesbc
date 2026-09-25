@@ -175,11 +175,13 @@ type Peer struct {
 	// bridge.onInvite's quota gate.
 	MaxConcurrentCalls int `yaml:"max_concurrent_calls"`
 	// TLSCA is the outbound trust anchor for dialing this peer over tls:
-	// a PEM CA bundle ADDED to the system roots, so a carrier
-	// with a private/self-signed CA is reachable without disabling
-	// verification. TLSClientCert/TLSClientKey present OUR client
-	// certificate when the carrier requires mutual TLS (both-or-neither).
-	// Changes take effect on restart (no hot rotation).
+	// a PEM CA bundle that REPLACES the system roots for this peer only,
+	// so a carrier with a private/self-signed CA is reachable without
+	// disabling verification and no other peer is anchored by it.
+	// TLSClientCert/TLSClientKey present OUR client certificate to this
+	// peer only, when it requires mutual TLS (both-or-neither). Two tls
+	// peers may not share an address host. Changes take effect on restart
+	// (no hot rotation).
 	TLSCA         string `yaml:"tls_ca"`
 	TLSClientCert string `yaml:"tls_client_cert"`
 	TLSClientKey  string `yaml:"tls_client_key"`

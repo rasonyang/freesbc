@@ -113,6 +113,9 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 		return 0, nil, fmt.Errorf("build register: %w", err)
 	}
 
+	// A TLS dial for this REGISTER (or its digest retry) presents this
+	// peer's client certificate (see clientTLS.clientCert).
+	ctx = withTLSPeer(ctx, p.Name)
 	res, err := client.Do(ctx, req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("register: %w", err)

@@ -169,11 +169,13 @@ func (s *Server) ShieldStats() shield.Stats {
 // a bind failure), or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
 	sipgoLog := s.log.With("caller", "sipgo")
-	// Outbound TLS trust anchors/client certs, merged from the
-	// per-peer config into sipgo's single UA-wide tls.Config (see
-	// buildClientTLSConfig). Built once at startup — cert material is not
-	// hot-rotated.
-	clientTLS, err := buildClientTLSConfig(s.store.Current().Peers)
+	// Outbound TLS: one UA-wide client tls.Config (all sipgo v1.4.3
+	// accepts) whose callbacks select trust roots and client certificate
+	// per peer (see clientTLS). Material is loaded once at startup — it
+	// is not hot-rotated.
+	peerTLS, err := newClientTLS(s.store.Current().Peers,
+		func() map[string]*config.Peer { return s.store.Current().Peers },
+		s.resolver.srvTargets)
 	if err != nil {
 		return fmt.Errorf("client tls config: %w", err)
 	}
@@ -185,9 +187,7 @@ func (s *Server) Run(ctx context.Context) error {
 			sip.WithTransportLayerReadFilter(s.preParseFilter()),
 		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
-	}
-	if clientTLS != nil {
-		uaOpts = append(uaOpts, sipgo.WithUserAgenTLSConfig(clientTLS))
+		sipgo.WithUserAgenTLSConfig(peerTLS.config()),
 	}
 	ua, err := sipgo.NewUA(uaOpts...)
 	if err != nil {

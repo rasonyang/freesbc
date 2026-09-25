@@ -348,7 +348,7 @@ There is **no reload-failure metric**.
 | `shield.rate_limit`, `shield.peer_rate_limit`, `shield.auto_ban.duration` | — |
 | `admin.auth.username` / `password_hash` (effective on the next request) | `admin.listen`, `admin.tls_cert`, `admin.tls_key`; the **existence** of the `admin:` section |
 | RTP port ranges and bind IPs, for **new** sessions only | Edge topology: upstream nodes, PSTN gateways/routes/match, `webrtc.*`, DTLS identity |
-| `listen.media.rtp_timeout`, for new sessions | Outbound per-peer TLS material (`buildClientTLSConfig`, once at trunk `Run`) |
+| `listen.media.rtp_timeout`, for new sessions | Outbound per-peer TLS material (`newClientTLS`, once at trunk `Run`; §6.14) |
 | `sip.upstreams.cooldown`, `sip.pstn.attempt_timeout`, `sip.pstn.cooldown` — re-read per call/registration | Inbound TLS certificates (built once at bind) |
 
 The only `Store.Subscribe()` consumers are `trunk.Registrar.Run` (which
@@ -482,7 +482,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `peers.<n>.srtp` | `disabled\|optional\|required` | `disabled` |
 | `peers.<n>.register_expires` | duration | 0 = use global; must be ≥ 1s when set |
 | `peers.<n>.max_concurrent_calls` | int | 0 = unlimited |
-| `peers.<n>.tls_ca` / `tls_client_cert` / `tls_client_key` | path | "" ; cert and key both-or-neither |
+| `peers.<n>.tls_ca` / `tls_client_cert` / `tls_client_key` | path | "" ; cert and key both-or-neither; two `transport: tls` peers may not share an address host (hostname or IP, any port) |
 | `routes[].{name,from,match.to,transform.to,to[]}` | | first match wins; `to` order is failover order |
 | `sip.bind_ip` | IP | none — when set it *replaces* the `listen.sip` list |
 | `sip.bind_port` | 1-65535 | required alongside any other `sip.*` topology key |
@@ -1144,6 +1144,52 @@ until RTP silence trips the watchdog or a BYE arrives.
 The refreshers are the only goroutines besides `onInvite` that use a trunk
 call's sipgo dialog sessions. They only build and send requests through
 them, which read the dialog's immutable INVITE/response and its atomic CSeq.
+
+### 6.14 Outbound TLS per peer
+
+sipgo v1.4.3 takes one client `tls.Config` per user agent, so trust roots
+and client certificates cannot be installed per peer. `clientTLS`
+(`tlscert.go`) keeps that one config and selects per peer through its
+callbacks (P2-TRK-016, option (c) of the audit decision):
+
+- `InsecureSkipVerify: true` switches off Go's single-pool check, and
+  `VerifyConnection` replaces it on every handshake. It matches the
+  connection to exactly one `transport: tls` peer of the current snapshot:
+  - by `cs.ServerName`, which sipgo sets to the dialled host: the peer whose
+    address host is that name, or a peer with a bare hostname whose cached
+    SRV targets (`Resolver.srvTargets`) include it;
+  - when `cs.ServerName` is empty, the dial was to an IP literal (Go leaves
+    IPs out of SNI). The peer is then the IP-literal TLS peer whose IP is
+    among the leaf's IP SANs.
+
+  No match, or more than one, fails the handshake. The leaf is then verified
+  against that peer's roots (its `tls_ca` alone, or the system roots when it
+  has none), with the presented intermediates, for the dialled name or IP.
+- `GetClientCertificate` reads the peer name from the handshake ctx
+  (`cri.Context()`; sipgo hands the request ctx to `HandshakeContext`). The
+  B2BUA sets it with `withTLSPeer` on the B-leg `Invite`, and registration on
+  its `REGISTER`. It returns that peer's certificate, or none when the ctx
+  names no peer or the peer has none.
+- Material (CA pools, key pairs) is loaded once at `Run` and a bad file
+  fails startup. The peer set follows reload, but a TLS peer added by reload
+  that names `tls_ca` or `tls_client_cert` fails its handshakes until
+  restart instead of using the system roots.
+
+Known limits:
+
+- Validation rejects two TLS peers that share an address host
+  (`validateTLSPeerHosts`), since the port never reaches the callbacks.
+  Distinct names that resolve to the same IP:port are not detected, and
+  sipgo's connection pool (keyed by remote address) would reuse one peer's
+  connection for the other.
+- A dial whose ctx does not carry the peer (a background-ctx path, such as a
+  new connection for an in-dialog request) sends no client certificate.
+- A new connection to an address that is not a peer's (a Contact on a
+  different host, say) matches no peer and fails.
+- For an IP-literal peer the match comes from the certificate: a leaf that
+  names peer A's IP and chains to A's roots is also accepted on a dial to
+  peer B. That needs A's key at B's address.
+- There is no per-peer SNI override.
 
 ---
 
@@ -2874,7 +2920,7 @@ firewall in front of FreeSBC.
 | Surface | Certificate | Minimum version | Client auth |
 |---|---|---|---|
 | Trunk `tls://` listener | `listen.tls_cert`/`tls_key`, else a **self-signed certificate generated at startup with a CN of "FreeSBC self-signed" and no SANs at all**, plus a WARN | TLS 1.2 | `RequireAndVerifyClientCert` when `listen.tls_client_ca` is set (mTLS) |
-| Trunk outbound (per peer) | every peer's `tls_client_cert`/`tls_client_key`, merged into **one UA-wide `tls.Config`** because sipgo v1.4.3 accepts only one; `RootCAs` = the system pool plus **every** peer's `tls_ca`, merged | TLS 1.2 | — |
+| Trunk outbound (per peer) | **one UA-wide `tls.Config`** (sipgo v1.4.3 accepts only one) whose callbacks select per peer (§6.14): the chain is verified against the matched peer's `tls_ca` alone, or the system roots when it has none; `GetClientCertificate` presents only that peer's `tls_client_cert` | TLS 1.2 | our client certificate when the peer asks and has one configured |
 | Edge `wss` listener | `sip.public.wss.cert_file`/`key_file`, else a self-signed certificate for `127.0.0.1`/`localhost` plus a WARN that browsers will refuse it | TLS 1.2 | — |
 | Admin HTTPS | `admin.tls_cert`/`tls_key` | TLS 1.2 | — |
 | WebRTC DTLS | `webrtc.dtls_cert_file`/`dtls_key_file`, else one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity) | — | `RequireAnyClientCert`, so there is always something to fingerprint |
@@ -3156,7 +3202,11 @@ true`, and binding remote without TLS logs a prominent startup warning.
 `Cache-Control: no-store` on every response but `/healthz`.
 
 **Transport security.** TLS 1.2 minimum on every TLS surface; optional mTLS
-on the trunk listener via `listen.tls_client_ca`; digest **realm pinning** on
+on the trunk listener via `listen.tls_client_ca`; outbound trunk TLS trusts
+and identifies per peer, never across peers: each peer is anchored by its
+own `tls_ca` (or the system roots) and receives only its own client
+certificate, and a handshake that matches no peer, or several, fails (§6.14);
+digest **realm pinning** on
 both outbound INVITEs and outbound REGISTERs, which aborts before any
 `Authorization` header is ever sent unless the challenge names the pinned
 realm under both RFC parsing and sipgo's own digest parser (§6.9).

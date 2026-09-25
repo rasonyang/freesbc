@@ -1079,7 +1079,7 @@ peers:
     register: true
     allowed_ips: [127.0.0.1/32]
   tlsexplicit:
-    address: tls.example.net:5999
+    address: tls2.example.net:5999
     transport: tls
     auth: { username: u, password: p }
     register: true
@@ -1101,7 +1101,7 @@ routes:
 	}{
 		{"tlsbare", "tls.example.net", 5061},
 		{"udpbare", "udp.example.net", 5060},
-		{"tlsexplicit", "tls.example.net", 5999},
+		{"tlsexplicit", "tls2.example.net", 5999},
 	} {
 		params := r.paramsFor(cfg, tc.peer, cfg.Peers[tc.peer])
 		if params.RegistrarHost != tc.wantHost || params.RegistrarPort != tc.wantPort {

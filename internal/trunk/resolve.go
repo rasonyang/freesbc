@@ -170,6 +170,25 @@ func (r *Resolver) resolveSRV(host, transport string, cacheTTL time.Duration) []
 	return epsAny.([]Endpoint)
 }
 
+// srvTargets returns the hosts of the endpoints last cached for the SRV
+// name host over transport, expired or not, or nil when it was never
+// resolved. The outbound TLS verifier uses it to recognise an SRV target's
+// ServerName as belonging to the peer whose address produced it.
+func (r *Resolver) srvTargets(host, transport string) []string {
+	key := host + "/" + strings.ToLower(transport)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.cache[key]
+	if !ok {
+		return nil
+	}
+	hosts := make([]string, len(e.endpoints))
+	for i, ep := range e.endpoints {
+		hosts[i] = ep.Host
+	}
+	return hosts
+}
+
 // classifyAddress splits a peer address into host/port and reports whether a
 // port was explicitly given and whether the host is a literal IP. The port
 // default is transport-aware in Resolve (defaultPort); the 5060

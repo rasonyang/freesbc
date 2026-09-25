@@ -303,6 +303,7 @@ func (c *Config) validate() error {
 	for name, p := range c.Peers {
 		checkFilePair(fail, "peers."+name, "tls_client_cert", p.TLSClientCert, "tls_client_key", p.TLSClientKey)
 	}
+	c.validateTLSPeerHosts(fail)
 
 	c.validateProxy(fail)
 
