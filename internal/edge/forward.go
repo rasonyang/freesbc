@@ -32,7 +32,8 @@ var errMaxForwards = errors.New("proxy: max forwards reached")
 //  1. clone, so the inbound request stays intact for the response path;
 //  2. record the sender's real source in ITS Via (received/rport), which
 //     is what lets the response find its way back through NAT;
-//  3. strip our own Route values (we are the hop they name);
+//  3. strip our own Route values (we are the hop they name), and drop
+//     the extensions the proxy cannot carry (sanitizeExtensions);
 //  4. decrement Max-Forwards and refuse a looped request;
 //  5. add Record-Route so in-dialog traffic keeps traversing us;
 //  6. add our own Via with a fresh branch;
@@ -42,6 +43,7 @@ func (s *Server) prepareForward(req *sip.Request, from, to side, dest string, re
 
 	annotateVia(out, req.Source())
 	s.stripOwnRoutes(out)
+	sanitizeExtensions(out)
 
 	if mf := out.MaxForwards(); mf != nil {
 		mf.Dec()
@@ -178,7 +180,8 @@ var errResponseDropped = errors.New("proxy: response cannot be routed back")
 // own Via, let the caller rewrite what it owns, then send it to the
 // request's transport SOURCE (symmetric response routing, RFC 3581) and
 // count it. Everything else in the response is the far end's and is left
-// alone.
+// alone, except the Allow and Supported values the proxy cannot carry
+// (sanitizeExtensions).
 //
 // adapt runs on the clone after the Via is popped and before anything is
 // sent. It is where each loop rewrites the Contact and the SDP body; the
@@ -196,6 +199,7 @@ func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res 
 			"code", out.StatusCode, "sip_call_id", fsip.CallID(out))
 		return errResponseDropped
 	}
+	sanitizeExtensions(out)
 	if adapt != nil {
 		if err := adapt(out); err != nil {
 			return err

@@ -35,3 +35,34 @@ func TestWebRTCFailureClassification(t *testing.T) {
 		})
 	}
 }
+
+// audit: P2-EDG-002
+//
+// Request counters are labelled from a bounded set: known methods and
+// transports keep their own label, and anything a client invents lands
+// in OTHER.
+func TestRequestInLabelsAreBounded(t *testing.T) {
+	m := NewMetrics()
+	m.RequestIn("INVITE", "UDP")
+	m.RequestIn("INVITE", "udp")
+	m.RequestIn("REGISTER", "wss")
+	for i := 0; i < 100; i++ {
+		m.RequestIn(fmt.Sprintf("X%d", i), "UDP")
+		m.RequestIn("BYE", fmt.Sprintf("T%d", i))
+	}
+	got := m.Snapshot().RequestsIn
+	want := map[string]uint64{
+		"INVITE/UDP":   2,
+		"REGISTER/WSS": 1,
+		"OTHER/UDP":    100,
+		"BYE/OTHER":    100,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("RequestsIn = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("RequestsIn[%q] = %d, want %d (all: %v)", k, got[k], v, got)
+		}
+	}
+}

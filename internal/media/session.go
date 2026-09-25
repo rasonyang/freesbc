@@ -16,43 +16,108 @@ const (
 	SideB Side = 1
 )
 
-// LatchMode controls how the first inbound packet of a stream is matched
-// against the SDP-signaled source address (spec §3 decision 5).
+// LatchMode controls which inbound packet sources a stream accepts before
+// and after it latches (spec §3 decision 5).
 type LatchMode int
 
 const (
-	// LatchStrict (default) requires the first packet's source IP to match
-	// the address set via SetExpectedRemote (or seeded by SetRemote); the
+	// LatchStrict (default) requires a packet's source IP to match the
+	// address set via SetExpectedRemote (or seeded by SetRemote); the
 	// port may differ (NAT). With no expectation set, every packet is
 	// rejected: a strict latch fails closed until signaling arms it.
 	LatchStrict LatchMode = iota
-	// LatchLoose accepts the first packet from any source (hard-NAT peers).
+	// LatchLoose also accepts a source signalling never named (a hard-NAT
+	// peer whose SDP carries an unroutable address), but only until a
+	// source signalling vouches for is heard: see latchRank.
 	LatchLoose
 )
 
-// latch tracks the remote endpoint of one UDP stream. The first accepted
-// packet fixes the remote address; the latch never moves afterwards
-// (RTP-hijack hardening).
+// latchRank is how well signalling vouches for a packet source. A latch
+// only ever moves UP this ranking (or through an authorised relatch), and
+// a latch at rankExact is final.
+//
+//   - rankExact: the exact IP:port the side's SDP signalled.
+//   - rankSignalled: the SDP's IP from another port (a NAT that rewrote
+//     the port), or the IP the side's SIP came from (SetSignallingSource:
+//     a phone behind NAT whose SDP carries its private address sends RTP
+//     from the same public IP as its SIP).
+//   - rankAny: any other source. LatchLoose only.
+//
+// This is what closes the first-packet hijack (P2-EDG-001): a source that
+// sprays the port range before the real endpoint speaks wins at most a
+// rankAny latch, which the endpoint's first packet from a vouched address
+// takes back.
+type latchRank uint8
+
+const (
+	rankNone latchRank = iota // not latched / rejected
+	rankAny
+	rankSignalled
+	rankExact
+)
+
+// LearnDelay is how long a latch keeps sending to the SDP-signalled
+// address after it latched a below-exact source, when that SDP address is
+// plausible: it is the address the side's SIP came from, so there is no
+// NAT between them and the endpoint should be sending from it. A packet
+// from the exact signalled address latches at once; only after the delay
+// does the destination move to the below-exact source. Modelled on
+// rtpengine's "delayed" endpoint learning: a symmetric endpoint never
+// waits, one whose port was rewritten loses at most this much of its
+// inbound audio, and a packet sprayed at the port from the endpoint's own
+// IP does not redirect the call's audio to its sender.
+const LearnDelay = 3 * time.Second
+
+// latch tracks the remote endpoint of one UDP stream. An inbound packet
+// that latches fixes where the stream's reverse direction is sent; after
+// that only a better-vouched source (see latchRank) or an authorised
+// relatch moves it (RTP-hijack hardening).
 type latch struct {
 	mu       sync.Mutex
 	mode     LatchMode
 	expected netip.Addr // zero value = no expectation
-	remote   *net.UDPAddr
-	// latched records whether remote was fixed by an ACCEPTED INBOUND
-	// packet, as opposed to merely seeded from SDP (see seed). Only a
-	// latched remote is treated as final; a seeded one is still open to
-	// being corrected by the first genuine packet, which is what makes
-	// symmetric RTP work through NAT.
-	latched bool
+	// signalled is the exact media address the side's SDP gave (see
+	// seed); zero until seeded.
+	signalled netip.AddrPort
+	// sigSource is the IP the side's SIP signalling came from, when the
+	// signaling plane knows it (setSignallingSource); zero otherwise.
+	sigSource netip.Addr
+	// dst is the PROVISIONAL send-to address seeded from SDP. It carries
+	// the reverse direction until an inbound packet latches — and, while
+	// learning is delayed, until LearnDelay has passed since then.
+	dst *net.UDPAddr
+	// remote is the source an ACCEPTED INBOUND packet latched, rank how
+	// well signalling vouched for it (rankNone = not latched), and
+	// learnedAt when it latched.
+	remote    *net.UDPAddr
+	rank      latchRank
+	learnedAt time.Time
 	// allowLoopback lets seed install a loopback destination. It comes
 	// from the pool the side was allocated from (PlaneParams.AllowLoopback)
 	// and is fixed for the latch's lifetime.
 	allowLoopback bool
+	// now is the clock; nil means time.Now. Tests replace it.
+	now func() time.Time
+}
+
+func (l *latch) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
 func (l *latch) setExpected(ip netip.Addr) {
 	l.mu.Lock()
 	l.expected = ip
+	l.mu.Unlock()
+}
+
+// setSignallingSource records the IP the side's SIP signalling came from
+// (see rankSignalled and LearnDelay).
+func (l *latch) setSignallingSource(ip netip.Addr) {
+	l.mu.Lock()
+	l.sigSource = ip.Unmap()
 	l.mu.Unlock()
 }
 
@@ -80,27 +145,29 @@ func (l *latch) setMode(m LatchMode) {
 func (l *latch) relatch(addr netip.AddrPort) {
 	l.mu.Lock()
 	l.expected = addr.Addr()
+	l.signalled = netip.AddrPort{}
+	l.dst = nil
 	l.remote = nil
-	l.latched = false
+	l.rank = rankNone
 	l.mu.Unlock()
 	l.seed(addr)
 }
 
-// seed sets both the expected source IP and a PROVISIONAL send-to address
-// taken from the far side's SDP, without latching.
+// seed sets the expected source IP, the exact signalled address and a
+// PROVISIONAL send-to address, all taken from the far side's SDP, without
+// latching.
 //
 // Without it the relay cannot send anything until the far side has sent
 // first: target() would be nil, so an endpoint waiting to hear audio
 // before producing any would deadlock against another doing the same. With
 // it, media flows to the signalled address immediately, and the first
-// packet that passes the strict-mode source check still overrides the
-// destination — which is exactly symmetric RTP, and is what carries the
-// stream through a NAT that rewrote the port.
+// packet that latches still overrides the destination — which is exactly
+// symmetric RTP, and is what carries the stream through a NAT that
+// rewrote the port.
 //
-// The anti-hijack property is unchanged: a seeded (not yet latched) remote
-// accepts inbound packets only from the expected IP, and once a real
-// packet has latched it, nothing moves it again short of an authorized
-// re-INVITE.
+// The anti-hijack property is unchanged: a seed never latches, and once a
+// real packet has latched, SDP does not move it; only a better-vouched
+// source (latchRank) or an authorized re-INVITE does.
 //
 // Only a unicast address is ever installed as a destination (see
 // seedableDestination): the unspecified address (RFC 3264 §8.4 hold),
@@ -119,13 +186,11 @@ func (l *latch) seed(addr netip.AddrPort) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.expected = ip
-	if l.latched {
-		return // a real packet already fixed this; SDP does not override it
-	}
+	l.signalled = netip.AddrPortFrom(ip, addr.Port())
 	if ip.IsLoopback() && !l.allowLoopback {
 		return // arm the source check, but never send to it
 	}
-	l.remote = &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(addr.Port())}
+	l.dst = &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(addr.Port())}
 }
 
 // unicastMediaAddr reports whether ip can be a unicast RTP peer at all:
@@ -142,36 +207,69 @@ func unicastMediaAddr(ip netip.Addr) bool {
 	return true
 }
 
+// rankOf is how well signalling vouches for src under the latch's mode.
+func (l *latch) rankOf(src *net.UDPAddr) latchRank {
+	ip, ok := netip.AddrFromSlice(src.IP)
+	if !ok {
+		return rankNone
+	}
+	ip = ip.Unmap()
+	if l.mode == LatchStrict && (!l.expected.IsValid() || ip != l.expected.Unmap()) {
+		return rankNone // strict: reject until SetExpectedRemote arms the latch
+	}
+	switch {
+	case l.signalled.IsValid() && ip == l.signalled.Addr() && src.Port == int(l.signalled.Port()):
+		return rankExact
+	case l.expected.IsValid() && ip == l.expected.Unmap(),
+		l.sigSource.IsValid() && ip == l.sigSource:
+		return rankSignalled
+	}
+	return rankAny
+}
+
 // accept reports whether a packet from src may be processed, latching the
-// stream to src on the first acceptance.
+// stream to src when it is the first acceptable source or a better-vouched
+// one than the source already latched.
 func (l *latch) accept(src *net.UDPAddr) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.latched {
-		return l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port
+	if l.rank != rankNone && l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port {
+		return true
 	}
-	if l.mode == LatchStrict {
-		if !l.expected.IsValid() {
-			return false // strict: reject until SetExpectedRemote arms the latch
-		}
-		ip, ok := netip.AddrFromSlice(src.IP)
-		if !ok || ip.Unmap() != l.expected.Unmap() {
-			return false
-		}
+	r := l.rankOf(src)
+	if r <= l.rank {
+		return false // unacceptable, or no better than the latched source
 	}
 	l.remote = &net.UDPAddr{
 		IP:   append(net.IP(nil), src.IP...),
 		Port: src.Port,
 		Zone: src.Zone,
 	}
-	l.latched = true
+	l.rank = r
+	l.learnedAt = l.clock()
 	return true
 }
 
-// target returns the latched remote, or nil before latching.
+// learningDelayed reports whether a below-exact latch waits LearnDelay
+// before it becomes the destination: the SDP address was installed and is
+// the address the side's SIP came from, so it is plausibly where the
+// endpoint listens — not a private address behind a NAT.
+func (l *latch) learningDelayed() bool {
+	return l.dst != nil && l.sigSource.IsValid() && l.signalled.Addr() == l.sigSource
+}
+
+// target returns where the reverse direction is sent: the latched remote,
+// the SDP-seeded destination before latching (or while learning is
+// delayed), or nil when there is neither.
 func (l *latch) target() *net.UDPAddr {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.rank == rankNone {
+		return l.dst
+	}
+	if l.rank < rankExact && l.learningDelayed() && l.clock().Sub(l.learnedAt) < LearnDelay {
+		return l.dst
+	}
 	return l.remote
 }
 
@@ -286,6 +384,15 @@ func (s *Session) RTPPort(side Side) int { return s.pairs[side].RTPPort() }
 func (s *Session) SetExpectedRemote(side Side, ip netip.Addr) {
 	s.rtp[side].setExpected(ip)
 	s.rtcp[side].setExpected(ip)
+}
+
+// SetSignallingSource records the IP one side's SIP signalling came from.
+// A loose latch ranks a packet from it above an unknown source, and, when
+// the side's SDP address is that same IP, delays learning any other
+// source by LearnDelay (see latchRank). Survives Relatch.
+func (s *Session) SetSignallingSource(side Side, ip netip.Addr) {
+	s.rtp[side].setSignallingSource(ip)
+	s.rtcp[side].setSignallingSource(ip)
 }
 
 // SetRemote seeds one side's send-to address AND its expected source IP

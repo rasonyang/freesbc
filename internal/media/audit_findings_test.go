@@ -235,6 +235,12 @@ func TestAuditMED004OneWaySilenceNeverReclaimed(t *testing.T) {
 // FreeSWITCH audio goes to the attacker. Needs 127.0.0.2 (Linux).
 func TestAuditMED006LooseLatchFirstPacketHijack(t *testing.T) {
 	pool := newAuditPool("audit", 24220, 24239, "")
+	// A loopback lab: the phone and FreeSWITCH both sit on 127.0.0.1, so
+	// their SDP-seeded destinations are loopback. Since the P2-MED-003 fix
+	// (afcae81) a pool sends to a loopback SDP address only when it allows
+	// loopback, and without that FreeSWITCH, which never sends first here,
+	// would have no destination and could hear nobody at all.
+	pool.loopback.Store(true)
 	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchStrict}, Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)

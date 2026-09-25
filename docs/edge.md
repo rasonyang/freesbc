@@ -64,7 +64,7 @@ configuration, and the "Edge proxy plane" section of
 | REGISTER | Proxied verbatim, digest and all. The Contact is rewritten toward FreeSWITCH (so inbound calls route back through the SBC) and restored on the way back (so sip.js accepts the registration). The binding expiry follows the registrar's grant for this device's own Contact, not the client's request. A `Contact: *` un-REGISTER is forwarded as `*` and removes every binding of the AoR. |
 | SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
 | Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
-| Media | Every stream anchored on an SBC port pair. Symmetric RTP: on this (edge) plane the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet; the trunk plane seeds only the answering side (from its answer), so media toward the caller flows once the caller sends. A destination is never an unspecified, multicast, broadcast or link-local address, nor a loopback one unless the SBC's own media plane is on loopback. Strict source latching resists off-path hijacking. |
+| Media | Every stream anchored on an SBC port pair. Symmetric RTP: on this (edge) plane the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet; the trunk plane seeds only the answering side (from its answer), so media toward the caller flows once the caller sends. A destination is never an unspecified, multicast, broadcast or link-local address, nor a loopback one unless the SBC's own media plane is on loopback. The public leg latches loosely (a hard-NAT phone may signal an unroutable address), but ranks sources: the exact SDP address beats the SDP or SIP source IP, which beats anything else, and a better-ranked source takes the latch back. An off-path source that sends first therefore holds the call's audio only until the phone's first packet; when the SDP address is the phone's SIP address, audio is not redirected to another port for 3 s. The private leg latches strictly on FreeSWITCH's signalled IP. |
 | WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint` inside the DTLS handshake, so a mismatched peer never gets SRTP keys and no media is relayed for it. Manual real-browser test: [`docs/smoke/webrtc-dtls.md`](smoke/webrtc-dtls.md). |
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role — in answers to the browser and in re-offers FreeSWITCH makes to it — so media is never interrupted. A re-INVITE that moves either side's media address re-points the anchor to it once the 2xx completes the exchange; one whose 2xx cannot be anchored is ACKed and the call is ended on both sides. |
@@ -228,7 +228,14 @@ These are structural rather than scheduled.
 - **No TURN and no full ICE.** FreeSBC is ICE-Lite and needs a publicly
   reachable media address; a client that can only reach it via a relay is
   out of scope.
-- **SUBSCRIBE/NOTIFY (and UPDATE, MESSAGE, REFER, PUBLISH) are answered
+- **PRACK and UPDATE are answered 405, not proxied**, so FreeSBC never
+  lets either end advertise them: it removes `PRACK`, `UPDATE` (and every
+  other method it does not proxy) from `Allow` and `100rel` from
+  `Supported` on everything it forwards or relays, and answers an INVITE
+  with `Require: 100rel` with `420 Bad Extension`. Provisional responses
+  are therefore never reliable, and session timers (`Supported: timer`
+  still passes) are refreshed with re-INVITE.
+- **SUBSCRIBE/NOTIFY (and MESSAGE, REFER, PUBLISH) are answered
   405, not proxied.** FreeSWITCH sends a NOTIFY for message-waiting
   indication after a registration; MWI and BLF therefore do not reach
   phones through the proxy. The event framework is

@@ -3,8 +3,11 @@ package edge
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/internal/media"
 )
@@ -13,10 +16,15 @@ import (
 //
 // Deliberately free of high-cardinality labels (spec §17): a Call-ID
 // belongs in a log line or a trace, never in a metric, because each
-// distinct value would create a permanent time series. Methods and status
-// classes are bounded sets and are safe to label by.
+// distinct value would create a permanent time series. Status classes are a
+// bounded set; request methods and transports come off the wire, so they
+// are bounded here (metricMethods, metricTransports) with one "OTHER"
+// bucket each rather than labelled by whatever a client wrote
+// (P2-EDG-002).
 type Metrics struct {
-	requestsIn   sync.Map // "method/transport" → *atomic.Uint64
+	// requestsIn is a fixed table, one counter per known method (plus
+	// OTHER) per known transport (plus OTHER): no request can add a row.
+	requestsIn   [len(metricMethods) + 1][len(metricTransports) + 1]atomic.Uint64
 	responsesOut sync.Map // status class ("2xx") → *atomic.Uint64
 
 	registrations       atomic.Int64 // gauge
@@ -51,7 +59,47 @@ func bump(m *sync.Map, key string) {
 	v.(*atomic.Uint64).Add(1)
 }
 
-func (m *Metrics) RequestIn(method, transport string) { bump(&m.requestsIn, method+"/"+transport) }
+// metricOther is the label of the bucket every unknown method or
+// transport is counted in.
+const metricOther = "OTHER"
+
+// metricMethods are the request methods counted under their own label: the
+// methods sipgo names (RFC 3261 and its extensions). Anything else is
+// OTHER.
+var metricMethods = [...]sip.RequestMethod{
+	sip.INVITE, sip.ACK, sip.CANCEL, sip.BYE, sip.REGISTER, sip.OPTIONS,
+	sip.SUBSCRIBE, sip.NOTIFY, sip.REFER, sip.INFO, sip.MESSAGE, sip.PRACK,
+	sip.UPDATE, sip.PUBLISH,
+}
+
+// metricTransports are the transports counted under their own label,
+// matched case-insensitively and labelled in upper case as a Via writes
+// them (RFC 3261 §20.42). Anything else is OTHER.
+var metricTransports = [...]string{"UDP", "TCP", "TLS", "WS", "WSS"}
+
+func methodIndex(method string) int {
+	for i, m := range metricMethods {
+		if string(m) == method {
+			return i
+		}
+	}
+	return len(metricMethods)
+}
+
+func transportIndex(transport string) int {
+	for i, t := range metricTransports {
+		if strings.EqualFold(t, transport) {
+			return i
+		}
+	}
+	return len(metricTransports)
+}
+
+// RequestIn counts one received request by method and transport, each
+// folded into a bounded label set.
+func (m *Metrics) RequestIn(method, transport string) {
+	m.requestsIn[methodIndex(method)][transportIndex(transport)].Add(1)
+}
 
 func (m *Metrics) ResponseOut(code int) {
 	if code < 100 || code > 699 {
@@ -155,10 +203,23 @@ func (m *Metrics) Snapshot() Snapshot {
 		WebRTCICEFailures:           m.iceFailures.Load(),
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
 	}
-	m.requestsIn.Range(func(k, v any) bool {
-		s.RequestsIn[k.(string)] = v.(*atomic.Uint64).Load()
-		return true
-	})
+	for i := range m.requestsIn {
+		method := metricOther
+		if i < len(metricMethods) {
+			method = string(metricMethods[i])
+		}
+		for j := range m.requestsIn[i] {
+			n := m.requestsIn[i][j].Load()
+			if n == 0 {
+				continue // as before: a label pair appears once it is counted
+			}
+			transport := metricOther
+			if j < len(metricTransports) {
+				transport = metricTransports[j]
+			}
+			s.RequestsIn[method+"/"+transport] = n
+		}
+	}
 	m.responsesOut.Range(func(k, v any) bool {
 		s.ResponsesOut[k.(string)] = v.(*atomic.Uint64).Load()
 		return true

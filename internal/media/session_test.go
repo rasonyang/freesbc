@@ -237,3 +237,139 @@ func TestSessionCloseIdempotentAndReleases(t *testing.T) {
 	}
 	s2.Close()
 }
+
+// audit: P2-MED-006
+//
+// A loose latch taken by a source signalling never named is only a
+// fallback: the first packet from the exact SDP address takes it back,
+// and from then on nothing but a relatch moves it.
+func TestLatchLooseExactSourceRetakesFromIntruder(t *testing.T) {
+	l := &latch{mode: LatchLoose}
+	l.seed(netip.MustParseAddrPort("198.51.100.7:4000"))
+	intruder := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 66), Port: 9999}
+	phone := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4000}
+	if !l.accept(intruder) {
+		t.Fatal("a loose latch must still accept an unnamed first source (hard NAT)")
+	}
+	if !l.accept(phone) {
+		t.Fatal("a packet from the exact signalled address must retake the latch")
+	}
+	if got := l.target(); got == nil || got.String() != phone.String() {
+		t.Fatalf("destination = %v, want the signalled phone %v", got, phone)
+	}
+	if l.accept(intruder) {
+		t.Fatal("the displaced source must be dropped")
+	}
+	if l.accept(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4002}) {
+		t.Fatal("a latch at the exact signalled address is final")
+	}
+}
+
+// audit: P2-MED-006
+//
+// The hard-NAT case: SDP carries a private address, the phone's RTP comes
+// from the public IP its SIP came from. An intruder that sends first gets
+// the latch (and the audio) only until the phone's first packet.
+func TestLatchLooseSignallingSourceRetakesFromIntruder(t *testing.T) {
+	l := &latch{mode: LatchLoose}
+	l.seed(netip.MustParseAddrPort("192.168.1.20:55135"))
+	l.setSignallingSource(netip.MustParseAddr("183.241.147.126"))
+	intruder := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 66), Port: 9999}
+	phone := &net.UDPAddr{IP: net.IPv4(183, 241, 147, 126), Port: 50699}
+	if !l.accept(intruder) {
+		t.Fatal("a loose latch must still accept an unnamed first source")
+	}
+	if got := l.target(); got == nil || got.String() != intruder.String() {
+		t.Fatalf("with a NATed SDP address, learning is immediate: destination = %v", got)
+	}
+	if !l.accept(phone) {
+		t.Fatal("a packet from the SIP source IP must retake the latch")
+	}
+	if got := l.target(); got == nil || got.String() != phone.String() {
+		t.Fatalf("destination = %v, want the NATed phone %v", got, phone)
+	}
+	if l.accept(intruder) {
+		t.Fatal("the displaced source must be dropped")
+	}
+	if l.accept(&net.UDPAddr{IP: net.IPv4(183, 241, 147, 126), Port: 50700}) {
+		t.Fatal("an equally ranked source must not move the latch")
+	}
+	if !l.accept(&net.UDPAddr{IP: net.IPv4(192, 168, 1, 20), Port: 55135}) {
+		t.Fatal("the exact signalled address still outranks the SIP source IP")
+	}
+}
+
+// audit: P2-EDG-001
+//
+// When the SDP address is the one the phone's SIP came from, a source on
+// that IP but another port is heard at once but not sent to for
+// LearnDelay: the phone should be sending from its SDP address, so audio
+// stays there unless it never does.
+func TestLatchLooseDelayedLearning(t *testing.T) {
+	now := time.Unix(1000, 0)
+	newLatch := func() *latch {
+		l := &latch{mode: LatchLoose, now: func() time.Time { return now }}
+		l.seed(netip.MustParseAddrPort("198.51.100.7:4000"))
+		l.setSignallingSource(netip.MustParseAddr("198.51.100.7"))
+		return l
+	}
+	sdpAddr := "198.51.100.7:4000"
+	other := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 5000}
+
+	l := newLatch()
+	if !l.accept(other) {
+		t.Fatal("a same-IP source must be accepted (NAT port rewrite)")
+	}
+	if got := l.target(); got == nil || got.String() != sdpAddr {
+		t.Fatalf("during the learning delay the destination must stay at the SDP address, got %v", got)
+	}
+	now = now.Add(LearnDelay)
+	if got := l.target(); got == nil || got.String() != other.String() {
+		t.Fatalf("after the learning delay the destination must move to the learned source, got %v", got)
+	}
+	exact := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4000}
+	if !l.accept(exact) {
+		t.Fatal("the exact signalled address must still retake the latch")
+	}
+	if got := l.target(); got.String() != sdpAddr {
+		t.Fatalf("destination = %v, want %s", got, sdpAddr)
+	}
+
+	// The endpoint speaks from its SDP address during the window: final.
+	l = newLatch()
+	_ = l.accept(other)
+	if !l.accept(exact) || l.accept(other) {
+		t.Fatal("the exact source must latch at once and lock out the other port")
+	}
+}
+
+// Strict latching also prefers the exact signalled address over another
+// port on the expected IP.
+func TestLatchStrictUpgradesToExactAddress(t *testing.T) {
+	l := &latch{mode: LatchStrict}
+	l.seed(netip.MustParseAddrPort("10.0.0.1:4000"))
+	other := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 5000}
+	exact := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4000}
+	if !l.accept(other) {
+		t.Fatal("strict mode tolerates a rewritten port")
+	}
+	if !l.accept(exact) || l.accept(other) {
+		t.Fatal("the exact signalled address must take the latch over and keep it")
+	}
+	if l.accept(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 4000}) {
+		t.Fatal("strict mode must still reject another IP")
+	}
+}
+
+// Relatch forgets the signalled address along with the latch.
+func TestRelatchForgetsSignalledAddress(t *testing.T) {
+	l := &latch{mode: LatchLoose}
+	l.seed(netip.MustParseAddrPort("198.51.100.7:4000"))
+	l.relatch(netip.MustParseAddrPort("198.51.100.8:0"))
+	if !l.accept(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4000}) {
+		t.Fatal("loose: an unnamed source is still acceptable")
+	}
+	if l.rank != rankAny {
+		t.Fatalf("the old SDP address must no longer rank as signalled, rank = %d", l.rank)
+	}
+}

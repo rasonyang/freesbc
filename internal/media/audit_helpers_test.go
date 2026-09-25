@@ -24,6 +24,10 @@ import (
 type auditPool struct {
 	*PlanePool
 	lo, hi atomic.Int32
+	// loopback is PlaneParams.AllowLoopback: a test that stands for a
+	// loopback lab, where both media peers sit on 127.0.0.1, sets it
+	// before Allocate so SDP-seeded loopback destinations are used.
+	loopback atomic.Bool
 }
 
 func newAuditPool(name string, lo, hi int, bind string) *auditPool {
@@ -36,10 +40,11 @@ func newAuditPool(name string, lo, hi int, bind string) *auditPool {
 	}
 	ap.PlanePool = NewPlanePool(name, func() PlaneParams {
 		return PlaneParams{
-			MinPort: uint16(ap.lo.Load()),
-			MaxPort: uint16(ap.hi.Load()),
-			BindIP:  ip,
-			Timeout: 30 * time.Second,
+			MinPort:       uint16(ap.lo.Load()),
+			MaxPort:       uint16(ap.hi.Load()),
+			BindIP:        ip,
+			Timeout:       30 * time.Second,
+			AllowLoopback: ap.loopback.Load(),
 		}
 	})
 	return ap

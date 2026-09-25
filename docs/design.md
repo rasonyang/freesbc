@@ -141,7 +141,7 @@ Created once, alive for the process lifetime:
 | `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:285`) | one goroutine per `register: true` peer |
 | `trunk.Resolver` | trunk | `NewServer` | SRV cache + singleflight + seeded `rand` |
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
-| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:268`) | immutable snapshot afterwards |
+| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:269`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
 | `edge.dialogTable` | edge | `edge.New` (`edge.go:143`) | grouped by Call-ID, matched on Call-ID + both tags |
 | `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:136-137`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
@@ -196,8 +196,8 @@ Created once, alive for the process lifetime:
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: closer, and `ln.Serve` | `Run` (`edge.go:272-283`) | `listenCtx` cancel / serve error |
-| `Location.Prune` ticker (30 s) | `Run` (`edge.go:297-312`) | `listenCtx` cancel |
+| per listener: closer, and `ln.Serve` | `Run` (`edge.go:273-283`) | `listenCtx` cancel / serve error |
+| `Location.Prune` ticker (30 s) | `Run` (`edge.go:310-325`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
 | WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:261`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
@@ -280,11 +280,22 @@ ws/wss listener on the trunk plane. TCP and TLS listeners are wrapped in
 `listen.tls_cert`/`tls_key` if present, otherwise mints a self-signed
 certificate and logs `"TLS listener using self-signed certificate"`.
 
-**Edge** (`edge.go:223-283`) binds **every socket synchronously before
+**Edge** (`edge.go:224-306`) binds **every socket synchronously before
 serving any of them**; on any failure every already-opened listener is closed
-and `Run` returns. The unexported `ready` channel closes once every socket
-is open; nothing in production waits on it (the exported `Ready()` was dead
-code and was removed) — it is the happens-before edge the test harness uses.
+and `Run` returns. It then starts one serving goroutine per socket and waits
+(`awaitUDPServing`, `edge.go:353-380`, bounded by 5 s) until every UDP
+listener is in sipgo's connection pool: sipgo pools a UDP listener only
+inside `ServeUDP`, on that goroutine, and a request pinned to the listener's
+address before then (every forward, §7.8) misses the pool, so sipgo binds a
+second socket on the same address and fails with "address already in use" —
+a 503 to the first callers after a restart. WS/WSS listeners need no wait,
+since nothing is sent pinned to them. A serve error or the timeout during
+that wait makes `Run` return it. Only then does the unexported `ready`
+channel close, so `ready` means every socket can both receive and send.
+Nothing in production waits on it (the exported `Ready()` was dead code and
+was removed); it is the happens-before edge the test harness uses, and the
+harness asserts, without waiting, that each UDP listener is pooled when it
+closes (`assertProxyServing`).
 The listener list is
 every enabled `cfg.PublicSIPListeners()` entry (`udp`, `ws`, `wss`) plus one
 synthetic `"udp-private"` entry for `sip.private.bind`.
@@ -296,7 +307,7 @@ unsynchronised variable, which the race detector flags on every graceful
 shutdown.
 
 After binding, the edge plane replaces its topology with
-`s.topo = s.topo.pinned(opened)` (`edge.go:268`). A wildcard bind does not
+`s.topo = s.topo.pinned(opened)` (`edge.go:269`). A wildcard bind does not
 come up as the address it was written with — on a dual-stack host `0.0.0.0`
 yields a socket whose local address is `[::]:port` — and sipgo keys its
 connection pool by the socket's real local address. Without pinning, an
@@ -1257,9 +1268,13 @@ it (`freesbc_sip_handler_panics_total`) and answers 500 **only when the
 transaction has not already had a final response** (the handler is given a
 `finalTracker` wrapping the server transaction, which records that);
 `fsip.SourceAddrPort(req)` (an unparseable source is **silently dropped**
-before metrics, shield and handler); `metrics.RequestIn(method, transport)`;
-then, only for requests that did *not* arrive on the private plane,
-`shield.Check(...)` with a silent return on `Drop`.
+before shield, metrics and handler); then, only for requests that did *not*
+arrive on the private plane, `shield.CheckFrom(...)` with a silent return on
+`Drop`; then `metrics.RequestIn(method, transport)`, so a request the shield
+dropped is not counted. `RequestIn` folds the method into the methods sipgo
+names (INVITE … PUBLISH) and the transport into UDP/TCP/TLS/WS/WSS, each with
+one `OTHER` bucket, into a fixed counter table (`edge/metrics.go`): a client
+cannot add a label value by inventing a method (P2-EDG-002).
 
 A source the shield has **banned** is also dropped by the edge read filter,
 before parsing: sipgo answers some messages itself before any handler runs
@@ -1302,6 +1317,7 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | Method | Handling |
 |---|---|
 | REGISTER | proxied to an upstream (§7.4); from the private plane → **403 Forbidden** |
+| INVITE with `Require: 100rel` | **420 Bad Extension** + `Unsupported: 100rel` (`rejectRequired100rel`, `extensions.go`), before any classification: a reliable 18x would need a PRACK the proxy refuses |
 | INVITE, no To-tag | dispatched by classification (§7.5) |
 | INVITE, To-tag present | `onReInvite` (§7.9) |
 | ACK | stateless forward (§7.8) |
@@ -1313,6 +1329,22 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 Every locally generated response and every relayed response is sent to
 `req.Source()` — symmetric response routing (RFC 3581), so a response reaches
 a phone behind NAT.
+
+**Advertised extensions** (`sanitizeExtensions`, `extensions.go`). Every
+request `prepareForward` builds and every response `relayResponse` relays
+has its `Allow` cut down to the methods above that the proxy carries
+(`allowedMethods`), and `100rel` removed from `Supported` (either spelling,
+`k` included); the headers are rewritten only when something is dropped, and
+one left empty is removed. Otherwise a callee that saw `Supported: 100rel`
+could send a reliable 18x whose PRACK gets 405 (RFC 3262 §3: the callee
+fails the call after 64·T1), and a session-timer refresher that saw
+`Allow: UPDATE` could refresh with UPDATE (RFC 4028 §9) and lose the call
+at expiry (P2-EDG-010). `Supported: timer` is kept: without UPDATE in
+`Allow` a refresher uses re-INVITE, which §7.9 proxies. PRACK and UPDATE
+are refused rather than proxied because both can carry SDP offers and
+answers inside a dialog, and the edge builds every SDP body itself (§8.8):
+proxying them would need a second offer/answer path beside the INVITE
+one.
 
 ### 7.4 REGISTER proxying and binding lifecycle
 
@@ -1570,7 +1602,7 @@ FreeSBC cannot anchor and to one that races a CANCEL.
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
 (`edge.go:171`). `freesbc_active_sip_dialogs` is a separate mechanism over the
 same set: the `Metrics.dialogs` gauge moved by `DialogStarted`/`DialogEnded`
-in `confirm`/`end` (`edge/metrics.go:67-68`), sampled through
+in `confirm`/`end` (`edge/metrics.go:119-120`), sampled through
 `Snapshot().ActiveDialogs` (`admin/metrics.go:57,129`).
 
 An `inviteAttempt` holds the request **as forwarded** (so a CANCEL carries
@@ -2013,24 +2045,26 @@ stateDiagram-v2
     Seeded --> Latched: accept(src) succeeds
     Armed --> Latched: accept(src) succeeds
     Unarmed --> Latched: accept(src) succeeds (loose mode only)
+    Latched --> Latched: accept(src) from a better-ranked source
     Latched --> Seeded: relatch (re-INVITE / new answer authorised)
     Seeded --> Seeded: relatch
     Armed --> Seeded: relatch
 ```
 
-Transitions: `setExpected` (`session.go:53-57`) records the expected source
-IP; `seed` (`session.go:111-129`) sets the expected IP **and** a provisional
-send-to destination from SDP, returning without touching `remote` if the
-latch is already latched; `accept` (`session.go:147-169`) is the gate the
-relay calls per packet and is what sets `latched`; `relatch`
-(`session.go:80-87`) takes the newly signalled address (IP **and** port),
-sets the expected IP, clears both `remote` and `latched` — unconditionally,
-from **any** state — and then seeds the new address, so the side keeps
+Transitions: `setExpected` (`session.go:110-114`) records the expected source
+IP; `seed` (`session.go:178-194`) records the expected IP, the exact
+signalled address **and** a provisional send-to destination (`dst`) from
+SDP, never touching the latched `remote`; `accept` (`session.go:233-251`) is
+the gate the relay calls per packet and is what sets `remote` and its `rank`;
+`relatch` (`session.go:145-154`) takes the newly signalled address (IP
+**and** port), sets the expected IP, clears `dst`, the signalled address,
+`remote` and `rank` — unconditionally, from **any** state — and then seeds
+the new address, so the side keeps
 receiving media after an authorised move even if it never sends first (a
 recvonly peer, an IVR waiting to hear audio). An address with no usable
 port only re-arms the source check (`Armed`).
 
-**What `seed` will send to** (`unicastMediaAddr`, `session.go:134`): the
+**What `seed` will send to** (`unicastMediaAddr`, `session.go:199`): the
 unspecified address (RFC 3264 §8.4 hold), multicast, the IPv4 broadcast
 address and link-local addresses are never installed, nor do they change
 the expected source. A loopback address arms the source check but becomes
@@ -2046,21 +2080,48 @@ edge derives from its advertised media addresses) loopback `c=` addresses
 with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
 `Address`.
 
-Acceptance rules in `accept`:
+Acceptance rules in `accept`. Every source is ranked by how well
+signalling vouches for it (`latchRank`, `rankOf` at `session.go:211-229`):
 
-- **Already latched**: accept only an exact IP **and** port match — this is
-  the post-latch hijack rejection.
-- **Strict, not latched**: reject when there is no expectation at all;
-  otherwise the source IP must equal the expected IP (compared `Unmap`ed).
-  **The port may differ**, which is what makes NAT port rewriting work.
-- **Loose, not latched**: accept the first packet from anywhere.
+1. **exact**: the exact IP **and** port the side's SDP signalled;
+2. **signalled**: the expected IP from another port (a NAT that rewrote the
+   port), or the IP the side's SIP came from (`SetSignallingSource`, set by
+   the edge on its public leg: a phone behind NAT whose SDP carries its
+   private address sends RTP from the public IP its SIP came from);
+3. **any**: every other source — loose mode only. In strict mode a source
+   whose IP is not the expected one (compared `Unmap`ed), or any source
+   before an expectation exists, is rejected outright.
+
+A packet from the latched source is always accepted. Any other packet is
+accepted only if it ranks **strictly above** the latched source (or, before
+latching, above nothing), and then it re-latches. So the first acceptable
+packet latches as before, an equally ranked newcomer is dropped (the
+post-latch hijack rejection), and an **exact** latch is final. What this
+buys (P2-EDG-001): an off-path source that sprays the loose public port
+before the phone speaks wins at most an *any* latch, which the phone's first
+packet from its SDP address or its SIP IP takes back.
+
+**Delayed learning** (`LearnDelay` = 3 s, `target` at `session.go:264-274`):
+when the SDP address was installed as a destination and **is** the IP the
+side's SIP came from — no NAT between them, so the endpoint should be
+sending from it — a below-exact latch does not become the destination until
+`LearnDelay` after it latched; until then audio keeps going to the SDP
+address. A packet from the exact address meanwhile latches at once. Modelled
+on rtpengine's delayed endpoint learning: a symmetric endpoint never waits,
+one whose port was rewritten loses at most 3 s of inbound audio, and a
+packet sprayed at the port from the phone's own IP (another host behind the
+same NAT) does not redirect the call's audio. When the SDP address differs
+from the SIP source (the NAT case, or a gateway whose media and signalling
+addresses differ), or no SIP source is known (the trunk plane), learning is
+immediate.
 
 `ParseLatchMode`: `"loose"` → loose, everything else (including `""`) →
 strict.
 
 **Symmetric RTP**: the seeded destination is overridden by the first
-*accepted* packet's real source address and port; nothing moves the latch
-afterwards short of an explicit `relatch` from the signalling plane. The
+*accepted* packet's real source address and port; afterwards only a
+better-ranked source or an explicit `relatch` from the signalling plane
+moves the latch. The
 local port never changes across a re-INVITE.
 
 Plane defaults:
@@ -2069,7 +2130,7 @@ Plane defaults:
 |---|---|---|
 | Trunk A-leg | the calling peer's `media_latch` (default `strict`) | `Allocate` config |
 | Trunk B-leg | the *selected target's* `media_latch`, re-applied per attempt | `SetLatchMode(SideB, …)` in `dialTarget` |
-| Edge public leg (side A) | **loose** | `allocateRTP` — a phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
+| Edge public leg (side A) | **loose**, with the client's SIP source IP as a signalled source | `allocateRTP` (caller: the INVITE's source) and `negotiateFork` (callee: the address the INVITE was sent to) — a phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
 | Edge private leg (side B) | **strict** | FreeSWITCH's signalled address is trustworthy, and strict already tolerates a NAT-rewritten port |
 | WebRTC public leg | none — ICE fixed the peer and SRTP authenticates every packet | — |
 | WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` |
@@ -2780,7 +2841,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `edge.cooldownTable.mu` ×2 | the `until` map |
 | `edge.privateSources.mu` (RWMutex) | the source map |
 | `media.PlanePool.mu` | `inUse` and `cursor`; held to reserve a candidate, never across a bind |
-| `media.latch.mu` (×4 per session) | mode, expected, remote, latched |
+| `media.latch.mu` (×4 per session) | mode, expected, signalled, sigSource, dst, remote, rank, learnedAt |
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
 | `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
@@ -2895,7 +2956,9 @@ Record-Route (`topology.go:325`), defaulting to the bind port.
   mode the source IP must match the signalled one but the **port may
   differ**, which is exactly the NAT port-rewrite case. The public edge leg
   is `loose` because a phone behind a hard NAT cannot be trusted to signal
-  the source its RTP comes from.
+  the source its RTP comes from; a source that neither SDP nor the phone's
+  SIP source IP vouches for is only a fallback that the phone's own first
+  packet displaces (§8.4).
 - **Signalling**: the edge plane adds `received=` when the top Via's host
   differs from the real source, and fills `rport=` **only when the client
   asked for it**. All responses are sent to the request's transport source
@@ -3003,7 +3066,7 @@ permanent series per call."
 | `freesbc_active_webrtc_sessions` | Gauge | — | edge |
 | `freesbc_registration_total` | Counter | — | edge `recordBinding` success |
 | `freesbc_registration_failure_total` | Counter | — | edge: series exhaustion, a rejected registration, and a full binding table |
-| `freesbc_sip_requests_total` | Counter | `method`, `transport` | edge `guard`, for **every** guarded request |
+| `freesbc_sip_requests_total` | Counter | `method` (a known method or `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS` or `OTHER`) | edge `guard`, for every request the shield admits |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | edge `respond` and `relayResponse` |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` |
@@ -3016,7 +3079,7 @@ Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`), so in a deployed system `freesbc_shield_drops_total`
 reports only `reason="rate"`. The ban and scanner branches run on the
-**edge** shield (`edge.go:564`), which `internal/app` never wires into
+**edge** shield (`edge.go:617`), which `internal/app` never wires into
 `admin.Deps` (`Deps.Shield` is set only when the trunk server exists), so
 edge bans and drops do not reach `/metrics`. The ban gauges
 (`freesbc_shield_banned_current`, `freesbc_shield_ban_adds_rejected_total`)
@@ -3262,8 +3325,10 @@ realm under both RFC parsing and sipgo's own digest parser (§6.9).
 **Media.** SRTP/SRTCP replay protection is explicitly enabled (windows
 64/128) — a replayed or tampered packet fails unprotect and is dropped, and
 the call stays up. Latching is fail-closed in strict mode until the
-signalling plane arms it, and nothing moves a latch after acceptance short of
-an authorised `Relatch`. The RTP-silence watchdog refreshes its liveness
+signalling plane arms it; after acceptance only a source signalling vouches
+for better (the exact SDP address, then the SDP or SIP source IP) or an
+authorised `Relatch` moves a latch, so a first-packet intruder on a loose leg
+is displaced by the endpoint's first packet (§8.4). The RTP-silence watchdog refreshes its liveness
 timestamp **only after** a packet is proven genuine. The WebRTC leg verifies
 the peer certificate against the signalled `a=fingerprint` **inside the DTLS
 handshake** (`VerifyPeerCertificate`), so a mismatched peer never reaches
@@ -3365,6 +3430,7 @@ read an environment variable.
 | SRV lookup | 3 s | one DNS query |
 | negative SRV cache | `min(srv_cache_ttl, 10 s)` | failed/empty lookup |
 | trunk TCP idle | 120 s | per stream connection read |
+| `udpServingTimeout` | 5 s | edge startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
 | `registerTimeout` | 32 s | one whole edge REGISTER series |
 | `inviteTimeout` | 5 min | one whole edge call (all three paths and re-INVITE) |
 | `sip.pstn.attempt_timeout` | 32 s (config) | one PSTN gateway attempt |
@@ -3372,6 +3438,7 @@ read an environment variable.
 | edge CANCEL / `ackThenBye` BYE | 5 s each | one transaction |
 | edge in-dialog (BYE/INFO) | 32 s | `forwardAndRelay` |
 | `listen.media.rtp_timeout` | 5 min (config) | media silence, both planes |
+| `media.LearnDelay` | 3 s | a loose latch keeps sending to a plausible SDP address before switching to another learned port (§8.4) |
 | WebRTC establishment | 30 s | ICE **and** DTLS together |
 | config reload debounce | 200 ms | fsnotify coalescing |
 | admin read-header / read / write / idle | 5 / 30 / 30 / 30 s | HTTP |
@@ -3488,8 +3555,9 @@ Stated because the code establishes them, not as future work.
   Bad Extension** + `Unsupported: 100rel` and never advertises it; there is no
   PRACK handler on either plane. A carrier that merely *offers* 100rel works;
   one that *mandates* it does not complete.
-- **No UPDATE** on either plane; the edge plane does not advertise it in
-  `Allow`.
+- **No UPDATE** on either plane. The edge plane also strips `UPDATE` and
+  `PRACK` from the `Allow`, and `100rel` from the `Supported`, of everything
+  it forwards or relays, and answers `Require: 100rel` with 420 (§7.3).
 - **No session-expiry enforcement.** The trunk plane refreshes a leg whose
   session timer names the SBC as refresher, and answers refresh re-INVITEs
   on legs where the far end refreshes (§6.13), but **no timer fires on

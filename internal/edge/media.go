@@ -159,7 +159,9 @@ func negotiateError(err error) error {
 // "do not pass browser ICE candidates to FreeSWITCH" and "FreeSWITCH never
 // learns the public endpoint's address" structural properties rather than
 // a list of attributes someone remembered to strip.
-func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []byte) (*offerResult, error) {
+//
+// src is the IP the client's INVITE came from (see allocateRTP).
+func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []byte, src netip.Addr) (*offerResult, error) {
 	offer, err := s.parseSDP(offerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: public offer: %w", err)
@@ -179,7 +181,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		}
 		sess, err = s.allocateWebRTC(ctx, offer)
 	} else {
-		sess, err = s.allocateRTP(offer)
+		sess, err = s.allocateRTP(offer, src)
 	}
 	if err != nil {
 		return nil, err
@@ -209,24 +211,27 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 }
 
 // allocateRTP builds the RTP↔RTP session for a plain SIP phone: side A in
-// the public plane, side B in the private one.
-func (s *Server) allocateRTP(offer *sdp.Session) (*mediaSession, error) {
+// the public plane, side B in the private one. src is the IP the phone's
+// SIP came from.
+func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr) (*mediaSession, error) {
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
 		// Loose latching on the PUBLIC leg (media.LatchLoose, the config
 		// name for "symmetric RTP"): a phone behind a hard NAT cannot be
 		// trusted to signal the source address its RTP actually comes from
 		// — some put an unroutable fake IP in c=/Via and send from the
-		// NATed one — so the first inbound packet from any source is
-		// accepted and fixes the send-destination to the real source. The
-		// SDP-seeded address still carries outbound audio until that first
-		// packet arrives (see latch.seed). The PRIVATE leg stays strict:
-		// FreeSWITCH's signalled address over wg0 is trustworthy, and
-		// strict mode already tolerates a NAT-rewritten port.
+		// NATed one — so a source signalling never named is still
+		// accepted and fixes the send-destination. It is only a fallback,
+		// though: a later packet from the exact SDP address, or from the
+		// IP the phone's SIP came from, takes the latch back from whoever
+		// sent first (media.latchRank, P2-EDG-001). The PRIVATE leg stays
+		// strict: FreeSWITCH's signalled address over wg0 is trustworthy,
+		// and strict mode already tolerates a NAT-rewritten port.
 		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
 	})
 	if err != nil {
 		return nil, err
 	}
+	sess.SetSignallingSource(media.SideA, src)
 	// Seed the public side from the client's own offer so audio can flow
 	// toward it immediately; its first packet still corrects the port
 	// (symmetric RTP through NAT).
@@ -415,6 +420,13 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		return nil, err
 	}
 	d.setForkAnswer(f, body, agreed, remote, rtcp)
+	if l.callee.calleePlane() == planePublic {
+		// The answering phone or gateway: rank its media by the address
+		// FreeSBC sent the INVITE to, as allocateRTP does for a caller.
+		if to, err := netip.ParseAddrPort(l.calleeRemote); err == nil {
+			sess.rtp.SetSignallingSource(media.SideA, to.Addr())
+		}
+	}
 	s.followFork(l, f)
 	return body, nil
 }
@@ -501,8 +513,10 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
 		// Same policy as allocateRTP: the public leg (the answering phone)
 		// latches loosely so a hard-NAT phone's real RTP source — which
-		// may differ from the IP it signalled — is what fixes the
-		// send-destination; the private FreeSWITCH leg stays strict.
+		// may differ from the IP it signalled — can fix the
+		// send-destination, below any source signalling vouches for
+		// (negotiateFork records the phone's SIP address); the private
+		// FreeSWITCH leg stays strict.
 		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
 	})
 	if err != nil {
