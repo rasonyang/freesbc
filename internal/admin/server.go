@@ -40,9 +40,7 @@ type PeerStatus struct {
 
 // ShieldStats mirrors the shield's activity snapshot for the API/metrics.
 type ShieldStats struct {
-	BannedCurrent   int
-	BanAddsRejected int64
-	DropsByReason   map[string]int64
+	DropsByReason map[string]int64
 }
 
 // Deps are the live-data closures the admin surface reads. All must be safe
@@ -54,10 +52,7 @@ type Deps struct {
 	Shield      func() ShieldStats
 	ActiveCalls func() int
 	KillCall    func(id string) bool
-	// Unban removes a shield ban by IP literal (memory table + kernel
-	// element) and reports whether a ban existed.
-	Unban   func(ip string) bool
-	Version string
+	Version     string
 	// Proxy reports the edge-proxy plane's counters, or is nil when that
 	// plane is not running (a trunk-only deployment).
 	Proxy func() ProxyStats
@@ -120,7 +115,6 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
 	mux.HandleFunc("DELETE /api/calls/{id}", s.requireAuth(s.handleKickCall))
-	mux.HandleFunc("DELETE /api/bans/{ip}", s.requireAuth(s.handleUnban))
 	mux.HandleFunc("/api/peers", s.requireAuth(s.handlePeers))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
@@ -405,19 +399,6 @@ func (s *Server) handleKickCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Error(w, "no such active call", http.StatusNotFound)
-}
-
-// handleUnban removes a shield ban by IP — the dep parses the
-// literal, clears the in-memory table, and synchronously deletes the kernel
-// element. 204 if a ban existed and was removed, 404 otherwise (including
-// an unparseable IP, which cannot correspond to any ban).
-func (s *Server) handleUnban(w http.ResponseWriter, r *http.Request) {
-	ip := r.PathValue("ip")
-	if s.deps.Unban != nil && s.deps.Unban(ip) {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	http.Error(w, "no such ban", http.StatusNotFound)
 }
 
 // handleStatus, handleCalls, handlePeers, handleConfig, and handleConfigGet
