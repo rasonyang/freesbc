@@ -39,6 +39,7 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request) {
 		start := time.Unix(0, c.StartUnixNano)
 		out = append(out, map[string]any{
 			"id":               c.ID,
+			"call_id":          c.CallID,
 			"from":             c.FromPeer,
 			"to":               c.ToPeer,
 			"started":          start.Format(time.RFC3339),

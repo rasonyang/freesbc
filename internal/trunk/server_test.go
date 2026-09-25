@@ -514,10 +514,7 @@ func TestServerByeNoDialogGets481(t *testing.T) {
 // this fails on any unsynchronised read.
 func TestKillCallRacesNaturalEnd(t *testing.T) {
 	const n = 200
-	s := &Server{
-		calls: map[string]*call{},
-		legs:  map[string]*call{},
-	}
+	s := &Server{}
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		id := "call-" + strconv.Itoa(i)

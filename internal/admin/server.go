@@ -25,7 +25,8 @@ import (
 // no SIP dialog or media session. app converts the planes' own records
 // into these.
 type Call struct {
-	ID            string // A-leg Call-ID
+	ID            string // admin call ID: what KillCall takes
+	CallID        string // A-leg SIP Call-ID, for correlating with traces
 	FromPeer      string
 	ToPeer        string
 	StartUnixNano int64

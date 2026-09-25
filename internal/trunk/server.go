@@ -32,14 +32,18 @@ type Server struct {
 	log   *slog.Logger
 
 	// callMu guards the one call store (calls.go): calls is every bridged
-	// call keyed by its A-leg Call-ID — the identity the admin API and
-	// KillCall use — and legs indexes the SAME *call under EACH leg's own
-	// Call-ID, which is how an in-dialog request is matched to the leg it
-	// actually arrived on. registerCall/endCall are the only writers, and
-	// they move a call through callState under this one lock.
-	callMu sync.Mutex
-	calls  map[string]*call
-	legs   map[string]*call
+	// call keyed by its admin ID — the identity the admin API and KillCall
+	// use — and legs indexes the SAME *call under EACH leg's own Call-ID,
+	// one entry per leg, so an in-dialog request is matched on the full
+	// dialog ID (Call-ID plus both tags) and live calls that share a
+	// Call-ID coexist. registerCall/endCall are the only writers of both,
+	// and they move a call through callState under this one lock. inviting
+	// holds the initial INVITEs being handled, for merged-request (482)
+	// detection (beginInvite).
+	callMu   sync.Mutex
+	calls    map[string]*call
+	legs     map[string][]legRef
+	inviting map[mergeKey]struct{}
 
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
@@ -107,7 +111,8 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		pool:     pool,
 		log:      log,
 		calls:    make(map[string]*call),
-		legs:     make(map[string]*call),
+		legs:     make(map[string][]legRef),
+		inviting: make(map[mergeKey]struct{}),
 		resolver: newResolver(time.Now().UnixNano()),
 		health:   newEndpointHealth(),
 

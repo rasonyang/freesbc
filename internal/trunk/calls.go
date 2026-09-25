@@ -2,6 +2,10 @@ package trunk
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -68,13 +72,19 @@ type legSDP struct {
 //
 // Only onInvite's goroutine writes these fields, and every field is written
 // before registerCall publishes the record; readers (Calls, ActiveCalls,
-// KillCall, lookupLeg) only ever see a published record, under Server.callMu.
-// The one exception is bSRTP, which dialTarget rewrites per failover attempt
-// while the call is still callDialing — i.e. before publication.
+// KillCall, lookupDialog) only ever see a published record, under
+// Server.callMu. The one exception is bSRTP, which dialTarget rewrites per
+// failover attempt while the call is still callDialing — i.e. before
+// publication.
 type call struct {
-	// id is the A-leg's Call-ID: the identity admin uses (/api/calls,
-	// KillCall). bID is the B-leg's own, distinct Call-ID, which a carrier
-	// refresh re-INVITE arrives under.
+	// adminID is the call's identity in the admin API (/api/calls,
+	// KillCall). It is minted by registerCall, unique among live calls, and
+	// deliberately NOT a Call-ID: a Call-ID names a dialog only together
+	// with both tags (RFC 3261 §12), so two live calls can share one.
+	adminID string
+
+	// id is the A-leg's Call-ID and bID the B-leg's own, distinct one. Each
+	// is only a third of its leg's dialog ID; the tags are in aSDP/bSDP.
 	id  string
 	bID string
 
@@ -93,7 +103,7 @@ type call struct {
 	bSRTP *legSRTP
 
 	// aSDP/bSDP are the established SDP bodies plus dialog tags for each
-	// leg, keyed into Server.legs by that leg's own Call-ID.
+	// leg; together with id/bID they are each leg's dialog ID.
 	aSDP legSDP
 	bSDP legSDP
 
@@ -106,36 +116,84 @@ type call struct {
 	state callState
 }
 
+// legRef is one entry of the Server.legs index: a live call and which of
+// its legs the indexing Call-ID belongs to.
+type legRef struct {
+	c     *call
+	bLeg  bool
+	entry legSDP
+}
+
+// mergeKey identifies an initial INVITE for merged-request detection
+// (RFC 3261 §8.2.2.2): the same From-tag, Call-ID and CSeq arriving again on
+// a different branch is the same request reaching us twice.
+type mergeKey struct {
+	callID, fromTag string
+	cseq            uint32
+}
+
+// adminIDSeq disambiguates admin IDs if crypto/rand ever fails.
+var adminIDSeq atomic.Uint64
+
+// newAdminID returns a random 16-hex-char admin call ID.
+func newAdminID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "call-" + strconv.FormatUint(adminIDSeq.Add(1), 10)
+	}
+	return hex.EncodeToString(b)
+}
+
 // registerCall publishes c as a live call, in one transition to
-// callBridged: it becomes visible to Calls/ActiveCalls and KillCall under
-// its A-leg Call-ID, and to the in-dialog refresh lookup under EITHER leg's
-// own Call-ID (a refresh from the caller carries the A-leg's Call-ID and is
-// answered with aSDP; one from the carrier carries the B-leg's and is
-// answered with bSDP). One lock, one moment: there is no window in which a
-// call is listed but unkillable, or killable but unlisted.
+// callBridged: it gets a fresh admin ID (unique among live calls) and
+// becomes visible to Calls/ActiveCalls and KillCall under it, and to the
+// in-dialog lookup under EITHER leg's dialog ID (a refresh from the caller
+// matches the A-leg's Call-ID and tags and is answered with aSDP; one from
+// the carrier matches the B-leg's and is answered with bSDP). One lock, one
+// moment: there is no window in which a call is listed but unkillable, or
+// killable but unlisted.
+//
+// Nothing here is keyed by Call-ID alone, so two live calls that share one
+// (a peer reusing a Call-ID with a new From-tag, or an A-leg Call-ID equal
+// to another call's B-leg Call-ID) never overwrite each other.
 func (s *Server) registerCall(c *call) {
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
+	if s.calls == nil {
+		s.calls = make(map[string]*call)
+	}
+	if s.legs == nil {
+		s.legs = make(map[string][]legRef)
+	}
 	c.state = callBridged
-	s.calls[c.id] = c
-	s.legs[c.id] = c
-	if c.bID != "" && c.bID != c.id {
-		s.legs[c.bID] = c
+	if c.adminID == "" {
+		c.adminID = newAdminID()
+	}
+	for s.calls[c.adminID] != nil {
+		c.adminID = newAdminID()
+	}
+	s.calls[c.adminID] = c
+	s.legs[c.id] = append(s.legs[c.id], legRef{c: c, entry: c.aSDP})
+	if c.bID != "" {
+		s.legs[c.bID] = append(s.legs[c.bID], legRef{c: c, bLeg: true, entry: c.bSDP})
 	}
 }
 
 // endCall is registerCall's exact inverse, deferred by onInvite so it runs
 // however the call ends (either leg's BYE, media silence, an admin kick, or
-// a panic unwind). It drops both leg indexes and the admin entry under one
-// lock, marks the call callEnded, and fires the kick hook's cancel (safe on
-// an already-cancelled context) so no call context outlives the call.
+// a panic unwind). It drops c's own leg entries and admin entry under one
+// lock — never another call's that shares a Call-ID — marks the call
+// callEnded, and fires the kick hook's cancel (safe on an already-cancelled
+// context) so no call context outlives the call.
 func (s *Server) endCall(c *call) {
 	s.callMu.Lock()
 	c.state = callEnded
-	delete(s.calls, c.id)
-	delete(s.legs, c.id)
+	if s.calls[c.adminID] == c {
+		delete(s.calls, c.adminID)
+	}
+	s.dropLegs(c.id, c)
 	if c.bID != "" {
-		delete(s.legs, c.bID)
+		s.dropLegs(c.bID, c)
 	}
 	cancel := c.cancel
 	s.callMu.Unlock()
@@ -144,38 +202,109 @@ func (s *Server) endCall(c *call) {
 	}
 }
 
-// lookupLeg returns the established SDP record for the leg whose OWN
-// Call-ID is callID, or ok=false when no live call has such a leg. Both
-// legs of every bridged call are indexed, so an in-dialog request is
-// answered with its own leg's state whichever side sent it.
+// dropLegs removes c's entries from the legs index under callID. Caller
+// holds callMu.
+func (s *Server) dropLegs(callID string, c *call) {
+	refs := s.legs[callID]
+	kept := refs[:0]
+	for _, r := range refs {
+		if r.c != c {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		delete(s.legs, callID)
+		return
+	}
+	// Zero the tail so the dropped *call is not kept reachable.
+	for i := len(kept); i < len(refs); i++ {
+		refs[i] = legRef{}
+	}
+	s.legs[callID] = kept
+}
+
+// lookupDialog returns the established SDP record for the live leg whose
+// dialog ID is (callID, fromTag, toTag) as the REMOTE endpoint of that leg
+// sends them in an in-dialog request (see legSDP), RFC 3261 §12.2.2.
+// knownCallID reports whether any live leg has this Call-ID at all, so the
+// caller can tell a request for a dialog that does not exist from one that
+// merely replays a live Call-ID with the wrong tags.
+func (s *Server) lookupDialog(callID, fromTag, toTag string) (entry legSDP, ok, knownCallID bool) {
+	s.callMu.Lock()
+	defer s.callMu.Unlock()
+	refs := s.legs[callID]
+	for _, r := range refs {
+		if r.entry.fromTag == fromTag && r.entry.toTag == toTag {
+			return r.entry, true, true
+		}
+	}
+	return legSDP{}, false, len(refs) > 0
+}
+
+// lookupLeg reports whether any live leg has callID as its own Call-ID,
+// returning the first such leg's record. It is a Call-ID-only probe for
+// tests and diagnostics; request handling matches the full dialog ID with
+// lookupDialog.
 func (s *Server) lookupLeg(callID string) (legSDP, bool) {
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	c, ok := s.legs[callID]
-	if !ok {
+	refs := s.legs[callID]
+	if len(refs) == 0 {
 		return legSDP{}, false
 	}
-	if callID == c.id {
-		return c.aSDP, true
-	}
-	return c.bSDP, true
+	return refs[0].entry, true
 }
 
-// KillCall tears down the live call with the given A-leg Call-ID by
-// cancelling its kick context (the onInvite goroutine then BYEs both legs
-// via the normal teardown — see byeBoth). Returns false if no such active
-// call is tracked. Idempotent: endCall removes the entry once the call
-// actually ends, so a second kick for the same id (or one racing a natural
-// end) returns false rather than firing twice.
+// beginInvite records an initial INVITE as in progress and reports false
+// when the same request (same Call-ID, From-tag and CSeq) is already being
+// handled: a merged request, which the caller answers 482 Loop Detected
+// (RFC 3261 §8.2.2.2). A retransmission on the SAME branch never gets here —
+// sipgo's server transaction absorbs it. The returned func releases the
+// entry; onInvite defers it, so it lives exactly as long as the call's
+// handler does.
+func (s *Server) beginInvite(k mergeKey) (done func(), ok bool) {
+	s.callMu.Lock()
+	defer s.callMu.Unlock()
+	if s.inviting == nil {
+		s.inviting = make(map[mergeKey]struct{})
+	}
+	if _, dup := s.inviting[k]; dup {
+		return nil, false
+	}
+	s.inviting[k] = struct{}{}
+	return func() {
+		s.callMu.Lock()
+		delete(s.inviting, k)
+		s.callMu.Unlock()
+	}, true
+}
+
+// KillCall tears down a live call by cancelling its kick context (the
+// onInvite goroutine then BYEs both legs via the normal teardown — see
+// byeBoth). id is the admin ID Calls lists. As a convenience for operators
+// who only have a Call-ID from a SIP trace, an id that is no admin ID is
+// also tried as an A-leg Call-ID, and then kills EVERY live call whose
+// A-leg carries it (a Call-ID alone does not name one dialog). Returns
+// false if nothing matched. Idempotent: endCall removes the entry once the
+// call actually ends, so a kick racing a natural end returns false rather
+// than firing twice.
 func (s *Server) KillCall(id string) bool {
 	s.callMu.Lock()
-	c, ok := s.calls[id]
-	s.callMu.Unlock()
-	if !ok {
-		return false
+	var victims []*call
+	if c, ok := s.calls[id]; ok {
+		victims = append(victims, c)
+	} else {
+		for _, r := range s.legs[id] {
+			if !r.bLeg {
+				victims = append(victims, r.c)
+			}
+		}
 	}
-	c.cancel()
-	return true
+	s.callMu.Unlock()
+	for _, c := range victims {
+		c.cancel()
+	}
+	return len(victims) > 0
 }
 
 // ActiveCalls returns the number of bridged calls, for metrics.
@@ -189,7 +318,8 @@ func (s *Server) ActiveCalls() int {
 // the SIP dialog and media objects stay inside the trunk plane. It is what
 // Calls hands out, so callers (the admin API) never touch call state.
 type CallRecord struct {
-	ID            string // A-leg Call-ID
+	ID            string // admin ID: what KillCall takes
+	CallID        string // A-leg Call-ID, for correlating with SIP traces
 	FromPeer      string
 	ToPeer        string
 	StartUnixNano int64
@@ -204,7 +334,8 @@ func (s *Server) Calls() []CallRecord {
 	out := make([]CallRecord, 0, len(s.calls))
 	for _, c := range s.calls {
 		out = append(out, CallRecord{
-			ID:            c.id,
+			ID:            c.adminID,
+			CallID:        c.id,
 			FromPeer:      c.fromPeer,
 			ToPeer:        c.toPeer,
 			StartUnixNano: c.start.UnixNano(),

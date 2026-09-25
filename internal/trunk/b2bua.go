@@ -163,22 +163,17 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// re-INVITE does not terminate the dialog, so the established call
 	// stays up with its existing media either way.
 	//
-	// req.CallID() is looked up directly — not assumed to be the A-leg's —
-	// because the call store indexes BOTH legs by their own Call-ID (see
-	// Server.lookupLeg): a refresh from the CALLER carries the A-leg's
-	// Call-ID and is answered with the A-leg's established answer, while a
-	// refresh from the CARRIER carries the B-leg's own, distinct Call-ID
-	// and is answered with the B-leg's. Same code path, correct answer
-	// either way.
+	// The request is matched on its full dialog ID — Call-ID, From-tag and
+	// To-tag, RFC 3261 §12.2.2 — against both legs of every live call (see
+	// Server.lookupDialog): a refresh from the CALLER matches the A-leg and
+	// is answered with the A-leg's established answer, while a refresh from
+	// the CARRIER matches the B-leg (its own, distinct Call-ID) and is
+	// answered with the B-leg's. Same code path, correct answer either way.
 	//
-	// The Call-ID naming a live leg is not enough — the
-	// request must also prove it IS on that leg's dialog before any
-	// established state is handed back. Both tags are checked against the
-	// pair recorded when the leg was established (entry.fromTag/entry.toTag,
-	// RFC 3261 §12.2.2 dialog match), so a request that merely replays a
-	// sniffed Call-ID and the established SDP gets 481 with no body — never
-	// entry.answer, which on a secure leg carries the SDES master key. A
-	// matching dialog is then held to the same refresh test as before.
+	// A live Call-ID with the wrong tags is not a match, so a request that
+	// merely replays a sniffed Call-ID and the established SDP gets 481 with
+	// no body — never entry.answer, which on a secure leg carries the SDES
+	// master key. A matching dialog is then held to the refresh test.
 	//
 	// Limitation: this bare-tx.Respond path does NOT retransmit the 2xx
 	// (sipgo's TU retransmit-until-ACK loop lives in
@@ -187,8 +182,8 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// out and per RFC 4028 §10 it may BYE at session expiry. Acceptable on a
 	// reliable link; a retransmit loop is deferred.
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
-		entry, known := s.lookupLeg(fsip.CallID(req))
-		if known && (fsip.FromTag(req) != entry.fromTag || tag != entry.toTag) {
+		entry, known, knownCallID := s.lookupDialog(fsip.CallID(req), fsip.FromTag(req), tag)
+		if !known && knownCallID {
 			s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 			return
 		}
@@ -216,6 +211,21 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 		s.reject(req, tx, 501, "Not Implemented")
 		return
 	}
+
+	// Merged-request detection (RFC 3261 §8.2.2.2): the same initial INVITE
+	// (Call-ID, From-tag, CSeq) arriving again on a different branch — an
+	// upstream proxy forking it to two of our addresses, or a loop — is
+	// answered 482 instead of placing a second call for it.
+	var cseq uint32
+	if h := req.CSeq(); h != nil {
+		cseq = h.SeqNo
+	}
+	doneInvite, fresh := s.beginInvite(mergeKey{callID: fsip.CallID(req), fromTag: fsip.FromTag(req), cseq: cseq})
+	if !fresh {
+		s.reject(req, tx, 482, "Loop Detected")
+		return
+	}
+	defer doneInvite()
 
 	cfg := s.store.Current()
 

@@ -173,7 +173,7 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 			out := make([]admin.Call, 0, len(recs))
 			for _, r := range recs {
 				out = append(out, admin.Call{
-					ID: r.ID, FromPeer: r.FromPeer, ToPeer: r.ToPeer, StartUnixNano: r.StartUnixNano,
+					ID: r.ID, CallID: r.CallID, FromPeer: r.FromPeer, ToPeer: r.ToPeer, StartUnixNano: r.StartUnixNano,
 				})
 			}
 			return out

@@ -6844,18 +6844,20 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 	// Call-ID.
 	callID := sess.InviteRequest.CallID().Value()
 
-	// Calls is what /api/calls lists, and its ID is what the kick takes.
+	// Calls is what /api/calls lists, and its ID (the admin ID, not the
+	// Call-ID) is what the kick takes.
 	recs := srv.Calls()
 	if len(recs) != 1 {
 		t.Fatalf("Calls() = %d records, want the one live call", len(recs))
 	}
-	if r := recs[0]; r.ID != callID || r.FromPeer != "local-uac" || r.ToPeer != "carrier" || r.StartUnixNano == 0 {
-		t.Errorf("Calls()[0] = %+v, want ID %q from local-uac to carrier with a start time", r, callID)
+	r := recs[0]
+	if r.ID == "" || r.ID == callID || r.CallID != callID || r.FromPeer != "local-uac" || r.ToPeer != "carrier" || r.StartUnixNano == 0 {
+		t.Errorf("Calls()[0] = %+v, want a distinct admin ID, Call-ID %q, from local-uac to carrier with a start time", r, callID)
 	}
 
 	killStart := time.Now()
-	if !srv.KillCall(callID) {
-		t.Fatalf("KillCall(%q) returned false for a live call", callID)
+	if !srv.KillCall(r.ID) {
+		t.Fatalf("KillCall(%q) returned false for a live call", r.ID)
 	}
 	// A-leg gets a BYE: the UAC's own server receives and answers it.
 	select {
@@ -6879,8 +6881,8 @@ func TestKillCallTearsDownBothLegs(t *testing.T) {
 	if recs := srv.Calls(); len(recs) != 0 {
 		t.Errorf("Calls() after the kick = %+v, want none", recs)
 	}
-	// a second kick / unknown id → false:
-	if srv.KillCall(callID) {
+	// a second kick (by admin ID or Call-ID) / unknown id → false:
+	if srv.KillCall(r.ID) || srv.KillCall(callID) {
 		t.Error("second KillCall should return false (call gone)")
 	}
 	if srv.KillCall("no-such-call") {
