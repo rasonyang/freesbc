@@ -45,6 +45,10 @@ func Run(ctx context.Context, opts Options) error {
 		log = slog.New(slog.NewTextHandler(nopWriter{}, nil))
 	}
 
+	// cfg is the startup snapshot. Every startup decision below reads it,
+	// never store.Current(): the watcher starts part-way through, and a
+	// reload landing then must not give one startup two configurations
+	// (audit P2-APP-004).
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -53,7 +57,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	pool := trunk.NewMediaPool(store)
 
-	mediaCfg := store.Current().Listen.Media
+	mediaCfg := cfg.Listen.Media
 	log.Info("media plane ready",
 		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
 		"rtp_timeout", mediaCfg.RTPTimeout.Std())
@@ -65,7 +69,7 @@ func Run(ctx context.Context, opts Options) error {
 	// peers is rejected at load time, so "no peers" really does mean "no
 	// trunk plane" rather than a silently dead listener.
 	var sipServer *trunk.Server
-	if len(store.Current().Peers) > 0 {
+	if len(cfg.Peers) > 0 {
 		sipServer = trunk.NewServer(store, pool, log)
 	}
 
@@ -74,7 +78,7 @@ func Run(ctx context.Context, opts Options) error {
 	// Entirely independent of the trunk plane above — its own user agent,
 	// listeners and media pools — so either may run alone or both together.
 	var edgeSrv *edge.Server
-	if store.Current().ProxyEnabled() {
+	if cfg.ProxyEnabled() {
 		edgeSrv, err = edge.New(store, log)
 		if err != nil {
 			return fmt.Errorf("edge proxy: %w", err)
@@ -96,6 +100,9 @@ func Run(ctx context.Context, opts Options) error {
 		// A dead watcher costs reloads, not calls: never fatal.
 		return nil
 	})
+	if testHookWatchStarted != nil {
+		testHookWatchStarted(store)
+	}
 
 	if sipServer != nil {
 		g.Go(func() error {
@@ -116,7 +123,7 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 
-	if adminCfg := store.Current().Admin; adminCfg != nil {
+	if adminCfg := cfg.Admin; adminCfg != nil {
 		deps := adminDeps(store, pool, sipServer, edgeSrv, opts.Version)
 		adminSrv := admin.New(adminCfg, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
@@ -130,8 +137,8 @@ func Run(ctx context.Context, opts Options) error {
 
 	log.Info("freesbc started",
 		"config", opts.ConfigPath,
-		"peers", len(store.Current().Peers),
-		"routes", len(store.Current().Routes))
+		"peers", len(cfg.Peers),
+		"routes", len(cfg.Routes))
 
 	<-gctx.Done()
 	log.Info("shutting down")
@@ -218,6 +225,11 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 	}
 	return deps
 }
+
+// testHookWatchStarted, when non-nil, runs right after Run starts the
+// config watcher, with the store the watcher replaces snapshots in. Only
+// tests set it, to land a reload in the middle of startup.
+var testHookWatchStarted func(*config.Store)
 
 // nopWriter discards log output, for a caller that passed no logger.
 type nopWriter struct{}

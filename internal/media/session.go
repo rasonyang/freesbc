@@ -278,7 +278,8 @@ type SessionConfig struct {
 	// Latch is the per-side latching mode (zero value = strict).
 	Latch [2]LatchMode
 	// Timeout tears the session down after this much silence; zero means
-	// use listen.media.rtp_timeout from the current config snapshot.
+	// the pool's PlaneParams.Timeout (listen.media.rtp_timeout), read with
+	// the rest of the allocation's parameters.
 	Timeout time.Duration
 }
 
@@ -336,7 +337,14 @@ func (s *Session) Stats() Stats { return s.counters.snapshot() }
 // the session — or rely on silence teardown — to return the ports.
 // Returns ErrPortsExhausted when the range is full.
 func (p *PlanePool) Allocate(cfg SessionConfig) (*Session, error) {
-	return AllocateAcross(p, p, cfg)
+	return p.AllocateWith(p.params(), cfg)
+}
+
+// AllocateWith is Allocate with the pool's parameters supplied by the
+// caller, for a signalling plane that takes one config snapshot per call
+// and must not let the pool read a second, newer one (audit P2-TRK-005).
+func (p *PlanePool) AllocateWith(par PlaneParams, cfg SessionConfig) (*Session, error) {
+	return allocateAcross(p, par, p, par, cfg)
 }
 
 // AllocateAcross binds side A from poolA and side B from poolB. This is
@@ -347,15 +355,27 @@ func (p *PlanePool) Allocate(cfg SessionConfig) (*Session, error) {
 //
 // On failure the already-bound pair is closed and released, so a partial
 // allocation never leaks a socket or a port reservation.
+//
+// Each pool's parameters are read once, so one allocation never mixes two
+// config snapshots (audit P2-MED-009).
 func AllocateAcross(poolA, poolB *PlanePool, cfg SessionConfig) (*Session, error) {
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = poolA.timeout()
+	parA := poolA.params()
+	parB := parA
+	if poolB != poolA {
+		parB = poolB.params()
 	}
-	a, err := poolA.allocatePair()
+	return allocateAcross(poolA, parA, poolB, parB, cfg)
+}
+
+func allocateAcross(poolA *PlanePool, parA PlaneParams, poolB *PlanePool, parB PlaneParams, cfg SessionConfig) (*Session, error) {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = parA.Timeout
+	}
+	a, err := poolA.allocatePairWith(parA)
 	if err != nil {
 		return nil, err
 	}
-	b, err := poolB.allocatePair()
+	b, err := poolB.allocatePairWith(parB)
 	if err != nil {
 		a.Close()
 		poolA.release(a.RTPPort())
@@ -367,7 +387,7 @@ func AllocateAcross(poolA, poolB *PlanePool, cfg SessionConfig) (*Session, error
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
 	}
-	allowLoopback := [2]bool{poolA.allowLoopback(), poolB.allowLoopback()}
+	allowLoopback := [2]bool{parA.AllowLoopback, parB.AllowLoopback}
 	for side := range s.pairs {
 		s.rtp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}
 		s.rtcp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}

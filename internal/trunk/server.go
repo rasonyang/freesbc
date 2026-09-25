@@ -74,6 +74,11 @@ type Server struct {
 	// bridged call.
 	onBridged func(*call)
 
+	// onSnapshot, when non-nil, runs right after onInvite takes the call's
+	// config snapshot. Only tests set it (before Run), to land a reload
+	// between that snapshot and the rest of the call.
+	onSnapshot func()
+
 	// shield is the front-door security plane: consulted before
 	// identify() on every inbound request (see withShield). Built in Run,
 	// so it is nil on a *Server constructed directly by unit tests (e.g.
@@ -430,11 +435,17 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 // source address. sipgo sets req.Source() from the real remote socket on
 // receive, so this is the trust boundary — never the Via/From host.
 func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
+	return s.identifyIn(s.store.Current(), req)
+}
+
+// identifyIn is identify against a snapshot the caller already holds (the
+// per-call one, see onInvite).
+func (s *Server) identifyIn(cfg *config.Config, req *sip.Request) (string, *config.Peer, bool) {
 	addr, ok := fsip.ParseHostPortAddr(req.Source())
 	if !ok {
 		return "", nil, false
 	}
-	return IdentifyPeer(s.store.Current(), addr)
+	return IdentifyPeer(cfg, addr)
 }
 
 // withShield wraps a request handler so every inbound request passes the

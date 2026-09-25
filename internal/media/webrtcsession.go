@@ -75,20 +75,21 @@ type WebRTCSessionConfig struct {
 // On error the private pair is released; the caller still owns the leg
 // (it holds the port and credentials that already went out in SDP).
 func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConfig) (*WebRTCSession, error) {
-	priv, err := privPool.allocatePair()
+	par := privPool.params() // once: one allocation, one snapshot
+	priv, err := privPool.allocatePairWith(par)
 	if err != nil {
 		return nil, err
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
-		timeout = privPool.timeout()
+		timeout = par.Timeout
 	}
 	return &WebRTCSession{
 		leg:      leg,
 		priv:     priv,
 		privPool: privPool,
-		privRTP:  &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
-		privRTCP: &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
+		privRTP:  &latch{mode: cfg.PrivateLatch, allowLoopback: par.AllowLoopback},
+		privRTCP: &latch{mode: cfg.PrivateLatch, allowLoopback: par.AllowLoopback},
 		timeout:  timeout,
 		log:      cfg.Log,
 		done:     make(chan struct{}),

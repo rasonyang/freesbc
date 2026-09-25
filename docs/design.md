@@ -707,11 +707,11 @@ RFC 3261's core compact names. Delta-seconds above 2^32-1 are clamped to it
 ```
 tx = &finalTx{tx}                             // records the first final response
 defer recoverCall(req, guard)                 // per-call panic umbrella: 500 / BYE
-identify(req); !ok -> silent return
+cfg := store.Current()                        // the call's one config snapshot
+identifyIn(cfg, req); !ok -> silent return
 From()/To()/CallID() nil -> 400
 [in-dialog branch, §6.2]
 beginInvite(Call-ID, From-tag, CSeq); dup -> 482; defer done
-cfg := store.Current()                        // per-call config snapshot
 quota.acquire(peer cap, global cap); !ok -> 503 Call Quota Exceeded + Retry-After: 30
 requires100rel -> 420 ; Session-Expires < min_se -> 422
 Resolve(cfg, peerName, req.Recipient.User)
@@ -719,7 +719,7 @@ Resolve(cfg, peerName, req.Recipient.User)
 dialogSrv.ReadInvite -> aLeg                  // err -> 400
 remoteMediaIP(req.Body())                     // err -> 488
 A-leg SRTP policy                             // required+insecure -> 488
-pool.Allocate(latch modes)                    // err -> 503
+pool.AllocateWith(planeParams(cfg), latch modes) // err -> 503
 SetExpectedRemote(SideA, remoteA); SetSRTP(SideA, …)
 c := &call{state: callDialing}                // not in any map yet
 placeCall(...)                                // §6.4; on failure it already responded
@@ -747,6 +747,16 @@ as soon as the answer arrives) is BYEd, or ACKed and BYEd if the ACK had not
 gone out yet. The `Close` defers only drop local dialog state, so without
 this the far ends would keep a confirmed dialog with dead media.
 
+Every value the call reads — the peer, the quotas, `min_se`, the route and
+its targets, `srv_cache_ttl`, the media range, bind and timeout, the
+advertised media address — comes from the one snapshot `onInvite` takes
+before identifying the source, and is passed down (`placeCall`,
+`expandTargets`, `dialTarget`, `planeParams`) rather than re-read (audit
+P2-TRK-005). The media pool is handed that snapshot's parameters
+(`PlanePool.AllocateWith`); its own `store.Current()` read serves only
+`Stats`. The advertised signalling port is restart-only and comes from the
+startup snapshot (`sigPort`, §4.4).
+
 The media session is allocated **once, before any target is dialled**, and is
 shared by every failover attempt. The only per-call timer goroutines are the
 session refreshers (§6.13), started only on a leg whose session timer names
@@ -771,9 +781,8 @@ return len(available) > 0 ? available : cooled
 ```
 
 Cooldown is **skip-if-alternatives**, never a hard block: when every endpoint
-is cooling, every endpoint is dialled anyway. (`expandTargets` takes its own
-fresh `store.Current()` snapshot for `srv_cache_ttl` alone, `b2bua.go:580`;
-the rest of the call runs on `onInvite`'s per-call snapshot.)
+is cooling, every endpoint is dialled anyway. `expandTargets` reads
+`srv_cache_ttl` from the call's snapshot, like the rest of the call.
 
 `placeCall` (`b2bua.go:649-716`) validates the offer once
 (`validAudioSDP`, target-independent → 488), then walks the endpoint list:
@@ -3517,8 +3526,9 @@ permanently unroutable peer through that path.
 **Reload with a bad config.** `Load` fails, the error is logged as
 `"config reload failed, keeping previous config"`, and the previous snapshot
 stays published. In-flight calls are unaffected in any case, because the
-trunk B2BUA takes a per-call snapshot at INVITE time and both media pools
-re-read parameters only at allocation.
+trunk B2BUA takes a per-call snapshot at INVITE time and every media pool
+reads its parameters once per allocation (`AllocateAcross`,
+`NewWebRTCSession`; audit P2-MED-009).
 
 **Media port exhaustion.** The trunk plane answers **503** (with no metric);
 the edge plane answers **503** and increments
