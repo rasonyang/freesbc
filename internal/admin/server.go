@@ -6,8 +6,12 @@ package admin
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -97,7 +101,8 @@ type Server struct {
 	started time.Time
 	cfgPath string
 
-	limiter authLimiter // per-IP auth-failure rate limit
+	limiter  authLimiter   // per-source auth-failure rate limit
+	verified verifiedCreds // credentials already verified by bcrypt
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -170,42 +175,55 @@ func (s *Server) Run(ctx context.Context) error {
 // bcrypt password compare, both evaluated before deciding (no timing oracle),
 // generic 401 on any failure (no user enumeration). /healthz is not wrapped.
 //
-// Hardening: (1) a request with no Authorization header at all
-// is rejected 401 before any bcrypt work — paying a full KDF for a request
-// that carries no credentials is exactly the unauthenticated CPU-DoS the
-// audit found, and the header's presence is public information, so skipping
-// bcrypt on its absence leaks nothing about the secret. (2) auth failures
-// are rate-limited per source IP (authFailLimit per authFailWindow): once an
-// IP exhausts its budget, every further request from it — even with valid
-// credentials — gets 429 until the window rolls over, bounding both
-// brute-force attempts and the bcrypt CPU a single address can demand.
+// Hardening: (1) a request with no Authorization header at all is rejected
+// 401 before any bcrypt work — paying a full KDF for a request that carries
+// no credentials is exactly the unauthenticated CPU-DoS the audit found. It
+// is not counted as a failure either: it guesses nothing, and a browser's
+// first request to the dashboard always looks like this. (2) Auth failures
+// are rate-limited per source (authFailLimit per authFailWindow, IPv6 per
+// /64): a slot is reserved under the limiter's lock BEFORE bcrypt runs, so
+// concurrent requests cannot all pass the check (audit P2-ADM-002); a
+// success refunds its slot. Once a source's budget is spent, further
+// requests get 429 without any bcrypt, bounding both brute force and the
+// KDF CPU one address can demand. (3) Credentials this process has already
+// verified are remembered (verifiedCreds), so an operator or the Prometheus
+// scrape that authenticated before keeps working while its address is
+// locked out by someone else's failures (loopback or a shared proxy).
+// Only an exact, previously verified header passes that way, so it gives a
+// guesser nothing.
 //
 // The credentials compared are the store's CURRENT admin
 // snapshot (adminAuth), not the construction-time cfg — a hot reload's new
 // password_hash takes effect on the very next request.
 func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="freesbc"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		auth := s.adminAuth()
+		if s.verified.has(auth, user, pass) {
+			h(w, r)
+			return
+		}
 		ip := remoteIP(r)
-		if s.limiter.over(ip, time.Now()) {
+		slot, ok := s.limiter.reserve(ip, time.Now())
+		if !ok {
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
-		if r.Header.Get("Authorization") == "" {
-			s.limiter.recordFail(ip, time.Now())
-			w.Header().Set("WWW-Authenticate", `Basic realm="freesbc"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		user, pass, _ := r.BasicAuth()
-		auth := s.adminAuth()
 		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(auth.Username)) == 1
 		passOK := bcrypt.CompareHashAndPassword([]byte(auth.PasswordHash), []byte(pass)) == nil
 		if !userOK || !passOK {
-			s.limiter.recordFail(ip, time.Now())
+			// The reserved slot stays: it is this failure.
 			w.Header().Set("WWW-Authenticate", `Basic realm="freesbc"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		s.limiter.refund(slot)
+		s.verified.add(auth, user, pass)
 		h(w, r)
 	}
 }
@@ -279,11 +297,11 @@ func (s *Server) watchListenChange(ctx context.Context) func() {
 	return func() { close(done) }
 }
 
-// authFailLimit, authFailWindow, and authFailMaxIPs bound the per-IP
-// auth-failure rate limiter: an IP is allowed authFailLimit
-// failures per authFailWindow; the next request from it within the window is
-// answered 429 instead of 401, and it stays 429 until the window rolls over.
-// authFailMaxIPs caps the tracked-IP table so its state can never grow
+// authFailLimit, authFailWindow, and authFailMaxIPs bound the per-source
+// auth-failure rate limiter: a source is allowed authFailLimit failures per
+// authFailWindow; the next request from it within the window is answered
+// 429 instead of 401, and it stays 429 until the window rolls over.
+// authFailMaxIPs caps the tracked-source table so its state can never grow
 // without bound.
 const (
 	authFailLimit  = 10
@@ -291,14 +309,16 @@ const (
 	authFailMaxIPs = 4096
 )
 
-// authLimiter is the per-IP auth-failure tracker behind requireAuth's 429.
-// The zero value is usable (the map is created lazily). Expired windows are
-// pruned on every access — the request stream itself is the cleanup clock,
-// so the table holds at most the current minute's failing IPs — and the
-// hard cap drops the whole table rather than letting a flood of >4096
-// distinct source IPs grow memory unboundedly (losing the counts at that
-// point is harmless: no more than a handful of failures per IP per minute
-// was being tracked anyway).
+// authLimiter is the per-source auth-failure tracker behind requireAuth's
+// 429. The zero value is usable (the map is created lazily).
+//
+// Sources are keyed by limiterKey: an IPv4 address, or the /64 of an IPv6
+// one, since a single host usually controls a whole /64 (audit P2-ADM-003).
+// Expired windows are pruned whenever a new window starts — the request
+// stream itself is the cleanup clock. When the table is full the entry with
+// the fewest failures (oldest first on a tie) is evicted, never the whole
+// table: clearing it let a flood of fresh sources reset an attacker's
+// exhausted budget.
 type authLimiter struct {
 	mu    sync.Mutex
 	perIP map[string]authFailEntry
@@ -306,44 +326,186 @@ type authLimiter struct {
 
 type authFailEntry struct {
 	start    time.Time
-	failures int
+	failures int // includes slots reserved by requests still in bcrypt
+}
+
+// authSlot is one reservation made by reserve, for refund.
+type authSlot struct {
+	key   string
+	start time.Time
+}
+
+// limiterKey maps a source address to its limiter key: the unmapped IPv4
+// address, or the IPv6 /64. Anything unparsable is used verbatim.
+func limiterKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	return netip.PrefixFrom(addr.WithZone(""), 64).Masked().String()
 }
 
 // over reports whether ip has already exhausted its failure budget for the
 // current window — i.e. whether the next failure (or any further request)
-// from ip must be refused with 429. It does not change state; recordFail
-// does.
+// from ip must be refused with 429. It does not change state.
 func (l *authLimiter) over(ip string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	w, ok := l.perIP[ip]
+	w, ok := l.perIP[limiterKey(ip)]
 	return ok && now.Sub(w.start) < authFailWindow && w.failures >= authFailLimit
 }
 
-// recordFail counts one auth failure for ip, creating the table (and
-// lazily pruning expired entries / applying the cap) as needed.
+// recordFail counts one auth failure for ip.
 func (l *authLimiter) recordFail(ip string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.countLocked(limiterKey(ip), now)
+}
+
+// reserve counts a failure for ip in advance, under the lock, unless its
+// budget is already spent (ok=false: answer 429). The caller refunds the
+// slot if the credentials turn out to be valid. Check and count are one
+// critical section, so N concurrent requests can take at most the
+// remaining budget between them.
+func (l *authLimiter) reserve(ip string, now time.Time) (authSlot, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := limiterKey(ip)
+	if w, ok := l.perIP[key]; ok && now.Sub(w.start) < authFailWindow && w.failures >= authFailLimit {
+		return authSlot{}, false
+	}
+	return authSlot{key: key, start: l.countLocked(key, now)}, true
+}
+
+// refund returns a reserved slot. A slot from a window that has since
+// rolled over is simply dropped: the new window never counted it.
+func (l *authLimiter) refund(slot authSlot) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if w, ok := l.perIP[slot.key]; ok && w.start.Equal(slot.start) && w.failures > 0 {
+		w.failures--
+		l.perIP[slot.key] = w
+	}
+}
+
+// countLocked adds one failure to key's window, starting a new window (and
+// pruning / evicting) as needed. It returns the window's start.
+func (l *authLimiter) countLocked(key string, now time.Time) time.Time {
 	if l.perIP == nil {
 		l.perIP = make(map[string]authFailEntry)
 	}
-	w := l.perIP[ip]
-	if now.Sub(w.start) >= authFailWindow {
-		// New window for this IP — sweep every expired entry while we're
+	w, ok := l.perIP[key]
+	if !ok || now.Sub(w.start) >= authFailWindow {
+		// New window for this key — sweep every expired entry while we're
 		// here, then enforce the cap.
 		for k, v := range l.perIP {
 			if now.Sub(v.start) >= authFailWindow {
 				delete(l.perIP, k)
 			}
 		}
-		if len(l.perIP) >= authFailMaxIPs {
-			clear(l.perIP)
+		if _, still := l.perIP[key]; !still && len(l.perIP) >= authFailMaxIPs {
+			l.evictLocked()
 		}
 		w = authFailEntry{start: now}
 	}
 	w.failures++
-	l.perIP[ip] = w
+	l.perIP[key] = w
+	return w.start
+}
+
+// evictLocked drops the entry that matters least: fewest failures, oldest
+// window on a tie. An exhausted source is therefore the last to go.
+func (l *authLimiter) evictLocked() {
+	var victim string
+	var vw authFailEntry
+	first := true
+	for k, w := range l.perIP {
+		if first || w.failures < vw.failures || (w.failures == vw.failures && w.start.Before(vw.start)) {
+			victim, vw, first = k, w, false
+		}
+	}
+	delete(l.perIP, victim)
+}
+
+// verifiedCredsMax bounds how many distinct verified credentials are
+// remembered; verifiedCredsTTL is how long one is remembered after its last
+// use.
+const (
+	verifiedCredsMax = 16
+	verifiedCredsTTL = time.Hour
+)
+
+// verifiedCreds remembers Basic credentials that passed bcrypt, so their
+// holder is not locked out by the failure limiter and a repeated scrape
+// skips the KDF. Entries are HMAC-SHA256 digests under a per-process random
+// key — never the password — over (username, password, current hash): a hot
+// reload that changes the username or the hash makes every entry
+// unmatchable at once, so revocation stays immediate. The zero value is
+// usable.
+type verifiedCreds struct {
+	mu   sync.Mutex
+	key  []byte
+	seen map[[sha256.Size]byte]time.Time // digest -> last use
+}
+
+func (v *verifiedCreds) digestLocked(auth config.AdminAuth, user, pass string) [sha256.Size]byte {
+	if v.key == nil {
+		v.key = make([]byte, 32)
+		if _, err := rand.Read(v.key); err != nil {
+			panic("admin: crypto/rand: " + err.Error()) // never fails on supported platforms
+		}
+	}
+	m := hmac.New(sha256.New, v.key)
+	for _, part := range []string{auth.Username, auth.PasswordHash, user, pass} {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(len(part)))
+		m.Write(n[:])
+		m.Write([]byte(part))
+	}
+	var d [sha256.Size]byte
+	copy(d[:], m.Sum(nil))
+	return d
+}
+
+// has reports whether (user, pass) was verified against auth before and is
+// still fresh, refreshing its last use.
+func (v *verifiedCreds) has(auth config.AdminAuth, user, pass string) bool {
+	now := time.Now()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	d := v.digestLocked(auth, user, pass)
+	last, ok := v.seen[d]
+	if !ok || now.Sub(last) >= verifiedCredsTTL {
+		return false
+	}
+	v.seen[d] = now
+	return true
+}
+
+// add remembers (user, pass) as verified against auth.
+func (v *verifiedCreds) add(auth config.AdminAuth, user, pass string) {
+	now := time.Now()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.seen == nil {
+		v.seen = make(map[[sha256.Size]byte]time.Time)
+	}
+	d := v.digestLocked(auth, user, pass)
+	if _, ok := v.seen[d]; !ok && len(v.seen) >= verifiedCredsMax {
+		var oldest [sha256.Size]byte
+		first := true
+		for k, t := range v.seen {
+			if first || t.Before(v.seen[oldest]) {
+				oldest, first = k, false
+			}
+		}
+		delete(v.seen, oldest)
+	}
+	v.seen[d] = now
 }
 
 // remoteIP extracts the client's IP from RemoteAddr, falling back to the raw

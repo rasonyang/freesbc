@@ -2738,7 +2738,8 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
 | `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
-| `admin.authLimiter.mu` | the per-IP auth-failure window |
+| `admin.authLimiter.mu` | the per-source auth-failure window, including reservations |
+| `admin.verifiedCreds.mu` | the verified-credential digests |
 | `config.Store.mu` | the subscriber slice only |
 
 ### 11.3 Atomics, channels, CAS
@@ -3042,23 +3043,43 @@ re-`Load`s.
 
 `requireAuth` runs per request:
 
-1. `remoteIP(r)` from `RemoteAddr` — **`X-Forwarded-For` is never
-   consulted**.
-2. If the IP is over budget → **429** `too many failed attempts`, with no
-   state change and without checking credentials.
-3. A request with **no `Authorization` header at all** gets a failure record,
+1. A request with **no (parseable) Basic `Authorization` header** gets
    `WWW-Authenticate: Basic realm="freesbc"` and **401 — without running
-   bcrypt**.
-4. Otherwise `subtle.ConstantTimeCompare` on the username **and**
-   `bcrypt.CompareHashAndPassword` on the password are **both** evaluated
-   before deciding, with a generic 401 on either failure.
-5. Credentials come from `store.Current().Admin.Auth` per request, falling
+   bcrypt and without counting a failure**: it guesses nothing, and a
+   browser's first request to the dashboard always looks like this.
+2. Credentials come from `store.Current().Admin.Auth` per request, falling
    back to the construction-time credentials when the reloaded config has no
    `admin:` section.
+3. If the credentials match a **previously verified** entry
+   (`verifiedCreds`), the request is served with no bcrypt and no limiter
+   check. Entries are HMAC-SHA256 digests (per-process random key) over the
+   configured username and hash plus the presented username and password,
+   so a reload that changes either invalidates them all at once; at most
+   **16** are kept, each for **1 h** after its last use. This is what keeps
+   an operator or the Prometheus scrape working when a shared source
+   address (loopback, a reverse proxy) is locked out by someone else's
+   failures, and it saves a KDF per scrape. Only an exact header that
+   already passed bcrypt matches, so it gives a guesser nothing.
+4. `remoteIP(r)` from `RemoteAddr` — **`X-Forwarded-For` is never
+   consulted** — then `limiter.reserve`: under the limiter's lock, if the
+   source is over budget → **429** `too many failed attempts` with no
+   credential check; otherwise one failure is counted **in advance**. The
+   check and the count are one critical section, so concurrent requests can
+   never take more than the remaining budget (audit P2-ADM-002).
+5. `subtle.ConstantTimeCompare` on the username **and**
+   `bcrypt.CompareHashAndPassword` on the password are **both** evaluated
+   before deciding. On failure the reserved count stays and the answer is a
+   generic 401; on success the reservation is refunded and the credentials
+   are remembered (step 3).
 
-Limiter constants: **10** failures per **1 minute** per IP, tracking at most
-**4096** IPs; when the table reaches that size, `recordFail` sweeps expired
-entries and, if it is still full, clears every count.
+Limiter constants: **10** failures per **1 minute** per source, tracking at
+most **4096** sources. A source is an IPv4 address (IPv4-mapped addresses
+are unmapped) or an IPv6 **/64**, so one host cannot mint fresh budgets from
+its own prefix. Expired windows are swept when a new window starts; when the
+table is still full, the entry with the **fewest failures** (oldest on a tie)
+is evicted, so a flood of fresh sources cannot reset an exhausted
+attacker's budget (audit P2-ADM-003). A client whose credentials were never
+verified still gets 429 while its source is over budget.
 
 `http.Server` timeouts: `ReadHeaderTimeout` 5 s, `ReadTimeout` 30 s,
 `WriteTimeout` 30 s, `IdleTimeout` 30 s. Shutdown gets a 5 s drain.
@@ -3164,7 +3185,10 @@ are capped at 64 characters; ICE tokens are sanitised to the ice-char set.
 **Admin.** One bcrypt Basic-Auth realm over the WebUI, `/metrics` and every
 `/api/*` route, with `/healthz` the only unauthenticated route. bcrypt cost
 ≥ 10 is enforced at config load. A missing `Authorization` header is refused
-before any bcrypt work. Per-IP failure limiting is 10/minute. A non-loopback
+before any bcrypt work and not counted as a failure. Failure limiting is
+10/minute per IPv4 address or IPv6 /64, reserved before bcrypt so
+concurrency cannot exceed it; credentials already verified keep working
+while their source is locked out (§13.4). A non-loopback
 `admin.listen` is a **hard validation error** unless `admin.allow_remote:
 true`, and binding remote without TLS logs a prominent startup warning.
 `Cache-Control: no-store` on every response but `/healthz`.
