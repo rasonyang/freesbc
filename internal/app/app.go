@@ -45,6 +45,10 @@ func Run(ctx context.Context, opts Options) error {
 		log = slog.New(slog.NewTextHandler(nopWriter{}, nil))
 	}
 
+	// cfg is the startup snapshot. Every startup decision below reads it,
+	// never store.Current(): the watcher starts part-way through, and a
+	// reload landing then must not give one startup two configurations
+	// (audit P2-APP-004).
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -53,11 +57,6 @@ func Run(ctx context.Context, opts Options) error {
 
 	pool := trunk.NewMediaPool(store)
 
-	mediaCfg := store.Current().Listen.Media
-	log.Info("media plane ready",
-		"port_range", fmt.Sprintf("%d-%d", mediaCfg.PortRange.Min, mediaCfg.PortRange.Max),
-		"rtp_timeout", mediaCfg.RTPTimeout.Std())
-
 	// The trunk B2BUA plane runs only when there are trunks to serve. A
 	// proxy-only deployment configures no peers and no listen.sip, and
 	// starting the trunk listeners there would bind ports nothing uses.
@@ -65,7 +64,7 @@ func Run(ctx context.Context, opts Options) error {
 	// peers is rejected at load time, so "no peers" really does mean "no
 	// trunk plane" rather than a silently dead listener.
 	var sipServer *trunk.Server
-	if len(store.Current().Peers) > 0 {
+	if len(cfg.Peers) > 0 {
 		sipServer = trunk.NewServer(store, pool, log)
 	}
 
@@ -74,7 +73,7 @@ func Run(ctx context.Context, opts Options) error {
 	// Entirely independent of the trunk plane above — its own user agent,
 	// listeners and media pools — so either may run alone or both together.
 	var edgeSrv *edge.Server
-	if store.Current().ProxyEnabled() {
+	if cfg.ProxyEnabled() {
 		edgeSrv, err = edge.New(store, log)
 		if err != nil {
 			return fmt.Errorf("edge proxy: %w", err)
@@ -83,6 +82,7 @@ func Run(ctx context.Context, opts Options) error {
 	if sipServer == nil && edgeSrv == nil {
 		return fmt.Errorf("nothing to run: configure trunk peers, sip.upstream.address (or sip.upstreams.nodes), or both")
 	}
+	logMediaPlanes(log, cfg, sipServer != nil, edgeSrv != nil)
 
 	// One errgroup for every long-running component: the first non-nil
 	// error cancels the shared context, which is how a fatal bind error in
@@ -96,6 +96,9 @@ func Run(ctx context.Context, opts Options) error {
 		// A dead watcher costs reloads, not calls: never fatal.
 		return nil
 	})
+	if testHookWatchStarted != nil {
+		testHookWatchStarted(store)
+	}
 
 	if sipServer != nil {
 		g.Go(func() error {
@@ -116,7 +119,7 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 
-	if adminCfg := store.Current().Admin; adminCfg != nil {
+	if adminCfg := cfg.Admin; adminCfg != nil {
 		deps := adminDeps(store, pool, sipServer, edgeSrv, opts.Version)
 		adminSrv := admin.New(adminCfg, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
@@ -130,8 +133,8 @@ func Run(ctx context.Context, opts Options) error {
 
 	log.Info("freesbc started",
 		"config", opts.ConfigPath,
-		"peers", len(store.Current().Peers),
-		"routes", len(store.Current().Routes))
+		"peers", len(cfg.Peers),
+		"routes", len(cfg.Routes))
 
 	<-gctx.Done()
 	log.Info("shutting down")
@@ -140,17 +143,45 @@ func Run(ctx context.Context, opts Options) error {
 
 // adminDeps assembles the admin API's view of whichever planes are
 // running. Either plane may be absent (a proxy-only or trunk-only
-// deployment), so every accessor is nil-guarded rather than assuming both.
+// deployment), so every accessor covers exactly the planes that run: the
+// call count and the call list agree, the port usage is that of the
+// running planes' pools, and the listeners are the ones they bound.
 //
-// Known gap: the call table, kill-call and shield accessors are
-// trunk-only. A proxy-only deployment therefore reports an empty call list,
-// a no-op DELETE /api/calls/{id} and zeroed shield drop counters even
-// though the edge plane has dialogs and a shield of its own.
+// Known gap: kill-call and the shield counters are trunk-only. A
+// proxy-only deployment therefore has a no-op DELETE /api/calls/{id} (404
+// for an edge call) and zeroed shield drop counters even though the edge
+// plane has a shield of its own.
 func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Server, edgeSrv *edge.Server, version string) admin.Deps {
 	deps := admin.Deps{
-		Ports:   pool.Stats,
 		Version: version,
-		Calls:   func() []admin.Call { return nil },
+		Ports: func() (inUse, total int) {
+			if sipServer != nil {
+				inUse, total = pool.Stats()
+			}
+			if edgeSrv != nil {
+				u, t := edgeSrv.PortStats()
+				inUse, total = inUse+u, total+t
+			}
+			return inUse, total
+		},
+		Calls: func() []admin.Call {
+			out := []admin.Call{}
+			if sipServer != nil {
+				for _, r := range sipServer.Calls() {
+					out = append(out, admin.Call{
+						ID: r.ID, CallID: r.CallID, FromPeer: r.FromPeer, ToPeer: r.ToPeer, StartUnixNano: r.StartUnixNano,
+					})
+				}
+			}
+			if edgeSrv != nil {
+				for _, r := range edgeSrv.Calls() {
+					out = append(out, admin.Call{
+						ID: r.ID, CallID: r.CallID, FromPeer: r.From, ToPeer: r.To, StartUnixNano: r.StartUnixNano,
+					})
+				}
+			}
+			return out
+		},
 		ActiveCalls: func() int {
 			n := 0
 			if sipServer != nil {
@@ -161,21 +192,21 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 			}
 			return n
 		},
+		Listeners: func() []string {
+			var out []string
+			if sipServer != nil {
+				out = append(out, sipServer.Listeners()...)
+			}
+			if edgeSrv != nil {
+				out = append(out, edgeSrv.Listeners()...)
+			}
+			return out
+		},
 		KillCall: func(string) bool { return false },
 		Shield:   func() admin.ShieldStats { return admin.ShieldStats{DropsByReason: map[string]int64{}} },
 		Peers:    func() []admin.PeerStatus { return nil },
 	}
 	if sipServer != nil {
-		deps.Calls = func() []admin.Call {
-			recs := sipServer.Calls()
-			out := make([]admin.Call, 0, len(recs))
-			for _, r := range recs {
-				out = append(out, admin.Call{
-					ID: r.ID, CallID: r.CallID, FromPeer: r.FromPeer, ToPeer: r.ToPeer, StartUnixNano: r.StartUnixNano,
-				})
-			}
-			return out
-		}
 		deps.KillCall = sipServer.KillCall
 		deps.Shield = func() admin.ShieldStats {
 			st := sipServer.ShieldStats()
@@ -218,6 +249,29 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 	}
 	return deps
 }
+
+// logMediaPlanes logs the RTP range of each running plane: the trunk's
+// effective range (rtp.port_min/max or listen.media.port_range) and the
+// edge's public and private pools.
+func logMediaPlanes(log *slog.Logger, cfg *config.Config, trunkOn, edgeOn bool) {
+	rng := func(lo, hi int) string { return fmt.Sprintf("%d-%d", lo, hi) }
+	if trunkOn {
+		r := cfg.RTPPortRange()
+		log.Info("media plane ready", "plane", "trunk", "port_range", rng(int(r.Min), int(r.Max)),
+			"rtp_timeout", cfg.Listen.Media.RTPTimeout.Std())
+	}
+	if edgeOn {
+		log.Info("media plane ready", "plane", "edge",
+			"public_port_range", rng(cfg.RTP.Public.PortMin, cfg.RTP.Public.PortMax),
+			"private_port_range", rng(cfg.RTP.Private.PortMin, cfg.RTP.Private.PortMax),
+			"rtp_timeout", cfg.Listen.Media.RTPTimeout.Std())
+	}
+}
+
+// testHookWatchStarted, when non-nil, runs right after Run starts the
+// config watcher, with the store the watcher replaces snapshots in. Only
+// tests set it, to land a reload in the middle of startup.
+var testHookWatchStarted func(*config.Store)
 
 // nopWriter discards log output, for a caller that passed no logger.
 type nopWriter struct{}

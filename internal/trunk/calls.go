@@ -185,6 +185,12 @@ func (s *Server) registerCall(c *call) {
 	if c.bID != "" {
 		s.legs[c.bID] = append(s.legs[c.bID], legRef{c: c, bLeg: true, entry: c.bSDP})
 	}
+	// Counted for drainCalls. A call answered after shutdown began missed
+	// its sweep (which takes callMu after setting the gate): end it now,
+	// like a kick.
+	if s.gate.bridge() && c.cancel != nil {
+		c.cancel()
+	}
 }
 
 // endCall is registerCall's exact inverse, deferred by onInvite so it runs

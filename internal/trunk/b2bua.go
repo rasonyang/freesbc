@@ -141,7 +141,17 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	guard := &callGuard{tx: ftx}
 	defer s.recoverCall(req, guard)
 
-	name, fromPeer, ok := s.identify(req)
+	// One config snapshot for the whole call (audit P2-TRK-005): the
+	// peer, the route, the quotas, the session-timer floor, the media
+	// range and the advertised addresses all come from cfg, so a reload
+	// landing mid-call can never give one call two configurations. The
+	// call keeps it until it ends.
+	cfg := s.store.Current()
+	if s.onSnapshot != nil {
+		s.onSnapshot()
+	}
+
+	name, fromPeer, ok := s.identifyIn(cfg, req)
 	if !ok {
 		return // unidentified source: silent drop
 	}
@@ -208,7 +218,6 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			return
 		}
 		if isRefreshReInvite(req, entry.compare) {
-			cfg := s.store.Current()
 			se := headerSeconds(req, "Session-Expires")
 			if minSE := cfg.MinSE.Std(); se < minSE {
 				// RFC 4028 §9 applies to a refresh as to the initial
@@ -224,7 +233,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			// from the current config and the re-INVITE's own transport
 			// (req.Transport(): whichever leg sent this refresh).
 			transport := sip.NetworkToLower(req.Transport())
-			contact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, transport), transport)
+			contact := buildContact(s.sigIP(cfg), s.sigPort(transport), transport)
 
 			res := sip.NewResponseFromRequest(req, 200, "OK", entry.answer)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
@@ -262,7 +271,22 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer doneInvite()
 
-	cfg := s.store.Current()
+	// Shutdown gate: once Run has begun draining, no new call is placed
+	// (503 + Retry-After, so the caller tries another SBC or later); a
+	// bridged one is BYEd and waited for, bounded, before the listeners
+	// close (shutdown.go).
+	if !s.gate.admit() {
+		s.reject(req, tx, 503, "Service Unavailable", sip.NewHeader("Retry-After", "30"))
+		return
+	}
+	// Deferred here, before any resource is taken, so it runs after every
+	// release below: drainCalls waits for it (registerCall counts the call).
+	bridged := false
+	defer func() {
+		if bridged {
+			s.gate.unbridge()
+		}
+	}()
 
 	// Call-quota gate for initial INVITEs (the in-dialog
 	// re-INVITE branch above already returned — a refresh never consumes a
@@ -411,7 +435,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// each target's own media_latch before dialing it, so the mode actually
 	// in effect always matches whichever target ends up winning failover —
 	// see placeCall/dialTarget for the loop.
-	sess, err := s.pool.Allocate(media.SessionConfig{
+	sess, err := s.pool.AllocateWith(planeParams(cfg), media.SessionConfig{
 		Latch: [2]media.LatchMode{
 			media.ParseLatchMode(fromPeer.MediaLatch),
 			media.ParseLatchMode(decision.Targets[0].Peer.MediaLatch),
@@ -450,7 +474,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	guard.c = c
 
-	bLeg, target, aAnswer, bOffer, ok := s.placeCall(c, decision.Targets, decision.OutNumber, req.Body(), mediaIP)
+	bLeg, target, aAnswer, bOffer, ok := s.placeCall(c, cfg, decision.Targets, decision.OutNumber, req.Body(), mediaIP)
 	if !ok {
 		return // placeCall already sent the A-leg's final response.
 	}
@@ -510,6 +534,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	defer killCancel()
 	c.cancel = killCancel
 	s.registerCall(c)
+	bridged = true
 	defer s.endCall(c)
 	if s.onBridged != nil {
 		s.onBridged(c)
@@ -644,8 +669,7 @@ type dialEndpoint struct {
 // (s.health, populated by placeCall's Penalize on a failDial) are skipped
 // in favor of healthy ones — but only when at least one healthy endpoint
 // exists; see the dial-anyway fallback below.
-func (s *Server) expandTargets(targets []Target) []dialEndpoint {
-	cfg := s.store.Current()
+func (s *Server) expandTargets(cfg *config.Config, targets []Target) []dialEndpoint {
 	var available, cooled []dialEndpoint
 	for _, t := range targets {
 		if t.Peer.Register && !s.IsRegistered(t.Name) {
@@ -714,7 +738,7 @@ func (s *Server) expandTargets(targets []Target) []dialEndpoint {
 // winning target) — like aAnswer (see attemptResult), the caller needs it
 // verbatim to answer a later B-LEG session-timer refresh with, rather than
 // the carrier's own answer.
-func (s *Server) placeCall(c *call, targets []Target, outNumber string, offerBody []byte, mediaIP netip.Addr) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
+func (s *Server) placeCall(c *call, cfg *config.Config, targets []Target, outNumber string, offerBody []byte, mediaIP netip.Addr) (bLeg *sipgo.DialogClientSession, winner Target, aAnswer []byte, bOffer []byte, ok bool) {
 	aLeg := c.aLeg
 	// Pre-loop validation only (the actual per-target offer, including any
 	// SRTP crypto, is built fresh inside dialTarget — see its doc comment):
@@ -726,12 +750,10 @@ func (s *Server) placeCall(c *call, targets []Target, outNumber string, offerBod
 		return nil, Target{}, nil, nil, false
 	}
 
-	cfg := s.store.Current()
-
 	haveReal := false
 	haveRing := false
 	lastRealCode, lastRealReason := 0, ""
-	for _, de := range s.expandTargets(targets) {
+	for _, de := range s.expandTargets(cfg, targets) {
 		dialedLeg, res := s.dialTarget(c, cfg, de.Target, de.Endpoint, outNumber, offerBody, mediaIP)
 		if res.ok {
 			// A bridged call proves this endpoint is reachable — clear any
@@ -917,7 +939,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	bTarget := peerURI(ep)
 	bTarget.User = outNumber
 
-	sigPort := s.ourSigPort(cfg, target.Peer.Transport)
+	sigPort := s.sigPort(target.Peer.Transport)
 	from := s.buildFrom(aLeg.InviteRequest, s.sigIP(cfg), sigPort)
 	contact := buildContact(s.sigIP(cfg), sigPort, target.Peer.Transport)
 
@@ -1045,7 +1067,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
-	aContact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, aTransport), aTransport)
+	aContact := buildContact(s.sigIP(cfg), s.sigPort(aTransport), aTransport)
 	timerHeaders, aTimer := aLegSessionTimer(aLeg.InviteRequest, cfg)
 	headers := append([]sip.Header{sip.NewHeader("Content-Type", "application/sdp"), aContact}, timerHeaders...)
 	if err := aLeg.Respond(200, "OK", aAnswer, headers...); err != nil {

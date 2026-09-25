@@ -171,6 +171,9 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		return nil, fmt.Errorf("%w: client offered %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
 
+	if !d.open() {
+		return nil, errShuttingDown
+	}
 	var sess *mediaSession
 	if offer.Audio.WebRTC() {
 		if !s.webrtcEnabled {
@@ -189,7 +192,9 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 	sess.codecs = codecs
 	// From here the session belongs to the dialog: every failure below
 	// leaves it to the dialog's own end(), which is the single teardown.
-	d.attach(sess)
+	if err := d.attach(sess); err != nil {
+		return nil, err
+	}
 
 	// A fresh session identity: the upstream body is FreeSBC's own offer,
 	// not a relay of the client's, so it must not reuse the client's o=
@@ -510,6 +515,9 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 	if !sdp.HasMedia(codecs) {
 		return nil, fmt.Errorf("%w: upstream offered %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
+	if !d.open() {
+		return nil, errShuttingDown
+	}
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
 		// Same policy as allocateRTP: the public leg (the answering phone)
 		// latches loosely so a hard-NAT phone's real RTP source — which
@@ -537,7 +545,9 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 	ms.seedApplied(planePrivate, remote)
 	// From here the session belongs to the dialog: every failure below
 	// leaves it to the dialog's own end(), which is the single teardown.
-	d.attach(ms)
+	if err := d.attach(ms); err != nil {
+		return nil, err
+	}
 	id, version := d.nextOrigin(planePublic)
 	body, err := sdp.Build{
 		Address:        s.topo.publicMediaIP,

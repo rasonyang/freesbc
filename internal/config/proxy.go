@@ -167,7 +167,8 @@ type UpstreamsConfig struct {
 // at all is skipped in favour of alternatives. Both are re-read from the
 // store on every call, so a reload changes the budget for the NEXT call;
 // gateways/routes/match are a startup snapshot (like the rest of the
-// topology).
+// topology). A reload that removes the section keeps the startup budgets
+// (edge/budgets.go).
 type PstnConfig struct {
 	Address   string   `yaml:"address"`   // v1 alias: host:port; literal IP enforced at topology build
 	Transport string   `yaml:"transport"` // v1 alias transport: udp (default; the only supported value)

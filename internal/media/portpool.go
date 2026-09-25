@@ -92,7 +92,12 @@ func NewPlanePool(name string, params func() PlaneParams) *PlanePool {
 // port+1) can never be bound outside the configured range — even when hi
 // is odd or lo is odd.
 func (p *PlanePool) allocatePair() (*portPair, error) {
-	par := p.params()
+	return p.allocatePairWith(p.params())
+}
+
+// allocatePairWith is allocatePair from params the caller already read, so
+// one allocation acts on one snapshot of the pool's configuration.
+func (p *PlanePool) allocatePairWith(par PlaneParams) (*portPair, error) {
 	pair, err := sweep(p, par, func(port int) (*portPair, error) { return bindPair(port, par.BindIP) })
 	if err != nil {
 		return nil, fmt.Errorf("%w: no free pair in %s range %d-%d", ErrPortsExhausted, p.name, par.MinPort, par.MaxPort)
@@ -200,13 +205,6 @@ func (p *PlanePool) release(rtpPort int) {
 	delete(p.inUse, rtpPort)
 	p.mu.Unlock()
 }
-
-// timeout is the pool's default silence teardown.
-func (p *PlanePool) timeout() time.Duration { return p.params().Timeout }
-
-// allowLoopback is the pool's loopback-destination policy, read once per
-// session at allocation.
-func (p *PlanePool) allowLoopback() bool { return p.params().AllowLoopback }
 
 // listenUDP is net.ListenUDP; a variable only so a test can observe what
 // the pool holds while a bind is in progress.

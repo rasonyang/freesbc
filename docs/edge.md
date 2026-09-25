@@ -122,6 +122,10 @@ Health is passive cooldown: a gateway that answered nothing before its
 budget expired is penalized for `cooldown` and dialed only when no
 healthy alternative remains (never a hard block); a successful call
 recovers it.
+`attempt_timeout` and `cooldown` hot-reload for the next call; the
+gateways, routes and `match` are read once at startup. A reload that
+removes `sip.pstn` leaves the running gateways in place, under the budgets
+they started with.
 
 On the FreeSWITCH side (no gateway definition needed — this is a plain
 peer-to-peer bridge):

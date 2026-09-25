@@ -183,7 +183,7 @@ func (s *Server) startRefreshers(ctx context.Context, c *call, cfg *config.Confi
 			write:   c.aLeg.WriteRequest,
 			remote:  c.aLeg.InviteRequest.Contact().Address,
 			sdp:     c.aSDP.answer,
-			contact: buildContact(s.sigIP(cfg), s.ourSigPort(cfg, transport), transport),
+			contact: buildContact(s.sigIP(cfg), s.sigPort(transport), transport),
 			minSE:   cfg.MinSE.Std(),
 		}, aTimer)
 	}
@@ -198,7 +198,7 @@ func (s *Server) startRefreshers(ctx context.Context, c *call, cfg *config.Confi
 			write:   c.bLeg.WriteRequest,
 			remote:  remote,
 			sdp:     c.bSDP.answer,
-			contact: buildContact(s.sigIP(cfg), s.ourSigPort(cfg, c.target.Peer.Transport), c.target.Peer.Transport),
+			contact: buildContact(s.sigIP(cfg), s.sigPort(c.target.Peer.Transport), c.target.Peer.Transport),
 			minSE:   cfg.MinSE.Std(),
 		}, bTimer)
 	}

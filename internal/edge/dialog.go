@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/netip"
 	"sync"
@@ -176,6 +177,10 @@ type dialog struct {
 	callerURI, calleeURI sip.Uri
 	cseq                 [2]uint32
 
+	// confirmedAt is when the record was confirmed (the admin call list's
+	// start time). Written under tab.mu in confirm.
+	confirmedAt time.Time
+
 	// media is the anchored session. It is attached once, right after the
 	// record is created, and then only closed — never replaced.
 	media *mediaSession
@@ -212,6 +217,12 @@ type dialog struct {
 type dialogTable struct {
 	mu       sync.Mutex
 	byCallID map[string][]*dialog
+
+	// closed is set when shutdown begins (see close): from then on no
+	// dialog is opened and no media is attached, so an INVITE still in
+	// flight can neither allocate after shutdown began nor leak what it
+	// allocated (audit P2-EDG-027).
+	closed bool
 
 	// onMediaEnd is called, once, for a confirmed dialog that ended because
 	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
@@ -255,6 +266,9 @@ func (t *dialogTable) begin(req *sip.Request, callerPlane plane) (*dialog, bool)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return nil, false // shutting down; see isClosed
+	}
 	for _, o := range t.byCallID[callID] {
 		if o.state == dialogEarly && o.callerTag == callerTag {
 			return nil, false
@@ -319,6 +333,55 @@ func (t *dialogTable) count() int {
 	return n
 }
 
+// CallRecord is one confirmed dialog as the admin API lists it.
+type CallRecord struct {
+	// ID identifies the dialog: "edge:" + Call-ID + ";" + caller tag.
+	ID     string
+	CallID string
+	// From/To are the planes the caller and the callee are on.
+	From, To      string
+	StartUnixNano int64
+}
+
+// calls lists the confirmed dialogs: the same set count counts.
+func (t *dialogTable) calls() []CallRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []CallRecord
+	for _, ds := range t.byCallID {
+		for _, d := range ds {
+			if d.state != dialogConfirmed {
+				continue
+			}
+			from, to := "edge:public", "edge:private"
+			if d.callerPlane != planePublic {
+				from, to = to, from
+			}
+			out = append(out, CallRecord{
+				ID: "edge:" + d.callID + ";" + d.callerTag, CallID: d.callID,
+				From: from, To: to, StartUnixNano: d.confirmedAt.UnixNano(),
+			})
+		}
+	}
+	return out
+}
+
+// close refuses every later begin and attach. Run calls it the moment
+// shutdown begins, before the listeners close; closeAll then ends what is
+// left.
+func (t *dialogTable) close() {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+}
+
+// isClosed reports whether close has run.
+func (t *dialogTable) isClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
 // closeAll ends every dialog. Called at shutdown so no socket, port
 // reservation or relay goroutine outlives the process's SIP plane.
 func (t *dialogTable) closeAll() {
@@ -350,12 +413,34 @@ func (t *dialogTable) removeLocked(d *dialog) {
 	t.byCallID[d.callID] = ds
 }
 
+// errShuttingDown refuses a call because the proxy is shutting down.
+var errShuttingDown = errors.New("proxy: shutting down")
+
 // attach records the media session this dialog anchors. Called once, on
-// the allocation that immediately follows begin.
-func (d *dialog) attach(sess *mediaSession) {
+// the allocation that immediately follows begin. When the dialog can no
+// longer own it — shutdown began, or the dialog already ended — the
+// session is closed here instead and errShuttingDown returned: nothing
+// else would ever close it.
+func (d *dialog) attach(sess *mediaSession) error {
+	d.tab.mu.Lock()
+	if d.tab.closed || d.state == dialogEnded {
+		d.tab.mu.Unlock()
+		_ = sess.Close()
+		return errShuttingDown
+	}
+	d.media = sess
+	d.tab.mu.Unlock()
+	return nil
+}
+
+// open reports whether media may still be allocated for d: shutdown has
+// not begun and the dialog has not ended. Checked before allocating, so a
+// handler in flight does not bind ports after shutdown began; attach is
+// the authoritative check.
+func (d *dialog) open() bool {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
-	d.media = sess
+	return !d.tab.closed && d.state != dialogEnded
 }
 
 // session is the anchored media session, or nil before one is attached.
@@ -638,6 +723,7 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	}
 	d.state = dialogConfirmed
 	d.calleeTag = calleeTag
+	d.confirmedAt = time.Now()
 	d.route = r
 	if f := d.forks[calleeTag]; f != nil && f.answer != nil {
 		// The caller has seen this fork's bodies, so its o= identity is the

@@ -31,6 +31,15 @@ type Server struct {
 	pool  *media.PlanePool
 	log   *slog.Logger
 
+	// boot is the snapshot the plane starts with (store.Current() in
+	// NewServer). Restart-only settings are read from it and never from the
+	// store: the listener set Run binds, the inbound TLS identity, the
+	// initial outbound TLS material and the signaling port this plane
+	// advertises (sigPort). A hot reload that edits them is published, but
+	// this plane keeps acting on what it actually bound (audit P2-TRK-004).
+	// Written once in NewServer, before any goroutine exists.
+	boot *config.Config
+
 	// callMu guards the one call store (calls.go): calls is every bridged
 	// call keyed by its admin ID — the identity the admin API and KillCall
 	// use — and legs indexes the SAME *call under EACH leg's own Call-ID,
@@ -47,7 +56,10 @@ type Server struct {
 
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
-	registrar *Registrar
+	// registrar is built in Run and read by IsRegistered from the admin
+	// goroutine (peer view, metrics), so it is published atomically, like
+	// shield below (audit P2-APP-002).
+	registrar atomic.Pointer[Registrar]
 
 	// client is the plane's sipgo client, set once in Run; forkWatch uses
 	// it to ACK and BYE forked B-leg answers. forks holds the live
@@ -64,6 +76,11 @@ type Server struct {
 	// call. Only tests set it (before Run), to exercise recoverCall on a
 	// bridged call.
 	onBridged func(*call)
+
+	// onSnapshot, when non-nil, runs right after onInvite takes the call's
+	// config snapshot. Only tests set it (before Run), to land a reload
+	// between that snapshot and the rest of the call.
+	onSnapshot func()
 
 	// shield is the front-door security plane: consulted before
 	// identify() on every inbound request (see withShield). Built in Run,
@@ -108,6 +125,12 @@ type Server struct {
 	// zero value is usable; it needs no Run-time wiring.
 	quota callQuota
 
+	// gate admits initial INVITEs and drains them at shutdown (see
+	// shutdown.go); shutdownGrace bounds that drain. Set by NewServer;
+	// only tests override the grace, before Run.
+	gate          callGate
+	shutdownGrace time.Duration
+
 	// onListening, when non-nil, is called once per listener immediately
 	// after its socket is bound and before it is handed to the transport
 	// layer. Only tests set it (from startServerAt, before the Run
@@ -125,6 +148,7 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		store:    store,
 		pool:     pool,
 		log:      log,
+		boot:     store.Current(),
 		calls:    make(map[string]*call),
 		legs:     make(map[string][]legRef),
 		inviting: make(map[mergeKey]struct{}),
@@ -135,6 +159,7 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		// connections and a 120s idle read deadline per connection.
 		tcpMaxConns:    1024,
 		tcpIdleTimeout: 120 * time.Second,
+		shutdownGrace:  defaultShutdownGrace,
 	}
 }
 
@@ -148,10 +173,21 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 // before Run has built the registrar at all: no registrar means no
 // registration gating, not "every peer is down".
 func (s *Server) IsRegistered(name string) bool {
-	if s.registrar == nil {
+	reg := s.registrar.Load()
+	if reg == nil {
 		return true
 	}
-	return s.registrar.IsRegistered(name)
+	return reg.IsRegistered(name)
+}
+
+// Listeners is the listener set Run binds, as transport://host:port, from
+// the startup snapshot (the set is restart-only).
+func (s *Server) Listeners() []string {
+	var out []string
+	for _, l := range s.boot.Listeners() {
+		out = append(out, fmt.Sprintf("%s://%s", l.Transport, net.JoinHostPort(l.Host, strconv.Itoa(l.Port))))
+	}
+	return out
 }
 
 // ShieldStats returns the current shield activity snapshot (nil-safe: zero
@@ -173,7 +209,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// accepts) whose callbacks select trust roots and client certificate
 	// per peer (see clientTLS). Material is loaded once at startup — it
 	// is not hot-rotated.
-	peerTLS, err := newClientTLS(s.store.Current().Peers,
+	peerTLS, err := newClientTLS(s.boot.Peers,
 		func() map[string]*config.Peer { return s.store.Current().Peers },
 		s.resolver.srvTargets)
 	if err != nil {
@@ -205,7 +241,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer client.Close()
 
-	cfg := s.store.Current()
+	cfg := s.boot
 	listeners := cfg.Listeners()
 	// The Contact host must be an address the far side can actually reach —
 	// see sigIP: same resolution (sip.advertised_ip, else the public_ip
@@ -214,10 +250,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// all interfaces) doesn't advertise an unroutable sip:0.0.0.0:port.
 	// The port is the advertised signaling port for listeners[0]'s
 	// transport (sip.advertised_port when configured), never a hardcoded
-	// 5060. Resolved once here from the config Run started with;
+	// 5060. Resolved once here from the startup snapshot (s.boot);
 	// hot-reloaded changes to advertised/listener settings don't
-	// retroactively update this cached Contact (mediaIP/sigIP's per-call
-	// uses, by contrast, are resolved fresh from the current config). The
+	// retroactively update this cached Contact (sigIP's per-call uses, by
+	// contrast, are resolved fresh from the current config; the port is
+	// restart-only everywhere, see sigPort). The
 	// len guard mirrors the pre-existing listeners[0] guard: validated
 	// configs always have at least one listener, but a *Server built
 	// directly by tests (without Parse) may have none.
@@ -291,10 +328,11 @@ func (s *Server) Run(ctx context.Context) error {
 	listenCtx, listenCancel := context.WithCancel(context.Background())
 	defer listenCancel()
 
-	s.registrar = NewRegistrar(s.store, client, s, s.log)
+	registrar := NewRegistrar(s.store, client, s, s.log)
+	s.registrar.Store(registrar)
 	regDone := make(chan struct{})
 	go func() {
-		if err := s.registrar.Run(regCtx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := registrar.Run(regCtx); err != nil && !errors.Is(err, context.Canceled) {
 			s.log.Debug("registrar stopped", "err", err)
 		}
 		close(regDone)
@@ -318,8 +356,12 @@ func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("sip server listening", "listeners", len(listeners))
 
 	<-stopCh
-	// Registrar first: every un-REGISTER attempt completes (success or its
-	// own bounded 2s timeout) while listener sockets are still open.
+	// Calls first: every bridged call is BYEd on both legs and its media
+	// released while the listeners (whose sockets the BYEs and their
+	// responses use) are still open (audit P2-TRK-017).
+	s.drainCalls(s.shutdownGrace)
+	// Then the registrar: every un-REGISTER attempt completes (success or
+	// its own bounded 2s timeout) while listener sockets are still open.
 	regCancel()
 	<-regDone
 	// Only now is it safe to close the listener sockets.
@@ -376,8 +418,8 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 		// self-signed one — clients (or our own outbound side, with a
 		// matching trust anchor) can then verify this listener for real.
 		// mTLS engages when tls_client_ca is set. Read at bind time from
-		// the startup config; cert material is not hot-rotated.
-		cfg := s.store.Current()
+		// the startup snapshot; cert material is not hot-rotated.
+		cfg := s.boot
 		var tlsConf *tls.Config
 		if cfg.Listen.TLSCert != "" {
 			conf, err := loadServerTLSConfig(cfg.Listen.TLSCert, cfg.Listen.TLSKey, cfg.Listen.TLSClientCA)
@@ -419,11 +461,17 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 // source address. sipgo sets req.Source() from the real remote socket on
 // receive, so this is the trust boundary — never the Via/From host.
 func (s *Server) identify(req *sip.Request) (string, *config.Peer, bool) {
+	return s.identifyIn(s.store.Current(), req)
+}
+
+// identifyIn is identify against a snapshot the caller already holds (the
+// per-call one, see onInvite).
+func (s *Server) identifyIn(cfg *config.Config, req *sip.Request) (string, *config.Peer, bool) {
 	addr, ok := fsip.ParseHostPortAddr(req.Source())
 	if !ok {
 		return "", nil, false
 	}
-	return IdentifyPeer(s.store.Current(), addr)
+	return IdentifyPeer(cfg, addr)
 }
 
 // withShield wraps a request handler so every inbound request passes the
@@ -518,13 +566,21 @@ func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
 	return s.advertisedIP(cfg, cfg.RTP.AdvertisedIP)
 }
 
+// sigPort is the signaling port this plane advertises for transport, from
+// the startup snapshot: the listener set is restart-only, so a reload that
+// edits listen.sip or sip.advertised_port must never make a Contact, From
+// or REGISTER name a port nothing is bound to (audit P2-TRK-004).
+func (s *Server) sigPort(transport string) int {
+	return s.ourSigPort(s.boot, transport)
+}
+
 // ourSigPort returns the port we advertise for our signaling on the given
 // transport: sip.advertised_port when the sip bind/advertised topology is
 // configured, else the first matching listen.sip port, else the first
 // listener's port — mirrors the Contact-port resolution Run does once at
-// startup (see the contact comment above), but re-resolved per call /
+// startup (see the contact comment above), but resolved per call /
 // per-target so it tracks whichever transport the B-leg is actually being
-// placed on. Validation guarantees at least one listener (listen.sip or
+// placed on. Callers pass the startup snapshot (see sigPort). Validation guarantees at least one listener (listen.sip or
 // sip.bind_ip), so a parsed Config never falls through to the zero return;
 // 0 only serves Configs built directly by unit tests without Parse. There
 // is deliberately no 5060 fallback: the configured ports are the source of

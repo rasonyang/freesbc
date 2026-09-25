@@ -21,7 +21,15 @@ const reloadDebounce = 200 * time.Millisecond
 // in-place edit of the target in another directory both reload. An invalid
 // config is logged and the previous one stays active — the process never
 // dies from a bad reload. Blocks until ctx is cancelled.
+//
+// Watch must start before anything else replaces the store's snapshot (it
+// is the only caller of Replace): the snapshot current when it starts is
+// the one the process started with, and every reload is diffed against it
+// with RestartOnlyChanges. A reload that edits restart-only settings is
+// still published, for its hot settings, with a warning naming the
+// settings that will only take effect on restart.
 func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) error {
+	boot := store.Current()
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return err
@@ -76,6 +84,10 @@ func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) err
 			if err != nil {
 				log.Error("config reload failed, keeping previous config", "err", err)
 				continue
+			}
+			if changed := RestartOnlyChanges(boot, cfg); len(changed) > 0 {
+				log.Warn("config reload changes restart-only settings; the running process keeps its startup values until restart",
+					"settings", changed)
 			}
 			store.Replace(cfg)
 			log.Info("config reloaded", "path", abs)

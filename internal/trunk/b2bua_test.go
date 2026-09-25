@@ -4999,7 +4999,7 @@ func TestExpandTargetsResolvesEndpointsInOrder(t *testing.T) {
 		}, nil
 	}
 	targets := []Target{{Name: "a", Peer: peerA}}
-	des := s.expandTargets(targets)
+	des := s.expandTargets(cfg, targets)
 	if len(des) != 2 {
 		t.Fatalf("want 2 dialEndpoints, got %d: %+v", len(des), des)
 	}
@@ -5033,14 +5033,14 @@ func TestExpandTargetsSkipsCooledEndpoints(t *testing.T) {
 
 	// Cool down ep1: expandTargets returns only ep2.
 	s.health.Penalize(Endpoint{Host: "ep1.example", Port: 5060, Transport: "udp"}, time.Hour)
-	des := s.expandTargets(targets)
+	des := s.expandTargets(cfg, targets)
 	if len(des) != 1 || des[0].Endpoint.Host != "ep2.example" {
 		t.Fatalf("with ep1 cooled, want [ep2.example], got %+v", des)
 	}
 
 	// Cool down ep2 as well: everything is cooled → dial them ALL anyway.
 	s.health.Penalize(Endpoint{Host: "ep2.example", Port: 5061, Transport: "udp"}, time.Hour)
-	des = s.expandTargets(targets)
+	des = s.expandTargets(cfg, targets)
 	if len(des) != 2 {
 		t.Fatalf("all cooled → dial-anyway must return both, got %+v", des)
 	}

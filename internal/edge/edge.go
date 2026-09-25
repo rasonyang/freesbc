@@ -30,6 +30,13 @@ type Server struct {
 	store *config.Store
 	log   *slog.Logger
 
+	// boot is the snapshot the plane was built from (store.Current() in
+	// New). Restart-only settings are read from it and never from the
+	// store: the listener set, the WSS certificate, the private bind the
+	// read filter trusts, the media planes and the fallbacks of the
+	// failure budgets (see budgets.go). Written once in New.
+	boot *config.Config
+
 	topo *topology
 
 	pubPool  *media.PlanePool
@@ -125,9 +132,10 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	raiseUDPSendLimit()
-	pub, priv := newMediaPools(store)
+	pub, priv := newMediaPools(store, cfg)
 	s := &Server{
 		store:            store,
+		boot:             cfg,
 		log:              log.With("component", "proxy"),
 		topo:             topo,
 		pubPool:          pub,
@@ -170,6 +178,28 @@ func (s *Server) Metrics() *Metrics { return s.metrics }
 
 // ActiveCalls is the number of proxied dialogs currently tracked.
 func (s *Server) ActiveCalls() int { return s.dialogs.count() }
+
+// Calls lists the confirmed dialogs ActiveCalls counts, for the admin call
+// list.
+func (s *Server) Calls() []CallRecord { return s.dialogs.calls() }
+
+// PortStats is the RTP port usage of the public and private media pools
+// together: pairs allocated and pairs the two ranges hold.
+func (s *Server) PortStats() (inUse, total int) {
+	pu, pt := s.pubPool.Stats()
+	qu, qt := s.privPool.Stats()
+	return pu + qu, pt + qt
+}
+
+// Listeners is the listener set Run binds, as transport://host:port, from
+// the startup snapshot (the set is restart-only).
+func (s *Server) Listeners() []string {
+	var out []string
+	for _, l := range s.boot.PublicSIPListeners() {
+		out = append(out, l.Transport+"://"+l.Bind.String())
+	}
+	return append(out, "udp://"+s.boot.SIP.Private.Bind.String()+" (private)")
+}
 
 // Run binds every listener and blocks until ctx is cancelled. It returns
 // the first fatal bind error, or nil on clean shutdown.
@@ -226,10 +256,10 @@ func (s *Server) Run(ctx context.Context) error {
 		addr      string
 	}
 	var listeners []bound
-	for _, l := range s.store.Current().PublicSIPListeners() {
+	for _, l := range s.boot.PublicSIPListeners() {
 		listeners = append(listeners, bound{l.Transport, l.Bind.String()})
 	}
-	listeners = append(listeners, bound{"udp-private", s.store.Current().SIP.Private.Bind.String()})
+	listeners = append(listeners, bound{"udp-private", s.boot.SIP.Private.Bind.String()})
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -324,20 +354,25 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
-	case err := <-errs:
-		listenCancel()
-		wg.Wait()
-		s.dialogs.closeAll()
-		return err
+	case runErr = <-errs:
 	}
+	// Shutdown. First close the dialog table, while the listeners are
+	// still up: an INVITE handler still in flight can then open no dialog
+	// and attach no media (it answers 503, and a session it already
+	// allocated is closed by attach), so nothing is allocated after this
+	// point or outlives Run (audit P2-EDG-027). Then close the listeners
+	// and wait for them, and end every dialog: every media session is torn
+	// down explicitly, so no socket, port reservation or relay goroutine
+	// outlives Run. There is no BYE on this plane's shutdown: the calls
+	// are dropped (docs/design.md §4.5).
+	s.dialogs.close()
 	listenCancel()
 	wg.Wait()
-	// Every media session is torn down explicitly at shutdown: no socket,
-	// port reservation or relay goroutine outlives Run.
 	s.dialogs.closeAll()
-	return nil
+	return runErr
 }
 
 // udpServingTimeout bounds how long Run waits for sipgo to pool its UDP
@@ -443,7 +478,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		l.stream = s.watchConnections(ln)
 		return l, nil
 	case "wss":
-		cfg := s.store.Current().SIP.Public.WSS
+		cfg := s.boot.SIP.Public.WSS
 		var tlsConf *tls.Config
 		if cfg.CertFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -536,7 +571,7 @@ const maxMessageSize = fsip.MaxReadSize
 // return an error live in fsip.ReadFilter; what is here is the proxy's own
 // trust decision.
 func (s *Server) readFilter() sip.TransportReadFilter {
-	privateAddr := s.store.Current().SIP.Private.Bind.String()
+	privateAddr := s.boot.SIP.Private.Bind.String()
 	return fsip.ReadFilter(maxMessageSize, func(info sip.TransportReadProps) bool {
 		// The private listener speaks to exactly one peer: FreeSWITCH.
 		// Anything else reaching it is either misrouted or hostile, and is
