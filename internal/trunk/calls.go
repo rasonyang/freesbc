@@ -283,6 +283,21 @@ func (s *Server) beginInvite(k mergeKey) (done func(), ok bool) {
 	}, true
 }
 
+// settingUp reports whether an initial INVITE with this Call-ID and
+// From-tag is still being handled without a published call: the dialog's
+// own set-up, which an in-dialog request can overtake between the 2xx's ACK
+// and registerCall.
+func (s *Server) settingUp(callID, fromTag string) bool {
+	s.callMu.Lock()
+	defer s.callMu.Unlock()
+	for k := range s.inviting {
+		if k.callID == callID && k.fromTag == fromTag {
+			return true
+		}
+	}
+	return false
+}
+
 // KillCall tears down a live call by cancelling its kick context (the
 // onInvite goroutine then BYEs both legs via the normal teardown — see
 // byeBoth). id is the admin ID Calls lists. As a convenience for operators

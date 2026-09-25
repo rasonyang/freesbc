@@ -196,6 +196,14 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// respond2xxUntilAck retransmits it itself; onAck stops it.
 	if tag, hasTag := req.To().Params.Get("tag"); hasTag && tag != "" {
 		entry, known := s.lookupDialog(fsip.CallID(req), fsip.FromTag(req), tag)
+		if !known && s.settingUp(fsip.CallID(req), fsip.FromTag(req)) {
+			// The caller's dialog exists but is not published yet (its
+			// INVITE's handler has not reached registerCall): 500 with
+			// Retry-After asks the UA to try again (RFC 3261 §14.2), where
+			// 481 would tell it to end the dialog it just set up.
+			s.reject(req, tx, 500, "Server Internal Error", sip.NewHeader("Retry-After", "1"))
+			return
+		}
 		if !known {
 			s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 			return

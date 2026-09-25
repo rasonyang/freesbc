@@ -2660,6 +2660,10 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	if !hasToTag || realToTag == "" {
 		t.Fatal("bridge's 200 OK carried no To-tag to reuse")
 	}
+	// The call is published (and its dialog matchable) only after the
+	// bridge has seen the ACK, a moment after the UAC's own Ack returns;
+	// wait for it, so the re-INVITE tests the live-dialog path.
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
 
 	reConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {

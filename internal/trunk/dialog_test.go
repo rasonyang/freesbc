@@ -633,3 +633,34 @@ func TestALegOriginStableAcrossFailover(t *testing.T) {
 	}
 	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }
+
+// audit: P2-TRK-013
+// A re-INVITE on a dialog whose own INVITE is still being handled (its 2xx
+// ACKed, the call not yet published) must not get 481, which would make
+// the UA end the dialog it just set up: 500 with Retry-After asks it to
+// retry (RFC 3261 §14.2).
+func TestReInviteDuringSetupGets500RetryAfter(t *testing.T) {
+	cfg := strings.Replace(dialogErrorsCfg, "13160", "13162", 1)
+	srv := startServer(t, 13162, cfg)
+	done, ok := srv.beginInvite(mergeKey{callID: "setting-up-1", fromTag: "t1", cseq: 1})
+	if !ok {
+		t.Fatal("beginInvite refused a fresh key")
+	}
+	defer done()
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	req := strings.Replace(sipRequest("INVITE", "13162", conn.LocalAddr().(*net.UDPAddr), "setting-up-1"),
+		"To: <sip:sbc@127.0.0.1>", "To: <sip:sbc@127.0.0.1>;tag=sbc-tag", 1)
+	req = strings.Replace(req, "CSeq: 1 INVITE", "CSeq: 2 INVITE", 1)
+	if _, err := conn.WriteToUDP([]byte(req), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 13162}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := readUntil(t, conn, "SIP/2.0 500", 3*time.Second)
+	if !ok || !strings.Contains(got, "Retry-After:") {
+		t.Fatalf("re-INVITE during its dialog's set-up must get 500 + Retry-After, got:\n%s", got)
+	}
+}
