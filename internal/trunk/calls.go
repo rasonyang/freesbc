@@ -102,6 +102,14 @@ type call struct {
 	aSRTP *legSRTP
 	bSRTP *legSRTP
 
+	// aOrigin is the SBC's own o= identity on the A-leg, shared by every
+	// body sent to the caller (early media and the answer, across
+	// failover). Each B-leg attempt gets its own, in dialTarget.
+	aOrigin *sdpOrigin
+
+	// aTimer is the session timer the A-leg 2xx set up (sessiontimer.go).
+	aTimer legTimer
+
 	// aSDP/bSDP are the established SDP bodies plus dialog tags for each
 	// leg; together with id/bID they are each leg's dialog ID.
 	aSDP legSDP
@@ -226,19 +234,15 @@ func (s *Server) dropLegs(callID string, c *call) {
 // lookupDialog returns the established SDP record for the live leg whose
 // dialog ID is (callID, fromTag, toTag) as the REMOTE endpoint of that leg
 // sends them in an in-dialog request (see legSDP), RFC 3261 §12.2.2.
-// knownCallID reports whether any live leg has this Call-ID at all, so the
-// caller can tell a request for a dialog that does not exist from one that
-// merely replays a live Call-ID with the wrong tags.
-func (s *Server) lookupDialog(callID, fromTag, toTag string) (entry legSDP, ok, knownCallID bool) {
+func (s *Server) lookupDialog(callID, fromTag, toTag string) (legSDP, bool) {
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	refs := s.legs[callID]
-	for _, r := range refs {
+	for _, r := range s.legs[callID] {
 		if r.entry.fromTag == fromTag && r.entry.toTag == toTag {
-			return r.entry, true, true
+			return r.entry, true
 		}
 	}
-	return legSDP{}, false, len(refs) > 0
+	return legSDP{}, false
 }
 
 // lookupLeg reports whether any live leg has callID as its own Call-ID,
@@ -277,6 +281,21 @@ func (s *Server) beginInvite(k mergeKey) (done func(), ok bool) {
 		delete(s.inviting, k)
 		s.callMu.Unlock()
 	}, true
+}
+
+// settingUp reports whether an initial INVITE with this Call-ID and
+// From-tag is still being handled without a published call: the dialog's
+// own set-up, which an in-dialog request can overtake between the 2xx's ACK
+// and registerCall.
+func (s *Server) settingUp(callID, fromTag string) bool {
+	s.callMu.Lock()
+	defer s.callMu.Unlock()
+	for k := range s.inviting {
+		if k.callID == callID && k.fromTag == fromTag {
+			return true
+		}
+	}
+	return false
 }
 
 // KillCall tears down a live call by cancelling its kick context (the

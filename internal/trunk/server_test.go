@@ -283,6 +283,10 @@ func TestServerKnownPeerUnhandledMethodGets405(t *testing.T) {
 	if !strings.Contains(got, "SIP/2.0 405") {
 		t.Fatalf("expected 405 Method Not Allowed for known peer, got:\n%s", got)
 	}
+	// audit: P2-TRK-014 — a 405 MUST carry Allow (RFC 3261 §21.4.6).
+	if !strings.Contains(got, "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS") {
+		t.Fatalf("405 must list the supported methods in Allow, got:\n%s", got)
+	}
 }
 
 // TestServerAdvertisedIPResolution is Fix 2's regression coverage for

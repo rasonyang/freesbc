@@ -63,7 +63,7 @@ The two sections are mutually independent: SIP can advertise one public address 
   or a self-signed fallback, optional mTLS), IP-authenticated peers, and
   registration-based trunks via outbound REGISTER with digest auth
 - **B2BUA with topology hiding** — two independent call legs with their own
-  Call-ID, From-tag and Via, and full SDP rewrite
+  Call-ID, From-tag and Via, and SDP built from scratch per leg (the SBC's own `o=`, address and port; only codec lines and direction carried over)
 - **Routing engine** — regex matching, number transformation, ordered
   failover with passive per-endpoint cooldown, and DNS SRV resolution
   (RFC 3263 priority/weight ordering, cached)
@@ -74,15 +74,17 @@ The two sections are mutually independent: SIP can advertise one public address 
   both directions, NAT traversal via hardened first-packet latching;
   **no transcoding** (left to the softswitch behind)
 - **Carrier interop baseline** — OPTIONS answering and session-timer
-  negotiation (RFC 4028), including the 422/Min-SE exchange on both legs; no
-  timer tears a call down on session expiry
+  negotiation (RFC 4028), including the 422/Min-SE exchange on both legs;
+  the SBC refreshes a leg whose far end names it refresher, and answers
+  refreshes (retransmitting the 200 until ACKed) on the others; no timer
+  tears a call down on session expiry
 
 ## Roadmap (trunk plane)
 
 Items not yet implemented.
 
 - **100rel/PRACK** — an INVITE carrying `Require: 100rel` is answered `420 Bad Extension` today, and the trunk plane neither advertises 100rel nor handles PRACK
-- **Mid-call re-INVITE on the trunk plane** — hold/resume and codec renegotiation are answered `501`; only session-timer refresh re-INVITEs are handled (the edge proxy does re-anchor re-INVITEs)
+- **Mid-call re-INVITE on the trunk plane** — hold/resume and codec renegotiation are answered `488`; only session-timer refresh re-INVITEs are handled (the edge proxy does re-anchor re-INVITEs)
 - **Inbound digest challenge** — the SBC answers challenges but never issues one; trunk peers are authenticated by source IP, plus TLS/mTLS where configured
 - **Active peer qualification** — outbound OPTIONS keepalives; peer liveness is passive cooldown today
 - **`listen.media.public_ip: auto`** — STUN-detected public address; a literal address is required for now

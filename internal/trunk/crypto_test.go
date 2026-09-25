@@ -54,12 +54,23 @@ func TestParseCryptoSkipsMalformed(t *testing.T) {
 	}
 }
 
-func TestParseCryptoIgnoresMKIAndLifetime(t *testing.T) {
-	lines := parseCryptoAttrs([]string{
-		"1 AES_CM_128_HMAC_SHA1_80 inline:" + b64key30() + "|2^20|1:4",
-	})
-	if len(lines) != 1 || len(lines[0].keyValue) != 30 {
-		t.Fatalf("MKI/lifetime after key must be ignored, got %+v", lines)
+// An MKI changes the SRTP packet format (RFC 4568 §6.1), so a key carrying
+// one is rejected; a lifetime alone does not, so it is accepted.
+// audit: P2-TRK-012
+func TestParseCryptoRejectsMKIAcceptsLifetime(t *testing.T) {
+	for _, kp := range []string{"|2^20|1:4", "|1:4", "|2^20|1:4|x", "|lifetime"} {
+		if lines := parseCryptoAttrs([]string{"1 AES_CM_128_HMAC_SHA1_80 inline:" + b64key30() + kp}); len(lines) != 0 {
+			t.Errorf("key-param suffix %q must be rejected, got %+v", kp, lines)
+		}
+	}
+	for _, kp := range []string{"|2^20", "|1048576"} {
+		lines := parseCryptoAttrs([]string{"1 AES_CM_128_HMAC_SHA1_80 inline:" + b64key30() + kp})
+		if len(lines) != 1 || len(lines[0].keyValue) != 30 {
+			t.Errorf("lifetime %q must be accepted, got %+v", kp, lines)
+		}
+	}
+	if lines := parseCryptoAttrs([]string{"1 AES_CM_128_HMAC_SHA1_80 inline:" + b64key30() + " KDR=1"}); len(lines) != 0 {
+		t.Errorf("a session parameter must be rejected, got %+v", lines)
 	}
 }
 

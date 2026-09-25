@@ -44,6 +44,9 @@ type stubRegistrar struct {
 	authorizedCount int
 	unregisterCount int
 	events          []bool // one entry per authorized REGISTER, in processed order; true = un-REGISTER (Expires:0)
+	// seen records every REGISTER's Call-ID and CSeq number, authorized
+	// or not, in processed order (startStubRegistrarFull only).
+	seen []regSeen
 
 	// conn is the stub's own bound UDP socket (the same one REGISTER
 	// traffic arrives on). Exposed so tests can send a raw packet FROM this
@@ -102,6 +105,9 @@ func startStubRegistrarFull(t *testing.T, port int, user, pass string, grantExpi
 	}
 
 	srv.OnRequest(sip.REGISTER, func(req *sip.Request, tx sip.ServerTransaction) {
+		r.mu.Lock()
+		r.seen = append(r.seen, regSeen{callID: req.CallID().Value(), cseq: req.CSeq().SeqNo})
+		r.mu.Unlock()
 		if !r.authorized(req) {
 			res := sip.NewResponseFromRequest(req, sip.StatusUnauthorized, "Unauthorized", nil)
 			res.AppendHeader(sip.NewHeader("WWW-Authenticate", r.challenge.String()))
@@ -386,7 +392,7 @@ func TestRegisterOnceRetriesOn423(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	granted, err := registerOnce(ctx, client, p, 1800*time.Second) // below Min-Expires 3600
+	granted, err := registerOnce(ctx, client, p, newRegSeq(), 1800*time.Second) // below Min-Expires 3600
 	if err != nil {
 		t.Fatalf("registerOnce: %v", err)
 	}
@@ -410,7 +416,7 @@ func TestRegisterOnceSucceedsWithDigest(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	granted, err := registerOnce(ctx, client, p, time.Hour)
+	granted, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour)
 	if err != nil {
 		t.Fatalf("registerOnce: %v", err)
 	}
@@ -439,7 +445,7 @@ func TestRegisterOnceContactExpiresBeatsExpiresHeader(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	granted, err := registerOnce(ctx, client, p, time.Hour)
+	granted, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour)
 	if err != nil {
 		t.Fatalf("registerOnce: %v", err)
 	}
@@ -465,7 +471,7 @@ func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := registerOnce(ctx, client, p, time.Hour); err == nil {
+	if _, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour); err == nil {
 		t.Fatal("expected error for mismatched challenge realm")
 	}
 	if evil.sawAuthorizedRegister() {
@@ -476,7 +482,7 @@ func TestRegisterRejectsUnexpectedRealm(t *testing.T) {
 	good := startStubRegistrarRealm(t, 11323, "reguser", "regpass", 1800, "good")
 	client = good.client(t)
 	p.RegistrarPort = 11323
-	if _, err := registerOnce(ctx, client, p, time.Hour); err != nil {
+	if _, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour); err != nil {
 		t.Fatalf("matching realm should register: %v", err)
 	}
 	if !good.sawAuthorizedRegister() {
@@ -498,7 +504,7 @@ func TestRegisterOnceBadCredentialsFails(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := registerOnce(ctx, client, p, time.Hour); err == nil {
+	if _, err := registerOnce(ctx, client, p, newRegSeq(), time.Hour); err == nil {
 		t.Fatal("expected error for wrong password")
 	}
 }
@@ -563,6 +569,7 @@ func TestRegistrationRunRefreshesAndUnregisters(t *testing.T) {
 			Transport: "udp", Username: "u", Password: "p",
 			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11997,
 		},
+		seq:           newRegSeq(),
 		setRegistered: set,
 		log:           discardLogger(),
 	}
@@ -601,6 +608,7 @@ func TestRegistrationRunBacksOffOnFailure(t *testing.T) {
 			Transport: "udp", Username: "u", Password: "p",
 			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 11996,
 		},
+		seq:           newRegSeq(),
 		setRegistered: set,
 		log:           discardLogger(),
 	}
@@ -1099,6 +1107,56 @@ routes:
 		if params.RegistrarHost != tc.wantHost || params.RegistrarPort != tc.wantPort {
 			t.Errorf("%s: registrar = %s:%d, want %s:%d",
 				tc.peer, params.RegistrarHost, params.RegistrarPort, tc.wantHost, tc.wantPort)
+		}
+	}
+}
+
+// regSeen is one REGISTER as the stub registrar received it.
+type regSeen struct {
+	callID string
+	cseq   uint32
+}
+
+// audit: P2-TRK-021
+// RFC 3261 §10.2: a UA SHOULD use the same Call-ID for every REGISTER to a
+// registrar during a boot cycle, incrementing CSeq. One registration's
+// REGISTER, digest retry and un-REGISTER must share a Call-ID, with CSeq
+// strictly increasing.
+func TestRegistrationReusesCallIDAndIncrementsCSeq(t *testing.T) {
+	reg := startStubRegistrar(t, 13260, "u", "p", 3600)
+	var mu sync.Mutex
+	registered := false
+	rg := &registration{
+		client: reg.client(t),
+		params: regParams{
+			Name: "carrier", RegistrarHost: "127.0.0.1", RegistrarPort: 13260,
+			Transport: "udp", Username: "u", Password: "p",
+			ContactIP: netip.MustParseAddr("127.0.0.1"), ContactPort: 13261,
+		},
+		seq:           newRegSeq(),
+		setRegistered: func(_ string, ok bool) { mu.Lock(); registered = registered || ok; mu.Unlock() },
+		log:           discardLogger(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { rg.run(ctx, time.Hour); close(done) }()
+	waitFor(t, 3*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return registered })
+	cancel()
+	<-done
+	waitFor(t, 3*time.Second, reg.sawUnregister)
+
+	reg.mu.Lock()
+	seen := append([]regSeen(nil), reg.seen...)
+	reg.mu.Unlock()
+	if len(seen) < 4 {
+		t.Fatalf("registrar saw %d REGISTERs, want REGISTER+retry and un-REGISTER+retry: %+v", len(seen), seen)
+	}
+	for i, r := range seen {
+		if r.callID != seen[0].callID {
+			t.Errorf("REGISTER %d has Call-ID %q, want the registration's %q", i, r.callID, seen[0].callID)
+		}
+		if i > 0 && r.cseq <= seen[i-1].cseq {
+			t.Errorf("REGISTER %d CSeq %d does not increase on %d", i, r.cseq, seen[i-1].cseq)
 		}
 	}
 }

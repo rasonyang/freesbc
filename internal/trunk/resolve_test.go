@@ -1,6 +1,7 @@
 package trunk
 
 import (
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -186,8 +187,11 @@ func TestResolveLookupTimeoutFallsBack(t *testing.T) {
 	r := newResolver(1)
 	block := make(chan struct{})
 	defer close(block)
-	r.lookupSRV = lookupSRVTimeout(func(_, _, _ string) (string, []*net.SRV, error) {
-		<-block // hang past the wrapper's deadline
+	r.lookupSRV = lookupSRVTimeout(func(ctx context.Context, _, _, _ string) (string, []*net.SRV, error) {
+		select { // hang past the wrapper's deadline
+		case <-block:
+		case <-ctx.Done():
+		}
 		return "", nil, &net.DNSError{Err: "late"}
 	})
 	start := time.Now()
@@ -318,5 +322,25 @@ func TestResolveWeightedSelectionZeroWeightGetsAChance(t *testing.T) {
 	// group as uniform).
 	if heavyFirst < samples*9/10 {
 		t.Fatalf("weight-100 record was first only %d/%d times, want large majority (weighting still in effect)", heavyFirst, samples)
+	}
+}
+
+// audit: P2-TRK-020
+// A timed-out SRV lookup must end, not be abandoned in a goroutine that
+// keeps running until the system resolver gives up: the lookup runs under
+// a context that expires with srvLookupTimeout.
+func TestSRVLookupTimeoutEndsTheLookup(t *testing.T) {
+	r := newResolver(1)
+	ended := make(chan struct{})
+	r.lookupSRV = lookupSRVTimeout(func(ctx context.Context, _, _, _ string) (string, []*net.SRV, error) {
+		defer close(ended)
+		<-ctx.Done() // a resolver that only returns when told to
+		return "", nil, ctx.Err()
+	})
+	r.Resolve(&config.Peer{Address: "hung.example", Transport: "udp"}, time.Minute)
+	select {
+	case <-ended:
+	default:
+		t.Fatal("Resolve returned while the timed-out lookup was still running")
 	}
 }

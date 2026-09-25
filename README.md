@@ -96,7 +96,7 @@ Details: [`docs/edge.md`](docs/edge.md) (topology, behaviour table, known limita
 ## Features
 
 - **SIP trunk interconnect** — UDP, TCP and TLS transports, real certificate or a self-signed fallback, optional mTLS, IP-authenticated peers, and registration-based trunks via outbound REGISTER with digest auth
-- **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and full SDP rewrite
+- **B2BUA with topology hiding** — two independent call legs with their own Call-ID, From-tag and Via, and SDP built from scratch per leg (the SBC's own `o=`, address and port; only codec lines and direction carried over)
 - **Routing engine** — regex matching, number transformation, ordered failover with passive per-endpoint cooldown, and DNS SRV resolution with RFC 3263 priority/weight ordering, cached
 - **RTP relay + SRTP (SDES)** — media anchoring, `a=crypto` negotiation with a per-peer `disabled`/`optional`/`required` policy on the trunk plane, SRTP↔RTP interworking in both directions, and NAT traversal via hardened first-packet latching
 - **Edge proxy plane** — the only public-facing element in front of a FreeSWITCH that stays on the private LAN: registration proxying to FreeSWITCH, UDP/WS/WSS interworking, RTP anchoring, WebRTC (ICE-Lite, DTLS-SRTP, RTCP-mux) relayed to plain RTP, a multi-upstream pool with per-user hashing and dialog stickiness, and an optional peer-to-peer PSTN trunk with gateway failover

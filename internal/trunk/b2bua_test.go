@@ -54,8 +54,9 @@ func TestBridgeRejectsUnroutableInvite(t *testing.T) {
 }
 
 // TestBridgeRejectsReInvite proves an in-dialog INVITE (a re-INVITE — e.g.
-// a phone pressing hold, or any target-refresh/renegotiation) is rejected
-// with 501 Not Implemented rather than being handed to
+// a phone pressing hold, or any target-refresh/renegotiation) that matches
+// no live dialog is rejected with 481 Call/Transaction Does Not Exist (RFC
+// 3261 §12.2.2; audit: P2-TRK-013) rather than being handed to
 // dialogSrv.ReadInvite: sipgo v1.4.3's DialogServerSession.ReadInvite is
 // single-use and corrupts the established dialog's To-tag if called again
 // for a re-INVITE, so mid-dialog renegotiation is deferred to M4 (see
@@ -102,12 +103,12 @@ func TestBridgeRejectsReInvite(t *testing.T) {
 			continue
 		}
 		got.Write(buf[:n])
-		if strings.Contains(got.String(), "SIP/2.0 501") {
+		if strings.Contains(got.String(), "SIP/2.0 481") {
 			break
 		}
 	}
-	if !strings.Contains(got.String(), "SIP/2.0 501") {
-		t.Fatalf("re-INVITE (To-tag present) must get 501 Not Implemented, got:\n%s", got.String())
+	if !strings.Contains(got.String(), "SIP/2.0 481") {
+		t.Fatalf("re-INVITE (To-tag present) for no live dialog must get 481, got:\n%s", got.String())
 	}
 
 	// The server must have survived unscathed: a fresh initial INVITE
@@ -220,7 +221,7 @@ func TestBridgeMalformedInviteGets400(t *testing.T) {
 
 	// sipRequest always builds a Contact header; strip it to produce the
 	// malformed variant under test. No To-tag, so this is still an initial
-	// INVITE (not the re-INVITE 501 path above).
+	// INVITE (not the in-dialog re-INVITE path above).
 	var lines []string
 	for _, line := range strings.Split(sipRequest("INVITE", "11072", local, "b2bua-malformed-1"), "\r\n") {
 		if strings.HasPrefix(line, "Contact:") {
@@ -2566,7 +2567,7 @@ routes:
 `
 
 // TestBridgeReInviteDuringCallDoesNotBreakCall closes a gap
-// TestBridgeRejectsReInvite left open: that test proves 501 on a
+// TestBridgeRejectsReInvite left open: that test proves 481 on a
 // standalone To-tagged request sent to a server with no established call
 // at all, which only proves the code *path* taken — it never demonstrates
 // Task 9's actual claim, that a re-INVITE arriving DURING a live call is
@@ -2574,7 +2575,8 @@ routes:
 // bridged call exactly like TestBridgePlacesCallAndBridges, then — while
 // it is up — sends an in-dialog INVITE that reuses this dialog's genuine
 // Call-ID, the UAC's own From-tag, and the real To-tag the bridge assigned
-// (read off the UAC's 200 OK), asserts 501, and then proves the original
+// (read off the UAC's 200 OK), asserts 488 Not Acceptable Here (RFC 3261
+// §14.2; audit: P2-TRK-013), and then proves the original
 // dialog is unharmed: its BYE still completes cleanly, the carrier's side
 // of the dialog still ends, and both the call registry and the media pool
 // fully drain — the observable proof that onInvite's To-tag guard rejects
@@ -2658,6 +2660,10 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 	if !hasToTag || realToTag == "" {
 		t.Fatal("bridge's 200 OK carried no To-tag to reuse")
 	}
+	// The call is published (and its dialog matchable) only after the
+	// bridge has seen the ACK, a moment after the UAC's own Ack returns;
+	// wait for it, so the re-INVITE tests the live-dialog path.
+	waitForActiveCalls(t, srv, 1, 3*time.Second)
 
 	reConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -2693,12 +2699,12 @@ func TestBridgeReInviteDuringCallDoesNotBreakCall(t *testing.T) {
 			continue
 		}
 		got.Write(buf[:n])
-		if strings.Contains(got.String(), "SIP/2.0 501") {
+		if strings.Contains(got.String(), "SIP/2.0 488") {
 			break
 		}
 	}
-	if !strings.Contains(got.String(), "SIP/2.0 501") {
-		t.Fatalf("re-INVITE during an established call must get 501, got:\n%s", got.String())
+	if !strings.Contains(got.String(), "SIP/2.0 488") {
+		t.Fatalf("re-INVITE during an established call must get 488, got:\n%s", got.String())
 	}
 
 	// --- prove the original call is unharmed: its BYE still tears
@@ -2761,7 +2767,7 @@ routes:
 // provably unharmed by the refresh: its real BYE still completes, the
 // carrier's dialog still ends, and the call registry/media pool still fully
 // drain. It also proves a second re-INVITE whose SDP has genuinely changed
-// still gets the M3.3 501 (media-change renegotiation stays out of scope
+// gets 488 (media-change renegotiation stays out of scope
 // for M4.3). Timing-based over real UDP loopback: re-run once before
 // treating a flake as failure.
 func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
@@ -2866,7 +2872,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	// wait for the A-leg entry to actually be on record before firing the
 	// refresh. (This genuinely races otherwise: the store write lands a full
 	// B-leg answer + A-leg ACK round trip after the UAC's own Ack() returns,
-	// and a lookup that misses the store would answer 501 and fail the
+	// and a lookup that misses the store would answer 481 and fail the
 	// assertion below for the wrong reason.)
 	entryDeadline := time.Now().Add(3 * time.Second)
 	for {
@@ -2931,7 +2937,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	}
 
 	// --- refresh re-INVITE: same SDP, Session-Expires present → 200 OK,
-	// echoing a Session-Expires header, not the M3.3 501. ---
+	// echoing a Session-Expires header, not a 488. ---
 	refreshResp := sendReInvite(t, 2, offerSDP, "reinvite-refresh", "SIP/2.0 200")
 	if !strings.Contains(refreshResp, "SIP/2.0 200") {
 		t.Fatalf("session-timer refresh re-INVITE must get 200, got:\n%s", refreshResp)
@@ -2960,7 +2966,7 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	// offer, but the o= line's version bumped, as a real UAC commonly does
 	// on every re-offer (RFC 3264 §8) — must still be recognized as a
 	// refresh (200, established answer), not misclassified as a media
-	// change (501). ---
+	// change (488). ---
 	bumpedOfferSDP := []byte(strings.Replace(string(offerSDP), "o=- 1 1", "o=- 1 2", 1))
 	if string(bumpedOfferSDP) == string(offerSDP) {
 		t.Fatal("test setup is broken: o= bump did not change the SDP")
@@ -2974,11 +2980,12 @@ func TestBridgeAnswersSessionTimerRefresh(t *testing.T) {
 	}
 
 	// --- media-change re-INVITE: same Session-Expires header, but a
-	// genuinely different SDP body → still 501, exactly like M3.3. ---
+	// genuinely different SDP body → 488 Not Acceptable Here (RFC 3261
+	// §14.2; audit: P2-TRK-013). ---
 	changedSDP := testSDPBody(uacRTPPort + 1)
-	changeResp := sendReInvite(t, 4, changedSDP, "reinvite-changed", "SIP/2.0 501")
-	if !strings.Contains(changeResp, "SIP/2.0 501") {
-		t.Fatalf("media-changing re-INVITE must still get 501, got:\n%s", changeResp)
+	changeResp := sendReInvite(t, 4, changedSDP, "reinvite-changed", "SIP/2.0 488")
+	if !strings.Contains(changeResp, "SIP/2.0 488") {
+		t.Fatalf("media-changing re-INVITE must get 488, got:\n%s", changeResp)
 	}
 
 	// --- B-leg (carrier-initiated) session-timer refresh (Fix 2): the
@@ -3161,7 +3168,7 @@ func TestRefreshReInviteWrongTagsGet481(t *testing.T) {
 	// once the B-leg answered, the A-leg 200 OK went out AND was ACKed — so
 	// wait for the A-leg entry to actually be on record before firing the
 	// forged refresh. The lookup must hit the entry and be refused by the
-	// TAG check, not miss the store entirely: a 501 from a not-yet-populated
+	// TAG check, not miss the store entirely: a 481 from a not-yet-populated
 	// store proves nothing (and this genuinely races — the store write
 	// lands a full B-leg answer + A-leg ACK round trip after anything the
 	// UAC side can observe).
@@ -4668,7 +4675,9 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 	inviteCtx, cancelInvite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelInvite()
 
-	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)))
+	// The caller supports session timers: only then does the A-leg 2xx
+	// carry Session-Expires (RFC 4028 §9).
+	sess, err := dialogCli.Invite(inviteCtx, bridgeURI, testSDPBody(uacRTPStubPort(t)), sip.NewHeader("Supported", "timer"))
 	if err != nil {
 		t.Fatalf("uac invite: %v", err)
 	}
@@ -4727,6 +4736,9 @@ func TestBridgeSessionTimerHeaders(t *testing.T) {
 	aSupported := sess.InviteResponse.GetHeaders("Supported")
 	if !hasToken(aSupported, "timer") {
 		t.Errorf("A-leg 200 Supported = %v, want to include timer", aSupported)
+	}
+	if aRequire := sess.InviteResponse.GetHeaders("Require"); !hasToken(aRequire, "timer") {
+		t.Errorf("A-leg 200 Require = %v, want timer (RFC 4028 §9)", aRequire)
 	}
 
 	// --- teardown ---
@@ -5999,13 +6011,14 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 		t.Fatalf("answer is secure (RTP/SAVP or has a=crypto), want plain RTP/AVP for two srtp:disabled peers:\n%s", answerBody)
 	}
 
-	// Byte-for-byte identical to the plaintext rewrite path.
+	// Identical to the plaintext build path, except for the o= line: each
+	// leg's o= session-id is the SBC's own, freshly generated.
 	sideAPort := sdpAudioPort(t, answerBody)
 	wantAnswer, err := rewriteSDPCrypto(carrierAnswer, netip.MustParseAddr("127.0.0.1"), sideAPort, nil)
 	if err != nil {
 		t.Fatalf("rewriteSDPCrypto reference (answer): %v", err)
 	}
-	if string(answerBody) != string(wantAnswer) {
+	if !sdpEqualIgnoringOrigin(answerBody, wantAnswer) {
 		t.Errorf("answer body diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", answerBody, wantAnswer)
 	}
 
@@ -6024,7 +6037,7 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rewriteSDPCrypto reference (offer): %v", err)
 	}
-	if string(carrierOffer.Body()) != string(wantOffer) {
+	if !sdpEqualIgnoringOrigin(carrierOffer.Body(), wantOffer) {
 		t.Errorf("b-leg offer diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", carrierOffer.Body(), wantOffer)
 	}
 

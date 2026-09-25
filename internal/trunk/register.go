@@ -35,6 +35,20 @@ type regParams struct {
 	ContactPort int
 }
 
+// regSeq is one registration's request sequence (RFC 3261 §10.2): the
+// Call-ID every REGISTER to the registrar reuses for the life of the
+// registration, and the last CSeq sent, which each new REGISTER (and each
+// digest retry) increments. It is used only by its registration's own
+// goroutine.
+type regSeq struct {
+	callID string
+	cseq   uint32
+}
+
+func newRegSeq() *regSeq {
+	return &regSeq{callID: freshTag()}
+}
+
 // registerOnce performs a REGISTER exchange for p, requesting the given
 // expires (0 = un-REGISTER). It handles a 401/407 digest challenge via
 // registerOnceNoRetry, and additionally applies at most one retry when the
@@ -44,8 +58,8 @@ type regParams struct {
 // directly (not registerOnce), so a registrar that keeps 423-ing above its
 // own advertised Min-Expires cannot cause unbounded recursion — at most two
 // REGISTER exchanges are ever sent for one registerOnce call.
-func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, expires time.Duration) (time.Duration, error) {
-	granted, res, err := registerOnceNoRetry(ctx, client, p, expires)
+func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, seq *regSeq, expires time.Duration) (time.Duration, error) {
+	granted, res, err := registerOnceNoRetry(ctx, client, p, seq, expires)
 	if err == nil || res == nil || res.StatusCode != sip.StatusIntervalToBrief {
 		return granted, err
 	}
@@ -53,7 +67,7 @@ func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, expire
 	if minExp <= expires || minExp <= 0 {
 		return granted, err
 	}
-	granted, _, err = registerOnceNoRetry(ctx, client, p, minExp)
+	granted, _, err = registerOnceNoRetry(ctx, client, p, seq, minExp)
 	return granted, err
 }
 
@@ -66,7 +80,7 @@ func registerOnce(ctx context.Context, client *sipgo.Client, p regParams, expire
 // response it returns the response alongside the error (registerOnce needs
 // it to inspect StatusCode/Min-Expires); res may be nil if the failure was
 // transport-level (no response was ever received).
-func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams, expires time.Duration) (time.Duration, *sip.Response, error) {
+func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams, seq *regSeq, expires time.Duration) (time.Duration, *sip.Response, error) {
 	registrar := sip.Uri{Scheme: "sip", Host: p.RegistrarHost, Port: p.RegistrarPort}
 	req := sip.NewRequest(sip.REGISTER, registrar)
 
@@ -82,11 +96,19 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 	exp := sip.ExpiresHeader(uint32(expires.Seconds()))
 	req.AppendHeader(&exp)
 
-	// ClientRequestRegisterBuild fills in Via/CSeq/Call-ID/Max-Forwards (it
-	// only sets a header when one isn't already present) and clears the
-	// Request-URI's userinfo — must run after From/To/Contact/Expires are
-	// set above, since it treats an existing CSeq as "retransmit, bump it"
-	// rather than "not yet built".
+	// The registration's own Call-ID, and its last CSeq, which
+	// ClientRequestRegisterBuild increments (RFC 3261 §10.2). The CSeq the
+	// exchange ended on — including sipgo's increment for a digest retry —
+	// is carried to the next REGISTER.
+	callID := sip.CallIDHeader(seq.callID)
+	req.AppendHeader(&callID)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq.cseq, MethodName: sip.REGISTER})
+	defer func() { seq.cseq = req.CSeq().SeqNo }()
+
+	// ClientRequestRegisterBuild fills in Via/Max-Forwards (it only sets a
+	// header when one isn't already present), bumps the existing CSeq, and
+	// clears the Request-URI's userinfo — must run after the headers above
+	// are set.
 	if err := sipgo.ClientRequestRegisterBuild(client, req); err != nil {
 		return 0, nil, fmt.Errorf("build register: %w", err)
 	}
@@ -100,7 +122,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 		// other realm is never answered — computing a digest of our
 		// credentials for it would let a rogue registrar harvest the
 		// response for offline cracking. Fail the registration as-is.
-		if p.Realm != "" && challengeRealm(res) != p.Realm {
+		if p.Realm != "" && !realmPinned(res, p.Realm) {
 			return 0, res, fmt.Errorf("register challenge realm %q does not match pinned realm %q", challengeRealm(res), p.Realm)
 		}
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{Username: p.Username, Password: p.Password})
@@ -138,6 +160,7 @@ const (
 type registration struct {
 	client        *sipgo.Client
 	params        regParams
+	seq           *regSeq // Call-ID and CSeq shared by every REGISTER of this registration
 	setRegistered func(name string, ok bool)
 	log           *slog.Logger
 }
@@ -151,7 +174,7 @@ type registration struct {
 func (rg *registration) run(ctx context.Context, requested time.Duration) {
 	backoff := regBackoffMin
 	for {
-		granted, err := registerOnce(ctx, rg.client, rg.params, requested)
+		granted, err := registerOnce(ctx, rg.client, rg.params, rg.seq, requested)
 		if ctx.Err() != nil {
 			break
 		}
@@ -191,7 +214,7 @@ func (rg *registration) unregister() {
 	rg.setRegistered(rg.params.Name, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := registerOnce(ctx, rg.client, rg.params, 0); err != nil {
+	if _, err := registerOnce(ctx, rg.client, rg.params, rg.seq, 0); err != nil {
 		rg.log.Debug("un-register failed", "peer", rg.params.Name, "err", err)
 	}
 }
@@ -320,7 +343,7 @@ func (r *Registrar) reconcile(ctx context.Context) {
 		r.epoch[name]++
 		gen := r.epoch[name]
 		setRegistered := func(name string, ok bool) { r.setRegisteredGen(name, gen, ok) }
-		rg := &registration{client: r.client, params: d, setRegistered: setRegistered, log: r.log}
+		rg := &registration{client: r.client, params: d, seq: newRegSeq(), setRegistered: setRegistered, log: r.log}
 		requested := r.requestedExpires(cfg, name)
 		// oldDone is nil for a fresh add; for a restart (changed peer) it is
 		// the just-stopped goroutine's done channel. Without waiting on it,

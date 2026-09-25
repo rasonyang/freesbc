@@ -1,6 +1,7 @@
 package trunk
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"net"
@@ -16,10 +17,10 @@ import (
 )
 
 const (
-	// srvLookupTimeout bounds ONE DNS resolution: net.LookupSRV
-	// takes no context, so the lookup runs in a throwaway goroutine and the
-	// caller abandons it after this long — a slow resolver must not pin the
-	// per-call goroutine for the resolver's own (much longer) timeout.
+	// srvLookupTimeout bounds ONE DNS resolution: the lookup runs under a
+	// context with this deadline, so a slow resolver neither pins the
+	// per-call goroutine for the resolver's own (much longer) timeout nor
+	// leaves a lookup running after the caller gave up.
 	srvLookupTimeout = 3 * time.Second
 	// srvFailCacheTTL is the short cache window for a FAILED or EMPTY SRV
 	// lookup: a transient DNS fault must not pin the fallback
@@ -68,35 +69,26 @@ func newResolver(seed int64) *Resolver {
 	return &Resolver{
 		cache:     make(map[string]cacheEntry),
 		rand:      rand.New(rand.NewSource(seed)),
-		lookupSRV: lookupSRVTimeout(net.LookupSRV),
+		lookupSRV: lookupSRVTimeout(net.DefaultResolver.LookupSRV),
 		now:       time.Now,
 	}
 }
 
-// lookupSRVTimeout wraps a lookupSRV-style function with srvLookupTimeout:
-// the wrapped function runs in a throwaway goroutine and the
-// caller abandons it when the deadline passes, falling back exactly like
-// any other lookup failure (short negative cache in resolveSRV). The
-// abandoned goroutine drains into a buffered channel and exits once the
-// underlying resolver eventually returns — never blocking the caller.
-func lookupSRVTimeout(fn func(service, proto, name string) (string, []*net.SRV, error)) func(service, proto, name string) (string, []*net.SRV, error) {
+// lookupSRVTimeout adapts a context-aware SRV lookup (net.Resolver's) to
+// the resolver's lookupSRV field, bounded by srvLookupTimeout. The lookup
+// runs on the caller's goroutine under a context with that deadline, so
+// when the deadline passes the lookup itself is cancelled and returns —
+// nothing is left running — and resolveSRV falls back exactly as for any
+// other lookup failure (short negative cache).
+func lookupSRVTimeout(fn func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)) func(service, proto, name string) (string, []*net.SRV, error) {
 	return func(service, proto, name string) (string, []*net.SRV, error) {
-		type result struct {
-			cname string
-			recs  []*net.SRV
-			err   error
+		ctx, cancel := context.WithTimeout(context.Background(), srvLookupTimeout)
+		defer cancel()
+		cname, recs, err := fn(ctx, service, proto, name)
+		if err != nil && ctx.Err() != nil {
+			return "", nil, fmt.Errorf("srv lookup timed out after %v: %w", srvLookupTimeout, err)
 		}
-		ch := make(chan result, 1)
-		go func() {
-			cname, recs, err := fn(service, proto, name)
-			ch <- result{cname, recs, err}
-		}()
-		select {
-		case r := <-ch:
-			return r.cname, r.recs, r.err
-		case <-time.After(srvLookupTimeout):
-			return "", nil, fmt.Errorf("srv lookup timed out after %v", srvLookupTimeout)
-		}
+		return cname, recs, err
 	}
 }
 

@@ -39,7 +39,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
   3. Arrival on the private socket goes to a registered client. The client is found by the `fsbc=` token that FreeSWITCH copies from the stored Contact into the Request-URI.
   4. Anything else goes to an upstream chosen by an FNV-1a hash of the user.
 - Edge handlers return after the final response. From then on `dialogTable` owns the dialog and its media; a dialog is matched on Call-ID plus both tags, and it is confirmed before its 2xx is relayed.
-- SDP: the edge builds every body from scratch with `internal/sip/sdp` (`Build`) and never copies the other leg's body. That is what guarantees topology hiding. The trunk edits the peer's body in place with `pion/sdp` directly (not the bounded `sdp` parser) and strips inbound `a=crypto`.
+- SDP: the edge builds every body from scratch with `internal/sip/sdp` (`Build`) and never copies the other leg's body. That is what guarantees topology hiding. The trunk builds every body from scratch too (`internal/trunk/sdp.go`), from an allow-list, with its own tolerant line parser (not `pion/sdp`, which rejects `m=image`) and its own `o=` per leg.
 
 ### Config model
 - `config.Parse` runs in this order: strict YAML (unknown keys are errors), `${VAR}` expansion, defaults, then `validate`, which joins all errors. Expansion runs after unmarshal, so parse errors never echo a secret, and expanded values are never written back. Validation rules are in `validate.go` (trunk, shield, admin) and `validate_proxy.go` (edge).
