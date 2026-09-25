@@ -652,8 +652,13 @@ func TestAuditResourceBalanceShutdownWithLiveCalls(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Run did not return within 15s of cancel")
 	}
+	// The suite's default 40s settle, not a shorter one: the BYEs this test
+	// requires the carrier to receive leave the in-process fake carrier's
+	// own sipgo BYE server transactions parked in TerminateGracefully for
+	// RFC 3261 Timer J (64*T1 = 32s on UDP), and those goroutines are
+	// counted against the baseline like the SBC's.
 	auditBalance{srv: as.srv, carrier: carrier, baseline: baseline, wantByes: auditCalls,
-		uacs: uacs, uacByes: true, settleFor: 20 * time.Second}.assert(t)
+		uacs: uacs, uacByes: true}.assert(t)
 }
 
 // audit: P2-TRK-004
