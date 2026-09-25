@@ -20,7 +20,6 @@ import (
 
 	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
-	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // auditSeqIs matches an RTP packet by its sequence number.
@@ -44,7 +43,7 @@ func TestAuditLooseLatchHijack(t *testing.T) {
 	defer fsRTP.Close()
 
 	_, res, phoneRTP := auditPhoneCall(t, h, phone)
-	answer, err := sdp.Parse(res.Body())
+	answer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +51,7 @@ func TestAuditLooseLatchHijack(t *testing.T) {
 	if len(upInv) != 1 {
 		t.Fatalf("FreeSWITCH saw %d INVITEs", len(upInv))
 	}
-	up, err := sdp.Parse(upInv[0].Body())
+	up, err := parseLabSDP(upInv[0].Body())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +130,7 @@ func TestAuditByeWrongTagsTearsDownCall(t *testing.T) {
 	if n := h.srv.ActiveCalls(); n != 1 {
 		t.Errorf("P2-EDG-005 confirmed: after a BYE with forged tags (far end answered %d) ActiveCalls = %d, want 1", byeRes.StatusCode, n)
 	}
-	answer, _ := sdp.Parse(res.Body())
+	answer, _ := parseLabSDP(res.Body())
 	fsRTP, err := net.ListenUDP("udp", auditLocalAddr(h.fs.rtpPort))
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +270,7 @@ func TestAuditForked2xxMediaFollowsAnswer(t *testing.T) {
 	if tag, _ := res.To().Params.Get("tag"); tag != "fork-b" {
 		t.Fatalf("phone's 200 carries To tag %q, want fork-b", tag)
 	}
-	answer, _ := sdp.Parse(res.Body())
+	answer, _ := parseLabSDP(res.Body())
 	sbcPublic := auditLocalAddr(answer.Audio.Port)
 	go func() {
 		for i := 0; i < 25; i++ {
@@ -354,8 +353,8 @@ func TestAuditReInviteNewPortApplied(t *testing.T) {
 	tag := <-tags
 	waitForDialog(t, h, fsip.CallID(invite))
 	upInv := h.fs.waitFor(sip.INVITE, 1, 3*time.Second)
-	answer, _ := sdp.Parse(res.Body())
-	up, _ := sdp.Parse(upInv[0].Body())
+	answer, _ := parseLabSDP(res.Body())
+	up, _ := parseLabSDP(upInv[0].Body())
 	sbcPublic, sbcPrivate := auditLocalAddr(answer.Audio.Port), auditLocalAddr(up.Audio.Port)
 
 	// Establish both latches on the original addresses.

@@ -109,7 +109,7 @@ func TestCaseB_UDPCallWithRTP(t *testing.T) {
 	if len(invites) != 1 {
 		t.Fatalf("FreeSWITCH saw %d INVITEs", len(invites))
 	}
-	upstream, err := sdp.Parse(invites[0].Body())
+	upstream, err := parseLabSDP(invites[0].Body())
 	if err != nil {
 		t.Fatalf("upstream offer unparseable: %v\n%s", err, invites[0].Body())
 	}
@@ -139,7 +139,7 @@ func TestCaseB_UDPCallWithRTP(t *testing.T) {
 	}
 
 	// --- what the phone was answered ---
-	answer, err := sdp.Parse(res.Body())
+	answer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatalf("answer unparseable: %v\n%s", err, res.Body())
 	}
@@ -325,7 +325,7 @@ func TestCaseD_WebRTCCallSDP(t *testing.T) {
 			t.Errorf("upstream offer leaks %q:\n%s", forbidden, body)
 		}
 	}
-	upstream, err := sdp.Parse(invites[0].Body())
+	upstream, err := parseLabSDP(invites[0].Body())
 	if err != nil {
 		t.Fatalf("upstream offer unparseable: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestCaseD_WebRTCCallSDP(t *testing.T) {
 			t.Errorf("browser answer missing %q:\n%s", want, ans)
 		}
 	}
-	answer, err := sdp.Parse(res.Body())
+	answer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatalf("answer unparseable: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestInboundCallReachesRegisteredClient(t *testing.T) {
 			t.Errorf("binding token leaked to the phone: %s", got.Recipient.String())
 		}
 		// And it must be offered the SBC's media, not FreeSWITCH's.
-		offer, err := sdp.Parse(got.Body())
+		offer, err := parseLabSDP(got.Body())
 		if err != nil {
 			t.Fatalf("inbound offer unparseable: %v", err)
 		}
@@ -466,7 +466,7 @@ func TestInboundCallReachesRegisteredClient(t *testing.T) {
 	}
 
 	// The answer FreeSWITCH got must point at the SBC's private media.
-	upstreamAnswer, err := sdp.Parse(res.Body())
+	upstreamAnswer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatalf("answer to FreeSWITCH unparseable: %v", err)
 	}
@@ -714,7 +714,7 @@ func TestReInviteKeepsMediaAnchored(t *testing.T) {
 	}
 	sendAck(t, phone, invite, res, h.publicUDP)
 
-	firstAnswer, err := sdp.Parse(res.Body())
+	firstAnswer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,7 +750,7 @@ func TestReInviteKeepsMediaAnchored(t *testing.T) {
 	if len(invites) < 2 {
 		t.Fatalf("FreeSWITCH saw %d INVITEs, want 2", len(invites))
 	}
-	upstream, err := sdp.Parse(invites[1].Body())
+	upstream, err := parseLabSDP(invites[1].Body())
 	if err != nil {
 		t.Fatalf("re-offer to FreeSWITCH unparseable: %v\n%s", err, invites[1].Body())
 	}
@@ -767,7 +767,7 @@ func TestReInviteKeepsMediaAnchored(t *testing.T) {
 	}
 
 	// --- what the client was answered ---
-	reAnswer, err := sdp.Parse(reRes.Body())
+	reAnswer, err := parseLabSDP(reRes.Body())
 	if err != nil {
 		t.Fatalf("re-answer unparseable: %v\n%s", err, reRes.Body())
 	}

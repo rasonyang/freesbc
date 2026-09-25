@@ -107,6 +107,9 @@ func TestWatchdogRefreshedByValidSRTP(t *testing.T) {
 	s.SetSRTP(SideB, nil, nil)
 	s.Start()
 	ea := dialSide(t, s, SideA)
+	// The watchdog watches each direction (P2-MED-004), so side B talks
+	// too; plaintext, as SideB has no SRTP.
+	eb := dialSide(t, s, SideB)
 
 	// Valid packets every 200ms (well under the 500ms timeout) keep the
 	// session alive for 1.2s — more than double the timeout.
@@ -121,6 +124,9 @@ func TestWatchdogRefreshedByValidSRTP(t *testing.T) {
 			t.Fatal("encrypt failed")
 		}
 		if _, err := ea.Write(cipher); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eb.Write(testRTPPacket()); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -207,10 +213,15 @@ func TestRelayActivityDefersTimeout(t *testing.T) {
 	s := newLooseSession(t, 23250, 23257, 500*time.Millisecond)
 	s.Start()
 	ea := dialSide(t, s, SideA)
-	// Keep the session alive for ~3 timeout periods with steady traffic.
+	eb := dialSide(t, s, SideB)
+	// Keep the session alive for ~3 timeout periods with steady traffic
+	// from both sides (the watchdog watches each direction, P2-MED-004).
 	stop := time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(stop) {
 		if _, err := ea.Write([]byte("keepalive")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eb.Write([]byte("keepalive")); err != nil {
 			t.Fatal(err)
 		}
 		select {

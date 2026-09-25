@@ -148,7 +148,7 @@ func auditRandomOffer(r *rand.Rand, s auditSentinels) string {
 // media codec and its telephone-event (same payload numbers, RFC 3264 §6),
 // with every sentinel seeded.
 func auditSentinelAnswer(r *rand.Rand, s auditSentinels, offerBody []byte) string {
-	off, err := sdp.Parse(offerBody)
+	off, err := parseLabSDP(offerBody)
 	if err != nil || off.Audio == nil {
 		return auditBuildSDP(r, s, []auditCodec{{pt: 0, rtpmap: "PCMU/8000"}}, "sendrecv", -1)
 	}

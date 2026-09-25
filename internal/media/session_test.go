@@ -100,7 +100,7 @@ func TestRelatchMovesToNewRemote(t *testing.T) {
 		t.Fatal("initial arm+latch failed")
 	}
 	// A re-INVITE moves media to a new address; Relatch re-arms.
-	l.relatch(netip.MustParseAddr("10.0.0.2"))
+	l.relatch(netip.MustParseAddrPort("10.0.0.2:2000"))
 	if l.accept(first) {
 		t.Fatal("after relatch, the old remote must no longer be accepted")
 	}
@@ -118,7 +118,7 @@ func TestSessionRelatchBothKinds(t *testing.T) {
 	}
 	defer s.Close()
 	s.SetExpectedRemote(SideB, netip.MustParseAddr("10.0.0.1"))
-	s.Relatch(SideB, netip.MustParseAddr("10.0.0.9"))
+	s.Relatch(SideB, netip.MustParseAddrPort("10.0.0.9:4000"))
 	if !s.rtp[SideB].accept(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 1}) {
 		t.Error("rtp latch not relatched")
 	}

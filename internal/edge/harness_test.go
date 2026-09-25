@@ -18,6 +18,7 @@ import (
 
 	"github.com/freesbc/freesbc/internal/config"
 	fsip "github.com/freesbc/freesbc/internal/sip"
+	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // This file builds a complete, real deployment on loopback: a FreeSBC edge
@@ -1139,4 +1140,10 @@ func (f *fakeSwitch) uacBye(t *testing.T, res *sip.Response) *sip.Response {
 			t.Fatal("fake switch BYE timed out")
 		}
 	}
+}
+
+// parseLabSDP parses a body the way the harness's SBC does: every media
+// plane here is on loopback, so a loopback c= is legitimate.
+func parseLabSDP(body []byte) (*sdp.Session, error) {
+	return sdp.ParseWithOptions(body, sdp.ParseOptions{AllowLoopback: true})
 }

@@ -121,7 +121,7 @@ func TestPSTNOutboundCallHappyPath(t *testing.T) {
 	if got := fmt.Sprintf("%s:%d", carrierInvite.Recipient.Host, carrierInvite.Recipient.Port); got != carrier.addr {
 		t.Errorf("carrier Request-URI = %s, want the gateway %s", got, carrier.addr)
 	}
-	offer, err := sdp.Parse(carrierInvite.Body())
+	offer, err := parseLabSDP(carrierInvite.Body())
 	if err != nil {
 		t.Fatalf("carrier offer unparseable: %v\n%s", err, carrierInvite.Body())
 	}
@@ -142,7 +142,7 @@ func TestPSTNOutboundCallHappyPath(t *testing.T) {
 	}
 
 	// --- what FreeSWITCH was answered ---
-	answer, err := sdp.Parse(resAtFS.Body())
+	answer, err := parseLabSDP(resAtFS.Body())
 	if err != nil {
 		t.Fatalf("answer to FreeSWITCH unparseable: %v\n%s", err, resAtFS.Body())
 	}
@@ -791,7 +791,7 @@ func TestPSTNFailoverRelatchesMedia(t *testing.T) {
 		// The offer is parsed here, synchronously: the hook's request may
 		// be touched by the stack once it returns, and the goroutine only
 		// needs the SBC's public media port.
-		offer, err := sdp.Parse(req.Body())
+		offer, err := parseLabSDP(req.Body())
 		if err != nil {
 			return true
 		}
@@ -864,7 +864,7 @@ func TestPSTNFailoverRelatchesMedia(t *testing.T) {
 
 	// The answer FreeSWITCH got is the WINNER's negotiation: PCMA, which
 	// only gw-b offered.
-	answer, err := sdp.Parse(res.Body())
+	answer, err := parseLabSDP(res.Body())
 	if err != nil {
 		t.Fatalf("answer to FreeSWITCH unparseable: %v\n%s", err, res.Body())
 	}
@@ -877,7 +877,7 @@ func TestPSTNFailoverRelatchesMedia(t *testing.T) {
 	// share an IP, so exclusivity cannot be asserted — only that the
 	// winner's media flows, which a stuck latch would break.)
 	inv := gw2.waitFor(sip.INVITE, 1, 3*time.Second)
-	offer, err := sdp.Parse(inv[0].Body())
+	offer, err := parseLabSDP(inv[0].Body())
 	if err != nil {
 		t.Fatalf("offer to gw-b unparseable: %v", err)
 	}

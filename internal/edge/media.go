@@ -160,7 +160,7 @@ func negotiateError(err error) error {
 // learns the public endpoint's address" structural properties rather than
 // a list of attributes someone remembered to strip.
 func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []byte) (*offerResult, error) {
-	offer, err := sdp.Parse(offerBody)
+	offer, err := s.parseSDP(offerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: public offer: %w", err)
 	}
@@ -241,19 +241,36 @@ func (s *Server) allocateRTP(offer *sdp.Session) (*mediaSession, error) {
 	return ms, nil
 }
 
+// parseSDP parses a body from either side under the edge's address
+// policy: a loopback c= is accepted only when one of the SBC's own media
+// planes advertises a loopback address (a single-host lab). The media
+// pools apply the same policy per plane before sending anything.
+func (s *Server) parseSDP(body []byte) (*sdp.Session, error) {
+	return sdp.ParseWithOptions(body, sdp.ParseOptions{
+		AllowLoopback: s.topo.publicMediaIP.IsLoopback() || s.topo.privateMediaIP.IsLoopback(),
+	})
+}
+
 // allocateWebRTC builds the browser leg and its private RTP pair, and
 // starts ICE/DTLS in the background so the SDP answer can go out
 // immediately — the browser cannot begin its connectivity checks until it
 // has our ICE credentials, so waiting here would deadlock.
 func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*mediaSession, error) {
 	a := offer.Audio
-	leg, err := media.NewWebRTCLeg(s.pubPool, media.WebRTCLegConfig{
+	cfg := media.WebRTCLegConfig{
 		AdvertisedIP: s.topo.publicMediaIP,
 		RemoteUfrag:  a.ICEUfrag,
 		RemotePwd:    a.ICEPwd,
 		RemoteSetup:  a.Setup,
 		Identity:     s.identity,
-	})
+	}
+	// The a=fingerprint is checked inside the DTLS handshake, so a peer
+	// with the wrong certificate never gets a media path at all.
+	if a.Fingerprint != nil {
+		cfg.RemoteFingerprintHash = a.Fingerprint.Hash
+		cfg.RemoteFingerprintValue = a.Fingerprint.Value
+	}
+	leg, err := media.NewWebRTCLeg(s.pubPool, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -277,9 +294,10 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 			return
 		}
 		// The a=fingerprint from signaling is the only thing binding the
-		// DTLS peer to the call. Verify it AFTER the handshake and drop
-		// the session on a mismatch: without this check, anyone who could
-		// answer the ICE checks could take over the media path.
+		// DTLS peer to the call. The handshake already refused a
+		// mismatched peer (sess.Start then fails with
+		// ErrFingerprintMismatch); this re-check is defence in depth, and
+		// the relay carries no media for a leg that was never verified.
 		if fingerprint != nil {
 			if err := leg.VerifyFingerprint(fingerprint.Hash, fingerprint.Value); err != nil {
 				// The message deliberately does not echo either
@@ -346,7 +364,7 @@ func (s *Server) forkAnswer(l *inviteLeg, res *sip.Response) ([]byte, error) {
 // negotiateFork negotiates one fork's answer, points the media at it and
 // builds the caller's body.
 func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([]byte, error) {
-	answer, err := sdp.Parse(answerBody)
+	answer, err := s.parseSDP(answerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: answer: %w", err)
 	}
@@ -435,7 +453,7 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 		// side follows signaling.
 		if p == planePrivate {
 			if moved {
-				sess.webrtc.RelatchPrivate(remote.Addr())
+				sess.webrtc.RelatchPrivate(remote)
 			}
 			sess.webrtc.SetPrivateRemote(remote)
 		}
@@ -446,7 +464,7 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 		side = media.SideA
 	}
 	if moved {
-		sess.rtp.Relatch(side, remote.Addr())
+		sess.rtp.Relatch(side, remote)
 	}
 	sess.rtp.SetRemote(side, remote)
 	if rtcp.IsValid() {
@@ -469,7 +487,7 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 // browser will reject. That limitation is documented in the README and is
 // what a future re-INVITE/offerless-INVITE path would address.
 func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, error) {
-	offer, err := sdp.Parse(offerBody)
+	offer, err := s.parseSDP(offerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: upstream offer: %w", err)
 	}
@@ -562,7 +580,7 @@ func (s *Server) setWebRTCAnswer(build *sdp.Build, leg *media.WebRTCLeg) {
 // proxy relays, with its payload numbers), so a re-offer that drops or
 // adds a codec still works without transcoding.
 func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]byte, *sdp.Session, error) {
-	offer, err := sdp.Parse(body)
+	offer, err := s.parseSDP(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog offer: %w", err)
 	}
@@ -604,7 +622,7 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 // returns the far end's answer as parsed, for the media update the 2xx
 // applies.
 func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byte, toward plane) ([]byte, *sdp.Session, error) {
-	answer, err := sdp.Parse(body)
+	answer, err := s.parseSDP(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
 	}

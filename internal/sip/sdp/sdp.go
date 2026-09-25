@@ -136,8 +136,14 @@ type Audio struct {
 	Proto []string // media transport tokens, e.g. ["RTP","AVP"]
 
 	// Address is the connection address media should be sent to: the
-	// media-level c= when present, else the session-level one.
+	// media-level c= when present, else the session-level one. It is the
+	// zero Addr when Hold is set. Parse refuses any other address that
+	// cannot be a unicast RTP peer (see ParseOptions).
 	Address netip.Addr
+	// Hold reports a c= of 0.0.0.0 or :: — RFC 3264 §8.4: send neither
+	// RTP nor RTCP to this side. Such a body is valid and must be
+	// accepted; it simply names no destination.
+	Hold bool
 	// Codecs is the section's payload-type list in offer order. Order is
 	// preference order and is preserved through every rewrite.
 	Codecs    []Codec
@@ -177,8 +183,29 @@ type Session struct {
 	MediaCount int
 }
 
-// Parse decodes and validates one SDP body.
+// ErrNotUnicast reports a connection address that can never be a unicast
+// RTP peer (multicast, broadcast, link-local), or a loopback address the
+// caller did not allow. It wraps ErrNoAddress.
+var ErrNotUnicast = fmt.Errorf("%w: not a unicast media address", ErrNoAddress)
+
+// ParseOptions is the caller's policy for what Parse accepts.
+type ParseOptions struct {
+	// AllowLoopback accepts a loopback c=. A loopback media address is
+	// legitimate only when the SBC's own media plane is on loopback (a
+	// single-host lab, the test suites); from a real client it points the
+	// SBC's media socket at a service on its own host. The media plane
+	// applies its own per-pool policy again before sending anything.
+	AllowLoopback bool
+}
+
+// Parse decodes and validates one SDP body, refusing a loopback c=. It is
+// ParseWithOptions with the zero ParseOptions.
 func Parse(body []byte) (*Session, error) {
+	return ParseWithOptions(body, ParseOptions{})
+}
+
+// ParseWithOptions decodes and validates one SDP body under opts.
+func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 	if len(body) == 0 {
 		return nil, errors.New("sdp: empty body")
 	}
@@ -220,7 +247,7 @@ func Parse(body []byte) (*Session, error) {
 		Proto:     append([]string(nil), md.MediaName.Protos...),
 		Direction: SendRecv,
 	}
-	if err := parseConnection(&sd, md, a); err != nil {
+	if err := parseConnection(&sd, md, a, opts); err != nil {
 		return nil, err
 	}
 	parseAttributes(&sd, md, a)
@@ -235,7 +262,7 @@ func Parse(body []byte) (*Session, error) {
 	return &Session{Audio: a, MediaCount: len(sd.MediaDescriptions)}, nil
 }
 
-func parseConnection(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescription, a *Audio) error {
+func parseConnection(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescription, a *Audio, opts ParseOptions) error {
 	conn := md.ConnectionInformation
 	if conn == nil {
 		conn = sd.ConnectionInformation
@@ -250,7 +277,18 @@ func parseConnection(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescriptio
 	if err != nil {
 		return fmt.Errorf("%w: %q", ErrNoAddress, conn.Address.Address)
 	}
-	a.Address = ip.Unmap()
+	ip = ip.Unmap()
+	switch {
+	case ip.IsUnspecified():
+		a.Hold = true // RFC 3264 §8.4: valid, but no destination
+	case ip.IsMulticast(), ip.IsLinkLocalUnicast(),
+		ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}):
+		return fmt.Errorf("%w: %s", ErrNotUnicast, ip)
+	case ip.IsLoopback() && !opts.AllowLoopback:
+		return fmt.Errorf("%w: loopback %s", ErrNotUnicast, ip)
+	default:
+		a.Address = ip
+	}
 	return nil
 }
 

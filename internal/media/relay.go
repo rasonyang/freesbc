@@ -20,7 +20,9 @@ func (s *Session) Start() bool {
 	if !s.state.CompareAndSwap(sessAllocated, sessRunning) {
 		return false // already running, or already closed
 	}
-	s.lastRx.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	s.lastRx[SideA].Store(now)
+	s.lastRx[SideB].Store(now)
 	s.forward(SideA, SideB, true)
 	s.forward(SideB, SideA, true)
 	s.forward(SideA, SideB, false)
@@ -44,11 +46,14 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 	}
 	go func() {
 		defer recoverRelayPanic(nil, s.Close)
-		buf := make([]byte, 1500)
+		buf := make([]byte, relayBufSize)
 		for {
-			n, src, err := in.ReadFromUDP(buf)
+			n, src, err := in.ReadFromUDP(buf[:maxPacketSize+1])
 			if err != nil {
 				return // socket closed (session teardown)
+			}
+			if n > maxPacketSize {
+				continue // oversize: forwarding it would forward a truncation
 			}
 			if !inLatch.accept(src) {
 				continue // pre-latch source mismatch, or post-latch hijack
@@ -57,12 +62,14 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// Decrypt what a secure sending leg gave us, then (re-)encrypt for
 			// a secure receiving leg. A failure at either step drops the packet
 			// (bad auth tag / replay) — fail-closed, call stays up.
+			// Both transforms run in place in buf, which has room for the
+			// SRTP overhead, so the relay allocates nothing per packet.
 			if ic := s.srtpIn[from].Load(); ic != nil {
 				var ok bool
 				if rtpKind {
-					pkt, ok = ic.unprotectRTP(pkt)
+					pkt, ok = ic.unprotectRTPInto(pkt, pkt)
 				} else {
-					pkt, ok = ic.unprotectRTCP(pkt)
+					pkt, ok = ic.unprotectRTCPInto(pkt, pkt)
 				}
 				if !ok {
 					continue
@@ -74,14 +81,14 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// A party who knows the latched source address could
 			// feed garbage that failed auth yet renewed rtp_timeout
 			// indefinitely, keeping a dead call alive forever.
-			s.lastRx.Store(time.Now().UnixNano())
+			s.lastRx[from].Store(time.Now().UnixNano())
 			s.counters.recordRx(from, rtpKind, len(pkt))
 			if oc := s.srtpOut[to].Load(); oc != nil {
 				var ok bool
 				if rtpKind {
-					pkt, ok = oc.protectRTP(pkt)
+					pkt, ok = oc.protectRTPInto(pkt, pkt)
 				} else {
-					pkt, ok = oc.protectRTCP(pkt)
+					pkt, ok = oc.protectRTCPInto(pkt, pkt)
 				}
 				if !ok {
 					continue
@@ -96,12 +103,20 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 	}()
 }
 
-// watchdog closes a session after `timeout` of media silence, so a
-// half-dead call never keeps its ports reserved (spec §7: half-dead calls
-// are reclaimed automatically). Shared by Session and WebRTCSession: both
-// track the last genuine packet in an atomic nanosecond timestamp and are
-// torn down the same way.
-func watchdog(timeout time.Duration, lastRx *atomic.Int64, done <-chan struct{}, closeFn func() error) {
+// relayBufSize is every relay read buffer: the largest datagram relayed
+// (maxPacketSize), one byte more to detect an oversize one, and room to
+// SRTP-protect a full-size packet in place.
+const relayBufSize = maxPacketSize + 1 + srtpMaxOverhead
+
+// watchdog closes a session once EITHER side has sent no genuine packet
+// for `timeout`, so a half-dead call never keeps its ports reserved (spec
+// §7: half-dead calls are reclaimed automatically). lastRx holds one
+// timestamp per sending side: a call whose one end has gone away (its BYE
+// lost) is reclaimed even while the other end — FreeSWITCH playing music
+// on hold, say — keeps streaming (P2-MED-004). Both RTP and RTCP count,
+// so a receive-only side that sends RTCP receiver reports stays alive.
+// Shared by Session and WebRTCSession.
+func watchdog(timeout time.Duration, lastRx *[2]atomic.Int64, done <-chan struct{}, closeFn func() error) {
 	interval := timeout / 4
 	if interval < 10*time.Millisecond {
 		interval = 10 * time.Millisecond
@@ -113,7 +128,8 @@ func watchdog(timeout time.Duration, lastRx *atomic.Int64, done <-chan struct{},
 		case <-done:
 			return
 		case <-t.C:
-			if time.Since(time.Unix(0, lastRx.Load())) > timeout {
+			oldest := min(lastRx[SideA].Load(), lastRx[SideB].Load())
+			if time.Since(time.Unix(0, oldest)) > timeout {
 				_ = closeFn()
 				return
 			}

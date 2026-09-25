@@ -39,8 +39,10 @@ type WebRTCSession struct {
 	privRTP  *latch
 	privRTCP *latch
 
-	timeout  time.Duration
-	lastRx   atomic.Int64
+	timeout time.Duration
+	// lastRx is per sending side, as on Session: SideA is the browser,
+	// SideB FreeSWITCH.
+	lastRx   [2]atomic.Int64
 	counters counters
 
 	log *slog.Logger // nil = the default logger
@@ -85,8 +87,8 @@ func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConf
 		leg:      leg,
 		priv:     priv,
 		privPool: privPool,
-		privRTP:  &latch{mode: cfg.PrivateLatch},
-		privRTCP: &latch{mode: cfg.PrivateLatch},
+		privRTP:  &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
+		privRTCP: &latch{mode: cfg.PrivateLatch, allowLoopback: privPool.allowLoopback()},
 		timeout:  timeout,
 		log:      cfg.Log,
 		done:     make(chan struct{}),
@@ -116,14 +118,18 @@ func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
 	}
 }
 
-// RelatchPrivate re-arms the private side's latches to ip, for an
+// RelatchPrivate re-arms the private side's latches to addr, for an
 // authorised change of FreeSWITCH's media address signalled in SDP (a
 // re-INVITE, or an answer from another fork). Once latched, a latch only
-// moves this way; follow it with SetPrivateRemote to give the relay the
-// new destination.
-func (s *WebRTCSession) RelatchPrivate(ip netip.Addr) {
-	s.privRTP.relatch(ip)
-	s.privRTCP.relatch(ip)
+// moves this way. It re-seeds the destinations too (RTCP at port+1), as
+// Session.Relatch does.
+func (s *WebRTCSession) RelatchPrivate(addr netip.AddrPort) {
+	s.privRTP.relatch(addr)
+	rtcp, ok := rtcpAddr(addr)
+	if !ok {
+		rtcp = netip.AddrPortFrom(addr.Addr(), 0)
+	}
+	s.privRTCP.relatch(rtcp)
 }
 
 // Done is closed when the session ends (Close or silence timeout).
@@ -175,7 +181,9 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 		_ = s.Close()
 		return err
 	}
-	s.lastRx.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	s.lastRx[SideA].Store(now)
+	s.lastRx[SideB].Store(now)
 	go s.publicToPrivate(conn, in)
 	go s.privateToPublic(conn, out, true)
 	go s.privateToPublic(conn, out, false)
@@ -190,26 +198,35 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 // NOT refresh the silence watchdog: only a packet proven genuine counts as
 // media activity, so an attacker who can reach the socket cannot keep a
 // dead call alive with garbage.
+//
+// Nothing is relayed, in either direction, while the leg's DTLS peer has
+// not been matched against the signalled fingerprint (mediaVerified):
+// authenticating SRTP only proves the packet came from whoever finished
+// the handshake, not that it is the browser signaling agreed on.
 func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 	defer recoverRelayPanic(s.log, s.Close)
-	buf := make([]byte, maxPacketSize)
+	buf := make([]byte, relayBufSize)
 	for {
-		n, err := conn.Read(buf)
+		// The demultiplexer never queues more than maxPacketSize bytes.
+		n, err := conn.Read(buf[:maxPacketSize])
 		if err != nil {
 			return // leg closed
+		}
+		if !s.leg.mediaVerified() {
+			continue // fingerprint not (yet) verified: fail closed
 		}
 		pkt := buf[:n]
 		rtcp := isRTCP(pkt)
 		var ok bool
 		if rtcp {
-			pkt, ok = in.unprotectRTCP(pkt)
+			pkt, ok = in.unprotectRTCPInto(pkt, pkt)
 		} else {
-			pkt, ok = in.unprotectRTP(pkt)
+			pkt, ok = in.unprotectRTPInto(pkt, pkt)
 		}
 		if !ok {
 			continue // bad auth tag or replay: fail closed, call stays up
 		}
-		s.lastRx.Store(time.Now().UnixNano())
+		s.lastRx[SideA].Store(time.Now().UnixNano())
 		s.counters.recordRx(SideA, !rtcp, len(pkt))
 
 		sock, lat := s.priv.RTP, s.privRTP
@@ -237,25 +254,36 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 	if !rtpKind {
 		sock, lat = s.priv.RTCP, s.privRTCP
 	}
-	buf := make([]byte, maxPacketSize)
+	buf := make([]byte, relayBufSize)
 	for {
-		n, src, err := sock.ReadFromUDP(buf)
+		n, src, err := sock.ReadFromUDP(buf[:maxPacketSize+1])
 		if err != nil {
 			return // socket closed (session teardown)
+		}
+		if n > maxPacketSize {
+			continue // oversize: forwarding it would forward a truncation
 		}
 		if !lat.accept(src) {
 			continue // pre-latch source mismatch, or post-latch hijack
 		}
+		if !s.leg.mediaVerified() {
+			// Never send media to an unverified DTLS peer. Latching the
+			// private side above is harmless: it is FreeSWITCH, on the
+			// trusted plane, and only tells the reverse direction where
+			// to send once the browser is verified.
+			continue
+		}
 		pkt := buf[:n]
 		rtcp := !rtpKind
-		s.lastRx.Store(time.Now().UnixNano())
+		s.lastRx[SideB].Store(time.Now().UnixNano())
 		s.counters.recordRx(SideB, !rtcp, n)
 
+		// In place: buf has room for the SRTP overhead.
 		var ok bool
 		if rtcp {
-			pkt, ok = out.protectRTCP(pkt)
+			pkt, ok = out.protectRTCPInto(pkt, pkt)
 		} else {
-			pkt, ok = out.protectRTP(pkt)
+			pkt, ok = out.protectRTPInto(pkt, pkt)
 		}
 		if !ok {
 			continue

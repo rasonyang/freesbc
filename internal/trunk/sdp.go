@@ -210,6 +210,16 @@ func remoteMediaIP(body []byte) (netip.Addr, error) {
 	return ip, nil
 }
 
+// remoteMediaPort returns the relayed audio section's m= port, or 0 when
+// the body has none (0 also means the peer declined the stream).
+func remoteMediaPort(body []byte) int {
+	_, a, err := parseAudioSDP(body)
+	if err != nil {
+		return 0
+	}
+	return a.port
+}
+
 // validAudioSDP reports whether body is an SDP the bridge can relay: it
 // parses and carries a live audio m= section with at least one RTP payload
 // type. It is the target-independent half of what the builder would

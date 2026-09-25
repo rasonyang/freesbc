@@ -3,14 +3,18 @@ package media
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/dtls/v3"
@@ -47,6 +51,16 @@ type WebRTCLeg struct {
 	remoteUfrag string
 	remotePwd   string
 	dtlsClient  bool
+	// remoteFingerprint is the browser's signalled a=fingerprint, checked
+	// inside the DTLS handshake when set. Zero means none was given.
+	remoteFingerprint fingerprint
+
+	// verified gates media: the relay forwards nothing to or from the
+	// browser until the DTLS peer's certificate has been matched against
+	// the signalled fingerprint — in the handshake (remoteFingerprint) or
+	// by a later VerifyFingerprint. Fail closed: an established leg with
+	// no fingerprint check yet carries no media.
+	verified atomic.Bool
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -69,8 +83,11 @@ type WebRTCLeg struct {
 	// peerCerts is the established connection's state accessor, kept so
 	// VerifyFingerprint can hash the peer certificate after the handshake.
 	peerCerts func() (dtls.State, bool)
-	err       error
-	state     legState
+	// cancel aborts an in-flight establish; Close calls it so ICE and the
+	// DTLS handshake stop at once instead of running to their deadline.
+	cancel context.CancelFunc
+	err    error
+	state  legState
 
 	closed chan struct{}
 }
@@ -138,6 +155,14 @@ type WebRTCLegConfig struct {
 	RemoteSetup string
 	// Identity is the DTLS certificate to present.
 	Identity *DTLSIdentity
+	// RemoteFingerprintHash/RemoteFingerprintValue are the browser's
+	// a=fingerprint (hash function token and colon-separated hex). When
+	// set, the DTLS handshake itself fails unless the peer's certificate
+	// matches, so no media is ever relayed for a mismatched peer. When
+	// left empty, the leg still establishes but carries no media until
+	// VerifyFingerprint succeeds.
+	RemoteFingerprintHash  string
+	RemoteFingerprintValue string
 }
 
 // Sentinels classifying how a browser leg failed. Every failure path below
@@ -174,6 +199,13 @@ func NewWebRTCLeg(pool *PlanePool, cfg WebRTCLegConfig) (*WebRTCLeg, error) {
 	if !cfg.AdvertisedIP.IsValid() {
 		return nil, errors.New("media: webrtc leg needs an advertised media address")
 	}
+	var fp fingerprint
+	if cfg.RemoteFingerprintHash != "" || cfg.RemoteFingerprintValue != "" {
+		var err error
+		if fp, err = newFingerprint(cfg.RemoteFingerprintHash, cfg.RemoteFingerprintValue); err != nil {
+			return nil, err
+		}
+	}
 	conn, err := pool.allocateSingle()
 	if err != nil {
 		return nil, err
@@ -197,9 +229,10 @@ func NewWebRTCLeg(pool *PlanePool, cfg WebRTCLegConfig) (*WebRTCLeg, error) {
 		// the conventional pick for a gateway with a stable address is the
 		// server role (a=setup:passive). Only an explicit a=setup:passive
 		// from the browser makes us the client.
-		dtlsClient: cfg.RemoteSetup == "passive",
-		ready:      make(chan struct{}),
-		closed:     make(chan struct{}),
+		dtlsClient:        cfg.RemoteSetup == "passive",
+		remoteFingerprint: fp,
+		ready:             make(chan struct{}),
+		closed:            make(chan struct{}),
 	}
 	return l, nil
 }
@@ -232,13 +265,27 @@ func (l *WebRTCLeg) Err() error {
 
 // Start drives ICE and DTLS in the background. ctx cancels establishment;
 // once established, the leg lives until Close.
+//
+// Only the first call on a freshly allocated leg does anything: the
+// legAllocated → legEstablishing transition is claimed under mu, so a
+// second Start (or a Start after Close) cannot launch a second establish
+// that would build another ICE agent over the same socket and leak it.
 func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	l.setState(legEstablishing, nil)
+	l.mu.Lock()
+	if l.state != legAllocated {
+		l.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	l.cancel = cancel
+	l.set(legEstablishing, nil)
+	l.mu.Unlock()
 	go func() {
-		if err := l.establish(ctx, timeout); err != nil {
+		defer cancel()
+		if err := l.establish(ctx); err != nil {
 			// Publish the failure BEFORE tearing down, then let Close
 			// close the ready channel: a caller that wakes on Ready must
 			// find every resource already released, or a "leg failed"
@@ -252,45 +299,62 @@ func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	}()
 }
 
-func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+// errLegClosed aborts establish when Close won the race for a resource.
+var errLegClosed = errors.New("media: webrtc leg closed during establishment")
 
+// keep runs store under mu unless the leg is already closed, and reports
+// whether it ran. establish hands every resource it creates to the leg
+// through keep; when it returns false, Close has already taken its one
+// snapshot of the handles, so the caller must close the resource itself
+// or it would outlive the leg.
+func (l *WebRTCLeg) keep(store func()) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state == legClosed {
+		return false
+	}
+	store()
+	return true
+}
+
+func (l *WebRTCLeg) establish(ctx context.Context) error {
 	// --- ICE-Lite ---
 	//
 	// A lite agent never sends connectivity checks; it answers them and
 	// lets the full-ICE peer nominate. Host candidates are the only kind
 	// it may offer (RFC 5245 §4.2), which is exactly right for a gateway
-	// with one stable public media address. NAT1To1IPs rewrites that host
-	// candidate to the advertised address, so a NAT'ed deployment binds
+	// with one stable public media address. The candidate the SDP answer
+	// advertises is written by the signaling plane at the configured
+	// public address (AdvertisedIP), so a NAT'ed deployment binds
 	// privately and advertises publicly without a STUN round trip.
 	loggerFactory := logging.NewDefaultLoggerFactory()
 	loggerFactory.DefaultLogLevel = logging.LogLevelError
 	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: l.conn, Logger: loggerFactory.NewLogger("ice")})
-	l.mu.Lock()
-	l.mux = mux
-	l.mu.Unlock()
-	agent, err := ice.NewAgent(&ice.AgentConfig{
-		Lite:           true,
-		CandidateTypes: []ice.CandidateType{ice.CandidateTypeHost},
-		NetworkTypes:   []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6},
-		UDPMux:         mux,
-		LocalUfrag:     l.localUfrag,
-		LocalPwd:       l.localPwd,
-		LoggerFactory:  loggerFactory,
+	if !l.keep(func() { l.mux = mux }) {
+		_ = mux.Close()
+		return errLegClosed
+	}
+	agent, err := ice.NewAgentWithOptions(
+		ice.WithICELite(true),
+		ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
+		ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6}),
+		ice.WithUDPMux(mux),
+		ice.WithLocalCredentials(l.localUfrag, l.localPwd),
+		ice.WithLoggerFactory(loggerFactory),
 		// A single-host deployment may legitimately serve media on
 		// loopback (an all-on-one-box lab, and every test in this
 		// package); excluding it would make those setups fail ICE for no
 		// security gain, since the socket is bound to exactly the address
 		// the operator configured either way.
-		IncludeLoopback: true,
-	})
+		ice.WithIncludeLoopback(),
+	)
 	if err != nil {
 		return fmt.Errorf("%w: ice agent: %w", ErrICEFailed, err)
 	}
-	l.mu.Lock()
-	l.agent = agent
-	l.mu.Unlock()
+	if !l.keep(func() { l.agent = agent }) {
+		_ = agent.Close()
+		return errLegClosed
+	}
 	// pion requires a candidate handler before gathering. FreeSBC does not
 	// use the gathered candidates in SDP — it advertises exactly one host
 	// candidate at the configured public address (see sdp.Build) — so the
@@ -311,57 +375,106 @@ func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error 
 
 	// --- DTLS over the same socket ---
 	dm := newDemux(iceConn)
-	l.mu.Lock()
-	l.demux = dm
-	l.srtpEP = dm.srtp
-	l.mu.Unlock()
+	if !l.keep(func() { l.demux, l.srtpEP = dm, dm.srtp }) {
+		_ = dm.Close()
+		return errLegClosed
+	}
 
-	dtlsCfg := &dtls.Config{
-		Certificates: []tls.Certificate{l.identity.Certificate},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
+	// The peer certificate is self-signed by design, so there is no PKI
+	// to verify a chain against and chain verification is skipped. What
+	// binds the certificate to the call is the a=fingerprint line from
+	// signaling, and it is checked INSIDE the handshake: a peer whose
+	// certificate does not match fails the handshake, so the leg never
+	// reaches legEstablished, no SRTP keys are derived and no media is
+	// relayed (RFC 5763 §5, RFC 8122 §5).
+	var fingerprintMismatch atomic.Bool
+	opts := []dtls.Option{
+		dtls.WithCertificates(l.identity.Certificate),
+		dtls.WithSRTPProtectionProfiles(
 			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
 			dtls.SRTP_AES128_CM_HMAC_SHA1_32,
-		},
-		// The peer certificate is self-signed by design; WebRTC binds it
-		// to the session through the a=fingerprint line in signaling, and
-		// the caller verifies that separately (see VerifyFingerprint).
-		// Skipping chain verification here is the correct behavior, not a
-		// weakening — there is no PKI to verify against.
-		InsecureSkipVerify: true,
-		ClientAuth:         dtls.RequireAnyClientCert,
+		),
+		dtls.WithInsecureSkipVerify(true),
+	}
+	if l.remoteFingerprint.Value != "" {
+		opts = append(opts, dtls.WithVerifyPeerCertificate(func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if err := l.remoteFingerprint.match(raw); err != nil {
+				fingerprintMismatch.Store(true)
+				return err
+			}
+			return nil
+		}))
 	}
 	var dtlsConn *dtls.Conn
 	if l.dtlsClient {
-		dtlsConn, err = dtls.Client(dm.dtls, dm.dtls.RemoteAddr(), dtlsCfg)
+		clientOpts := make([]dtls.ClientOption, 0, len(opts))
+		for _, o := range opts {
+			clientOpts = append(clientOpts, o)
+		}
+		dtlsConn, err = dtls.ClientWithOptions(dm.dtls, dm.dtls.RemoteAddr(), clientOpts...)
 	} else {
-		dtlsConn, err = dtls.Server(dm.dtls, dm.dtls.RemoteAddr(), dtlsCfg)
+		// As the server we must ask for the browser's certificate, or
+		// there would be nothing to check the fingerprint against.
+		serverOpts := make([]dtls.ServerOption, 0, len(opts)+1)
+		for _, o := range opts {
+			serverOpts = append(serverOpts, o)
+		}
+		serverOpts = append(serverOpts, dtls.WithClientAuth(dtls.RequireAnyClientCert))
+		dtlsConn, err = dtls.ServerWithOptions(dm.dtls, dm.dtls.RemoteAddr(), serverOpts...)
 	}
 	if err != nil {
 		return fmt.Errorf("%w: dtls setup: %w", ErrDTLSHandshake, err)
 	}
-	// dtls.Client/Server only build the connection; the handshake itself
-	// runs here, under the establishment deadline, so a peer that opens
-	// the flow and then goes quiet cannot pin the port past the timeout.
+	// ClientWithOptions/ServerWithOptions only build the connection; the
+	// handshake itself runs here, under the establishment deadline, so a
+	// peer that opens the flow and then goes quiet cannot pin the port
+	// past the timeout.
 	if err := dtlsConn.HandshakeContext(ctx); err != nil {
 		_ = dtlsConn.Close()
+		if fingerprintMismatch.Load() {
+			// pion wraps the callback's error in an alert; classify it
+			// from the callback itself so errors.Is is reliable.
+			return fmt.Errorf("%w: %w", ErrFingerprintMismatch, err)
+		}
 		return fmt.Errorf("%w: %w", ErrDTLSHandshake, err)
 	}
-	l.mu.Lock()
-	l.peerCerts = dtlsConn.ConnectionState
-	l.mu.Unlock()
+	// The DTLS connection has done its job once keyed (it exists only to
+	// key SRTP); its records are already drained by the demultiplexer, and
+	// closing it here would tear the shared socket down. It is retained
+	// only so a late renegotiation attempt is absorbed rather than
+	// reaching SRTP, and is closed with the leg — on every path from here
+	// on, including a keying failure below, which ends in Close.
+	go func() {
+		<-l.closed
+		_ = dtlsConn.Close()
+	}()
+	if !l.keep(func() { l.peerCerts = dtlsConn.ConnectionState }) {
+		return errLegClosed
+	}
+	// Defence in depth: pion only calls VerifyPeerCertificate when the
+	// peer sent a certificate, so re-match the one the handshake actually
+	// ended with before anything is keyed. A certificate-less handshake
+	// cannot pass this.
+	if l.remoteFingerprint.Value != "" {
+		state, ok := dtlsConn.ConnectionState()
+		if !ok {
+			return fmt.Errorf("%w: connection state unavailable", ErrFingerprintMismatch)
+		}
+		if err := l.remoteFingerprint.match(state.PeerCertificates); err != nil {
+			return err
+		}
+	}
 
 	// --- SRTP keying (RFC 5764 §4.2) ---
 	if err := l.deriveSRTP(dtlsConn); err != nil {
 		return err
 	}
-	// The DTLS connection has done its job (it exists only to key SRTP);
-	// its records are already drained by the demultiplexer, and closing it
-	// here would tear the shared socket down. It is retained only so a
-	// late renegotiation attempt is absorbed rather than reaching SRTP.
-	go func() {
-		<-l.closed
-		_ = dtlsConn.Close()
-	}()
+	// The handshake only completed if VerifyPeerCertificate accepted the
+	// peer, so a leg given the fingerprint up front is verified now,
+	// before Start publishes legEstablished and the relay can start.
+	if l.remoteFingerprint.Value != "" {
+		l.verified.Store(true)
+	}
 	return nil
 }
 
@@ -448,6 +561,12 @@ func srtpProfileFor(id dtls.SRTPProtectionProfile) (srtp.ProtectionProfile, erro
 // produced against the a=fingerprint the browser signalled. This is the
 // ONLY binding between the signaling identity and the media path in
 // WebRTC, so a mismatch must fail the leg.
+//
+// A leg configured with RemoteFingerprint* has already done this inside
+// the handshake; calling it again is a harmless re-check. For a leg
+// configured without one, a successful call is what opens the media gate,
+// and a mismatch keeps (or puts) it shut: nothing is relayed to or from
+// the peer, and the caller is expected to tear the session down.
 func (l *WebRTCLeg) VerifyFingerprint(hash, value string) error {
 	select {
 	case <-l.ready:
@@ -457,34 +576,93 @@ func (l *WebRTCLeg) VerifyFingerprint(hash, value string) error {
 	if err := l.loadErr(); err != nil {
 		return err
 	}
-	if hash != "sha-256" {
-		return fmt.Errorf("%w: unsupported hash %q", ErrFingerprintMismatch, hash)
-	}
-	got, err := l.peerFingerprint()
+	want, err := newFingerprint(hash, value)
 	if err != nil {
+		l.verified.Store(false)
 		return err
 	}
-	if !strings.EqualFold(got, value) {
-		return ErrFingerprintMismatch
-	}
-	return nil
-}
-
-// peerFingerprint hashes the peer's leaf certificate for comparison with
-// the signalled a=fingerprint.
-func (l *WebRTCLeg) peerFingerprint() (string, error) {
 	l.mu.Lock()
 	get := l.peerCerts
 	established := l.state == legEstablished
 	l.mu.Unlock()
 	if !established || get == nil {
-		return "", ErrWebRTCNotReady
+		return ErrWebRTCNotReady
 	}
 	state, ok := get()
-	if !ok || len(state.PeerCertificates) == 0 {
-		return "", fmt.Errorf("%w: peer presented no certificate", ErrFingerprintMismatch)
+	if !ok {
+		l.verified.Store(false)
+		return fmt.Errorf("%w: peer presented no certificate", ErrFingerprintMismatch)
 	}
-	return fingerprintHex(state.PeerCertificates[0]), nil
+	if err := want.match(state.PeerCertificates); err != nil {
+		l.verified.Store(false)
+		return err
+	}
+	l.verified.Store(true)
+	return nil
+}
+
+// mediaVerified reports whether the relay may carry media for this leg:
+// the DTLS peer has been matched against the signalled fingerprint.
+func (l *WebRTCLeg) mediaVerified() bool { return l.verified.Load() }
+
+// fingerprint is a signalled a=fingerprint, normalised for comparison.
+type fingerprint struct {
+	Hash  string // "sha-256", "sha-384" or "sha-512"
+	Value string // colon-separated uppercase hex
+}
+
+// newFingerprint validates a signalled fingerprint. The hash functions
+// are the ones internal/sip/sdp accepts; SHA-1 and MD5 are refused.
+func newFingerprint(hash, value string) (fingerprint, error) {
+	hash = strings.ToLower(hash)
+	switch hash {
+	case "sha-256", "sha-384", "sha-512":
+	default:
+		return fingerprint{}, fmt.Errorf("%w: unsupported hash %q", ErrFingerprintMismatch, hash)
+	}
+	if value == "" {
+		return fingerprint{}, fmt.Errorf("%w: empty fingerprint", ErrFingerprintMismatch)
+	}
+	return fingerprint{Hash: hash, Value: strings.ToUpper(value)}, nil
+}
+
+// match reports whether the peer's leaf certificate (the first of certs,
+// DER) hashes to f.
+func (f fingerprint) match(certs [][]byte) error {
+	if len(certs) == 0 || len(certs[0]) == 0 {
+		return fmt.Errorf("%w: peer presented no certificate", ErrFingerprintMismatch)
+	}
+	if got := fingerprintWith(f.Hash, certs[0]); got != f.Value {
+		return ErrFingerprintMismatch
+	}
+	return nil
+}
+
+// fingerprintWith renders der's digest under hash the way SDP
+// a=fingerprint does: colon-separated uppercase hex.
+func fingerprintWith(hash string, der []byte) string {
+	var sum []byte
+	switch hash {
+	case "sha-384":
+		d := sha512.Sum384(der)
+		sum = d[:]
+	case "sha-512":
+		d := sha512.Sum512(der)
+		sum = d[:]
+	default:
+		d := sha256.Sum256(der)
+		sum = d[:]
+	}
+	hexed := strings.ToUpper(hex.EncodeToString(sum))
+	var b strings.Builder
+	b.Grow(len(hexed) + len(sum))
+	for i := 0; i < len(hexed); i += 2 {
+		if i > 0 {
+			b.WriteByte(':')
+		}
+		b.WriteString(hexed[i : i+2])
+	}
+	return b.String()
 }
 
 // SRTPContexts returns the leg's inbound (decrypt) and outbound (encrypt)
@@ -522,9 +700,16 @@ func (l *WebRTCLeg) Close() error {
 		return nil
 	}
 	l.set(legClosed, nil)
-	dm, agent, mux := l.demux, l.agent, l.mux
+	dm, agent, mux, cancel := l.demux, l.agent, l.mux, l.cancel
 	l.mu.Unlock()
 
+	// From here on establish cannot store a new handle (keep refuses once
+	// the state is legClosed), so this snapshot is complete; anything it
+	// creates later it closes itself. Cancelling its context makes it
+	// notice promptly instead of at its deadline.
+	if cancel != nil {
+		cancel()
+	}
 	close(l.closed)
 	if dm != nil {
 		_ = dm.Close()

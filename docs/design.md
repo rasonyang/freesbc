@@ -811,7 +811,8 @@ The dial loop runs at most twice, bounded by a `retried422` flag:
 Post-answer (2xx), every path is non-retryable except one:
 
 - `processAnswerSDP(sess, answer, SideB, bSRTP)` installs SRTP contexts,
-  `Relatch`es side B to the answered address and calls `sess.Start()`.
+  `Relatch`es side B to the answered `c=`/`m=` address (re-seeding its
+  destination) and calls `sess.Start()`.
   `errSRTPRequiredMismatch` is the single retryable post-answer case: log,
   `ackThenBye`, `failDial`. Any other error answers the caller **502 Bad
   Gateway** and *then* tears the carrier down.
@@ -1767,7 +1768,7 @@ the caller's one final: `pumpResult.finalised` stops any second one.
 
 | Operation | Where | Notes |
 |---|---|---|
-| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer. SRTCP is **not** relayed uninterpreted: the RTCP forward loop unprotects and re-protects with the same context as SRTP (`relay.go:60-89`), so it belongs in the *transformation* row; only its **contents** are never inspected |
+| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer. SRTCP is **not** relayed uninterpreted: the RTCP forward loop unprotects and re-protects with the same context as SRTP (`relay.go:67-95`), so it belongs in the *transformation* row; only its **contents** are never inspected |
 | **Termination** — a protocol endpoint FreeSBC itself terminates | SRTP/SRTCP (SDES and DTLS-keyed), the DTLS handshake, the ICE-Lite agent | the far side's cryptographic association ends at FreeSBC |
 | **Transformation** — re-keying and rewriting | SRTP↔RTP interworking and SRTP↔SRTP re-keying (decrypt with the peer's key, re-encrypt with ours); SDP rewriting (trunk: in-place edit; edge: construction from scratch) | proven by `TestRelaySRTPToSRTPRekeyed`: the packet delivered to B decrypts with key B and **must not** decrypt with key A |
 | **Transcoding** | **none, anywhere** | there is no codec conversion in `internal/media`; payload-type numbers must survive end to end, which is why `sdp.ErrRenumbered` rejects a renumbering answer |
@@ -1807,12 +1808,19 @@ Exhaustion returns `ErrPortsExhausted`. `allocateSingle` (WebRTC only) is the
 same sweep but binds only the even port and **reserves the odd one without
 binding it**, so a muxed session still consumes a pair's worth of range.
 
-The pool mutex is held across the entire bind sweep, including the blocking
-`net.ListenUDP` syscalls — deliberately, because that is what makes "no
-duplicate allocation" true under a burst of simultaneous calls.
+The pool mutex covers only the **reservation** (`reserveNext`): each
+candidate is taken from the cursor and entered in `inUse` under the lock,
+then bound with the lock released, and a failed bind drops the reservation.
+Reserving before binding is what keeps "no duplicate allocation" true under
+a burst of simultaneous calls; binding outside the lock means a sweep past
+ports other processes hold never stalls `Stats`, `release` or another
+allocation on the plane.
 
 `Stats()` returns `(inUse, total)`, where `total` is `(hi - lo + 1) / 2`
-after the even-bump, clamped to 0.
+after the even-bump, clamped to 0, and `inUse` counts only reservations
+**inside the current range**. After a hot reload that moves or shrinks the
+range, live calls keep their old ports until they end; those are not
+counted against the new capacity, so `inUse` never exceeds `total`.
 
 Deployment sizing: **2 ports per call per plane**. A trunk call consumes 2
 pairs from the one trunk pool; an edge call consumes 1 pair from `rtp.public`
@@ -1836,7 +1844,7 @@ stateDiagram-v2
 Transitions: `Start` (`relay.go:19-22`) is a single
 `CompareAndSwap(sessAllocated, sessRunning)` and returns whether *this* call
 started it, so the relay starts at most once whichever path wins; `Close`
-(`session.go:325-336`) is a single `Swap(sessClosed)` that closes both pairs,
+(`session.go:374-385`) is a single `Swap(sessClosed)` that closes both pairs,
 releases both port reservations and closes `done`, making it idempotent and
 safe from any goroutine. Transitions only ever move forward.
 
@@ -1848,14 +1856,22 @@ so an INVITE abandoned before the answer holds its ports until someone calls
 The per-packet loop, per direction and kind:
 
 ```
-read from the `from` side's socket        (buffer 1500 bytes)
+read from the `from` side's socket        (up to maxPacketSize = 1508 bytes)
+larger than maxPacketSize? -> drop        // never forward a truncation
 inLatch.accept(src)?  no -> drop
-srtpIn[from] != nil   -> unprotect; failure -> drop
-lastRx.Store(now)                          // T-22: only after proof
+srtpIn[from] != nil   -> unprotect in place; failure -> drop
+lastRx[from].Store(now)                    // T-22: only after proof
 counters.recordRx(from, rtpKind, len)
-srtpOut[to] != nil    -> protect; failure -> drop
+srtpOut[to] != nil    -> protect in place; failure -> drop
 outLatch.target() != nil -> write from the `to` side's own socket
 ```
+
+Every relay loop (this one and the two `WebRTCSession` directions) reads
+into one buffer of `relayBufSize` = `maxPacketSize + 1 + srtpMaxOverhead`
+bytes: one byte more than the largest datagram relayed, so an oversize one
+is detected and dropped rather than forwarded cut short (`ReadFromUDP`
+truncates silently), and room for the SRTP overhead so both transforms run
+in place. The per-packet path allocates nothing.
 
 Packets are sent **from the `to` side's own socket**, so the far remote sees
 the port it already talks to. A `nil` destination (the far side has not
@@ -1875,19 +1891,38 @@ stateDiagram-v2
     Seeded --> Latched: accept(src) succeeds
     Armed --> Latched: accept(src) succeeds
     Unarmed --> Latched: accept(src) succeeds (loose mode only)
-    Latched --> Armed: relatch (re-INVITE authorised)
-    Seeded --> Armed: relatch
+    Latched --> Seeded: relatch (re-INVITE / new answer authorised)
+    Seeded --> Seeded: relatch
+    Armed --> Seeded: relatch
 ```
 
-Transitions: `setExpected` (`session.go:48-52`) records the expected source
-IP; `seed` (`session.go:91-102`) sets the expected IP **and** a provisional
+Transitions: `setExpected` (`session.go:53-57`) records the expected source
+IP; `seed` (`session.go:111-129`) sets the expected IP **and** a provisional
 send-to destination from SDP, returning without touching `remote` if the
-latch is already latched; `accept` (`session.go:106-128`) is the gate the
+latch is already latched; `accept` (`session.go:147-169`) is the gate the
 relay calls per packet and is what sets `latched`; `relatch`
-(`session.go:68-74`) sets a new expected IP and clears both `remote` and
-`latched` — unconditionally, so it reaches `Armed` from **any** state,
-including a `Seeded` latch that a re-INVITE re-points before the first packet
-ever arrived.
+(`session.go:80-87`) takes the newly signalled address (IP **and** port),
+sets the expected IP, clears both `remote` and `latched` — unconditionally,
+from **any** state — and then seeds the new address, so the side keeps
+receiving media after an authorised move even if it never sends first (a
+recvonly peer, an IVR waiting to hear audio). An address with no usable
+port only re-arms the source check (`Armed`).
+
+**What `seed` will send to** (`unicastMediaAddr`, `session.go:134`): the
+unspecified address (RFC 3264 §8.4 hold), multicast, the IPv4 broadcast
+address and link-local addresses are never installed, nor do they change
+the expected source. A loopback address arms the source check but becomes
+a destination only when the side's pool allows it
+(`PlaneParams.AllowLoopback`): the edge sets it for a media plane whose bind
+or advertised address is loopback, and the trunk for a loopback
+`rtp.bind_ip` — a single-host lab or the test suites. Anywhere else a
+client's SDP could point the SBC's media socket at a service on its own
+host. The policy is read once per session, at allocation. `internal/sip/sdp`
+enforces the same classes one step earlier: `Parse` refuses multicast,
+broadcast, link-local and (unless `ParseOptions.AllowLoopback`, which the
+edge derives from its advertised media addresses) loopback `c=` addresses
+with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
+`Address`.
 
 Acceptance rules in `accept`:
 
@@ -1917,17 +1952,27 @@ Plane defaults:
 | WebRTC public leg | none — ICE fixed the peer and SRTP authenticates every packet | — |
 | WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` |
 
-The trunk plane calls `SetExpectedRemote` and `Relatch` but **never**
-`SetRemote`, i.e. it never seeds a provisional destination; the edge plane
-seeds both sides from the signalled address.
+The trunk plane calls `SetExpectedRemote` for side A and never `SetRemote`;
+side B is seeded by `Relatch` from the answer's `c=`/`m=` in
+`processAnswerSDP`, so the answering carrier hears the caller before it
+sends anything. Side A is not seeded, so media toward the caller flows once
+it sends. The edge plane seeds both sides from the signalled address.
 
 ### 8.5 Silence watchdog
 
 `watchdog(timeout, &lastRx, done, Close)` ticks at `timeout/4`, floored at
-**10 ms**, and calls `Close` when `time.Since(lastRx) > timeout`. `timeout`
-is `listen.media.rtp_timeout`, default **5 minutes**, taken from the pool's
-params at allocation (from **pool A** even when the two sides come from
-different pools).
+**10 ms**. `lastRx` holds **one timestamp per sending side**, and the
+watchdog calls `Close` when **either** is older than `timeout`: a call is
+reclaimed when one end has gone silent, even while the other keeps
+streaming (FreeSWITCH playing music on hold to a phone that vanished with
+its BYE lost). RTP and RTCP both count, so a receive-only side that sends
+RTCP receiver reports (RFC 3550; RFC 3264 §5.1 keeps RTCP flowing on hold)
+stays alive. A held endpoint that sends **neither** RTP nor RTCP for
+`rtp_timeout` is reclaimed; raise `rtp_timeout` if such endpoints hold for
+longer. `timeout` is `listen.media.rtp_timeout`, default **5 minutes**,
+taken from the pool's params at allocation (from **pool A** even when the
+two sides come from different pools). A `WebRTCSession` tracks the browser
+(side A) and FreeSWITCH (side B) the same way.
 
 `lastRx` is refreshed **only after a packet is proven genuine**: latch
 acceptance for a plaintext leg, and successful SRTP authentication where an
@@ -1948,7 +1993,22 @@ answers 408) instead.
 `SRTPContext` wraps pion's lockless `*srtp.Context` behind a mutex, because
 the RTP-forward and RTCP-forward goroutines of one direction share it.
 Replay protection is explicitly enabled — pion's default is none — with
-windows **64** for SRTP and **128** for SRTCP, per context.
+windows **64** for SRTP and **128** for SRTCP, per context. It is pion's own
+sliding-window detector (`replaydetector.New`, what `SRTPReplayProtection`
+installs), plugged in through `SRTPReplayDetectorFactory` behind
+`tokenReplayDetector`, which uses the detector's `CheckSeq`/`Accept` token
+API instead of `Check`: `Check` returns a fresh closure per packet.
+
+**No per-packet allocation.** pion is always given a header to reuse and a
+destination buffer. The relays call the `…Into(dst, pkt)` variants on their
+own read buffer, so protect and unprotect run in place. `protectRTP`,
+`unprotectRTP` and the RTCP pair leave their input untouched and return a
+slice of a per-context 16 KiB slab that is only ever appended to, so a
+returned slice is never overwritten and one allocation serves about 80
+packets. **A plaintext RTP packet carrying a Cryptex (RFC 9335)
+header-extension profile, `0xC0DE` or `0xC2DE`, is refused by `protectRTP`**:
+those profiles mean "encrypted header extension" to the receiving side, and
+Cryptex is not negotiated, so the SRTP could never be unprotected.
 
 Two suites exist: `AES_CM_128_HMAC_SHA1_80` and `AES_CM_128_HMAC_SHA1_32`.
 `SDESKeyLen = 30` (a 16-byte master key concatenated with a 14-byte master
@@ -1961,7 +2021,7 @@ decrypts what is received *from* that side, `outbound` encrypts what is sent
 failover target's answer replacing an earlier target's early-media contexts
 needs. A plaintext outcome always installs `(nil, nil)` so a previous
 target's contexts cannot linger. On a **closed** session it is a silent no-op
-(`session.go:312-318`): keys are never installed on a relay that no longer
+(`session.go:361-367`): keys are never installed on a relay that no longer
 exists.
 
 On any protect/unprotect failure the packet is dropped with a bare
@@ -1992,21 +2052,33 @@ stateDiagram-v2
     legClosed --> [*]
 ```
 
-Transitions: `NewWebRTCLeg` (`webrtcleg.go:187-203`) leaves the state at the
-zero value `legAllocated`; `Start` (`webrtcleg.go:239`) sets `legEstablishing`
-and spawns `establish`; that goroutine sets `legFailed` and immediately calls
-`Close` on error (`webrtcleg.go:246-247`) or `legEstablished` on success
-(`:250`); `Close` (`webrtcleg.go:524`) sets `legClosed`, which `set`
-(`:107-109`) treats as terminal. The first error recorded wins, and a leg
-closed before it was established is retroactively stamped with
-`"webrtc leg closed before it was established"`.
+Transitions: `NewWebRTCLeg` (`webrtcleg.go:192-238`) leaves the state at the
+zero value `legAllocated`; `Start` (`webrtcleg.go:273-300`) claims
+`legAllocated → legEstablishing` under `mu` and spawns `establish` — a second
+`Start`, or a `Start` after `Close`, is a no-op, so no second ICE agent can
+be built over the same socket; that goroutine sets `legFailed` and
+immediately calls `Close` on error (`webrtcleg.go:293-294`) or
+`legEstablished` on success (`:297`); `Close` (`webrtcleg.go:693`) sets
+`legClosed`, which `set` (`:124-126`) treats as terminal. The first error
+recorded wins, and a leg closed before it was established is retroactively
+stamped with `"webrtc leg closed before it was established"`.
+
+`Close` during establishment releases everything: it cancels `establish`'s
+context and snapshots the mux/agent/demux handles once, and `establish`
+hands every handle it creates to the leg through `keep` (`webrtcleg.go:310`),
+which refuses once the state is `legClosed` — `establish` then closes that
+handle itself and returns. The DTLS connection is tied to the leg's `closed`
+channel as soon as its handshake succeeds, so a keying failure after the
+handshake no longer leaks it.
 
 `establish` runs under **one deadline covering ICE and DTLS together** —
 `Start(ctx, timeout)` with `timeout <= 0` meaning **30 s**:
 
 1. `ice.NewUDPMuxDefault` over the single allocated socket.
-2. `ice.NewAgent{Lite: true, CandidateTypes: [host], NetworkTypes: [UDP4,
-   UDP6], IncludeLoopback: true}` — a genuine ICE-lite agent, host candidates
+2. `ice.NewAgentWithOptions(WithICELite(true), WithCandidateTypes([host]),
+   WithNetworkTypes([UDP4, UDP6]), WithIncludeLoopback(), …)` — the
+   options-based constructor (the `AgentConfig` one is deprecated in
+   pion/ice v4) — a genuine ICE-lite agent, host candidates
    only, **no STUN and no TURN servers configured**. The candidate handler is
    intentionally empty: FreeSBC does not use gathered candidates in SDP; it
    advertises exactly one host candidate at the configured public media
@@ -2022,11 +2094,20 @@ closed before it was established is retroactively stamped with
    be able to tear down a live call's media path. Buffers: 64 KiB for DTLS,
    1 MiB for SRTP; a full buffer drops the packet rather than blocking the
    read loop, which would stall the other endpoint too.
-5. DTLS with the process identity, offering
-   `SRTP_AES128_CM_HMAC_SHA1_80` and `_32`, `InsecureSkipVerify: true` and
-   `ClientAuth: RequireAnyClientCert`. The peer certificate is self-signed by
-   design and there is no PKI; the binding to the session is the
-   `a=fingerprint` line, checked separately.
+5. DTLS via `dtls.ServerWithOptions`/`ClientWithOptions` (the
+   `dtls.Config` constructors are deprecated in pion/dtls v3) with the
+   process identity, offering `SRTP_AES128_CM_HMAC_SHA1_80` and `_32`,
+   `WithInsecureSkipVerify(true)` and, as server,
+   `WithClientAuth(RequireAnyClientCert)`. The peer certificate is
+   self-signed by design and there is no PKI to verify a chain against; the
+   binding to the session is the `a=fingerprint` line. When the leg was
+   given it (`WebRTCLegConfig.RemoteFingerprintHash`/`Value`, which the edge
+   plane always sets from the offer), `WithVerifyPeerCertificate` checks the
+   leaf certificate against it during the handshake, and a mismatch fails
+   the handshake with `ErrFingerprintMismatch` — before any key is derived
+   or any packet relayed. Because pion calls that hook only when the peer
+   sent a certificate, the leaf the handshake ended with is re-matched from
+   `ConnectionState` before keying as well, in either DTLS role.
 6. `HandshakeContext(ctx)` is run **explicitly** under the establishment
    deadline, so a peer that opens the flow and then goes quiet cannot pin the
    port past the timeout.
@@ -2041,12 +2122,20 @@ closed before it was established is retroactively stamped with
 FreeSBC the DTLS **server**, advertised as `a=setup:passive` — the
 conventional pick for a gateway with a stable address (RFC 5763 §5).
 
-**Fingerprint verification** (`VerifyFingerprint`) is the only binding
-between the signalling identity and the media path. It requires the leg to be
-ready, accepts **only `sha-256`**, hashes the peer's leaf certificate, and
-compares case-insensitively. The edge plane calls it after
-`WebRTCSession.Start` and tears the session down on mismatch, logging the
-failure without echoing either fingerprint.
+**Fingerprint verification** is the only binding between the signalling
+identity and the media path, and **media is gated on it**: the leg's
+`verified` flag is set when the in-handshake check passed or when a later
+`VerifyFingerprint` succeeds, and both relay directions of `WebRTCSession`
+drop every packet (without refreshing the watchdog) while it is false. A leg
+built without a signalled fingerprint therefore establishes but carries no
+media until `VerifyFingerprint` succeeds. `VerifyFingerprint` requires the
+leg to be ready, accepts `sha-256`, `sha-384` and `sha-512` (the set
+`internal/sip/sdp` parses), hashes the peer's leaf certificate and compares
+case-insensitively; a mismatch clears `verified`. The edge plane passes the
+offer's fingerprint into the leg config, so a mismatch surfaces as
+`WebRTCSession.Start` failing with `ErrFingerprintMismatch`; it still calls
+`VerifyFingerprint` after `Start` as a re-check, and tears the session down
+on either failure, logging neither fingerprint.
 
 **ICE credentials** are 3 random bytes → 4 base64url characters (ufrag) and
 18 bytes → 24 characters (pwd). They are secrets: anyone who learns the pwd
@@ -2061,7 +2150,7 @@ and RTCP are separated by the RFC 5761 payload-type range, not by socket.
 `Close` closes the private pair, releases its port, and closes the leg. Both
 the WebRTC relay and the demultiplexer read into `maxPacketSize` = **1508**
 bytes (`mux.go:54`) — the MTU plus room for an SRTP tag on an already-full
-packet — where the plain `Session` relay reads 1500.
+packet — as does the plain `Session` relay (§8.3).
 
 **rtcp-mux is not supported on the plain `Session` path.** There is no muxing
 logic; a peer that muxed RTCP onto the RTP port would have its RTCP fed into
@@ -2092,7 +2181,7 @@ all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:554-560`) — with a
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with a
 length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
 accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.
@@ -2189,14 +2278,16 @@ only inside `dialog.end()`.
 
 ### 8.10 Statistics
 
-`media.Stats` carries packets and bytes, rx and tx, for the public (side A)
-and private (side B) legs. **RTCP is relayed but never counted.** There is
+`media.Stats` carries packets and bytes, rx and tx, per side: `Stats.A` and
+`Stats.B` (`Side`, `Total`). The orientation is the plane's: on the edge, A is
+the client-facing (public) leg and B the FreeSWITCH-facing (private) one; on
+the trunk, A is the leg the call arrived on and B the one it was placed on. **RTCP is relayed but never counted.** There is
 no drop counter, no auth-failure counter and no RTCP counter. Rx counts the
 length after inbound decryption; Tx counts the bytes actually written after
 outbound encryption, and **only when the `WriteToUDP` itself succeeded**
-(`relay.go:91-93`), so the two differ by the SRTP overhead on a mixed session.
+(`relay.go:97-101`), so the two differ by the SRTP overhead on a mixed session.
 On a `WebRTCSession` the private-side rx is the raw plaintext length read off
-the socket before `protectRTP` (`webrtcsession.go:242`), so the public-side tx
+the socket before `protectRTPInto` (`webrtcsession.go:279`), so the public-side tx
 exceeds it by the SRTP overhead.
 
 ---
@@ -2337,8 +2428,9 @@ sequenceDiagram
     B->>H: ACK (forwarded statelessly to FS)
     Note over H: commit -> dialog.confirm -> media watcher goroutine started
     B->>E: ICE connectivity checks (pion agent, Lite/controlled)
-    B->>E: DTLS handshake -> ExportKeyingMaterial -> SRTP contexts
-    E->>E: leg.VerifyFingerprint(offer fp), mismatch -> sess.Close()
+    B->>E: DTLS handshake, peer cert checked against the offer fp in VerifyPeerCertificate
+    Note over E: mismatch -> handshake fails, ErrFingerprintMismatch, sess.Close(), no keys, no relay
+    E->>E: ExportKeyingMaterial -> SRTP contexts, leg verified, relay starts
     B-)M: SRTP -> decrypted -> plain RTP to FS
     FS-)M: plain RTP -> encrypted -> SRTP to B
 ```
@@ -2483,8 +2575,8 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **edge dialog** (`*edge.dialog`) | `dialogTable` | `begin(callID, callerTag, callerPlane)` | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end accepted, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
 | **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **edge upstream / PSTN cooldown** | two `cooldownTable`s on `Server` | `edge.New` (always allocated) | absent ⇄ `until[name]` | keyed by **name**, never address; all-cooling falls back to dialling everything | handler goroutines only | `Recover` on any final (upstream) or success (PSTN); lazy expiry otherwise | `cooldownTable.mu` |
-| **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx atomic.Int64`, per-latch `mu` |
-| **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
+| **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx [2]atomic.Int64` (one per sending side), per-latch `mu` |
+| **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
 | **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
@@ -2539,7 +2631,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `edge.dialogTable.mu` | `byCallID` **and every mutable field of every dialog** |
 | `edge.cooldownTable.mu` ×2 | the `until` map |
 | `edge.privateSources.mu` (RWMutex) | the source map |
-| `media.PlanePool.mu` | `inUse` and `cursor`, held across the bind sweep |
+| `media.PlanePool.mu` | `inUse` and `cursor`; held to reserve a candidate, never across a bind |
 | `media.latch.mu` (×4 per session) | mode, expected, remote, latched |
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
@@ -2556,7 +2648,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 - `media.Session.srtpIn/srtpOut` are `atomic.Pointer` arrays because the
   forward loops read them per packet while `SetSRTP` may legitimately store
   again after `Start`.
-- `lastRx atomic.Int64` is the only channel between the relay loops and the
+- `lastRx [2]atomic.Int64` (one per sending side) is the only channel between the relay loops and the
   watchdog.
 - `done` channels (`Session`, `WebRTCSession`) are closed exactly once by
   `Close` and are both the watchdog's exit signal and the signalling plane's
@@ -2982,8 +3074,12 @@ the call stays up. Latching is fail-closed in strict mode until the
 signalling plane arms it, and nothing moves a latch after acceptance short of
 an authorised `Relatch`. The RTP-silence watchdog refreshes its liveness
 timestamp **only after** a packet is proven genuine. The WebRTC leg verifies
-the peer certificate against the signalled `a=fingerprint` and tears the
-session down on mismatch, logging neither fingerprint. The RFC 7983
+the peer certificate against the signalled `a=fingerprint` **inside the DTLS
+handshake** (`VerifyPeerCertificate`), so a mismatched peer never reaches
+`legEstablished`, gets no SRTP keys and has no media relayed; the relay
+additionally refuses to carry media for any leg whose fingerprint has not
+been verified. The session is torn down on mismatch, logging neither
+fingerprint. The RFC 7983
 demultiplexer drops everything that is not DTLS or SRTP, so a single hostile
 datagram cannot tear down a live media path. Keys are never copied across
 legs.

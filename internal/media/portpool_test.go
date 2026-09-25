@@ -13,7 +13,8 @@ import (
 // testPool builds a pool over [minPort, maxPort] bound to every interface.
 func testPool(minPort, maxPort int) *PlanePool {
 	return NewPlanePool("test", func() PlaneParams {
-		return PlaneParams{MinPort: uint16(minPort), MaxPort: uint16(maxPort), Timeout: 5 * time.Minute}
+		// The suites run every peer on loopback: a lab, so allow it.
+		return PlaneParams{MinPort: uint16(minPort), MaxPort: uint16(maxPort), Timeout: 5 * time.Minute, AllowLoopback: true}
 	})
 }
 
