@@ -351,6 +351,23 @@ func (c *Config) PrivateSIPAdvertisedPort() int {
 // the operator wrote something in the corresponding section, so a
 // trunk-only config is untouched.
 func proxyWithDefaults(c *Config) {
+	upstreamDefaults(c)
+	pstnDefaults(&c.SIP.Pstn)
+	listenerDefaults(c)
+	// Each media plane binds its own network plane's address unless told
+	// otherwise, so `bind_ip` need only be written once per side.
+	if c.RTP.Public.configured() && c.RTP.Public.BindIP == "" {
+		c.RTP.Public.BindIP = c.Network.Public.BindIP
+	}
+	if c.RTP.Private.configured() && c.RTP.Private.BindIP == "" {
+		c.RTP.Private.BindIP = c.Network.Private.BindIP
+	}
+	if c.WebRTC.Enabled && c.WebRTC.ICEMode == "" {
+		c.WebRTC.ICEMode = "lite"
+	}
+}
+
+func upstreamDefaults(c *Config) {
 	if c.SIP.Upstream.Address != "" && c.SIP.Upstream.Transport == "" {
 		c.SIP.Upstream.Transport = "udp"
 	}
@@ -366,8 +383,8 @@ func proxyWithDefaults(c *Config) {
 			ups.Cooldown = Duration(30 * time.Second)
 		}
 		for _, n := range ups.Nodes {
-			// A nil entry (an empty `fs-1:` block) is a config error
-			// validation names; do not panic on the way there.
+			// Parse rejects null entries before defaults run; the nil
+			// check keeps this safe on a Config built by hand.
 			if n != nil && n.Transport == "" {
 				n.Transport = "udp"
 			}
@@ -376,28 +393,37 @@ func proxyWithDefaults(c *Config) {
 	if len(ups.Nodes) > 0 && ups.Algorithm == "" {
 		ups.Algorithm = "hash-user"
 	}
-	if c.SIP.Pstn.Address != "" && c.SIP.Pstn.Transport == "" {
-		c.SIP.Pstn.Transport = "udp"
+}
+
+func pstnDefaults(pstn *PstnConfig) {
+	if pstn.Address != "" && pstn.Transport == "" {
+		pstn.Transport = "udp"
 	}
 	// The pstn failure-budget defaults mirror peer_cooldown's (schema.go):
 	// they only apply when the section was actually written — a config
 	// without sip.pstn keeps a fully zero PstnConfig so "is the trunk
 	// configured" stays decidable — and zero still means "operator did not
 	// say", which is why validation only has to reject negatives.
-	pstn := &c.SIP.Pstn
-	if pstn.configured() {
-		if pstn.AttemptTimeout == 0 {
-			pstn.AttemptTimeout = Duration(32 * time.Second)
-		}
-		if pstn.Cooldown == 0 {
-			pstn.Cooldown = Duration(30 * time.Second)
-		}
-		for _, g := range pstn.Gateways {
-			if g.Transport == "" {
-				g.Transport = "udp"
-			}
+	if !pstn.configured() {
+		return
+	}
+	if pstn.AttemptTimeout == 0 {
+		pstn.AttemptTimeout = Duration(32 * time.Second)
+	}
+	if pstn.Cooldown == 0 {
+		pstn.Cooldown = Duration(30 * time.Second)
+	}
+	for _, g := range pstn.Gateways {
+		if g != nil && g.Transport == "" {
+			g.Transport = "udp"
 		}
 	}
+}
+
+// listenerDefaults fills the SIP binds. Every enabled public listener and,
+// while the proxy is on, the private socket always leave here with a bind,
+// which is why validation has no "bind required" check (audit P2-CFG-010).
+func listenerDefaults(c *Config) {
 	// A public listener written without an explicit bind gets the public
 	// plane's bind address and the transport's conventional port, so the
 	// minimal config is `sip.public.udp.enabled: true` plus a network block.
@@ -421,16 +447,5 @@ func proxyWithDefaults(c *Config) {
 			host = "0.0.0.0"
 		}
 		c.SIP.Private.Bind = HostPort{Host: host, Port: 5060}
-	}
-	// Each media plane binds its own network plane's address unless told
-	// otherwise, so `bind_ip` need only be written once per side.
-	if c.RTP.Public.configured() && c.RTP.Public.BindIP == "" {
-		c.RTP.Public.BindIP = c.Network.Public.BindIP
-	}
-	if c.RTP.Private.configured() && c.RTP.Private.BindIP == "" {
-		c.RTP.Private.BindIP = c.Network.Private.BindIP
-	}
-	if c.WebRTC.Enabled && c.WebRTC.ICEMode == "" {
-		c.WebRTC.ICEMode = "lite"
 	}
 }

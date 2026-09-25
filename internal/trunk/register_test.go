@@ -639,7 +639,7 @@ func registrarConfigYAML(port int, user, pass string, registerCarrier bool) stri
 	return fmt.Sprintf(`
 listen:
   sip: [udp://127.0.0.1:11999]
-  media: { port_range: 11900-11901, public_ip: 127.0.0.1 }
+  media: { port_range: 11900-11903, public_ip: 127.0.0.1 }
 peers:
   carrier:
     address: 127.0.0.1:%d
@@ -769,7 +769,7 @@ func registrarConfigYAMLPublicIP(port int, user, pass, publicIP string, register
 	return fmt.Sprintf(`
 listen:
   sip: [udp://127.0.0.1:11999]
-  media: { port_range: 11900-11901, public_ip: %s }
+  media: { port_range: 11900-11903, public_ip: %s }
 peers:
   carrier:
     address: 127.0.0.1:%d
@@ -963,7 +963,7 @@ func TestServerShutdownDeliversUnregisterBeforeListenerCloses(t *testing.T) {
 	cfgYAML := `
 listen:
   sip: [udp://127.0.0.1:11341]
-  media: { port_range: 11902-11903, public_ip: 127.0.0.1 }
+  media: { port_range: 11904-11907, public_ip: 127.0.0.1 }
 peers:
   carrier:
     address: 127.0.0.1:11340

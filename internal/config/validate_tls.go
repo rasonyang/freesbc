@@ -13,7 +13,7 @@ import (
 // handshake's ServerName, or for an IP literal the certificate's IP SAN —
 // and a port never reaches that choice, so such peers could not be told
 // apart (P2-TRK-016).
-func (c *Config) validateTLSPeerHosts(fail func(string, ...any)) {
+func (c *Config) validateTLSPeerHosts(fail failFunc) {
 	names := make([]string, 0, len(c.Peers))
 	for name, p := range c.Peers {
 		if p != nil && p.Transport == "tls" {

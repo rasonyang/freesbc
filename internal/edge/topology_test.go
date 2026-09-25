@@ -21,7 +21,7 @@ network:
     bind_ip: 10.77.0.2
 sip:
   public:
-    udp: {enabled: true, bind: "0.0.0.0:16060"}
+    udp: {enabled: true, bind: "203.0.113.7:16060"}
     ws:  {enabled: true, bind: "0.0.0.0:18080"}
   private:
     bind: "10.77.0.2:16060"
@@ -174,13 +174,28 @@ func TestTopologyFromUpstream(t *testing.T) {
 	}
 }
 
-// The upstream must be a literal: resolving a name for the private leg
-// would let a poisoned resolver redirect it.
-func TestBuildTopologyRejectsHostname(t *testing.T) {
-	cfg, err := config.Parse([]byte(strings.Replace(topoYAML, "address: 10.77.0.10:5060", "address: fs.example.com:5060", 1)))
+// parseThenBreak parses a valid config, checks that config validation
+// already rejects the broken form (so `check` catches it), then applies the
+// same break to the parsed snapshot so buildTopology's own guard is still
+// exercised: it is the defence behind validation.
+func parseThenBreak(t *testing.T, valid, from, to string, breakCfg func(*config.Config)) *config.Config {
+	t.Helper()
+	if _, err := config.Parse([]byte(strings.Replace(valid, from, to, 1))); err == nil {
+		t.Errorf("config validation accepted %q", to)
+	}
+	cfg, err := config.Parse([]byte(valid))
 	if err != nil {
 		t.Fatal(err)
 	}
+	breakCfg(cfg)
+	return cfg
+}
+
+// The upstream must be a literal: resolving a name for the private leg
+// would let a poisoned resolver redirect it.
+func TestBuildTopologyRejectsHostname(t *testing.T) {
+	cfg := parseThenBreak(t, topoYAML, "address: 10.77.0.10:5060", "address: fs.example.com:5060",
+		func(c *config.Config) { c.SIP.Upstream.Address = "fs.example.com:5060" })
 	if _, err := buildTopology(cfg); err == nil {
 		t.Fatal("a hostname upstream was accepted")
 	}
@@ -236,12 +251,9 @@ func TestTopologyUpstreamMulti(t *testing.T) {
 
 // Every node address is resolved like the alias: no DNS.
 func TestBuildTopologyRejectsUpstreamNodeHostname(t *testing.T) {
-	cfg, err := config.Parse([]byte(strings.Replace(topoYAML,
-		"  upstream:\n    address: 10.77.0.10:5060\n",
-		strings.Replace(multiUpstreamBlock, "10.77.0.11:5060", "fs-b.example.com:5060", 1), 1)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	valid := strings.Replace(topoYAML, "  upstream:\n    address: 10.77.0.10:5060\n", multiUpstreamBlock, 1)
+	cfg := parseThenBreak(t, valid, "10.77.0.11:5060", "fs-b.example.com:5060",
+		func(c *config.Config) { c.SIP.Upstreams.Nodes["fs-b"].Address = "fs-b.example.com:5060" })
 	if _, err := buildTopology(cfg); err == nil ||
 		!strings.Contains(err.Error(), "sip.upstreams.nodes.fs-b must be a literal IP:port, got fs-b.example.com") {
 		t.Fatalf("want the per-node literal-IP error, got %v", err)
@@ -506,49 +518,53 @@ func TestTopologyPSTNMulti(t *testing.T) {
 
 // Every gateway address is resolved like the upstream: no DNS. A hostname
 // would make the carrier leg resolve per dial — or, if the name is gone,
-// silently fail every bridged call. (All rows still PASS config validation
-// — a host:port name is a legal config shape — and fail only here, at
-// topology build.)
+// silently fail every bridged call. Config validation rejects every row
+// too, so `check` agrees with `run` (audit P2-CFG-004); the break is also
+// applied to a parsed snapshot to keep this guard covered.
 func TestBuildTopologyRejectsPSTNHostnames(t *testing.T) {
+	matchHost := func(c *config.Config) { c.SIP.Pstn.Match.Host = "pstn.example.com" }
 	tests := []struct {
 		name  string
 		block string // pstn section to start from (alias or multi shape)
-		// from/to break one field of the otherwise valid block.
+		// from/to break one field of the otherwise valid block; breakCfg
+		// applies the same break to a parsed config.
 		from, to, want string
+		breakCfg       func(*config.Config)
 	}{
 		{
 			"alias address",
 			pstnTopoBlock,
 			"address: 223.76.90.4:16060", "address: gw.example.com:16060",
 			"sip.pstn.address must be a literal IP:port, got gw.example.com",
+			func(c *config.Config) { c.SIP.Pstn.Address = "gw.example.com:16060" },
 		},
 		{
 			"alias match",
 			pstnTopoBlock,
 			"match: 10.77.0.2:16061", "match: pstn.example.com:16061",
 			"sip.pstn.match must be a literal IP, got pstn.example.com",
+			matchHost,
 		},
 		{
 			"multi gateway address names a host",
 			pstnMultiTopoBlock,
 			"address: 223.76.90.4:16060\n", "address: gw-mobile.example.com:16060\n",
 			"sip.pstn.gateways.gw-mobile must be a literal IP:port, got gw-mobile.example.com",
+			func(c *config.Config) { c.SIP.Pstn.Gateways["gw-mobile"].Address = "gw-mobile.example.com:16060" },
 		},
 		{
 			"multi match",
 			pstnMultiTopoBlock,
 			"match: 10.77.0.2:16061\n", "match: pstn.example.com:16061\n",
 			"sip.pstn.match must be a literal IP, got pstn.example.com",
+			matchHost,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			yaml := strings.Replace(topoYAML, "    address: 10.77.0.10:5060\n",
 				"    address: 10.77.0.10:5060\n"+tt.block, 1)
-			cfg, err := config.Parse([]byte(strings.Replace(yaml, tt.from, tt.to, 1)))
-			if err != nil {
-				t.Fatal(err)
-			}
+			cfg := parseThenBreak(t, yaml, tt.from, tt.to, tt.breakCfg)
 			if _, err := buildTopology(cfg); err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("want error containing %q, got %v", tt.want, err)
 			}
