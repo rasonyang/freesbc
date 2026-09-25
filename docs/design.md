@@ -1768,7 +1768,7 @@ the caller's one final: `pumpResult.finalised` stops any second one.
 
 | Operation | Where | Notes |
 |---|---|---|
-| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer. SRTCP is **not** relayed uninterpreted: the RTCP forward loop unprotects and re-protects with the same context as SRTP (`relay.go:60-89`), so it belongs in the *transformation* row; only its **contents** are never inspected |
+| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer. SRTCP is **not** relayed uninterpreted: the RTCP forward loop unprotects and re-protects with the same context as SRTP (`relay.go:67-95`), so it belongs in the *transformation* row; only its **contents** are never inspected |
 | **Termination** — a protocol endpoint FreeSBC itself terminates | SRTP/SRTCP (SDES and DTLS-keyed), the DTLS handshake, the ICE-Lite agent | the far side's cryptographic association ends at FreeSBC |
 | **Transformation** — re-keying and rewriting | SRTP↔RTP interworking and SRTP↔SRTP re-keying (decrypt with the peer's key, re-encrypt with ours); SDP rewriting (trunk: in-place edit; edge: construction from scratch) | proven by `TestRelaySRTPToSRTPRekeyed`: the packet delivered to B decrypts with key B and **must not** decrypt with key A |
 | **Transcoding** | **none, anywhere** | there is no codec conversion in `internal/media`; payload-type numbers must survive end to end, which is why `sdp.ErrRenumbered` rejects a renumbering answer |
@@ -1837,7 +1837,7 @@ stateDiagram-v2
 Transitions: `Start` (`relay.go:19-22`) is a single
 `CompareAndSwap(sessAllocated, sessRunning)` and returns whether *this* call
 started it, so the relay starts at most once whichever path wins; `Close`
-(`session.go:325-336`) is a single `Swap(sessClosed)` that closes both pairs,
+(`session.go:374-385`) is a single `Swap(sessClosed)` that closes both pairs,
 releases both port reservations and closes `done`, making it idempotent and
 safe from any goroutine. Transitions only ever move forward.
 
@@ -1849,14 +1849,22 @@ so an INVITE abandoned before the answer holds its ports until someone calls
 The per-packet loop, per direction and kind:
 
 ```
-read from the `from` side's socket        (buffer 1500 bytes)
+read from the `from` side's socket        (up to maxPacketSize = 1508 bytes)
+larger than maxPacketSize? -> drop        // never forward a truncation
 inLatch.accept(src)?  no -> drop
-srtpIn[from] != nil   -> unprotect; failure -> drop
-lastRx.Store(now)                          // T-22: only after proof
+srtpIn[from] != nil   -> unprotect in place; failure -> drop
+lastRx[from].Store(now)                    // T-22: only after proof
 counters.recordRx(from, rtpKind, len)
-srtpOut[to] != nil    -> protect; failure -> drop
+srtpOut[to] != nil    -> protect in place; failure -> drop
 outLatch.target() != nil -> write from the `to` side's own socket
 ```
+
+Every relay loop (this one and the two `WebRTCSession` directions) reads
+into one buffer of `relayBufSize` = `maxPacketSize + 1 + srtpMaxOverhead`
+bytes: one byte more than the largest datagram relayed, so an oversize one
+is detected and dropped rather than forwarded cut short (`ReadFromUDP`
+truncates silently), and room for the SRTP overhead so both transforms run
+in place. The per-packet path allocates nothing.
 
 Packets are sent **from the `to` side's own socket**, so the far remote sees
 the port it already talks to. A `nil` destination (the far side has not
@@ -1946,10 +1954,18 @@ it sends. The edge plane seeds both sides from the signalled address.
 ### 8.5 Silence watchdog
 
 `watchdog(timeout, &lastRx, done, Close)` ticks at `timeout/4`, floored at
-**10 ms**, and calls `Close` when `time.Since(lastRx) > timeout`. `timeout`
-is `listen.media.rtp_timeout`, default **5 minutes**, taken from the pool's
-params at allocation (from **pool A** even when the two sides come from
-different pools).
+**10 ms**. `lastRx` holds **one timestamp per sending side**, and the
+watchdog calls `Close` when **either** is older than `timeout`: a call is
+reclaimed when one end has gone silent, even while the other keeps
+streaming (FreeSWITCH playing music on hold to a phone that vanished with
+its BYE lost). RTP and RTCP both count, so a receive-only side that sends
+RTCP receiver reports (RFC 3550; RFC 3264 §5.1 keeps RTCP flowing on hold)
+stays alive. A held endpoint that sends **neither** RTP nor RTCP for
+`rtp_timeout` is reclaimed; raise `rtp_timeout` if such endpoints hold for
+longer. `timeout` is `listen.media.rtp_timeout`, default **5 minutes**,
+taken from the pool's params at allocation (from **pool A** even when the
+two sides come from different pools). A `WebRTCSession` tracks the browser
+(side A) and FreeSWITCH (side B) the same way.
 
 `lastRx` is refreshed **only after a packet is proven genuine**: latch
 acceptance for a plaintext leg, and successful SRTP authentication where an
@@ -1970,7 +1986,22 @@ answers 408) instead.
 `SRTPContext` wraps pion's lockless `*srtp.Context` behind a mutex, because
 the RTP-forward and RTCP-forward goroutines of one direction share it.
 Replay protection is explicitly enabled — pion's default is none — with
-windows **64** for SRTP and **128** for SRTCP, per context.
+windows **64** for SRTP and **128** for SRTCP, per context. It is pion's own
+sliding-window detector (`replaydetector.New`, what `SRTPReplayProtection`
+installs), plugged in through `SRTPReplayDetectorFactory` behind
+`tokenReplayDetector`, which uses the detector's `CheckSeq`/`Accept` token
+API instead of `Check`: `Check` returns a fresh closure per packet.
+
+**No per-packet allocation.** pion is always given a header to reuse and a
+destination buffer. The relays call the `…Into(dst, pkt)` variants on their
+own read buffer, so protect and unprotect run in place. `protectRTP`,
+`unprotectRTP` and the RTCP pair leave their input untouched and return a
+slice of a per-context 16 KiB slab that is only ever appended to, so a
+returned slice is never overwritten and one allocation serves about 80
+packets. **A plaintext RTP packet carrying a Cryptex (RFC 9335)
+header-extension profile, `0xC0DE` or `0xC2DE`, is refused by `protectRTP`**:
+those profiles mean "encrypted header extension" to the receiving side, and
+Cryptex is not negotiated, so the SRTP could never be unprotected.
 
 Two suites exist: `AES_CM_128_HMAC_SHA1_80` and `AES_CM_128_HMAC_SHA1_32`.
 `SDESKeyLen = 30` (a 16-byte master key concatenated with a 14-byte master
@@ -1983,7 +2014,7 @@ decrypts what is received *from* that side, `outbound` encrypts what is sent
 failover target's answer replacing an earlier target's early-media contexts
 needs. A plaintext outcome always installs `(nil, nil)` so a previous
 target's contexts cannot linger. On a **closed** session it is a silent no-op
-(`session.go:312-318`): keys are never installed on a relay that no longer
+(`session.go:361-367`): keys are never installed on a relay that no longer
 exists.
 
 On any protect/unprotect failure the packet is dropped with a bare
@@ -2110,7 +2141,7 @@ and RTCP are separated by the RFC 5761 payload-type range, not by socket.
 `Close` closes the private pair, releases its port, and closes the leg. Both
 the WebRTC relay and the demultiplexer read into `maxPacketSize` = **1508**
 bytes (`mux.go:54`) — the MTU plus room for an SRTP tag on an already-full
-packet — where the plain `Session` relay reads 1500.
+packet — as does the plain `Session` relay (§8.3).
 
 **rtcp-mux is not supported on the plain `Session` path.** There is no muxing
 logic; a peer that muxed RTCP onto the RTP port would have its RTCP fed into
@@ -2243,9 +2274,9 @@ and private (side B) legs. **RTCP is relayed but never counted.** There is
 no drop counter, no auth-failure counter and no RTCP counter. Rx counts the
 length after inbound decryption; Tx counts the bytes actually written after
 outbound encryption, and **only when the `WriteToUDP` itself succeeded**
-(`relay.go:91-93`), so the two differ by the SRTP overhead on a mixed session.
+(`relay.go:97-101`), so the two differ by the SRTP overhead on a mixed session.
 On a `WebRTCSession` the private-side rx is the raw plaintext length read off
-the socket before `protectRTP` (`webrtcsession.go:269`), so the public-side tx
+the socket before `protectRTPInto` (`webrtcsession.go:279`), so the public-side tx
 exceeds it by the SRTP overhead.
 
 ---
@@ -2533,7 +2564,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **edge dialog** (`*edge.dialog`) | `dialogTable` | `begin(callID, callerTag, callerPlane)` | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end accepted, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
 | **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **edge upstream / PSTN cooldown** | two `cooldownTable`s on `Server` | `edge.New` (always allocated) | absent ⇄ `until[name]` | keyed by **name**, never address; all-cooling falls back to dialling everything | handler goroutines only | `Recover` on any final (upstream) or success (PSTN); lazy expiry otherwise | `cooldownTable.mu` |
-| **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx atomic.Int64`, per-latch `mu` |
+| **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx [2]atomic.Int64` (one per sending side), per-latch `mu` |
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
@@ -2606,7 +2637,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 - `media.Session.srtpIn/srtpOut` are `atomic.Pointer` arrays because the
   forward loops read them per packet while `SetSRTP` may legitimately store
   again after `Start`.
-- `lastRx atomic.Int64` is the only channel between the relay loops and the
+- `lastRx [2]atomic.Int64` (one per sending side) is the only channel between the relay loops and the
   watchdog.
 - `done` channels (`Session`, `WebRTCSession`) are closed exactly once by
   `Close` and are both the watchdog's exit signal and the signalling plane's

@@ -355,3 +355,95 @@ func TestAuditMED003LoopbackSeedFollowsPoolPolicy(t *testing.T) {
 		t.Error("a unicast public address was not seeded")
 	}
 }
+
+// audit: P1-012
+//
+// The Session relay read into a 1500-byte buffer while the WebRTC path
+// uses maxPacketSize (1508), and ReadFromUDP silently truncates: a larger
+// datagram was forwarded cut short. Now every relay reads up to
+// maxPacketSize and drops anything larger rather than forward a
+// truncation.
+func TestAuditP1012RelayBufferMatchesMaxPacketSize(t *testing.T) {
+	pool := NewPlanePool("audit", func() PlaneParams {
+		return PlaneParams{
+			MinPort: 24920, MaxPort: 24939, BindIP: netip.MustParseAddr("127.0.0.1"),
+			Timeout: 30 * time.Second, AllowLoopback: true,
+		}
+	})
+	s, err := pool.Allocate(SessionConfig{Latch: [2]LatchMode{LatchLoose, LatchLoose}, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a := auditUDP(t, "127.0.0.1")
+	b := auditUDP(t, "127.0.0.1")
+	s.SetRemote(SideB, auditAddrPort(b))
+	s.Start()
+	pubA := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: s.RTPPort(SideA)}
+	buf := make([]byte, 4096)
+	relay := func(size int) (int, bool) {
+		pkt := make([]byte, size)
+		for i := range pkt {
+			pkt[i] = byte(i)
+		}
+		if _, err := a.WriteToUDP(pkt, pubA); err != nil {
+			t.Fatal(err)
+		}
+		_ = b.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		n, _, err := b.ReadFromUDP(buf)
+		if err != nil {
+			return 0, false
+		}
+		return n, string(buf[:n]) == string(pkt[:n])
+	}
+	if n, ok := relay(maxPacketSize); !ok || n != maxPacketSize {
+		t.Errorf("P1-012: a %d-byte datagram arrived as %d bytes (intact prefix %v)", maxPacketSize, n, ok)
+	}
+	if n, ok := relay(maxPacketSize + 200); ok {
+		t.Errorf("P1-012: an oversize %d-byte datagram was forwarded as %d bytes; it must be dropped, not truncated", maxPacketSize+200, n)
+	}
+}
+
+// audit: P2-MED-007
+//
+// The relays protect and unprotect in place in their own read buffers,
+// which have room for the SRTP overhead: no allocation at all, not even
+// the slab the generic API draws from.
+func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
+	key := NewSDESKey()
+	send, _ := NewSRTPContext(SuiteAES128CM80, key)
+	recv, _ := NewSRTPContext(SuiteAES128CM80, key)
+	// Relay-style buffers: room for the SRTP overhead past the packet.
+	// AllocsPerRun makes one extra warm-up call, hence runs+1.
+	const runs = 1000
+	pkts := make([][]byte, runs+1)
+	for i := range pkts {
+		p := make([]byte, 0, relayBufSize)
+		pkts[i] = append(p, rtpPacket(0, uint16(i+1), 160)...)
+	}
+	// One transform per measured run, as TestAuditMED007SRTPAllocsPerPacket
+	// does: under -race, sync.Pool (pion's XOR scratch) randomly drops
+	// items, which shows up as a fraction of an allocation per call.
+	i := 0
+	protectAllocs := testing.AllocsPerRun(runs, func() {
+		out, ok := send.protectRTPInto(pkts[i], pkts[i])
+		if !ok {
+			panic("protect")
+		}
+		pkts[i] = out
+		i++
+	})
+	j := 0
+	unprotectAllocs := testing.AllocsPerRun(runs, func() {
+		if _, ok := recv.unprotectRTPInto(pkts[j], pkts[j]); !ok {
+			panic("unprotect")
+		}
+		j++
+	})
+	if protectAllocs > 0 || unprotectAllocs > 0 {
+		t.Errorf("P2-MED-007: the in-place relay path allocates per packet: protect=%.0f unprotect=%.0f", protectAllocs, unprotectAllocs)
+	}
+	if send.slab != nil || recv.slab != nil {
+		t.Error("P2-MED-007: the in-place path drew on the slab")
+	}
+}

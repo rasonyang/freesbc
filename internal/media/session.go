@@ -210,7 +210,7 @@ type Session struct {
 	srtpIn  [2]atomic.Pointer[SRTPContext] // decrypt packets received FROM this side (nil = plaintext)
 	srtpOut [2]atomic.Pointer[SRTPContext] // encrypt packets sent TO this side (nil = plaintext)
 
-	lastRx   atomic.Int64 // unix nanos of the last accepted packet
+	lastRx   [2]atomic.Int64 // per sending side: unix nanos of its last genuine packet
 	counters counters
 	done     chan struct{}
 
