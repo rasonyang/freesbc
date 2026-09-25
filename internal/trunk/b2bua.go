@@ -1185,6 +1185,9 @@ func (s *Server) dialAttempt(c *call, cfg *config.Config, target Target, mediaIP
 		// classifies the attempt as a timeout, which is the same outcome
 		// an in-band error would have produced.
 		defer s.recoverBWaiter(target.Name)
+		// A panic must not leave the fork watch undecided (and so never
+		// expired); on the normal path decide has already run.
+		defer fw.decide("")
 		err := bLeg.WaitAnswer(attemptCtx, sipgo.AnswerOptions{
 			OnResponse: func(res *sip.Response) (err error) {
 				// Once the main path has abandoned this attempt (ring

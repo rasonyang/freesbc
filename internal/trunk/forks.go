@@ -116,9 +116,14 @@ func (fw *forkWatch) observe(res *sip.Response) {
 
 // decide records the To-tag of the 2xx the attempt itself acted on ("" when
 // it acted on none) and tears down every other fork seen so far. The watch
-// then expires after 64·T1.
+// then expires after 64·T1. Only the first call counts, so a deferred
+// decide("") can back up the normal one.
 func (fw *forkWatch) decide(winner string) {
 	fw.mu.Lock()
+	if fw.decided {
+		fw.mu.Unlock()
+		return
+	}
 	fw.decided = true
 	fw.winner = winner
 	pending := fw.pending
