@@ -20,7 +20,13 @@ func newMediaPools(store *config.Store) (public, private *media.PlanePool) {
 			cfg := store.Current()
 			p := get(cfg)
 			r := p.Range()
-			bind := fsip.ParseBindIP(p.BindIP)
+			bind, err := fsip.ParseBindIP(p.BindIP)
+			if err != nil {
+				// Unreachable for a validated config. Fail closed: an
+				// empty range allocates nothing (ErrPortsExhausted, a
+				// 503) instead of binding every interface.
+				return media.PlaneParams{MinPort: 1, MaxPort: 0}
+			}
 			return media.PlaneParams{
 				MinPort: r.Min,
 				MaxPort: r.Max,

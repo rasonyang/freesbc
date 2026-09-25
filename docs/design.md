@@ -1137,10 +1137,17 @@ inbound-only, so its outbound path is the client's own pooled connection and
 `laddr` stays zero. `side.via(branch)` adds an empty `rport` parameter on
 **UDP only** (RFC 3581). `side.recordRoute()` always carries `lr`.
 
-**Read filter** (`fsip.ReadFilter(64 KiB, accept)`): anything larger than
-**64 KiB** is dropped before the parser. The `accept` policy captures the
-private bind address **once at `Run` time**; a read whose local address is
-not that bind is accepted unconditionally (the public plane has no source
+**Read filter** (`fsip.ReadFilter(fsip.MaxReadSize, accept)`): a read larger
+than **24 KiB** is dropped before the parser. The cap sits below sipgo's
+32 KiB read buffer (`TransportBufferReadSize`), which bounds every read, so it
+can fire: an oversized datagram or WebSocket frame arrives truncated to 32 KiB
+and is dropped here rather than parsed as a partial message (a cap at or above
+the buffer, as the earlier 64 KiB one was, never fires). The `accept` policy
+captures the private bind address **once at `Run` time**. A read is on the
+private listener only when its transport is UDP **and** its local address is
+that bind (`fsip.SameListener`; a wildcard bind matches any host on its port);
+a WS/WSS read on the same port number is a public read. A read that is not on
+the private listener is accepted unconditionally (the public plane has no source
 allowlist — phones and browsers have no fixed address), and a read that *is*
 on the private bind must come from an upstream IP, else it is dropped. On
 accept it records the exact `addr:port` in `privateSources`.
@@ -1194,7 +1201,8 @@ no DNS anywhere in the edge plane.
 
 `isSelf(uri)` compares host and port only, ignoring parameters, defaulting a
 missing port to **5060**; `isSelfVia` defaults instead to
-`fsip.DefaultPort(transport)`.
+`fsip.DefaultPort(transport)`: 5060 for UDP/TCP, 5061 for TLS, and the
+RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 
 ### 7.3 Method dispatch
 
@@ -2332,7 +2340,7 @@ sequenceDiagram
     participant FS as FreeSWITCH (upstream node)
 
     P->>G: REGISTER sip:example.com (To: 1001@example.com, Contact: phone, Expires: 600)
-    Note over G: readFilter (64 KiB, public accept) -> guard: shield.Check -> onRegister
+    Note over G: readFilter (24 KiB, public accept) -> guard: shield.Check -> onRegister
     Note over G: aorOf(To), token = existing or NewToken(), ctx = 32s series budget
     G->>FS: REGISTER (R-URI unchanged, Via with received/rport, Contact sip:1001@privAdv with transport=udp and fsbc=TOKEN)
     FS-->>G: 401 Unauthorized + WWW-Authenticate
@@ -2732,8 +2740,10 @@ The two are independent everywhere.
 
 **Trunk plane.** Signalling binds `listen.sip` entries (or the single
 `sip.bind_ip:sip.bind_port` listener, which replaces the list). Media binds
-`rtp.bind_ip` (the zero address = every interface) over the configured port
-range. Advertised addresses are resolved **per call**
+`rtp.bind_ip` (unset = every interface) over the configured port range. An
+unparseable `bind_ip` (unreachable after validation) is an error from
+`fsip.ParseBindIP`, never every interface: the media pool then allocates
+nothing (503). Advertised addresses are resolved **per call**
 (`advertisedIP(cfg, preferred)`), in this order:
 
 1. the `preferred` literal (`sip.advertised_ip` for signalling,
@@ -3006,7 +3016,8 @@ port capacity. This gap is recorded in `internal/app/app.go:146-150`.
 runs before the SIP parser, the transaction layer, the connection pool and
 any log. The trunk's filter accepts only bytes whose source IP matches a
 configured peer's `allowed_ips` (no size cap). The edge's filter enforces a
-**64 KiB** size cap on every read; for reads arriving on the private bind it
+**24 KiB** size cap on every read (`fsip.MaxReadSize`, below sipgo's 32 KiB
+read buffer so it can fire); for reads arriving on the private bind it
 requires an upstream source IP, and for public reads it drops a source the
 edge shield has banned — its IP, or on UDP its exact socket
 (`Shield.BannedFrom`) — so a ban stays silent even for what sipgo would
@@ -3074,7 +3085,7 @@ shield, whose bans are not exported to `/metrics`, and no API lifts a ban.
 SBC exists. That is why `onNoRoute` is overridden at all: known peers get
 405, unknown sources get silence.
 
-**Message and body limits.** Edge reads are capped at 64 KiB; edge SDP is
+**Message and body limits.** Edge reads are capped at 24 KiB; edge SDP is
 capped at 16 KiB with at most 16 media sections, 256 attributes per level and
 128 payload types; REGISTER AoR user parts are capped at 128 characters and
 hosts at 255, with a character allowlist that excludes CR/LF; `fsbc` tokens

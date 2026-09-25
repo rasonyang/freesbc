@@ -16,7 +16,13 @@ func NewMediaPool(store *config.Store) *media.PlanePool {
 	return media.NewPlanePool("trunk", func() media.PlaneParams {
 		cfg := store.Current()
 		r := cfg.RTPPortRange()
-		bind := fsip.ParseBindIP(cfg.RTP.BindIP)
+		bind, err := fsip.ParseBindIP(cfg.RTP.BindIP)
+		if err != nil {
+			// Unreachable for a validated config. Fail closed: an empty
+			// range allocates nothing (ErrPortsExhausted, a 503) instead
+			// of binding every interface.
+			return media.PlaneParams{MinPort: 1, MaxPort: 0}
+		}
 		return media.PlaneParams{
 			MinPort: r.Min,
 			MaxPort: r.Max,

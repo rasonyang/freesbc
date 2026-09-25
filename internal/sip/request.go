@@ -67,7 +67,7 @@ func CSeqNumber(msg sip.Message) uint32 {
 // instead: they hold the route set and the remote target this function
 // does not see.
 func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header, seq uint32) *sip.Request {
-	req := sip.NewRequest(method, ContactOrSource(res))
+	req := sip.NewRequest(method, contactOrSource(res))
 	req.PrependHeader(via)
 	sip.CopyHeaders("From", res, req)
 	sip.CopyHeaders("To", res, req)
@@ -80,11 +80,11 @@ func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header
 	return req
 }
 
-// ContactOrSource is the request target for an in-dialog request built
+// contactOrSource is the request target for an in-dialog request built
 // from a response: the far end's Contact when it sent one (RFC 3261
 // §12.1.2 remote target), else its transport source rendered as a URI,
 // which is where the response demonstrably came from.
-func ContactOrSource(res *sip.Response) sip.Uri {
+func contactOrSource(res *sip.Response) sip.Uri {
 	if u, ok := ContactURI(res); ok {
 		return u
 	}

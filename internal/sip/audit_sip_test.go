@@ -116,8 +116,8 @@ func FuzzAuditSIPMessageHelpers(f *testing.F) {
 		if out, err := filter(props, data); err != nil || (out == nil && len(data) <= 64<<10) {
 			t.Fatalf("ReadFilter returned (%v, %v) for an in-cap read", out == nil, err)
 		}
-		_ = SameAddr(string(data), "0.0.0.0:5060")
-		_ = ParseBindIP(string(data))
+		_ = sameAddr(string(data), "0.0.0.0:5060")
+		_, _ = ParseBindIP(string(data))
 		msg, err := sip.NewParser().ParseSIP(data)
 		if err != nil {
 			return
@@ -142,7 +142,7 @@ func FuzzAuditSIPMessageHelpers(f *testing.F) {
 		case *sip.Response:
 			_ = Forwardable(m)
 			_ = GrantedExpires(m, time.Hour)
-			_ = ContactOrSource(m)
+			_ = contactOrSource(m)
 			via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP", Host: "10.0.0.1", Port: 5060, Params: sip.NewParams()}
 			_ = TeardownRequest(sip.BYE, m, via, CSeqNumber(m)+1).String()
 			_ = m.String()
