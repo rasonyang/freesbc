@@ -114,10 +114,17 @@ func TestAuditSDPLeakProperty(t *testing.T) {
 					if err != nil {
 						t.Fatalf("iteration %d: rewrite error %v\ninput:\n%s", i, err, in)
 					}
+					// The o= line is checked field by field: its session-id
+					// and version are numbers the SBC generates for its own
+					// leg (RFC 4566 §5.2), and a random one can contain the
+					// port sentinel's digits by chance. Its username and
+					// address must be the SBC's, and its session-id must not
+					// be the other leg's.
+					rest := auditCheckOrigin(t, i, secure, in, string(out), ourIP)
 					for _, sentinel := range []string{auditSentinelIP, auditSentinelPort, auditSentinelUser} {
-						if strings.Contains(string(out), sentinel) {
+						if strings.Contains(rest, sentinel) {
 							var leaked []string
-							for _, l := range strings.Split(string(out), "\r\n") {
+							for _, l := range strings.Split(rest, "\r\n") {
 								if strings.Contains(l, sentinel) {
 									leaked = append(leaked, l)
 								}
@@ -130,4 +137,40 @@ func TestAuditSDPLeakProperty(t *testing.T) {
 			}
 		})
 	}
+}
+
+// auditCheckOrigin checks the relayed body's o= line — username and address
+// are not the other leg's, the address is ours, and the session-id is not
+// the other leg's — and returns the body without that line, for the
+// sentinel search over everything else.
+func auditCheckOrigin(t *testing.T, i int, secure bool, in, out string, ourIP netip.Addr) string {
+	t.Helper()
+	originOf := func(body string) []string {
+		for _, l := range strings.Split(body, "\r\n") {
+			if strings.HasPrefix(l, "o=") {
+				return strings.Fields(l[2:])
+			}
+		}
+		return nil
+	}
+	o, inO := originOf(out), originOf(in)
+	if len(o) != 6 || len(inO) != 6 {
+		t.Fatalf("iteration %d (secure=%v): o= line missing or malformed\ninput:\n%s\noutput:\n%s", i, secure, in, out)
+	}
+	if o[0] == inO[0] || strings.Contains(o[0], auditSentinelUser) {
+		t.Fatalf("iteration %d (secure=%v): o= username %q is the other leg's\noutput:\n%s", i, secure, o[0], out)
+	}
+	if o[1] == inO[1] {
+		t.Fatalf("iteration %d (secure=%v): o= session-id %q is the other leg's\noutput:\n%s", i, secure, o[1], out)
+	}
+	if o[5] != ourIP.String() {
+		t.Fatalf("iteration %d (secure=%v): o= address %q, want %v\noutput:\n%s", i, secure, o[5], ourIP, out)
+	}
+	var kept []string
+	for _, l := range strings.Split(out, "\r\n") {
+		if !strings.HasPrefix(l, "o=") {
+			kept = append(kept, l)
+		}
+	}
+	return strings.Join(kept, "\r\n")
 }
