@@ -54,6 +54,10 @@ type Config struct {
 	// the trunk B2BUA plane above is unaffected.
 	Network NetworkConfig `yaml:"network"`
 	WebRTC  WebRTCConfig  `yaml:"webrtc"`
+
+	// envRedact is set by expandEnv: what ${VAR} expansion substituted, so
+	// validate can keep expanded values out of its error messages.
+	envRedact envRedaction
 }
 
 type ListenConfig struct {
@@ -226,7 +230,9 @@ type RouteMatch struct {
 }
 
 type RouteTransform struct {
-	To string `yaml:"to"`
+	// To is a regexp replacement template ($1, ${1}, ${name}). It is never
+	// ${ENV}-expanded: ${name} there names a capture group of match.to.
+	To string `yaml:"to" env:"-"`
 }
 
 type ShieldConfig struct {

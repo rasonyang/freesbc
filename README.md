@@ -116,7 +116,7 @@ Details: [`docs/edge.md`](docs/edge.md) (topology, behaviour table, known limita
 
 Enable the optional `admin` block (a bcrypt `password_hash` — generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`), then:
 
-- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard (active calls, peers, port/registration status) and the raw-config editor — edits are validated, written atomically, and hot-reloaded; keep secrets as `${ENV}` references,
+- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard (active calls, peers, port/registration status) and the raw-config editor — edits are validated, written atomically, and hot-reloaded; keep secrets as `${ENV}` references (plain string keys only; a validation error shows the `${ENV}` text, never the value),
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
 - tear down a stuck call: `curl -u admin:… -X DELETE http://<admin.listen>/api/calls/<call-id>` (204 killed, 404 already gone) — the `<call-id>` is the `id` from `GET /api/calls`.
 

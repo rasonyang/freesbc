@@ -308,7 +308,7 @@ the process's life.
 
 ### 4.4 Reload
 
-Reload is driven only by `config.Watch` (`internal/config/reload.go:19-83`):
+Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
 
 - `fsnotify` watches **the parent directory**, not the file, so atomic-rename
   saves are seen.
@@ -316,13 +316,17 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go:19-83`):
   `Op & (Write|Create|Rename) != 0`; `Chmod` and `Remove` are ignored.
 - **Debounce: 200 ms** (`reloadDebounce`), implemented as a `time.AfterFunc`
   that does a non-blocking send into a buffer-1 `fire` channel.
-- On fire: `Load(abs)`. On failure, log
+- On fire: `loadNoPanic(abs)`, which is `Load` behind a last-resort
+  `recover()`. On failure, log
   `"config reload failed, keeping previous config"` and continue — the
   running config is untouched and the process never dies from a bad reload.
-  On success, `store.Replace(cfg)` and log `"config reloaded"`.
+  `Parse` itself never panics: null map/list entries are rejected before
+  defaults run, and a go-yaml decoder panic is turned into a parse error
+  (audit P2-CFG-001, P3-CORE-001). On success, `store.Replace(cfg)` and log
+  `"config reloaded"`.
 - Event-loop errors are logged, never fatal, and the loop always returns nil.
   `Watch` itself can still fail before the loop starts — `filepath.Abs`,
-  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,26,30`). `app.Run`'s wrapper
+  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,25,30`). `app.Run`'s wrapper
   goroutine logs that error and returns nil anyway (`app.go:93-99`), so a
   watcher that never started silently disables reload for the process's life.
 
@@ -397,20 +401,46 @@ config at startup, 2 on a usage error.
 
 ## 5. Configuration
 
-`config.Parse` (`loader.go:31-43`) runs four steps in order:
+`config.Parse` (`loader.go`) runs five steps in order:
 
-1. `yaml.UnmarshalWithOptions(data, &c, yaml.Strict())` — **unknown keys are
-   errors**, formatted with line numbers via `yaml.FormatError`.
-2. `expandEnv(&c)` — `${VAR}` expansion.
-3. `withDefaults(&c)`.
-4. `c.validate()` — collects **every** error and joins them with newlines.
+1. `unmarshalStrict` — `yaml.UnmarshalWithOptions(data, &c, yaml.Strict())`;
+   **unknown keys are errors**, formatted with line numbers via
+   `yaml.FormatError`. A panic inside go-yaml (v1.19.2 has one on some
+   malformed tags) is recovered and reported as a parse error.
+2. `rejectNullEntries(&c)` — a null `peers`, `sip.upstreams.nodes` or
+   `sip.pstn.gateways` entry (an empty `name:` block) or a null `routes` /
+   `sip.pstn.routes` item (`- ~`) is an error. Later steps dereference them.
+3. `expandEnv(&c)` — `${VAR}` expansion.
+4. `withDefaults(&c)`.
+5. `c.validate()` — collects **every** error and joins them with newlines.
 
 Env expansion runs after the strict unmarshal and before defaults so that
 parse errors can never echo a secret. The only supported syntax is
 `${NAME}`; `${VAR:-default}` is rejected as malformed, and `${1}`-style
-numeric references are passed through verbatim so route transforms can use
-them. Expanded values are never re-scanned. Missing variables are reported
-once each.
+numeric references are passed through verbatim. Expanded values are never
+re-scanned. Missing variables are reported once each.
+
+- **Plain string fields only.** Expansion walks every exported field whose Go
+  type is `string` (including inside slices, maps and pointers). Typed scalars
+  — durations, `port_range`, `listen.sip` URLs, `host:port` keys such as
+  `sip.public.*.bind` and `sip.pstn.match`, and every int or bool — are
+  decoded in step 1, before expansion, so `ring_timeout: ${RT}` fails with
+  `invalid duration "${RT}"`. Keep secrets in string keys (`password`,
+  `username`, `password_hash`, `address`, file paths).
+- **`routes[].transform.to` is never expanded** (`env:"-"` on
+  `RouteTransform.To`). It is a regexp replacement template: `$1`, `${1}` and
+  `${name}` all refer to capture groups of `match.to`. An env-shaped
+  `${name}` that `match.to` does not define as a named group is a validation
+  error, so a config that used to rely on env expansion there fails loudly
+  instead of expanding to nothing.
+- **Validation errors never echo an expanded value.** `expandEnv` records each
+  substitution on the `Config` (`envRedaction`). `validate`'s `fail` collector
+  redacts every argument: an expanded field's value is shown as the template
+  the operator wrote (`"${FS_ADDR}:5060"`), and any leftover environment value
+  as `${NAME}`. Errors that quote only part of a value (regexp compile errors,
+  rate-limit and bcrypt errors) are withheld altogether when the value came
+  from expansion. This covers `freesbc check` output and the 400 body of
+  `PUT /api/config`.
 
 Validation rules are exhaustive in `internal/config/validate.go` (trunk,
 shield, admin, NAT topology) and `internal/config/validate_proxy.go` (edge
@@ -456,12 +486,12 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `routes[].{name,from,match.to,transform.to,to[]}` | | first match wins; `to` order is failover order |
 | `sip.bind_ip` | IP | none — when set it *replaces* the `listen.sip` list |
 | `sip.bind_port` | 1-65535 | required alongside any other `sip.*` topology key |
-| `sip.transport` | `udp\|tcp\|tls` | `udp` (`schema.go:286-288`) |
-| `sip.advertised_ip` | IP | `sip.bind_ip` (`schema.go:289-291`) |
-| `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:292-294`) |
+| `sip.transport` | `udp\|tcp\|tls` | `udp` (`schema.go:291-293`) |
+| `sip.advertised_ip` | IP | `sip.bind_ip` (`schema.go:294-296`) |
+| `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:297-299`) |
 | `rtp.bind_ip` | IP | `""` = every interface |
 | `rtp.advertised_ip` | IP | `""` = the `advertisedIP` chain of §12.1 |
-| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:51-104`) |
+| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:55-108`) |
 
 Key relationships: `sip.bind_ip` and `listen.sip` are mutually exclusive
 (`sip.bind_ip` *replaces* the listener list); `rtp.port_min/max` and
@@ -2753,6 +2783,8 @@ spin.
 | `edge.guard` | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` | every relay goroutine; closes **that session only** |
 | `admin.recoverMW` | every HTTP handler; re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `config.unmarshalStrict` | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
+| `config.loadNoPanic` | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
 ---
 
@@ -2981,7 +3013,7 @@ write-back.
 `PUT /api/config`, in order: read at most **1 MiB** + 1 (413 above that);
 optional `If-Match` re-reads the file and returns **409** on a mismatch;
 `config.Parse(body)` on a throwaway config (400 on failure, with the
-validation text); then `writeFileAtomic` — `CreateTemp` in the **same
+validation text, in which expanded `${ENV}` values are redacted — §5); then `writeFileAtomic` — `CreateTemp` in the **same
 directory**, write, `Sync`, `Close`, `Chmod` (0600, or the existing file's
 mode when it exists), `Rename`. Every failure path removes the temp file and
 leaves the original untouched. The submitted bytes are written **verbatim**,
@@ -3155,8 +3187,11 @@ inbound `a=crypto`, and clears all attributes on declined sections.
 **Credential handling.** The edge plane proxies REGISTER and its digest
 challenge verbatim and never holds a credential; `logRegister` never logs an
 Authorization header, a nonce or a password. `${ENV}` references in the
-config are expanded only in memory and never written back, and parse errors
-cannot echo a secret because expansion runs after the unmarshal.
+config are expanded only in memory and never written back. Parse errors
+cannot echo a secret because expansion runs after the unmarshal, and
+validation errors are redacted back to the `${ENV}` text (§5), so neither
+`freesbc check` nor the admin `PUT /api/config` response can be used to
+read an environment variable.
 
 ### 14.2 Deployment assumptions (not enforced by the code)
 

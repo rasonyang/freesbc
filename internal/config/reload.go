@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"time"
@@ -71,7 +72,7 @@ func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) err
 			}
 			log.Error("config watcher error", "err", err)
 		case <-fire:
-			cfg, err := Load(abs)
+			cfg, err := loadNoPanic(abs)
 			if err != nil {
 				log.Error("config reload failed, keeping previous config", "err", err)
 				continue
@@ -80,4 +81,17 @@ func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) err
 			log.Info("config reloaded", "path", abs)
 		}
 	}
+}
+
+// loadNoPanic is Load with a last-resort recover. Parse is written never to
+// panic, but the reload goroutine is the one place where a panic would kill
+// the whole process on an operator's save, so a missed case still leaves the
+// previous snapshot in place and is logged as a failed reload.
+func loadNoPanic(path string) (cfg *Config, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			cfg, err = nil, fmt.Errorf("config parser panicked (this is a bug): %v", r)
+		}
+	}()
+	return Load(path)
 }
