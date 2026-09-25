@@ -557,7 +557,6 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		if !ok {
 			return
 		}
-		s.metrics.RequestIn(req.Method.String(), req.Transport())
 		// FreeSWITCH is not subject to the public abuse plane: it is the
 		// element the proxy exists to serve, and rate-limiting it would
 		// turn a busy switch into a dropped call.
@@ -570,6 +569,9 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 				return // silent
 			}
 		}
+		// Counted after the shield: a dropped flood is the shield's to
+		// account for, not a request the proxy handled.
+		s.metrics.RequestIn(req.Method.String(), req.Transport())
 		next(req, tx, src)
 	}
 }

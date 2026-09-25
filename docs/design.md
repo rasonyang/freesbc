@@ -1257,9 +1257,13 @@ it (`freesbc_sip_handler_panics_total`) and answers 500 **only when the
 transaction has not already had a final response** (the handler is given a
 `finalTracker` wrapping the server transaction, which records that);
 `fsip.SourceAddrPort(req)` (an unparseable source is **silently dropped**
-before metrics, shield and handler); `metrics.RequestIn(method, transport)`;
-then, only for requests that did *not* arrive on the private plane,
-`shield.Check(...)` with a silent return on `Drop`.
+before shield, metrics and handler); then, only for requests that did *not*
+arrive on the private plane, `shield.CheckFrom(...)` with a silent return on
+`Drop`; then `metrics.RequestIn(method, transport)`, so a request the shield
+dropped is not counted. `RequestIn` folds the method into the methods sipgo
+names (INVITE … PUBLISH) and the transport into UDP/TCP/TLS/WS/WSS, each with
+one `OTHER` bucket, into a fixed counter table (`edge/metrics.go`): a client
+cannot add a label value by inventing a method (P2-EDG-002).
 
 A source the shield has **banned** is also dropped by the edge read filter,
 before parsing: sipgo answers some messages itself before any handler runs
@@ -1570,7 +1574,7 @@ FreeSBC cannot anchor and to one that races a CANCEL.
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
 (`edge.go:171`). `freesbc_active_sip_dialogs` is a separate mechanism over the
 same set: the `Metrics.dialogs` gauge moved by `DialogStarted`/`DialogEnded`
-in `confirm`/`end` (`edge/metrics.go:67-68`), sampled through
+in `confirm`/`end` (`edge/metrics.go:119-120`), sampled through
 `Snapshot().ActiveDialogs` (`admin/metrics.go:57,129`).
 
 An `inviteAttempt` holds the request **as forwarded** (so a CANCEL carries
@@ -3034,7 +3038,7 @@ permanent series per call."
 | `freesbc_active_webrtc_sessions` | Gauge | — | edge |
 | `freesbc_registration_total` | Counter | — | edge `recordBinding` success |
 | `freesbc_registration_failure_total` | Counter | — | edge: series exhaustion, a rejected registration, and a full binding table |
-| `freesbc_sip_requests_total` | Counter | `method`, `transport` | edge `guard`, for **every** guarded request |
+| `freesbc_sip_requests_total` | Counter | `method` (a known method or `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS` or `OTHER`) | edge `guard`, for every request the shield admits |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | edge `respond` and `relayResponse` |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` |
@@ -3047,7 +3051,7 @@ Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:97-105`), so in a deployed system `freesbc_shield_drops_total`
 reports only `reason="rate"`. The ban and scanner branches run on the
-**edge** shield (`edge.go:564`), which `internal/app` never wires into
+**edge** shield (`edge.go:565`), which `internal/app` never wires into
 `admin.Deps` (`Deps.Shield` is set only when the trunk server exists), so
 edge bans and drops do not reach `/metrics`. The ban gauges
 (`freesbc_shield_banned_current`, `freesbc_shield_ban_adds_rejected_total`)
