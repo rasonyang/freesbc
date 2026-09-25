@@ -190,6 +190,11 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 // NOT refresh the silence watchdog: only a packet proven genuine counts as
 // media activity, so an attacker who can reach the socket cannot keep a
 // dead call alive with garbage.
+//
+// Nothing is relayed, in either direction, while the leg's DTLS peer has
+// not been matched against the signalled fingerprint (mediaVerified):
+// authenticating SRTP only proves the packet came from whoever finished
+// the handshake, not that it is the browser signaling agreed on.
 func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 	defer recoverRelayPanic(s.log, s.Close)
 	buf := make([]byte, maxPacketSize)
@@ -197,6 +202,9 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return // leg closed
+		}
+		if !s.leg.mediaVerified() {
+			continue // fingerprint not (yet) verified: fail closed
 		}
 		pkt := buf[:n]
 		rtcp := isRTCP(pkt)
@@ -242,6 +250,9 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 		n, src, err := sock.ReadFromUDP(buf)
 		if err != nil {
 			return // socket closed (session teardown)
+		}
+		if !s.leg.mediaVerified() {
+			continue // never send media to an unverified DTLS peer
 		}
 		if !lat.accept(src) {
 			continue // pre-latch source mismatch, or post-latch hijack

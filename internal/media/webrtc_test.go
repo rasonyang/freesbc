@@ -2,7 +2,6 @@ package media
 
 import (
 	"context"
-	"crypto/tls"
 	"net"
 	"net/netip"
 	"strings"
@@ -191,12 +190,12 @@ func TestWebRTCLegOnWildcardBind(t *testing.T) {
 
 	lf := logging.NewDefaultLoggerFactory()
 	lf.DefaultLogLevel = logging.LogLevelError
-	browser, err := ice.NewAgent(&ice.AgentConfig{
-		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
-		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost},
-		IncludeLoopback: true,
-		LoggerFactory:   lf,
-	})
+	browser, err := ice.NewAgentWithOptions(
+		ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4}),
+		ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
+		ice.WithIncludeLoopback(),
+		ice.WithLoggerFactory(lf),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,11 +260,11 @@ func TestWebRTCLegOnWildcardBind(t *testing.T) {
 
 	bDemux := newDemux(browserConn)
 	defer bDemux.Close()
-	bDTLS, err := dtls.Client(bDemux.dtls, bDemux.dtls.RemoteAddr(), &dtls.Config{
-		Certificates:           []tls.Certificate{browserCert},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
-		InsecureSkipVerify:     true,
-	})
+	bDTLS, err := dtls.ClientWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
+		dtls.WithCertificates(browserCert),
+		dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
+		dtls.WithInsecureSkipVerify(true),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,12 +299,12 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 	// --- the "browser": a full ICE agent, controlling, DTLS client ---
 	lf := logging.NewDefaultLoggerFactory()
 	lf.DefaultLogLevel = logging.LogLevelError
-	browser, err := ice.NewAgent(&ice.AgentConfig{
-		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
-		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost},
-		IncludeLoopback: true,
-		LoggerFactory:   lf,
-	})
+	browser, err := ice.NewAgentWithOptions(
+		ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4}),
+		ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
+		ice.WithIncludeLoopback(),
+		ice.WithLoggerFactory(lf),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,11 +314,19 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The browser's DTLS certificate, and the a=fingerprint its offer
+	// would carry: the leg checks it inside the handshake.
+	browserCert, err := selfSignedForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	leg, err := NewWebRTCLeg(pubPool, WebRTCLegConfig{
 		AdvertisedIP: netip.MustParseAddr("127.0.0.1"),
 		RemoteUfrag:  bUfrag, RemotePwd: bPwd,
-		RemoteSetup: "actpass", // → FreeSBC is the DTLS server
-		Identity:    id,
+		RemoteSetup:            "actpass", // → FreeSBC is the DTLS server
+		Identity:               id,
+		RemoteFingerprintHash:  "sha-256",
+		RemoteFingerprintValue: fingerprintOf(browserCert),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -389,17 +396,13 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 	defer browserConn.Close()
 
 	// The browser's DTLS client half, over its own ICE connection.
-	browserCert, err := selfSignedForTest()
-	if err != nil {
-		t.Fatal(err)
-	}
 	bDemux := newDemux(browserConn)
 	defer bDemux.Close()
-	bDTLS, err := dtls.Client(bDemux.dtls, bDemux.dtls.RemoteAddr(), &dtls.Config{
-		Certificates:           []tls.Certificate{browserCert},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
-		InsecureSkipVerify:     true,
-	})
+	bDTLS, err := dtls.ClientWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
+		dtls.WithCertificates(browserCert),
+		dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
+		dtls.WithInsecureSkipVerify(true),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

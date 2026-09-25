@@ -1992,20 +1992,20 @@ stateDiagram-v2
     legClosed --> [*]
 ```
 
-Transitions: `NewWebRTCLeg` (`webrtcleg.go:170-207`) leaves the state at the
-zero value `legAllocated`; `Start` (`webrtcleg.go:243-270`) claims
+Transitions: `NewWebRTCLeg` (`webrtcleg.go:192-238`) leaves the state at the
+zero value `legAllocated`; `Start` (`webrtcleg.go:273-300`) claims
 `legAllocated → legEstablishing` under `mu` and spawns `establish` — a second
 `Start`, or a `Start` after `Close`, is a no-op, so no second ICE agent can
 be built over the same socket; that goroutine sets `legFailed` and
-immediately calls `Close` on error (`webrtcleg.go:263-264`) or
-`legEstablished` on success (`:267`); `Close` (`webrtcleg.go:552`) sets
-`legClosed`, which `set` (`:110-112`) treats as terminal. The first error
+immediately calls `Close` on error (`webrtcleg.go:293-294`) or
+`legEstablished` on success (`:297`); `Close` (`webrtcleg.go:680`) sets
+`legClosed`, which `set` (`:124-126`) treats as terminal. The first error
 recorded wins, and a leg closed before it was established is retroactively
 stamped with `"webrtc leg closed before it was established"`.
 
 `Close` during establishment releases everything: it cancels `establish`'s
 context and snapshots the mux/agent/demux handles once, and `establish`
-hands every handle it creates to the leg through `keep` (`webrtcleg.go:280`),
+hands every handle it creates to the leg through `keep` (`webrtcleg.go:310`),
 which refuses once the state is `legClosed` — `establish` then closes that
 handle itself and returns. The DTLS connection is tied to the leg's `closed`
 channel as soon as its handshake succeeds, so a keying failure after the
@@ -2015,8 +2015,10 @@ handshake no longer leaks it.
 `Start(ctx, timeout)` with `timeout <= 0` meaning **30 s**:
 
 1. `ice.NewUDPMuxDefault` over the single allocated socket.
-2. `ice.NewAgent{Lite: true, CandidateTypes: [host], NetworkTypes: [UDP4,
-   UDP6], IncludeLoopback: true}` — a genuine ICE-lite agent, host candidates
+2. `ice.NewAgentWithOptions(WithICELite(true), WithCandidateTypes([host]),
+   WithNetworkTypes([UDP4, UDP6]), WithIncludeLoopback(), …)` — the
+   options-based constructor (the `AgentConfig` one is deprecated in
+   pion/ice v4) — a genuine ICE-lite agent, host candidates
    only, **no STUN and no TURN servers configured**. The candidate handler is
    intentionally empty: FreeSBC does not use gathered candidates in SDP; it
    advertises exactly one host candidate at the configured public media
@@ -2032,11 +2034,18 @@ handshake no longer leaks it.
    be able to tear down a live call's media path. Buffers: 64 KiB for DTLS,
    1 MiB for SRTP; a full buffer drops the packet rather than blocking the
    read loop, which would stall the other endpoint too.
-5. DTLS with the process identity, offering
-   `SRTP_AES128_CM_HMAC_SHA1_80` and `_32`, `InsecureSkipVerify: true` and
-   `ClientAuth: RequireAnyClientCert`. The peer certificate is self-signed by
-   design and there is no PKI; the binding to the session is the
-   `a=fingerprint` line, checked separately.
+5. DTLS via `dtls.ServerWithOptions`/`ClientWithOptions` (the
+   `dtls.Config` constructors are deprecated in pion/dtls v3) with the
+   process identity, offering `SRTP_AES128_CM_HMAC_SHA1_80` and `_32`,
+   `WithInsecureSkipVerify(true)` and, as server,
+   `WithClientAuth(RequireAnyClientCert)`. The peer certificate is
+   self-signed by design and there is no PKI to verify a chain against; the
+   binding to the session is the `a=fingerprint` line. When the leg was
+   given it (`WebRTCLegConfig.RemoteFingerprintHash`/`Value`, which the edge
+   plane always sets from the offer), `WithVerifyPeerCertificate` checks the
+   leaf certificate against it during the handshake, and a mismatch fails
+   the handshake with `ErrFingerprintMismatch` — before any key is derived
+   or any packet relayed.
 6. `HandshakeContext(ctx)` is run **explicitly** under the establishment
    deadline, so a peer that opens the flow and then goes quiet cannot pin the
    port past the timeout.
@@ -2051,12 +2060,20 @@ handshake no longer leaks it.
 FreeSBC the DTLS **server**, advertised as `a=setup:passive` — the
 conventional pick for a gateway with a stable address (RFC 5763 §5).
 
-**Fingerprint verification** (`VerifyFingerprint`) is the only binding
-between the signalling identity and the media path. It requires the leg to be
-ready, accepts **only `sha-256`**, hashes the peer's leaf certificate, and
-compares case-insensitively. The edge plane calls it after
-`WebRTCSession.Start` and tears the session down on mismatch, logging the
-failure without echoing either fingerprint.
+**Fingerprint verification** is the only binding between the signalling
+identity and the media path, and **media is gated on it**: the leg's
+`verified` flag is set when the in-handshake check passed or when a later
+`VerifyFingerprint` succeeds, and both relay directions of `WebRTCSession`
+drop every packet (without refreshing the watchdog) while it is false. A leg
+built without a signalled fingerprint therefore establishes but carries no
+media until `VerifyFingerprint` succeeds. `VerifyFingerprint` requires the
+leg to be ready, accepts `sha-256`, `sha-384` and `sha-512` (the set
+`internal/sip/sdp` parses), hashes the peer's leaf certificate and compares
+case-insensitively; a mismatch clears `verified`. The edge plane passes the
+offer's fingerprint into the leg config, so a mismatch surfaces as
+`WebRTCSession.Start` failing with `ErrFingerprintMismatch`; it still calls
+`VerifyFingerprint` after `Start` as a re-check, and tears the session down
+on either failure, logging neither fingerprint.
 
 **ICE credentials** are 3 random bytes → 4 base64url characters (ufrag) and
 18 bytes → 24 characters (pwd). They are secrets: anyone who learns the pwd
@@ -2102,7 +2119,7 @@ all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:598-605`) — with a
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:726-733`) — with a
 length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
 accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.
@@ -2206,7 +2223,7 @@ length after inbound decryption; Tx counts the bytes actually written after
 outbound encryption, and **only when the `WriteToUDP` itself succeeded**
 (`relay.go:91-93`), so the two differ by the SRTP overhead on a mixed session.
 On a `WebRTCSession` the private-side rx is the raw plaintext length read off
-the socket before `protectRTP` (`webrtcsession.go:242`), so the public-side tx
+the socket before `protectRTP` (`webrtcsession.go:269`), so the public-side tx
 exceeds it by the SRTP overhead.
 
 ---
@@ -2347,8 +2364,9 @@ sequenceDiagram
     B->>H: ACK (forwarded statelessly to FS)
     Note over H: commit -> dialog.confirm -> media watcher goroutine started
     B->>E: ICE connectivity checks (pion agent, Lite/controlled)
-    B->>E: DTLS handshake -> ExportKeyingMaterial -> SRTP contexts
-    E->>E: leg.VerifyFingerprint(offer fp), mismatch -> sess.Close()
+    B->>E: DTLS handshake, peer cert checked against the offer fp in VerifyPeerCertificate
+    Note over E: mismatch -> handshake fails, ErrFingerprintMismatch, sess.Close(), no keys, no relay
+    E->>E: ExportKeyingMaterial -> SRTP contexts, leg verified, relay starts
     B-)M: SRTP -> decrypted -> plain RTP to FS
     FS-)M: plain RTP -> encrypted -> SRTP to B
 ```
@@ -2992,8 +3010,12 @@ the call stays up. Latching is fail-closed in strict mode until the
 signalling plane arms it, and nothing moves a latch after acceptance short of
 an authorised `Relatch`. The RTP-silence watchdog refreshes its liveness
 timestamp **only after** a packet is proven genuine. The WebRTC leg verifies
-the peer certificate against the signalled `a=fingerprint` and tears the
-session down on mismatch, logging neither fingerprint. The RFC 7983
+the peer certificate against the signalled `a=fingerprint` **inside the DTLS
+handshake** (`VerifyPeerCertificate`), so a mismatched peer never reaches
+`legEstablished`, gets no SRTP keys and has no media relayed; the relay
+additionally refuses to carry media for any leg whose fingerprint has not
+been verified. The session is torn down on mismatch, logging neither
+fingerprint. The RFC 7983
 demultiplexer drops everything that is not DTLS or SRTP, so a single hostile
 datagram cannot tear down a live media path. Keys are never copied across
 legs.

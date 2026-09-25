@@ -247,13 +247,20 @@ func (s *Server) allocateRTP(offer *sdp.Session) (*mediaSession, error) {
 // has our ICE credentials, so waiting here would deadlock.
 func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*mediaSession, error) {
 	a := offer.Audio
-	leg, err := media.NewWebRTCLeg(s.pubPool, media.WebRTCLegConfig{
+	cfg := media.WebRTCLegConfig{
 		AdvertisedIP: s.topo.publicMediaIP,
 		RemoteUfrag:  a.ICEUfrag,
 		RemotePwd:    a.ICEPwd,
 		RemoteSetup:  a.Setup,
 		Identity:     s.identity,
-	})
+	}
+	// The a=fingerprint is checked inside the DTLS handshake, so a peer
+	// with the wrong certificate never gets a media path at all.
+	if a.Fingerprint != nil {
+		cfg.RemoteFingerprintHash = a.Fingerprint.Hash
+		cfg.RemoteFingerprintValue = a.Fingerprint.Value
+	}
+	leg, err := media.NewWebRTCLeg(s.pubPool, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -277,9 +284,10 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 			return
 		}
 		// The a=fingerprint from signaling is the only thing binding the
-		// DTLS peer to the call. Verify it AFTER the handshake and drop
-		// the session on a mismatch: without this check, anyone who could
-		// answer the ICE checks could take over the media path.
+		// DTLS peer to the call. The handshake already refused a
+		// mismatched peer (sess.Start then fails with
+		// ErrFingerprintMismatch); this re-check is defence in depth, and
+		// the relay carries no media for a leg that was never verified.
 		if fingerprint != nil {
 			if err := leg.VerifyFingerprint(fingerprint.Hash, fingerprint.Value); err != nil {
 				// The message deliberately does not echo either

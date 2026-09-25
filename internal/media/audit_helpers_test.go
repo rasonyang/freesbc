@@ -126,12 +126,12 @@ func auditEstablishBrowserCall(tb testing.TB, pubLo, pubHi, privLo, privHi int) 
 	}
 	lf := logging.NewDefaultLoggerFactory()
 	lf.DefaultLogLevel = logging.LogLevelError
-	browser, err := ice.NewAgent(&ice.AgentConfig{
-		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
-		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost},
-		IncludeLoopback: true,
-		LoggerFactory:   lf,
-	})
+	browser, err := ice.NewAgentWithOptions(
+		ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4}),
+		ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
+		ice.WithIncludeLoopback(),
+		ice.WithLoggerFactory(lf),
+	)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -196,11 +196,11 @@ func auditEstablishBrowserCall(tb testing.TB, pubLo, pubHi, privLo, privHi int) 
 	}
 	bDemux := newDemux(browserConn)
 	tb.Cleanup(func() { _ = bDemux.Close() })
-	bDTLS, err := dtls.Client(bDemux.dtls, bDemux.dtls.RemoteAddr(), &dtls.Config{
-		Certificates:           []tls.Certificate{browserCert},
-		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AES128_CM_HMAC_SHA1_80},
-		InsecureSkipVerify:     true,
-	})
+	bDTLS, err := dtls.ClientWithOptions(bDemux.dtls, bDemux.dtls.RemoteAddr(),
+		dtls.WithCertificates(browserCert),
+		dtls.WithSRTPProtectionProfiles(dtls.SRTP_AES128_CM_HMAC_SHA1_80),
+		dtls.WithInsecureSkipVerify(true),
+	)
 	if err != nil {
 		tb.Fatal(err)
 	}
