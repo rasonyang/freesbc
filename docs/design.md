@@ -308,7 +308,7 @@ the process's life.
 
 ### 4.4 Reload
 
-Reload is driven only by `config.Watch` (`internal/config/reload.go:19-83`):
+Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
 
 - `fsnotify` watches **the parent directory**, not the file, so atomic-rename
   saves are seen.
@@ -316,13 +316,17 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go:19-83`):
   `Op & (Write|Create|Rename) != 0`; `Chmod` and `Remove` are ignored.
 - **Debounce: 200 ms** (`reloadDebounce`), implemented as a `time.AfterFunc`
   that does a non-blocking send into a buffer-1 `fire` channel.
-- On fire: `Load(abs)`. On failure, log
+- On fire: `loadNoPanic(abs)`, which is `Load` behind a last-resort
+  `recover()`. On failure, log
   `"config reload failed, keeping previous config"` and continue — the
   running config is untouched and the process never dies from a bad reload.
-  On success, `store.Replace(cfg)` and log `"config reloaded"`.
+  `Parse` itself never panics: null map/list entries are rejected before
+  defaults run, and a go-yaml decoder panic is turned into a parse error
+  (audit P2-CFG-001, P3-CORE-001). On success, `store.Replace(cfg)` and log
+  `"config reloaded"`.
 - Event-loop errors are logged, never fatal, and the loop always returns nil.
   `Watch` itself can still fail before the loop starts — `filepath.Abs`,
-  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,26,30`). `app.Run`'s wrapper
+  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,25,30`). `app.Run`'s wrapper
   goroutine logs that error and returns nil anyway (`app.go:93-99`), so a
   watcher that never started silently disables reload for the process's life.
 
@@ -397,13 +401,18 @@ config at startup, 2 on a usage error.
 
 ## 5. Configuration
 
-`config.Parse` (`loader.go:31-43`) runs four steps in order:
+`config.Parse` (`loader.go`) runs five steps in order:
 
-1. `yaml.UnmarshalWithOptions(data, &c, yaml.Strict())` — **unknown keys are
-   errors**, formatted with line numbers via `yaml.FormatError`.
-2. `expandEnv(&c)` — `${VAR}` expansion.
-3. `withDefaults(&c)`.
-4. `c.validate()` — collects **every** error and joins them with newlines.
+1. `unmarshalStrict` — `yaml.UnmarshalWithOptions(data, &c, yaml.Strict())`;
+   **unknown keys are errors**, formatted with line numbers via
+   `yaml.FormatError`. A panic inside go-yaml (v1.19.2 has one on some
+   malformed tags) is recovered and reported as a parse error.
+2. `rejectNullEntries(&c)` — a null `peers`, `sip.upstreams.nodes` or
+   `sip.pstn.gateways` entry (an empty `name:` block) or a null `routes` /
+   `sip.pstn.routes` item (`- ~`) is an error. Later steps dereference them.
+3. `expandEnv(&c)` — `${VAR}` expansion.
+4. `withDefaults(&c)`.
+5. `c.validate()` — collects **every** error and joins them with newlines.
 
 Env expansion runs after the strict unmarshal and before defaults so that
 parse errors can never echo a secret. The only supported syntax is
@@ -2753,6 +2762,8 @@ spin.
 | `edge.guard` | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` | every relay goroutine; closes **that session only** |
 | `admin.recoverMW` | every HTTP handler; re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `config.unmarshalStrict` | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
+| `config.loadNoPanic` | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
 ---
 

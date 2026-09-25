@@ -247,3 +247,15 @@ func TestParseDigitLedNonNumericRefStillMalformed(t *testing.T) {
 		}
 	}
 }
+
+// audit: P2-CFG-001
+// A null upstream node is rejected up front with a message naming it, like
+// the other null map/list entries, instead of being left to later steps.
+func TestParseRejectsNullUpstreamNode(t *testing.T) {
+	src := strings.Replace(proxyYAML, "  upstream:\n    address: 10.77.0.10:5060\n    transport: udp\n",
+		"  upstreams:\n    nodes:\n      fs-a:\n", 1)
+	_, err := Parse([]byte(src))
+	if err == nil || !strings.Contains(err.Error(), "sip.upstreams.nodes.fs-a: empty entry (null)") {
+		t.Fatalf("want a null-entry error for fs-a, got %v", err)
+	}
+}
