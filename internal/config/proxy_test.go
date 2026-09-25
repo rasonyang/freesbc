@@ -28,7 +28,7 @@ sip:
       enabled: true
       bind: 0.0.0.0:18443
   private:
-    bind: 10.77.0.2:16060
+    bind: 10.77.0.2:5060
   upstream:
     address: 10.77.0.10:5060
     transport: udp
@@ -92,7 +92,7 @@ func TestProxyOnlyConfigIsValid(t *testing.T) {
 	if got := c.PrivateRTPAdvertisedIP().String(); got != "10.77.0.2" {
 		t.Errorf("PrivateRTPAdvertisedIP = %s", got)
 	}
-	if got := c.PrivateSIPAdvertisedPort(); got != 16060 {
+	if got := c.PrivateSIPAdvertisedPort(); got != 5060 {
 		t.Errorf("PrivateSIPAdvertisedPort = %d", got)
 	}
 }
@@ -482,7 +482,7 @@ func TestPSTNMultiValidationErrors(t *testing.T) {
 		{
 			"match names the private socket in the multi shape",
 			func(s string) string {
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:16060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:5060", 1)
 			},
 			"sip.pstn.match: must not name the SBC's private SIP address",
 		},
@@ -613,7 +613,7 @@ func TestProxyValidationErrors(t *testing.T) {
 			"pstn match names the private socket",
 			func(s string) string {
 				s = withPSTN(s, pstnTrunk)
-				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:16060", 1)
+				return strings.Replace(s, "match: 203.0.113.7:16060", "match: 10.77.0.2:5060", 1)
 			},
 			"sip.pstn.match: must not name the SBC's private SIP address",
 		},
@@ -754,5 +754,100 @@ func TestHostPortParse(t *testing.T) {
 		if err := h.UnmarshalYAML([]byte(bad)); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// audit: P2-CFG-010
+// validateProxy has no "bind required" check for the public listeners or
+// the private socket, because defaults always fill them while the proxy is
+// on. This pins that invariant: if a default is ever dropped, an unbound
+// listener must not slip through validation silently.
+func TestProxyDefaultsAlwaysFillBinds(t *testing.T) {
+	src := `
+network:
+  public:
+    bind_ip: 203.0.113.7
+  private:
+    bind_ip: 10.77.0.2
+sip:
+  public:
+    udp: { enabled: true }
+    ws: { enabled: true }
+    wss: { enabled: true, cert_file: c.pem, key_file: k.pem }
+  upstream:
+    address: 10.77.0.10:5060
+rtp:
+  public: { port_min: 30000, port_max: 30999 }
+  private: { port_min: 40000, port_max: 40999 }
+`
+	c := mustParseProxy(t, src)
+	for _, l := range c.PublicSIPListeners() {
+		if l.Bind.IsZero() {
+			t.Errorf("sip.public.%s: bind left empty by defaults", l.Transport)
+		}
+	}
+	if c.SIP.Private.Bind.IsZero() {
+		t.Error("sip.private.bind left empty by defaults")
+	}
+	want := map[string]string{"udp": "203.0.113.7:5060", "ws": "203.0.113.7:5066", "wss": "203.0.113.7:5061"}
+	for _, l := range c.PublicSIPListeners() {
+		if got := l.Bind.String(); got != want[l.Transport] {
+			t.Errorf("sip.public.%s.bind = %s, want %s", l.Transport, got, want[l.Transport])
+		}
+	}
+	if got := c.SIP.Private.Bind.String(); got != "10.77.0.2:5060" {
+		t.Errorf("sip.private.bind = %s, want 10.77.0.2:5060", got)
+	}
+}
+
+// audit: P2-CFG-004
+// With both network binds left as wildcards, the default public UDP bind
+// and the default private bind are both 0.0.0.0:5060: `run` cannot bind
+// the second, so `check` must reject it. Also covers the admin API sharing
+// a TCP port with a ws listener.
+func TestProxySocketCollisionsRejected(t *testing.T) {
+	defaults := `
+network:
+  public: { bind_ip: 0.0.0.0, advertised_ip: 203.0.113.7 }
+  private: { bind_ip: 0.0.0.0, advertised_ip: 10.77.0.2 }
+sip:
+  public:
+    udp: { enabled: true }
+  upstream:
+    address: 10.77.0.10:5060
+rtp:
+  public: { port_min: 30000, port_max: 30999 }
+  private: { port_min: 40000, port_max: 40999 }
+`
+	_, err := Parse([]byte(defaults))
+	if err == nil || !strings.Contains(err.Error(), "sip.private.bind: udp/0.0.0.0:5060 already bound by sip.public.udp.bind") {
+		t.Errorf("default public/private binds collide; got %v", err)
+	}
+
+	admin := proxyYAML + `
+admin:
+  listen: 127.0.0.1:18080
+  auth: { username: a, password_hash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy" }
+`
+	_, err = Parse([]byte(admin))
+	if err == nil || !strings.Contains(err.Error(), "admin.listen: tcp/127.0.0.1:18080 already bound by sip.public.ws.bind") {
+		t.Errorf("admin on the ws port; got %v", err)
+	}
+
+	// udp and tcp on one port are two sockets, and two specific addresses
+	// on one port do not collide.
+	ok := strings.Replace(proxyYAML, "      bind: 0.0.0.0:18080\n", "      bind: 0.0.0.0:16060\n", 1)
+	if _, err := Parse([]byte(ok)); err != nil {
+		t.Errorf("udp and ws on the same port number must not collide: %v", err)
+	}
+}
+
+// audit: P2-CFG-009
+// An edge media plane must hold at least one RTP/RTCP pair.
+func TestProxyRTPPlaneHoldsOnePair(t *testing.T) {
+	src := strings.Replace(proxyYAML, "    port_min: 30000\n    port_max: 39999\n", "    port_min: 30001\n    port_max: 30002\n", 1)
+	_, err := Parse([]byte(src))
+	if err == nil || !strings.Contains(err.Error(), "rtp.public: 30001-30002 holds no RTP/RTCP pair") {
+		t.Errorf("a pair-less range validated: %v", err)
 	}
 }

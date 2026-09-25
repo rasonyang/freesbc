@@ -223,7 +223,7 @@ closer — about **6** excluding pion's internal goroutines.
 |---|---|---|
 | no args | usage to stderr | 2 |
 | `-h` / `--help` / `help` | usage to stdout | 0 |
-| `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"` | 0 / 1 |
+| `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"`. It parses and validates only: it opens no certificate or key file and binds no socket, so a missing cert file or a port another process holds is found by `run` alone. Everything validation can decide from the file — literal edge addresses, socket collisions between listeners — `check` rejects exactly as `run` would | 0 / 1 |
 | `run [-c path]` | `app.Run` under `signal.NotifyContext(SIGINT, SIGTERM)` | 0 / 1 |
 | `check`/`run` with an unrecognised flag | Go's own flag usage to stderr; the flag set is `flag.ExitOnError` (`main.go:37`), so `app.Run` is never reached | 2 |
 | anything else | usage to stderr | 2 |
@@ -308,12 +308,19 @@ the process's life.
 
 ### 4.4 Reload
 
-Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
+Reload is driven only by `config.Watch` (`internal/config/reload.go`, `Watch` and `linkTracker`):
 
 - `fsnotify` watches **the parent directory**, not the file, so atomic-rename
   saves are seen.
-- Events are filtered by base name and by
-  `Op & (Write|Create|Rename) != 0`; `Chmod` and `Remove` are ignored.
+- Events are filtered by `Op & (Write|Create|Rename) != 0` (`Chmod` and
+  `Remove` are ignored) and by `linkTracker.affects`: an event on the config
+  path itself, or on the file it resolves to, reloads; any other entry in the
+  directory reloads only if `filepath.EvalSymlinks(path)` now resolves
+  somewhere new. That catches a Kubernetes ConfigMap update, which renames a
+  new `..data` link into place and never touches the visible file, and any
+  other symlink swap on the way (audit P2-CFG-011). When the path resolves
+  into another directory, that directory is watched too, so an in-place edit
+  of the target reloads.
 - **Debounce: 200 ms** (`reloadDebounce`), implemented as a `time.AfterFunc`
   that does a non-blocking send into a buffer-1 `fire` channel.
 - On fire: `loadNoPanic(abs)`, which is `Load` behind a last-resort
@@ -326,7 +333,8 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go:20-84`):
   `"config reloaded"`.
 - Event-loop errors are logged, never fatal, and the loop always returns nil.
   `Watch` itself can still fail before the loop starts — `filepath.Abs`,
-  `fsnotify.NewWatcher`, `w.Add` (`reload.go:21,25,30`). `app.Run`'s wrapper
+  `fsnotify.NewWatcher`, `w.Add` of the config's directory. Failing to watch
+  a symlink target's other directory is only a warning. `app.Run`'s wrapper
   goroutine logs that error and returns nil anyway (`app.go:93-99`), so a
   watcher that never started silently disables reload for the process's life.
 
@@ -450,9 +458,9 @@ plane). Only the relationships that shape deployment are summarised here.
 
 | Mode | Requires | Skipped requirements |
 |---|---|---|
-| Trunk-only | ≥1 SIP listener (`listen.sip` or `sip.bind_ip`) and ≥1 peer | the entire edge block must be absent — configuring any of `sip.public`/`sip.private`/`sip.pstn`/`rtp.public`/`rtp.private`/`webrtc` without an upstream is rejected (`validate_proxy.go:28-30`) |
+| Trunk-only | ≥1 SIP listener (`listen.sip` or `sip.bind_ip`) and ≥1 peer | the entire edge block must be absent — configuring any of `sip.public`/`sip.private`/`sip.pstn`/`rtp.public`/`rtp.private`/`webrtc` without an upstream is rejected (`validate_proxy.go:21-26`) |
 | Edge-only | `sip.upstream.address` or `sip.upstreams.nodes`; ≥1 public listener; `sip.private.bind`; both `rtp.public` and `rtp.private` ranges; advertised IPs for both planes | "at least one SIP listener" and "at least one peer" are skipped when `ProxyEnabled()` |
-| Both | all of the above, and a trunk listener must have peers (`validate_proxy.go:41-43`); all three media ranges must be pairwise disjoint where their binds can collide (`validate_proxy.go:266-292`) | — |
+| Both | all of the above, and a trunk listener must have peers (`validate_proxy.go:34-36`); all three media ranges must be pairwise disjoint where their binds can collide (`validatePoolOverlap`, `validate_proxy.go:270-295`); no two listeners on either plane or the admin API may bind the same socket (`validateSockets`, `validate_proxy.go:326-355`) | — |
 
 Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 `TestTrunkOnlyConfigUnaffected` (`internal/config/proxy_test.go`).
@@ -462,7 +470,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | Key | Type | Default |
 |---|---|---|
 | `listen.sip[]` | `udp\|tcp\|tls://host:port` | none |
-| `listen.media.port_range` | `"min-max"` | `16384-32768`, applied only when neither `rtp.port_min` nor `rtp.port_max` is set |
+| `listen.media.port_range` | `"min-max"` | `16384-32768`, applied only when neither `rtp.port_min` nor `rtp.port_max` is set. With peers configured the range must hold one trunk call: two RTP/RTCP pairs, RTP on an even port (so at least 4 ports from an even start) |
 | `listen.media.public_ip` | IP or `"auto"` | `"auto"` |
 | `listen.media.rtp_timeout` | duration | `5m` |
 | `listen.tls_cert` / `tls_key` / `tls_client_ca` | path | "" |
@@ -475,7 +483,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `max_concurrent_calls` | int | 0 = unlimited |
 | `peers.<n>.address` | `host[:port]` or hostname | required |
 | `peers.<n>.transport` | `udp\|tcp\|tls` | `udp` |
-| `peers.<n>.allowed_ips[]` | CIDR or IP | **≥1 required**, canonicalised with `.Masked()`, no wider than IPv4 /8 or IPv6 /32 |
+| `peers.<n>.allowed_ips[]` | CIDR or IP | **≥1 required**, canonicalised with `.Masked()`, no wider than IPv4 /8 or IPv6 /32. An IPv4-mapped entry (`::ffff:10.0.0.1`, `::ffff:10.0.0.0/104`) is stored as the IPv4 prefix it maps, because sources are unmapped before matching; one shorter than /96 is rejected |
 | `peers.<n>.auth.{username,password,realm}` | | `realm: ""` accepts any challenge realm |
 | `peers.<n>.register` | bool | false; `true` requires `auth` |
 | `peers.<n>.media_latch` | `strict\|loose` | `strict` |
@@ -491,7 +499,7 @@ Pinned by `TestProxyOnlyConfigIsValid`, `TestProxyAndTrunkCoexist`,
 | `sip.advertised_port` | 1-65535 | `sip.bind_port` (`schema.go:297-299`) |
 | `rtp.bind_ip` | IP | `""` = every interface |
 | `rtp.advertised_ip` | IP | `""` = the `advertisedIP` chain of §12.1 |
-| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max` (`validate.go:55-108`) |
+| `rtp.port_min` / `rtp.port_max` | int | 0 = use `listen.media.port_range`; both-or-neither, ≥ 1024, `min < max`, and room for one trunk call (`validateTrunkMediaRange`) |
 
 Key relationships: `sip.bind_ip` and `listen.sip` are mutually exclusive
 (`sip.bind_ip` *replaces* the listener list); `rtp.port_min/max` and
@@ -532,7 +540,7 @@ durations beyond "> 0".
 | `network.public.{bind_ip,advertised_ip}` | advertised defaults to bind only when the bind is a *specific* address; a wildcard bind makes `advertised_ip` mandatory |
 | `network.private.{bind_ip,advertised_ip}` | same |
 | `sip.public.udp` / `ws` / `wss` | `{enabled, bind, cert_file, key_file}`; default binds are `:5060` / `:5066` / `:5061` on `network.public.bind_ip` (else `0.0.0.0`) |
-| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`proxy.go:418-424`) — always defaulted while the proxy is on, so the `required` check at `validate_proxy.go:236` cannot fire |
+| `sip.private.bind` | `network.private.bind_ip:5060`, or `0.0.0.0:5060` when that is unset (`listenerDefaults`, `proxy.go:444-450`) — always defaulted while the proxy is on, so validation has no "required" check. With both network binds unset, the default public UDP bind collides with it and validation says so |
 | `sip.private.advertised_ip` / `advertised_port` | port defaults to the bind port |
 | `sip.upstream.address` / `transport` | v1 single-node alias; transport must be `udp` |
 | `sip.upstreams.nodes.<n>.{address,transport}` | multi-node pool; addresses must be literal `IP:port`, transport `udp` |
@@ -542,7 +550,7 @@ durations beyond "> 0".
 | `sip.pstn.match` | required; must name neither the private SIP socket nor any upstream |
 | `sip.pstn.attempt_timeout` | `32s` |
 | `sip.pstn.cooldown` | `30s` |
-| `rtp.public` / `rtp.private` `{bind_ip,advertised_ip,port_min,port_max}` | both planes' ranges are required when the proxy is on, and must be disjoint from each other and from the trunk range |
+| `rtp.public` / `rtp.private` `{bind_ip,advertised_ip,port_min,port_max}` | both planes' ranges are required when the proxy is on, must each hold at least one RTP/RTCP pair, and must be disjoint from each other and from the trunk range |
 | `webrtc.enabled` | false |
 | `webrtc.ice_mode` | `"lite"` — the only supported value |
 | `webrtc.rtcp_mux` | `*bool`, nil = true; an explicit `false` is rejected |
@@ -552,8 +560,14 @@ Notable cross-key rules: `sip.upstream.address` and `sip.upstreams.nodes` are
 mutually exclusive; `sip.pstn.address` and `sip.pstn.gateways`/`routes` are
 mutually exclusive; `sip.pstn` requires `sip.public.udp.enabled` because the
 carrier leg rides the public UDP side; `webrtc.enabled` requires `ws` or
-`wss`; and upstream/gateway addresses must be **literal IP:port** — there is
-no DNS on the edge plane.
+`wss`; and upstream/gateway addresses must be **literal IP:port** and
+`sip.pstn.match` a literal IP — there is no DNS on the edge plane. Validation
+enforces this (`checkIPPort`, `validatePSTNMatch`), so `check` rejects a
+hostname exactly as `run`'s `parseEndpoint` does. Every listener — trunk
+`listen.sip`/`sip.bind_ip`, edge `sip.public.*` and `sip.private.bind`, and
+`admin.listen` — is also checked for socket collisions: tcp, tls, ws and wss
+all listen on TCP, udp on UDP, and a wildcard bind collides with every
+address on its port.
 
 ### 5.6 Custom scalar types
 
@@ -2903,9 +2917,9 @@ IP verification rejects it.
 | A single routable media address (no TURN) | **Assumed**; the fallback is the first specific `listen.sip` host, else 127.0.0.1 + WARN |
 | Advertised addresses are routable from their own side | **Enforced when the bind is a wildcard** |
 | Media pools do not overlap | **Enforced** across `rtp.public`, `rtp.private` and the trunk range |
-| Upstreams are UDP FreeSWITCHes at literal IPs | **Enforced** |
+| Upstreams are UDP FreeSWITCHes at literal IPs | **Enforced** by validation (`check` and `run`) and again at topology build |
 | Upstream pool members share one FreeSWITCH registration database | **Assumed.** After a failover the new node re-challenges and the phone's answer is valid there too — one extra round trip, not a broken registration. The pool is modulo-hashed, so changing the node set reshuffles users; with a shared database that is a re-registration, not an outage |
-| PSTN gateways are literal IPs, UDP only, never registered and never probed | **Enforced / by design**; the only traffic a gateway sees is the call it is answering |
+| PSTN gateways are literal IPs, UDP only, never registered and never probed | **Enforced** by validation and at topology build **/ by design**; the only traffic a gateway sees is the call it is answering |
 | RTP/RTCP ranges reachable end to end | **Assumed** |
 | IP fragmentation survives the path | **Assumed** |
 | Edge ws/wss listeners are resource-capped | **Not enforced** — the connection cap and idle timeout exist only on the trunk plane |

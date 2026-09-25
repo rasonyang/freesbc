@@ -188,61 +188,72 @@ func (e *envExpander) walk(v reflect.Value, path string) {
 		}
 
 	case reflect.Map:
-		if v.IsNil() {
-			return
-		}
-		iter := v.MapRange()
-		for iter.Next() {
-			key := iter.Key()
-			mv := iter.Value()
-			elemPath := fmt.Sprintf("%s[%v]", path, key.Interface())
-			if mv.Kind() == reflect.Ptr || mv.Kind() == reflect.Interface {
-				// Pointer/interface map values reference shared memory, so
-				// walking them in place mutates the real data.
-				e.walk(mv, elemPath)
-				continue
-			}
-			// Non-pointer map values aren't addressable straight out of the
-			// map; expand a settable copy and write it back.
-			nv := reflect.New(mv.Type()).Elem()
-			nv.Set(mv)
-			e.walk(nv, elemPath)
-			v.SetMapIndex(key, nv)
-		}
+		e.walkMap(v, path)
 
 	case reflect.String:
-		if !v.CanSet() {
-			return
-		}
-		orig := v.String()
-		if !strings.Contains(orig, "${") {
-			return
-		}
-		if snippet, ok := malformedRef(orig); ok {
-			e.malformed = append(e.malformed, fmt.Sprintf("%q in %s", snippet, path))
-			return
-		}
-		expanded := envRef.ReplaceAllFunc([]byte(orig), func(m []byte) []byte {
-			name := string(envRef.FindSubmatch(m)[1])
-			val, ok := os.LookupEnv(name)
-			if !ok {
-				if !e.seenMissing[name] {
-					e.seenMissing[name] = true
-					e.missing = append(e.missing, name)
-				}
-				return m
-			}
-			e.record(val, name)
-			return []byte(val)
-		})
-		if out := string(expanded); out != orig {
-			if e.redact.fields == nil {
-				e.redact.fields = map[string]string{}
-			}
-			e.redact.fields[out] = orig
-			v.SetString(out)
-		}
+		e.expandString(v, path)
 	}
+}
+
+// walkMap expands every value of a map.
+func (e *envExpander) walkMap(v reflect.Value, path string) {
+	if v.IsNil() {
+		return
+	}
+	iter := v.MapRange()
+	for iter.Next() {
+		key := iter.Key()
+		mv := iter.Value()
+		elemPath := fmt.Sprintf("%s[%v]", path, key.Interface())
+		if mv.Kind() == reflect.Ptr || mv.Kind() == reflect.Interface {
+			// Pointer/interface map values reference shared memory, so
+			// walking them in place mutates the real data.
+			e.walk(mv, elemPath)
+			continue
+		}
+		// Non-pointer map values aren't addressable straight out of the
+		// map; expand a settable copy and write it back.
+		nv := reflect.New(mv.Type()).Elem()
+		nv.Set(mv)
+		e.walk(nv, elemPath)
+		v.SetMapIndex(key, nv)
+	}
+}
+
+// expandString expands the ${VAR} references in one settable string.
+func (e *envExpander) expandString(v reflect.Value, path string) {
+	if !v.CanSet() {
+		return
+	}
+	orig := v.String()
+	if !strings.Contains(orig, "${") {
+		return
+	}
+	if snippet, ok := malformedRef(orig); ok {
+		e.malformed = append(e.malformed, fmt.Sprintf("%q in %s", snippet, path))
+		return
+	}
+	expanded := envRef.ReplaceAllStringFunc(orig, func(m string) string {
+		name := envRef.FindStringSubmatch(m)[1]
+		val, ok := os.LookupEnv(name)
+		if !ok {
+			if !e.seenMissing[name] {
+				e.seenMissing[name] = true
+				e.missing = append(e.missing, name)
+			}
+			return m
+		}
+		e.record(val, name)
+		return val
+	})
+	if expanded == orig {
+		return
+	}
+	if e.redact.fields == nil {
+		e.redact.fields = map[string]string{}
+	}
+	e.redact.fields[expanded] = orig
+	v.SetString(expanded)
 }
 
 func (e *envExpander) record(val, name string) {
