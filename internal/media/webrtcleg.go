@@ -69,8 +69,11 @@ type WebRTCLeg struct {
 	// peerCerts is the established connection's state accessor, kept so
 	// VerifyFingerprint can hash the peer certificate after the handshake.
 	peerCerts func() (dtls.State, bool)
-	err       error
-	state     legState
+	// cancel aborts an in-flight establish; Close calls it so ICE and the
+	// DTLS handshake stop at once instead of running to their deadline.
+	cancel context.CancelFunc
+	err    error
+	state  legState
 
 	closed chan struct{}
 }
@@ -232,13 +235,27 @@ func (l *WebRTCLeg) Err() error {
 
 // Start drives ICE and DTLS in the background. ctx cancels establishment;
 // once established, the leg lives until Close.
+//
+// Only the first call on a freshly allocated leg does anything: the
+// legAllocated → legEstablishing transition is claimed under mu, so a
+// second Start (or a Start after Close) cannot launch a second establish
+// that would build another ICE agent over the same socket and leak it.
 func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	l.setState(legEstablishing, nil)
+	l.mu.Lock()
+	if l.state != legAllocated {
+		l.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	l.cancel = cancel
+	l.set(legEstablishing, nil)
+	l.mu.Unlock()
 	go func() {
-		if err := l.establish(ctx, timeout); err != nil {
+		defer cancel()
+		if err := l.establish(ctx); err != nil {
 			// Publish the failure BEFORE tearing down, then let Close
 			// close the ready channel: a caller that wakes on Ready must
 			// find every resource already released, or a "leg failed"
@@ -252,9 +269,25 @@ func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	}()
 }
 
-func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+// errLegClosed aborts establish when Close won the race for a resource.
+var errLegClosed = errors.New("media: webrtc leg closed during establishment")
+
+// keep runs store under mu unless the leg is already closed, and reports
+// whether it ran. establish hands every resource it creates to the leg
+// through keep; when it returns false, Close has already taken its one
+// snapshot of the handles, so the caller must close the resource itself
+// or it would outlive the leg.
+func (l *WebRTCLeg) keep(store func()) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state == legClosed {
+		return false
+	}
+	store()
+	return true
+}
+
+func (l *WebRTCLeg) establish(ctx context.Context) error {
 
 	// --- ICE-Lite ---
 	//
@@ -267,9 +300,10 @@ func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error 
 	loggerFactory := logging.NewDefaultLoggerFactory()
 	loggerFactory.DefaultLogLevel = logging.LogLevelError
 	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: l.conn, Logger: loggerFactory.NewLogger("ice")})
-	l.mu.Lock()
-	l.mux = mux
-	l.mu.Unlock()
+	if !l.keep(func() { l.mux = mux }) {
+		_ = mux.Close()
+		return errLegClosed
+	}
 	agent, err := ice.NewAgent(&ice.AgentConfig{
 		Lite:           true,
 		CandidateTypes: []ice.CandidateType{ice.CandidateTypeHost},
@@ -288,9 +322,10 @@ func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error 
 	if err != nil {
 		return fmt.Errorf("%w: ice agent: %w", ErrICEFailed, err)
 	}
-	l.mu.Lock()
-	l.agent = agent
-	l.mu.Unlock()
+	if !l.keep(func() { l.agent = agent }) {
+		_ = agent.Close()
+		return errLegClosed
+	}
 	// pion requires a candidate handler before gathering. FreeSBC does not
 	// use the gathered candidates in SDP — it advertises exactly one host
 	// candidate at the configured public address (see sdp.Build) — so the
@@ -311,10 +346,10 @@ func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error 
 
 	// --- DTLS over the same socket ---
 	dm := newDemux(iceConn)
-	l.mu.Lock()
-	l.demux = dm
-	l.srtpEP = dm.srtp
-	l.mu.Unlock()
+	if !l.keep(func() { l.demux, l.srtpEP = dm, dm.srtp }) {
+		_ = dm.Close()
+		return errLegClosed
+	}
 
 	dtlsCfg := &dtls.Config{
 		Certificates: []tls.Certificate{l.identity.Certificate},
@@ -346,22 +381,24 @@ func (l *WebRTCLeg) establish(ctx context.Context, timeout time.Duration) error 
 		_ = dtlsConn.Close()
 		return fmt.Errorf("%w: %w", ErrDTLSHandshake, err)
 	}
-	l.mu.Lock()
-	l.peerCerts = dtlsConn.ConnectionState
-	l.mu.Unlock()
+	// The DTLS connection has done its job once keyed (it exists only to
+	// key SRTP); its records are already drained by the demultiplexer, and
+	// closing it here would tear the shared socket down. It is retained
+	// only so a late renegotiation attempt is absorbed rather than
+	// reaching SRTP, and is closed with the leg — on every path from here
+	// on, including a keying failure below, which ends in Close.
+	go func() {
+		<-l.closed
+		_ = dtlsConn.Close()
+	}()
+	if !l.keep(func() { l.peerCerts = dtlsConn.ConnectionState }) {
+		return errLegClosed
+	}
 
 	// --- SRTP keying (RFC 5764 §4.2) ---
 	if err := l.deriveSRTP(dtlsConn); err != nil {
 		return err
 	}
-	// The DTLS connection has done its job (it exists only to key SRTP);
-	// its records are already drained by the demultiplexer, and closing it
-	// here would tear the shared socket down. It is retained only so a
-	// late renegotiation attempt is absorbed rather than reaching SRTP.
-	go func() {
-		<-l.closed
-		_ = dtlsConn.Close()
-	}()
 	return nil
 }
 
@@ -522,9 +559,16 @@ func (l *WebRTCLeg) Close() error {
 		return nil
 	}
 	l.set(legClosed, nil)
-	dm, agent, mux := l.demux, l.agent, l.mux
+	dm, agent, mux, cancel := l.demux, l.agent, l.mux, l.cancel
 	l.mu.Unlock()
 
+	// From here on establish cannot store a new handle (keep refuses once
+	// the state is legClosed), so this snapshot is complete; anything it
+	// creates later it closes itself. Cancelling its context makes it
+	// notice promptly instead of at its deadline.
+	if cancel != nil {
+		cancel()
+	}
 	close(l.closed)
 	if dm != nil {
 		_ = dm.Close()

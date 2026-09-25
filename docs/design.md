@@ -1992,14 +1992,24 @@ stateDiagram-v2
     legClosed --> [*]
 ```
 
-Transitions: `NewWebRTCLeg` (`webrtcleg.go:187-203`) leaves the state at the
-zero value `legAllocated`; `Start` (`webrtcleg.go:239`) sets `legEstablishing`
-and spawns `establish`; that goroutine sets `legFailed` and immediately calls
-`Close` on error (`webrtcleg.go:246-247`) or `legEstablished` on success
-(`:250`); `Close` (`webrtcleg.go:524`) sets `legClosed`, which `set`
-(`:107-109`) treats as terminal. The first error recorded wins, and a leg
-closed before it was established is retroactively stamped with
-`"webrtc leg closed before it was established"`.
+Transitions: `NewWebRTCLeg` (`webrtcleg.go:170-207`) leaves the state at the
+zero value `legAllocated`; `Start` (`webrtcleg.go:243-270`) claims
+`legAllocated → legEstablishing` under `mu` and spawns `establish` — a second
+`Start`, or a `Start` after `Close`, is a no-op, so no second ICE agent can
+be built over the same socket; that goroutine sets `legFailed` and
+immediately calls `Close` on error (`webrtcleg.go:263-264`) or
+`legEstablished` on success (`:267`); `Close` (`webrtcleg.go:552`) sets
+`legClosed`, which `set` (`:110-112`) treats as terminal. The first error
+recorded wins, and a leg closed before it was established is retroactively
+stamped with `"webrtc leg closed before it was established"`.
+
+`Close` during establishment releases everything: it cancels `establish`'s
+context and snapshots the mux/agent/demux handles once, and `establish`
+hands every handle it creates to the leg through `keep` (`webrtcleg.go:280`),
+which refuses once the state is `legClosed` — `establish` then closes that
+handle itself and returns. The DTLS connection is tied to the leg's `closed`
+channel as soon as its handshake succeeds, so a keying failure after the
+handshake no longer leaks it.
 
 `establish` runs under **one deadline covering ICE and DTLS together** —
 `Start(ctx, timeout)` with `timeout <= 0` meaning **30 s**:
@@ -2092,7 +2102,7 @@ all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:554-560`) — with a
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:598-605`) — with a
 length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
 accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.
