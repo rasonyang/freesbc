@@ -1184,7 +1184,7 @@ func (s *Server) dialAttempt(c *call, cfg *config.Config, target Target, mediaIP
 					// unsatisfied-challenge failDial.
 					if auth := target.Peer.Auth; auth != nil && auth.Realm != "" &&
 						(res.StatusCode == sip.StatusUnauthorized || res.StatusCode == sip.StatusProxyAuthRequired) &&
-						challengeRealm(res) != auth.Realm {
+						!realmPinned(res, auth.Realm) {
 						err = fmt.Errorf("auth challenge realm %q does not match pinned realm %q", challengeRealm(res), auth.Realm)
 						return
 					}

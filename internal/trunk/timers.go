@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo/sip"
+	"github.com/icholy/digest"
 )
 
 // compactNames maps a header's long name to its compact form, for the
@@ -70,40 +71,142 @@ func hasOptionTag(m sip.Message, name, tag string) bool {
 	return false
 }
 
-// challengeRealm extracts the realm from a 401/407 digest challenge
-// response: WWW-Authenticate for 401, Proxy-Authenticate for
-// 407. Returns "" when the header is absent or unparseable — callers
-// compare it against a pinned realm, so "" simply never matches (fail
-// closed). Both double- and single-quoted realms are accepted (some
-// servers violate the quoted-string convention).
-func challengeRealm(res *sip.Response) string {
+// challengeHeader returns the challenge header value sipgo answers for a
+// 401/407: the FIRST WWW-Authenticate for 401, the first Proxy-Authenticate
+// for 407 (sipgo's digestAuthApply/digestProxyAuthApply read exactly that).
+func challengeHeader(res *sip.Response) (string, bool) {
 	name := "WWW-Authenticate"
 	if res.StatusCode == sip.StatusProxyAuthRequired {
 		name = "Proxy-Authenticate"
 	}
-	headers := res.GetHeaders(name)
-	if len(headers) == 0 {
+	h := res.GetHeader(name)
+	if h == nil {
+		return "", false
+	}
+	return h.Value(), true
+}
+
+// challengeRealm extracts the realm from a 401/407 digest challenge (see
+// challengeHeader for which header). The challenge is parsed as RFC 2617
+// §1.2 / RFC 3261 §25.1 define it: a "Digest" scheme followed by
+// comma-separated auth-params whose names are case-insensitive and whose
+// values are tokens or quoted-strings. Returns "" when the header is
+// absent, unparseable, not Digest, or names a realm more than once —
+// callers compare it against a pinned realm, so "" never matches (fail
+// closed).
+func challengeRealm(res *sip.Response) string {
+	v, ok := challengeHeader(res)
+	if !ok {
 		return ""
 	}
-	v := headers[0].Value()
-	i := strings.Index(v, "realm=")
-	if i < 0 {
+	params, ok := parseDigestChallenge(v)
+	if !ok {
 		return ""
 	}
-	rest := strings.TrimSpace(v[i+len("realm="):])
-	if rest == "" {
-		return ""
-	}
-	if rest[0] == '"' || rest[0] == '\'' {
-		if j := strings.IndexByte(rest[1:], rest[0]); j >= 0 {
-			return rest[1 : 1+j]
+	realm, n := "", 0
+	for _, p := range params {
+		if strings.EqualFold(p[0], "realm") {
+			realm = p[1]
+			n++
 		}
+	}
+	if n != 1 {
 		return ""
 	}
-	if j := strings.IndexAny(rest, ", "); j >= 0 {
-		rest = rest[:j]
+	return realm
+}
+
+// realmPinned reports whether a 401/407 challenge may be answered for a
+// peer that pins realm: the challenge must name exactly that realm under
+// RFC parsing (challengeRealm) AND under the parser sipgo itself digests
+// with (icholy/digest), so the realm checked is the realm our credentials
+// would be hashed over. A challenge the two parsers read differently — a
+// realm hidden in another parameter's name or value, a case variant only
+// one of them understands, a duplicated realm — is never answered.
+func realmPinned(res *sip.Response, realm string) bool {
+	if challengeRealm(res) != realm {
+		return false
 	}
-	return rest
+	v, _ := challengeHeader(res)
+	chal, err := digest.ParseChallenge(v)
+	return err == nil && chal.Realm == realm
+}
+
+// parseDigestChallenge splits a Digest challenge into its auth-params, in
+// order, as [name, value] pairs (quoted-string values unquoted and
+// unescaped). ok is false for anything that is not a well-formed Digest
+// challenge.
+func parseDigestChallenge(v string) (params [][2]string, ok bool) {
+	v = strings.TrimSpace(v)
+	scheme, rest, _ := strings.Cut(v, " ")
+	if !strings.EqualFold(scheme, "Digest") {
+		return nil, false
+	}
+	i := 0
+	skip := func(set string) {
+		for i < len(rest) && strings.IndexByte(set, rest[i]) >= 0 {
+			i++
+		}
+	}
+	for {
+		skip(" \t,")
+		if i >= len(rest) {
+			return params, true
+		}
+		start := i
+		for i < len(rest) && isTokenChar(rest[i]) {
+			i++
+		}
+		name := rest[start:i]
+		skip(" \t")
+		if name == "" || i >= len(rest) || rest[i] != '=' {
+			return nil, false
+		}
+		i++
+		skip(" \t")
+		var value strings.Builder
+		if i < len(rest) && rest[i] == '"' {
+			i++
+			closed := false
+			for i < len(rest) {
+				c := rest[i]
+				i++
+				if c == '\\' && i < len(rest) {
+					value.WriteByte(rest[i])
+					i++
+					continue
+				}
+				if c == '"' {
+					closed = true
+					break
+				}
+				value.WriteByte(c)
+			}
+			if !closed {
+				return nil, false
+			}
+		} else {
+			start := i
+			for i < len(rest) && isTokenChar(rest[i]) {
+				i++
+			}
+			if start == i {
+				return nil, false
+			}
+			value.WriteString(rest[start:i])
+		}
+		params = append(params, [2]string{name, value.String()})
+		skip(" \t")
+		if i < len(rest) && rest[i] != ',' {
+			return nil, false
+		}
+	}
+}
+
+// isTokenChar reports whether c may appear in an RFC 3261 §25.1 token.
+func isTokenChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		strings.IndexByte("-.!%*_+`'~", c) >= 0
 }
 
 // requires100rel reports whether any Require header lists the 100rel option

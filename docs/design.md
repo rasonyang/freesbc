@@ -938,6 +938,14 @@ An answer whose suite differs from the offered one is treated as "no usable
 crypto". Only two suites exist in `internal/media`:
 `AES_CM_128_HMAC_SHA1_80` and `_32`; parsing is case-sensitive.
 
+A line is usable only with exactly one `inline:` key-param and no session
+parameters (`parseCryptoAttrs`, `crypto.go`). A key carrying an MKI
+(`|<mki>:<len>`) is rejected, because every SRTP packet would then carry an
+MKI the contexts do not expect (RFC 4568 §6.1); so is any session parameter
+(`KDR`, `UNENCRYPTED_SRTP`, `FEC_ORDER`, `WSH`, ...), none of which is
+implemented (§6.3). A key lifetime alone (`|2^20`) is accepted but not
+enforced: the SBC never rekeys.
+
 When SDES keys are negotiated over a non-TLS signalling transport, one
 `Warn` is logged per secure leg.
 
@@ -953,9 +961,14 @@ default 1 h).
 - `registerOnce` sends a REGISTER; a **423 Interval Too Brief** carrying a
   larger `Min-Expires` is retried **once**, non-recursively — at most two
   exchanges.
-- On 401/407, **realm pinning runs first**: a challenge naming a realm other
-  than the peer's configured `auth.realm` fails the registration outright and
-  no `Authorization` header is ever sent. Otherwise `DoDigestAuth`.
+- On 401/407, **realm pinning runs first** (`realmPinned`, `timers.go`): the
+  first challenge header is parsed as RFC 2617 auth-params (case-insensitive
+  names, quoted-string values) **and** with the parser sipgo digests with
+  (`icholy/digest`); unless both name exactly the peer's configured
+  `auth.realm`, once, the registration fails outright and no `Authorization`
+  header is ever sent. A realm hidden in another parameter's name
+  (`xrealm=`), a duplicated realm, or a case variant only one parser reads
+  all fail closed. Otherwise `DoDigestAuth`.
 - The granted lifetime is read from the response: `Expires` header → Contact
   `expires` param → the requested value.
 - On success: mark registered, reset backoff, and refresh at
@@ -2983,8 +2996,8 @@ true`, and binding remote without TLS logs a prominent startup warning.
 **Transport security.** TLS 1.2 minimum on every TLS surface; optional mTLS
 on the trunk listener via `listen.tls_client_ca`; digest **realm pinning** on
 both outbound INVITEs and outbound REGISTERs, which aborts before any
-`Authorization` header is ever sent when a challenge names an unexpected
-realm.
+`Authorization` header is ever sent unless the challenge names the pinned
+realm under both RFC parsing and sipgo's own digest parser (§6.9).
 
 **Media.** SRTP/SRTCP replay protection is explicitly enabled (windows
 64/128) — a replayed or tampered packet fails unprotect and is dropped, and

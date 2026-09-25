@@ -100,7 +100,7 @@ func registerOnceNoRetry(ctx context.Context, client *sipgo.Client, p regParams,
 		// other realm is never answered — computing a digest of our
 		// credentials for it would let a rogue registrar harvest the
 		// response for offline cracking. Fail the registration as-is.
-		if p.Realm != "" && challengeRealm(res) != p.Realm {
+		if p.Realm != "" && !realmPinned(res, p.Realm) {
 			return 0, res, fmt.Errorf("register challenge realm %q does not match pinned realm %q", challengeRealm(res), p.Realm)
 		}
 		res, err = client.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{Username: p.Username, Password: p.Password})
