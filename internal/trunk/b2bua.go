@@ -224,7 +224,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 			// from the current config and the re-INVITE's own transport
 			// (req.Transport(): whichever leg sent this refresh).
 			transport := sip.NetworkToLower(req.Transport())
-			contact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, transport), transport)
+			contact := buildContact(s.sigIP(cfg), s.sigPort(transport), transport)
 
 			res := sip.NewResponseFromRequest(req, 200, "OK", entry.answer)
 			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
@@ -917,7 +917,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	bTarget := peerURI(ep)
 	bTarget.User = outNumber
 
-	sigPort := s.ourSigPort(cfg, target.Peer.Transport)
+	sigPort := s.sigPort(target.Peer.Transport)
 	from := s.buildFrom(aLeg.InviteRequest, s.sigIP(cfg), sigPort)
 	contact := buildContact(s.sigIP(cfg), sigPort, target.Peer.Transport)
 
@@ -1045,7 +1045,7 @@ func (s *Server) dialTarget(c *call, cfg *config.Config, target Target, ep Endpo
 	// 2xx up to 64*T1 otherwise); onAck routes it to dialogSrv.ReadAck.
 	// Respond blocks identically (same WriteResponse underneath).
 	aTransport := sip.NetworkToLower(aLeg.InviteRequest.Transport())
-	aContact := buildContact(s.sigIP(cfg), s.ourSigPort(cfg, aTransport), aTransport)
+	aContact := buildContact(s.sigIP(cfg), s.sigPort(aTransport), aTransport)
 	timerHeaders, aTimer := aLegSessionTimer(aLeg.InviteRequest, cfg)
 	headers := append([]sip.Header{sip.NewHeader("Content-Type", "application/sdp"), aContact}, timerHeaders...)
 	if err := aLeg.Respond(200, "OK", aAnswer, headers...); err != nil {

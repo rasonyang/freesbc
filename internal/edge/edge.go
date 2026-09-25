@@ -30,6 +30,13 @@ type Server struct {
 	store *config.Store
 	log   *slog.Logger
 
+	// boot is the snapshot the plane was built from (store.Current() in
+	// New). Restart-only settings are read from it and never from the
+	// store: the listener set, the WSS certificate, the private bind the
+	// read filter trusts, the media planes and the fallbacks of the
+	// failure budgets (see budgets.go). Written once in New.
+	boot *config.Config
+
 	topo *topology
 
 	pubPool  *media.PlanePool
@@ -125,9 +132,10 @@ func New(store *config.Store, log *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	raiseUDPSendLimit()
-	pub, priv := newMediaPools(store)
+	pub, priv := newMediaPools(store, cfg)
 	s := &Server{
 		store:            store,
+		boot:             cfg,
 		log:              log.With("component", "proxy"),
 		topo:             topo,
 		pubPool:          pub,
@@ -226,10 +234,10 @@ func (s *Server) Run(ctx context.Context) error {
 		addr      string
 	}
 	var listeners []bound
-	for _, l := range s.store.Current().PublicSIPListeners() {
+	for _, l := range s.boot.PublicSIPListeners() {
 		listeners = append(listeners, bound{l.Transport, l.Bind.String()})
 	}
-	listeners = append(listeners, bound{"udp-private", s.store.Current().SIP.Private.Bind.String()})
+	listeners = append(listeners, bound{"udp-private", s.boot.SIP.Private.Bind.String()})
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -443,7 +451,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		l.stream = s.watchConnections(ln)
 		return l, nil
 	case "wss":
-		cfg := s.store.Current().SIP.Public.WSS
+		cfg := s.boot.SIP.Public.WSS
 		var tlsConf *tls.Config
 		if cfg.CertFile != "" {
 			cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -536,7 +544,7 @@ const maxMessageSize = fsip.MaxReadSize
 // return an error live in fsip.ReadFilter; what is here is the proxy's own
 // trust decision.
 func (s *Server) readFilter() sip.TransportReadFilter {
-	privateAddr := s.store.Current().SIP.Private.Bind.String()
+	privateAddr := s.boot.SIP.Private.Bind.String()
 	return fsip.ReadFilter(maxMessageSize, func(info sip.TransportReadProps) bool {
 		// The private listener speaks to exactly one peer: FreeSWITCH.
 		// Anything else reaching it is either misrouted or hostile, and is

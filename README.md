@@ -60,7 +60,7 @@ Then validate and run:
 ./freesbc run   -c sbc.yaml
 ```
 
-The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC) and the `admin` listener are read once at startup and need a restart.
+The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC), the edge media planes (`rtp.public`/`rtp.private`), which planes run and the `admin` listener are read once at startup and need a restart; a reload that edits them is logged as a warning listing the keys, and the running process keeps its startup values.
 
 ## Keep FreeSWITCH off the public internet
 

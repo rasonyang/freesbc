@@ -414,7 +414,7 @@ func (r *Registrar) paramsFor(cfg *config.Config, name string, p *config.Peer) r
 	return regParams{
 		Name: name, RegistrarHost: host, RegistrarPort: port,
 		Transport: p.Transport, Username: p.Auth.Username, Password: p.Auth.Password, Realm: p.Auth.Realm,
-		ContactIP: sigIP, ContactPort: r.srv.ourSigPort(cfg, p.Transport),
+		ContactIP: sigIP, ContactPort: r.srv.sigPort(p.Transport),
 	}
 }
 

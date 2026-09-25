@@ -362,13 +362,23 @@ There is **no reload-failure metric**.
 
 | Hot (re-read per use) | Restart-only |
 |---|---|
-| `peers.*` (address, allowed_ips, auth, srtp, transport, quotas) — read per packet in the trunk read filter and per call in the B2BUA | The listener set: `listen.sip` / `sip.bind_ip`, `sip.public.*`, `sip.private.bind` |
-| `routes` | Trunk dialog-cache Contact (resolved once in `trunk.Server.Run`) |
-| `shield.rate_limit`, `shield.peer_rate_limit`, `shield.auto_ban.duration` | — |
-| `admin.auth.username` / `password_hash` (effective on the next request) | `admin.listen`, `admin.tls_cert`, `admin.tls_key`; the **existence** of the `admin:` section |
-| RTP port ranges and bind IPs, for **new** sessions only | Edge topology: upstream nodes, PSTN gateways/routes/match, `webrtc.*`, DTLS identity |
-| `listen.media.rtp_timeout`, for new sessions | Outbound per-peer TLS material (`newClientTLS`, once at trunk `Run`; §6.14) |
-| `sip.upstreams.cooldown`, `sip.pstn.attempt_timeout`, `sip.pstn.cooldown` — re-read per call/registration | Inbound TLS certificates (built once at bind) |
+| `peers.*` (address, allowed_ips, auth, srtp, transport, quotas) — read per packet in the trunk read filter and per call in the B2BUA | Which planes run: trunk (`peers` non-empty), edge (`sip.upstream` / `sip.upstreams.nodes`), admin (`admin:` present) — decided once in `app.Run` |
+| `routes` | The trunk listener set: `listen.sip` / `sip.bind_ip` / `sip.bind_port` / `sip.transport`, and `sip.advertised_port` — every Contact, From and REGISTER port comes from `trunk.Server.boot` (`sigPort`) |
+| `sip.advertised_ip`, `rtp.advertised_ip`, `listen.media.public_ip` (trunk signalling and SDP address, per call) | Trunk dialog-cache Contact (resolved once in `trunk.Server.Run`) |
+| `shield.rate_limit`, `shield.peer_rate_limit`, `shield.auto_ban.duration` | Inbound TLS certificates (`listen.tls_*`, built once at bind) and outbound per-peer TLS material (`newClientTLS`, once at trunk `Run`; §6.14) |
+| `admin.auth.username` / `password_hash` (effective on the next request) | `admin.listen`, `admin.allow_remote`, `admin.tls_cert`, `admin.tls_key` |
+| Trunk RTP port range and `rtp.bind_ip`, for **new** sessions only | Edge listeners and topology: `sip.public.*`, `sip.private.*`, `network.*`, upstream nodes and algorithm, PSTN gateways/routes/match, `webrtc.*`, DTLS identity |
+| `listen.media.rtp_timeout`, for new sessions (both planes) | Edge media planes `rtp.public` / `rtp.private` (range and bind; the advertised address is topology, so the bind follows it — audit P2-EDG-025) |
+| `sip.upstreams.cooldown`, `sip.pstn.attempt_timeout`, `sip.pstn.cooldown` — re-read per call/registration; when a reload removes the section, the startup value applies (`edge/budgets.go`, audit P2-CFG-002) | — |
+
+A reload that changes anything in the right-hand column is still published —
+its hot settings apply at once — but `config.Watch` logs
+`"config reload changes restart-only settings; ..."` with the list of changed
+keys (`config.RestartOnlyChanges`, `internal/config/restart.go`, audit
+P2-CFG-007), diffed against the snapshot current when the watcher started.
+The planes never act on the new values: each keeps the snapshot it was built
+from (`trunk.Server.boot`, `edge.Server.boot`) and reads every restart-only
+setting from it, never from the store.
 
 The only `Store.Subscribe()` consumers are `trunk.Registrar.Run` (which
 reconciles the registration set on every publication) and

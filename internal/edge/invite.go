@@ -232,8 +232,8 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 
 	// The failure budget is re-read from the store on EVERY call, so a
 	// reload changes it for the next call without a restart; the node set is
-	// a startup snapshot like the rest of the topology.
-	cooldown := s.store.Current().SIP.Upstreams.Cooldown.Std()
+	// a startup snapshot like the rest of the topology (see budgets.go).
+	cooldown := s.upstreamPenalty()
 
 	// The caller's hash order, cooled nodes at the tail: everything this
 	// user does starts on the same switch, and a switch that just failed is
@@ -583,10 +583,8 @@ func (s *Server) inviteToPSTN(req *sip.Request, tx sip.ServerTransaction) {
 	// The failure budgets are re-read from the store on EVERY call, so a
 	// config reload changes them for the next call without a restart; the
 	// gateway set and routes are a startup snapshot like the rest of the
-	// topology.
-	cfg := s.store.Current().SIP.Pstn
-	budget := cfg.AttemptTimeout.Std()
-	cooldown := cfg.Cooldown.Std()
+	// topology (see budgets.go).
+	budget, cooldown := s.pstnBudget()
 
 	// Cooldown ordering: keep the route's failover order, but SKIP every
 	// cooling gateway while any alternative is available, so a sick gateway

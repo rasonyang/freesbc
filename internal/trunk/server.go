@@ -31,6 +31,15 @@ type Server struct {
 	pool  *media.PlanePool
 	log   *slog.Logger
 
+	// boot is the snapshot the plane starts with (store.Current() in
+	// NewServer). Restart-only settings are read from it and never from the
+	// store: the listener set Run binds, the inbound TLS identity, the
+	// initial outbound TLS material and the signaling port this plane
+	// advertises (sigPort). A hot reload that edits them is published, but
+	// this plane keeps acting on what it actually bound (audit P2-TRK-004).
+	// Written once in NewServer, before any goroutine exists.
+	boot *config.Config
+
 	// callMu guards the one call store (calls.go): calls is every bridged
 	// call keyed by its admin ID — the identity the admin API and KillCall
 	// use — and legs indexes the SAME *call under EACH leg's own Call-ID,
@@ -125,6 +134,7 @@ func NewServer(store *config.Store, pool *media.PlanePool, log *slog.Logger) *Se
 		store:    store,
 		pool:     pool,
 		log:      log,
+		boot:     store.Current(),
 		calls:    make(map[string]*call),
 		legs:     make(map[string][]legRef),
 		inviting: make(map[mergeKey]struct{}),
@@ -173,7 +183,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// accepts) whose callbacks select trust roots and client certificate
 	// per peer (see clientTLS). Material is loaded once at startup — it
 	// is not hot-rotated.
-	peerTLS, err := newClientTLS(s.store.Current().Peers,
+	peerTLS, err := newClientTLS(s.boot.Peers,
 		func() map[string]*config.Peer { return s.store.Current().Peers },
 		s.resolver.srvTargets)
 	if err != nil {
@@ -205,7 +215,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer client.Close()
 
-	cfg := s.store.Current()
+	cfg := s.boot
 	listeners := cfg.Listeners()
 	// The Contact host must be an address the far side can actually reach —
 	// see sigIP: same resolution (sip.advertised_ip, else the public_ip
@@ -214,10 +224,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// all interfaces) doesn't advertise an unroutable sip:0.0.0.0:port.
 	// The port is the advertised signaling port for listeners[0]'s
 	// transport (sip.advertised_port when configured), never a hardcoded
-	// 5060. Resolved once here from the config Run started with;
+	// 5060. Resolved once here from the startup snapshot (s.boot);
 	// hot-reloaded changes to advertised/listener settings don't
-	// retroactively update this cached Contact (mediaIP/sigIP's per-call
-	// uses, by contrast, are resolved fresh from the current config). The
+	// retroactively update this cached Contact (sigIP's per-call uses, by
+	// contrast, are resolved fresh from the current config; the port is
+	// restart-only everywhere, see sigPort). The
 	// len guard mirrors the pre-existing listeners[0] guard: validated
 	// configs always have at least one listener, but a *Server built
 	// directly by tests (without Parse) may have none.
@@ -376,8 +387,8 @@ func (s *Server) bindListener(ctx context.Context, srv *sipgo.Server, l config.S
 		// self-signed one — clients (or our own outbound side, with a
 		// matching trust anchor) can then verify this listener for real.
 		// mTLS engages when tls_client_ca is set. Read at bind time from
-		// the startup config; cert material is not hot-rotated.
-		cfg := s.store.Current()
+		// the startup snapshot; cert material is not hot-rotated.
+		cfg := s.boot
 		var tlsConf *tls.Config
 		if cfg.Listen.TLSCert != "" {
 			conf, err := loadServerTLSConfig(cfg.Listen.TLSCert, cfg.Listen.TLSKey, cfg.Listen.TLSClientCA)
@@ -518,13 +529,21 @@ func (s *Server) mediaIP(cfg *config.Config) netip.Addr {
 	return s.advertisedIP(cfg, cfg.RTP.AdvertisedIP)
 }
 
+// sigPort is the signaling port this plane advertises for transport, from
+// the startup snapshot: the listener set is restart-only, so a reload that
+// edits listen.sip or sip.advertised_port must never make a Contact, From
+// or REGISTER name a port nothing is bound to (audit P2-TRK-004).
+func (s *Server) sigPort(transport string) int {
+	return s.ourSigPort(s.boot, transport)
+}
+
 // ourSigPort returns the port we advertise for our signaling on the given
 // transport: sip.advertised_port when the sip bind/advertised topology is
 // configured, else the first matching listen.sip port, else the first
 // listener's port — mirrors the Contact-port resolution Run does once at
-// startup (see the contact comment above), but re-resolved per call /
+// startup (see the contact comment above), but resolved per call /
 // per-target so it tracks whichever transport the B-leg is actually being
-// placed on. Validation guarantees at least one listener (listen.sip or
+// placed on. Callers pass the startup snapshot (see sigPort). Validation guarantees at least one listener (listen.sip or
 // sip.bind_ip), so a parsed Config never falls through to the zero return;
 // 0 only serves Configs built directly by unit tests without Parse. There
 // is deliberately no 5060 fallback: the configured ports are the source of
