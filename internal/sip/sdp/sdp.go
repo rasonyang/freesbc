@@ -81,16 +81,19 @@ const (
 )
 
 // Codec is one payload type of an audio section, as offered or answered.
-// FMTP is carried verbatim: the proxy never rewrites codec parameters
-// because it never transcodes, so whatever the two endpoints agree on
-// (opus stereo, useinbandfec, telephone-event event ranges) must reach the
-// far side exactly as written.
+//
+// FMTP is never the other leg's text. Parse keeps only the parameters on a
+// per-codec allowlist (fmtp.go), validated against a type and re-rendered
+// canonically, and Build applies the same filter again before writing an
+// a=fmtp line. What the two endpoints agree on (opus stereo, useinbandfec,
+// telephone-event event ranges) still reaches the far side; free text,
+// addresses and line breaks do not.
 type Codec struct {
 	PayloadType uint8
 	Name        string // as written, e.g. "opus", "PCMU", "telephone-event"
 	ClockRate   uint32
 	Channels    int    // 0 when the rtpmap omitted it
-	FMTP        string // the a=fmtp value, without the payload type
+	FMTP        string // canonical allowlisted fmtp parameters, without the payload type
 }
 
 // key is the transcoding-free identity of a codec: two codecs are the same
@@ -176,11 +179,29 @@ func (a *Audio) WebRTC() bool {
 // Session is a parsed SDP body: the audio section the proxy relays, plus
 // what it needs to build a matching body for the other leg.
 type Session struct {
-	// Audio is the first audio m= section. Parse fails when there is none.
+	// Audio is the first live audio m= section. Parse fails when there is
+	// none.
 	Audio *Audio
 	// MediaCount is how many m= sections the body had, including the ones
 	// the proxy declines.
 	MediaCount int
+	// AudioIndex is the position of Audio among the body's m= sections.
+	// An answer must put its live audio section at the same index
+	// (RFC 3264 §6).
+	AudioIndex int
+	// Sections is the media type and transport of every m= section, in
+	// order, so an answer can decline each one with a matching m= line.
+	// Both are normalised (see Section); nothing else is kept.
+	Sections []Section
+}
+
+// Section is what an answer needs to decline one offered m= section: its
+// media type and transport protocol. Both are checked against a fixed
+// grammar before they are kept, because they are echoed into the body
+// built for the other leg.
+type Section struct {
+	Media string   // "audio", "video", ...: letters only, lower-cased
+	Proto []string // e.g. ["RTP","AVP"]; one of knownProtos
 }
 
 // ErrNotUnicast reports a connection address that can never be a unicast
@@ -224,15 +245,18 @@ func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 	}
 
 	var md *pionsdp.MediaDescription
-	for _, m := range sd.MediaDescriptions {
+	audioIndex := 0
+	sections := make([]Section, 0, len(sd.MediaDescriptions))
+	for i, m := range sd.MediaDescriptions {
 		if len(m.Attributes) > MaxAttributes {
 			return nil, fmt.Errorf("%w: %d media attributes", ErrTooLarge, len(m.Attributes))
 		}
+		sections = append(sections, section(m))
 		// The FIRST audio section is the one relayed; a declined (port 0)
 		// section is skipped so a body that offers a dead audio stream
 		// followed by a live one still works.
 		if md == nil && m.MediaName.Media == "audio" && m.MediaName.Port.Value != 0 {
-			md = m
+			md, audioIndex = m, i
 		}
 	}
 	if md == nil {
@@ -259,7 +283,40 @@ func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 		return nil, errors.New("sdp: audio section has no payload types")
 	}
 
-	return &Session{Audio: a, MediaCount: len(sd.MediaDescriptions)}, nil
+	return &Session{
+		Audio:      a,
+		MediaCount: len(sd.MediaDescriptions),
+		AudioIndex: audioIndex,
+		Sections:   sections,
+	}, nil
+}
+
+// knownProtos is every transport an answer may echo when it declines a
+// section. An unknown one is answered as RTP/AVP: the proto of a rejected
+// stream is moot, and echoing an unvetted token would carry the other
+// leg's text across.
+var knownProtos = map[string]bool{
+	"RTP/AVP": true, "RTP/AVPF": true, "RTP/SAVP": true, "RTP/SAVPF": true,
+	"UDP/TLS/RTP/SAVP": true, "UDP/TLS/RTP/SAVPF": true,
+	"TCP/TLS/RTP/SAVP": true, "TCP/TLS/RTP/SAVPF": true,
+	"TCP/DTLS/RTP/SAVP": true, "TCP/DTLS/RTP/SAVPF": true,
+	"UDP/DTLS/SCTP": true, "TCP/DTLS/SCTP": true, "DTLS/SCTP": true,
+	"udptl": true, "TCP/MSRP": true, "TCP/TLS/MSRP": true,
+	"UDP/BFCP": true, "TCP/BFCP": true, "TCP/TLS/BFCP": true,
+	"TCP": true, "UDP": true,
+}
+
+// section normalises one m= line into what a declining answer echoes.
+func section(m *pionsdp.MediaDescription) Section {
+	media := strings.ToLower(m.MediaName.Media)
+	if media == "" || len(media) > 32 || strings.IndexFunc(media, func(r rune) bool { return r < 'a' || r > 'z' }) >= 0 {
+		media = "audio"
+	}
+	proto := []string{"RTP", "AVP"}
+	if knownProtos[strings.Join(m.MediaName.Protos, "/")] {
+		proto = append([]string(nil), m.MediaName.Protos...)
+	}
+	return Section{Media: media, Proto: proto}
 }
 
 func parseConnection(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescription, a *Audio, opts ParseOptions) error {
@@ -366,7 +423,7 @@ func parseCodecs(md *pionsdp.MediaDescription) ([]Codec, error) {
 			continue
 		}
 		seen[pt] = true
-		c := Codec{PayloadType: pt, FMTP: fmtp[pt]}
+		c := Codec{PayloadType: pt}
 		if m, ok := rtpmap[pt]; ok {
 			name, rate, ch, ok := parseRTPMap(m)
 			if !ok {
@@ -378,6 +435,7 @@ func parseCodecs(md *pionsdp.MediaDescription) ([]Codec, error) {
 		} else {
 			continue // dynamic payload type with no rtpmap: unusable
 		}
+		c.FMTP = canonicalFMTP(c.Name, fmtp[pt])
 		out = append(out, c)
 	}
 	return out, nil

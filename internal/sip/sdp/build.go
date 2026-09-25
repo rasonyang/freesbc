@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	// pion's package is also called sdp; alias it so this package can
 	// keep the name that reads best at its own call sites.
@@ -63,23 +64,41 @@ type Build struct {
 // relays. A multi-section offer is answered by declining the rest, which
 // Decline builds; callers that must preserve the section count use
 // MarshalDeclining instead.
-func (b Build) Marshal() ([]byte, error) { return b.marshal(0) }
+func (b Build) Marshal() ([]byte, error) { return b.marshal(nil) }
 
-// MarshalDeclining renders the body with (extra) additional audio/video/
-// application sections declined at port 0, so the section count and order
-// of an offer are preserved as RFC 3264 §6 requires of an answer. The
-// declined sections carry no attributes and no connection line: a declined
-// section's contents are moot, and clearing them is what keeps a peer's
-// keys, candidates and addresses from riding along.
+// MarshalDeclining renders the body as an answer to offer: one m= line per
+// offered section, in the offer's order (RFC 3264 §6). The relayed audio
+// section sits at offer.AudioIndex; every other section is declined at
+// port 0 with the offer's media type and transport, so a video-first offer
+// is answered video (declined), audio (live).
+//
+// The declined sections carry no attributes and no connection line: a
+// declined section's contents are moot, and clearing them is what keeps a
+// peer's keys, candidates and addresses from riding along. Their format is
+// a fixed placeholder chosen by transport, never the offer's.
+//
+// A Session not produced by Parse may carry only MediaCount; its sections
+// are then taken to be RTP/AVP audio with the live one first.
 func (b Build) MarshalDeclining(offer *Session) ([]byte, error) {
-	extra := 0
-	if offer != nil && offer.MediaCount > 1 {
-		extra = offer.MediaCount - 1
+	if offer == nil {
+		return b.marshal(nil)
 	}
-	return b.marshal(extra)
+	if len(offer.Sections) == 0 && offer.MediaCount > 1 {
+		o := *offer
+		o.AudioIndex = 0
+		o.Sections = make([]Section, offer.MediaCount)
+		for i := range o.Sections {
+			o.Sections[i] = Section{Media: "audio", Proto: []string{"RTP", "AVP"}}
+		}
+		offer = &o
+	}
+	if len(offer.Sections) <= 1 || offer.AudioIndex < 0 || offer.AudioIndex >= len(offer.Sections) {
+		return b.marshal(nil)
+	}
+	return b.marshal(offer)
 }
 
-func (b Build) marshal(declined int) ([]byte, error) {
+func (b Build) marshal(offer *Session) ([]byte, error) {
 	if !b.Address.IsValid() {
 		return nil, fmt.Errorf("sdp: build: no advertised address")
 	}
@@ -143,8 +162,11 @@ func (b Build) marshal(declined int) ([]byte, error) {
 	}
 	for _, c := range b.Codecs {
 		md.Attributes = append(md.Attributes, attr("rtpmap", rtpmapValue(c)))
-		if c.FMTP != "" {
-			md.Attributes = append(md.Attributes, attr("fmtp", fmt.Sprintf("%d %s", c.PayloadType, c.FMTP)))
+		// Filtered again here, not only in Parse: a Codec may have been
+		// built by the caller, and the emitted text must be this package's
+		// own rendering whatever its origin.
+		if f := canonicalFMTP(c.Name, c.FMTP); f != "" {
+			md.Attributes = append(md.Attributes, attr("fmtp", fmt.Sprintf("%d %s", c.PayloadType, f)))
 		}
 	}
 	dir := b.Direction
@@ -160,10 +182,16 @@ func (b Build) marshal(declined int) ([]byte, error) {
 	// ptime is not emitted: the proxy does not repacketize, so claiming a
 	// packetization interval it does not enforce would be a lie the far
 	// side could act on.
-	sd.MediaDescriptions = append(sd.MediaDescriptions, md)
-
-	for i := 0; i < declined; i++ {
-		sd.MediaDescriptions = append(sd.MediaDescriptions, declinedSection())
+	if offer == nil {
+		sd.MediaDescriptions = append(sd.MediaDescriptions, md)
+		return sd.Marshal()
+	}
+	for i, sec := range offer.Sections {
+		if i == offer.AudioIndex {
+			sd.MediaDescriptions = append(sd.MediaDescriptions, md)
+		} else {
+			sd.MediaDescriptions = append(sd.MediaDescriptions, declinedSection(sec))
+		}
 	}
 	return sd.Marshal()
 }
@@ -192,17 +220,34 @@ func rtpmapValue(c Codec) string {
 
 func attr(k, v string) pionsdp.Attribute { return pionsdp.Attribute{Key: k, Value: v} }
 
-// declinedSection is an RFC 3264 §6 rejected stream: port 0, no
-// attributes, no connection information.
-func declinedSection() *pionsdp.MediaDescription {
+// declinedSection is an RFC 3264 §6 rejected stream: the offered media
+// type and transport, port 0, no attributes, no connection information.
+func declinedSection(sec Section) *pionsdp.MediaDescription {
 	return &pionsdp.MediaDescription{
 		MediaName: pionsdp.MediaName{
-			Media:   "audio",
+			Media:   sec.Media,
 			Port:    pionsdp.RangedPort{Value: 0},
-			Protos:  []string{"RTP", "AVP"},
-			Formats: []string{"0"},
+			Protos:  sec.Proto,
+			Formats: []string{placeholderFormat(sec.Proto)},
 		},
 	}
+}
+
+// placeholderFormat is the fmt token a declined m= line carries. RFC 4566
+// requires at least one; its value is moot for a rejected stream, so it is
+// a constant per transport family rather than the offer's list.
+func placeholderFormat(proto []string) string {
+	switch p := strings.Join(proto, "/"); p {
+	case "UDP/DTLS/SCTP", "TCP/DTLS/SCTP":
+		return "webrtc-datachannel"
+	case "DTLS/SCTP":
+		return "5000"
+	case "udptl":
+		return "t38"
+	case "TCP/MSRP", "TCP/TLS/MSRP", "UDP/BFCP", "TCP/BFCP", "TCP/TLS/BFCP", "TCP", "UDP":
+		return "*"
+	}
+	return "0"
 }
 
 // AddrType is the RFC 4566 addrtype token for an address, as it appears in

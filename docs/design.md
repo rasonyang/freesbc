@@ -2195,9 +2195,21 @@ payload-type numbers**. The `sdp` package holds no codec policy of its own
 (`sdp.go:8-10`); it only parses, intersects and renders. `Negotiate(offer, answer)` returns the intersection in **offer
 order with offer payload numbers and answer FMTP**, fails with
 `ErrNoCommonCodec` when nothing usable is shared or only `telephone-event`
-is, and fails with `ErrRenumbered` when a codec both sides named sits on
-different payload numbers — honouring that would mean rewriting every RTP
-packet's PT byte.
+is, and fails with `ErrRenumbered` when the answer puts an offered encoding
+on a payload number the offer never gave that encoding — honouring that
+would mean rewriting every RTP packet's PT byte. Codecs are matched on the
+offered payload number first, so an offer that carries one encoding on
+several numbers (RFC 3264 §6.1, e.g. opus on 111 and on 96) is not
+mistaken for a renumbering.
+
+`a=fmtp` is **never copied** from the other leg. Parse keeps only the
+parameters on a per-codec allowlist (`fmtpAllow` in `fmtp.go`: opus per
+RFC 7587, AMR/AMR-WB, G.729 `annexb`, iLBC `mode`, G.722.1 `bitrate`, and
+the RFC 4733 event list for `telephone-event`), each checked against a
+typed value, and re-renders them as `name=value;name=value`. Unknown
+parameters, malformed values and codecs with no entry lose their fmtp.
+`Build` runs the same filter again before it writes an `a=fmtp` line, so
+free text, addresses and bare CRs from one leg cannot reach the other.
 
 `sdp.Build` constructs bodies from scratch; **nothing is copied from the
 other leg's body**. That is what makes the two structural guarantees hold:
@@ -2213,17 +2225,22 @@ ICE candidates can never reach FreeSWITCH.
 | `m=audio` proto | `RTP/AVP` | `UDP/TLS/RTP/SAVPF` |
 | ICE | — | `a=ice-lite`, `a=ice-ufrag`, `a=ice-pwd`, one `a=candidate:1 1 UDP <prio> <Address> <Port> typ host`, `a=end-of-candidates` |
 | DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` |
-| codecs | `a=rtpmap` per codec, `a=fmtp` verbatim | same |
+| codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:155-157`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:484`), so in practice always present on a browser leg |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:484`), so in practice always present on a browser leg |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 
-`MarshalDeclining(offer)` appends `offer.MediaCount - 1` declined sections so
-the answer preserves the offer's section count (RFC 3264 §6); a declined
-section is `m=audio 0 RTP/AVP 0` with **no attributes and no connection
-line**, which is what keeps a peer's keys, candidates and addresses from
-riding along.
+`MarshalDeclining(offer)` answers with one `m=` line per offered section **in
+the offer's order** (RFC 3264 §6): the live audio sits at `offer.AudioIndex`
+and every other section is declined at port 0 with the offer's media type and
+transport. Parse keeps those two per section (`Session.Sections`) only after
+normalising them: the media type must be letters only (else `audio`) and the
+transport must be on a fixed list (else `RTP/AVP`). A declined section's
+format is a constant per transport (`0`, `webrtc-datachannel`, `t38`, `*`),
+and it has **no attributes and no connection line**, which is what keeps a
+peer's keys, candidates and addresses from riding along. Offers are built
+with `Marshal`, which emits the audio section alone.
 
 The single host candidate's priority is `iceLitePriority = 126<<24 |
 65535<<8 | 255`.
