@@ -2013,24 +2013,26 @@ stateDiagram-v2
     Seeded --> Latched: accept(src) succeeds
     Armed --> Latched: accept(src) succeeds
     Unarmed --> Latched: accept(src) succeeds (loose mode only)
+    Latched --> Latched: accept(src) from a better-ranked source
     Latched --> Seeded: relatch (re-INVITE / new answer authorised)
     Seeded --> Seeded: relatch
     Armed --> Seeded: relatch
 ```
 
-Transitions: `setExpected` (`session.go:53-57`) records the expected source
-IP; `seed` (`session.go:111-129`) sets the expected IP **and** a provisional
-send-to destination from SDP, returning without touching `remote` if the
-latch is already latched; `accept` (`session.go:147-169`) is the gate the
-relay calls per packet and is what sets `latched`; `relatch`
-(`session.go:80-87`) takes the newly signalled address (IP **and** port),
-sets the expected IP, clears both `remote` and `latched` — unconditionally,
-from **any** state — and then seeds the new address, so the side keeps
+Transitions: `setExpected` (`session.go:110-114`) records the expected source
+IP; `seed` (`session.go:178-194`) records the expected IP, the exact
+signalled address **and** a provisional send-to destination (`dst`) from
+SDP, never touching the latched `remote`; `accept` (`session.go:233-251`) is
+the gate the relay calls per packet and is what sets `remote` and its `rank`;
+`relatch` (`session.go:145-154`) takes the newly signalled address (IP
+**and** port), sets the expected IP, clears `dst`, the signalled address,
+`remote` and `rank` — unconditionally, from **any** state — and then seeds
+the new address, so the side keeps
 receiving media after an authorised move even if it never sends first (a
 recvonly peer, an IVR waiting to hear audio). An address with no usable
 port only re-arms the source check (`Armed`).
 
-**What `seed` will send to** (`unicastMediaAddr`, `session.go:134`): the
+**What `seed` will send to** (`unicastMediaAddr`, `session.go:199`): the
 unspecified address (RFC 3264 §8.4 hold), multicast, the IPv4 broadcast
 address and link-local addresses are never installed, nor do they change
 the expected source. A loopback address arms the source check but becomes
@@ -2046,21 +2048,48 @@ edge derives from its advertised media addresses) loopback `c=` addresses
 with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
 `Address`.
 
-Acceptance rules in `accept`:
+Acceptance rules in `accept`. Every source is ranked by how well
+signalling vouches for it (`latchRank`, `rankOf` at `session.go:211-229`):
 
-- **Already latched**: accept only an exact IP **and** port match — this is
-  the post-latch hijack rejection.
-- **Strict, not latched**: reject when there is no expectation at all;
-  otherwise the source IP must equal the expected IP (compared `Unmap`ed).
-  **The port may differ**, which is what makes NAT port rewriting work.
-- **Loose, not latched**: accept the first packet from anywhere.
+1. **exact**: the exact IP **and** port the side's SDP signalled;
+2. **signalled**: the expected IP from another port (a NAT that rewrote the
+   port), or the IP the side's SIP came from (`SetSignallingSource`, set by
+   the edge on its public leg: a phone behind NAT whose SDP carries its
+   private address sends RTP from the public IP its SIP came from);
+3. **any**: every other source — loose mode only. In strict mode a source
+   whose IP is not the expected one (compared `Unmap`ed), or any source
+   before an expectation exists, is rejected outright.
+
+A packet from the latched source is always accepted. Any other packet is
+accepted only if it ranks **strictly above** the latched source (or, before
+latching, above nothing), and then it re-latches. So the first acceptable
+packet latches as before, an equally ranked newcomer is dropped (the
+post-latch hijack rejection), and an **exact** latch is final. What this
+buys (P2-EDG-001): an off-path source that sprays the loose public port
+before the phone speaks wins at most an *any* latch, which the phone's first
+packet from its SDP address or its SIP IP takes back.
+
+**Delayed learning** (`LearnDelay` = 3 s, `target` at `session.go:264-274`):
+when the SDP address was installed as a destination and **is** the IP the
+side's SIP came from — no NAT between them, so the endpoint should be
+sending from it — a below-exact latch does not become the destination until
+`LearnDelay` after it latched; until then audio keeps going to the SDP
+address. A packet from the exact address meanwhile latches at once. Modelled
+on rtpengine's delayed endpoint learning: a symmetric endpoint never waits,
+one whose port was rewritten loses at most 3 s of inbound audio, and a
+packet sprayed at the port from the phone's own IP (another host behind the
+same NAT) does not redirect the call's audio. When the SDP address differs
+from the SIP source (the NAT case, or a gateway whose media and signalling
+addresses differ), or no SIP source is known (the trunk plane), learning is
+immediate.
 
 `ParseLatchMode`: `"loose"` → loose, everything else (including `""`) →
 strict.
 
 **Symmetric RTP**: the seeded destination is overridden by the first
-*accepted* packet's real source address and port; nothing moves the latch
-afterwards short of an explicit `relatch` from the signalling plane. The
+*accepted* packet's real source address and port; afterwards only a
+better-ranked source or an explicit `relatch` from the signalling plane
+moves the latch. The
 local port never changes across a re-INVITE.
 
 Plane defaults:
@@ -2069,7 +2098,7 @@ Plane defaults:
 |---|---|---|
 | Trunk A-leg | the calling peer's `media_latch` (default `strict`) | `Allocate` config |
 | Trunk B-leg | the *selected target's* `media_latch`, re-applied per attempt | `SetLatchMode(SideB, …)` in `dialTarget` |
-| Edge public leg (side A) | **loose** | `allocateRTP` — a phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
+| Edge public leg (side A) | **loose**, with the client's SIP source IP as a signalled source | `allocateRTP` (caller: the INVITE's source) and `negotiateFork` (callee: the address the INVITE was sent to) — a phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
 | Edge private leg (side B) | **strict** | FreeSWITCH's signalled address is trustworthy, and strict already tolerates a NAT-rewritten port |
 | WebRTC public leg | none — ICE fixed the peer and SRTP authenticates every packet | — |
 | WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` |
@@ -2780,7 +2809,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `edge.cooldownTable.mu` ×2 | the `until` map |
 | `edge.privateSources.mu` (RWMutex) | the source map |
 | `media.PlanePool.mu` | `inUse` and `cursor`; held to reserve a candidate, never across a bind |
-| `media.latch.mu` (×4 per session) | mode, expected, remote, latched |
+| `media.latch.mu` (×4 per session) | mode, expected, signalled, sigSource, dst, remote, rank, learnedAt |
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
 | `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
@@ -2895,7 +2924,9 @@ Record-Route (`topology.go:325`), defaulting to the bind port.
   mode the source IP must match the signalled one but the **port may
   differ**, which is exactly the NAT port-rewrite case. The public edge leg
   is `loose` because a phone behind a hard NAT cannot be trusted to signal
-  the source its RTP comes from.
+  the source its RTP comes from; a source that neither SDP nor the phone's
+  SIP source IP vouches for is only a fallback that the phone's own first
+  packet displaces (§8.4).
 - **Signalling**: the edge plane adds `received=` when the top Via's host
   differs from the real source, and fills `rport=` **only when the client
   asked for it**. All responses are sent to the request's transport source
@@ -3262,8 +3293,10 @@ realm under both RFC parsing and sipgo's own digest parser (§6.9).
 **Media.** SRTP/SRTCP replay protection is explicitly enabled (windows
 64/128) — a replayed or tampered packet fails unprotect and is dropped, and
 the call stays up. Latching is fail-closed in strict mode until the
-signalling plane arms it, and nothing moves a latch after acceptance short of
-an authorised `Relatch`. The RTP-silence watchdog refreshes its liveness
+signalling plane arms it; after acceptance only a source signalling vouches
+for better (the exact SDP address, then the SDP or SIP source IP) or an
+authorised `Relatch` moves a latch, so a first-packet intruder on a loose leg
+is displaced by the endpoint's first packet (§8.4). The RTP-silence watchdog refreshes its liveness
 timestamp **only after** a packet is proven genuine. The WebRTC leg verifies
 the peer certificate against the signalled `a=fingerprint` **inside the DTLS
 handshake** (`VerifyPeerCertificate`), so a mismatched peer never reaches

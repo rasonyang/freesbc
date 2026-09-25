@@ -191,7 +191,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	}
 	defer d.endUnlessUp()
 
-	offer, err := s.buildUpstreamOffer(ctx, d, body)
+	offer, err := s.buildUpstreamOffer(ctx, d, body, src.Addr())
 	if err != nil {
 		s.rejectMedia(req, tx, err)
 		return
