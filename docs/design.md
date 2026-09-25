@@ -55,7 +55,7 @@ end-to-end.
 | Peer identification, routing, failover, cooldown | SIP transaction state machines, retransmission, Timer B/F/J — `emiago/sipgo` v1.4.3 |
 | B2BUA call and leg state (`trunk`), proxy dialog state (`edge`) | Trunk dialog bookkeeping — `sipgo.DialogServerCache` / `DialogClientCache` |
 | Port allocation, latching, relay loops, watchdog | SRTP transforms — `pion/srtp/v3`; DTLS handshake and key export — `pion/dtls/v3`; ICE connectivity checks — `pion/ice/v4` |
-| SDP parsing limits, codec intersection, body construction | SDP syntax — `pion/sdp/v3` |
+| SDP parsing limits, codec intersection, body construction (the trunk plane also parses and writes SDP itself, `trunk/sdp.go`) | SDP syntax on the edge plane — `pion/sdp/v3` |
 | In-memory ban table, rate limiting, scanner signatures | Optional kernel enforcement — the `nft` binary, invoked by `exec` |
 | Config schema, validation, atomic hot-swap | YAML parsing — `goccy/go-yaml`; file-change notification — `fsnotify` |
 | Admin HTTP API, WebUI, metric collection | Metric exposition — `prometheus/client_golang` |
@@ -744,9 +744,10 @@ Pre-dial, per attempt:
 2. B-leg SRTP policy from the target peer: `required` → always secure;
    `optional` → secure only if the A-leg is secure; anything else →
    plaintext.
-3. Build the B-leg offer with `rewriteSDPCrypto` (§6.7) — **always**, never a
-   port-only rewrite, so a secure caller's `a=crypto` cannot leak to a
-   plaintext carrier.
+3. Build the B-leg offer from the caller's offer (§6.7), with a fresh `o=`
+   identity per target; nothing of the caller's body but its codec lines is
+   copied, so a secure caller's `a=crypto` cannot leak to a plaintext
+   carrier.
 4. `bTarget = peerURI(endpoint)` with `bTarget.User = decision.OutNumber`.
 5. Headers, at fixed positions:
    `[0] From, [1] Contact, [2] Supported: timer, [3] Session-Expires: <session_expires>;refresher=uas, [4] Min-SE: <min_se>`.
@@ -805,7 +806,7 @@ Post-answer (2xx), every path is non-retryable except one:
   `errSRTPRequiredMismatch` is the single retryable post-answer case: log,
   `ackThenBye`, `failDial`. Any other error answers the caller **502 Bad
   Gateway** and *then* tears the carrier down.
-- The A-leg answer is built with `rewriteSDPCrypto` against
+- The A-leg answer is built (§6.7) under the call's A-leg origin against
   `sess.RTPPort(SideA)`; on error 502 + `ackThenBye`.
 - `bLeg.Ack(aLeg.Context())`; on error `bLeg.Close()` and 502.
 - The A-leg 200 OK carries `Content-Type: application/sdp`, a Contact built
@@ -840,33 +841,56 @@ a losing target's stale contexts and the call would go silent.
 
 ### 6.7 SDP handling
 
-The trunk plane parses with `pion/sdp/v3` **directly**, not with the bounded
-`internal/sip/sdp` parser used by the edge plane: "the trunk is a byte relay
-between carriers and must not reject a body the far side would have accepted"
-(`sdp.go:17-21`). `validAudioSDP` requires exactly one thing: at least one
-non-declined `m=audio` section.
+The trunk plane **builds** every body it sends; it never edits the peer's
+(`sdp.go`). A small, tolerant line parser (`parseSDP`, `sdp.go:68-121`) reads
+the peer's body: it accepts CRLF or bare LF and any media type (`m=image` for
+T.38 included), ignores line types it does not use, and fails only on a body
+that is not SDP at all. It is neither `pion/sdp` (which rejects `m=image`) nor
+the edge plane's bounded `internal/sip/sdp` parser: the trunk relays between
+carriers and must not refuse a body on size or codec policy the peers agreed
+between themselves. `validAudioSDP` requires a non-declined `m=audio` section
+with at least one RTP payload type (0-127).
 
-`rewriteSDPCrypto(body, mediaIP, rtpPort, crypto)` edits the parsed pion tree
-**in place** and re-marshals it. What changes:
+`sdpOrigin.build(src, mediaIP, rtpPort, crypto)` (`sdp.go:296-351`) writes the
+body for one leg from the other leg's body, out of an allow-list:
 
-1. Session-level `c=` → the SBC's advertised media address.
-2. `o=` NetworkType/AddressType/UnicastAddress → ours. **The `o=` username
-   and session-id/version stay the peer's.**
-3. On the relayed audio section: `m=` port → the SBC's port; media-level
-   `c=` removed so the session-level one applies; protos → `RTP/SAVP` when
-   secure, else `RTP/AVP`; every inbound `a=crypto` dropped; `a=rtcp`
-   rewritten to `rtpPort + 1`; exactly one `a=crypto` appended when secure.
-4. Every declined / non-relayed `m=` section: port 0, connection info
-   cleared, and **all attributes cleared**. This is unconditional on both the
-   secure and plaintext paths, because an SDES offerer commonly reuses one
-   master key across every `m=` line, so a declined section's `a=crypto`
-   would otherwise carry a live key across the bridge.
-5. Session-level `a=crypto` stripped.
+1. `v=0`, `o=FreeSBC <session-id> <version> IN IP4|IP6 <mediaIP>`,
+   `s=FreeSBC`, `c=` at the SBC's advertised media address, `t=0 0`. The `o=`
+   identity is the SBC's own per leg (`sdpOrigin`, `sdp.go:267-283`): one
+   random session-id for the life of the leg, and a version that moves by one
+   each time the body the SBC sends on that leg changes (RFC 3264 §8). The
+   A-leg's origin lives on the call (`call.aOrigin`), so the caller sees one
+   session across early media, the answer and failover, whichever carrier the
+   body came from (RFC 6337 §3.1). Each B-leg attempt gets a fresh one.
+2. The relayed audio section (the first `m=audio` with a non-zero port):
+   `m=audio <rtpPort> RTP/SAVP|RTP/AVP <payload types>`, then only
+   - `a=rtpmap` for the relayed payload types, rebuilt from their parsed
+     parts;
+   - `a=fmtp` for them, keeping only allow-listed `name=value` parameters
+     (`fmtpParams`, `sdp.go:460-475`: the parameters G.729, G.723.1, iLBC,
+     AMR/AMR-WB, Opus, EVS, G.722.1, Speex and SILK define) and the bare
+     number lists telephone-event and RED use, with every number at most 255;
+   - `a=ptime`, `a=maxptime`;
+   - the direction attribute (media-level, else the session-level one);
+   - `a=rtcp:<rtpPort+1>` when the peer's section had an `a=rtcp`;
+   - exactly one `a=crypto` — ours — when secure.
+3. Every other section: the same media type, proto and formats at port 0, with
+   no `c=` and no attributes (RFC 3264 §6), so section count and order are
+   preserved.
 
-Everything else passes through unchanged: codecs, `a=rtpmap`, `a=fmtp`,
-direction attributes, `b=`, `t=`, `s=`, and every other media attribute —
-including `candidate`, `fingerprint`, `ice-*`, `setup` and `ssrc`. There is
-no codec filtering and no transcoding on the trunk plane.
+Nothing else from the peer's body is copied: not its `o=` username or
+session-id, `b=`, session attributes, `a=candidate`, `a=ice-*`,
+`a=fingerprint`, `a=setup`, `a=ssrc`, `a=rtcp-mux`, vendor `a=fmtp`
+parameters, nor any `a=crypto` (so a declined or session-level SDES key can
+never cross the bridge). There is no codec filtering and no transcoding on
+the trunk plane: the payload types and codecs are relayed as offered and
+answered.
+
+`offeredCrypto` treats `RTP/SAVP` and `RTP/SAVPF` (RFC 5124) as secure. The
+builder offers and answers `RTP/SAVP` or `RTP/AVP` only: RTCP feedback is not
+relayed. `remoteMediaIP` accepts an FQDN in `c=` (RFC 4566 §5.7) but does not
+resolve it on the call path: it returns no address, and that side's latch is
+switched to loose (`looseForFQDN`), so media latches to the first packet.
 
 ### 6.8 SRTP per leg
 
@@ -1718,7 +1742,7 @@ Its `PlaneParams` closure re-reads `store.Current()` on **every allocation**,
 so a hot-reloaded range or bind address applies to new sessions without
 disturbing established ones. The advertised address is the signalling
 plane's concern and reaches SDP only through `sdp.Build.Address` (edge) or
-`rewriteSDPCrypto`'s media IP (trunk).
+the trunk SDP builder's media IP (`sdpOrigin.build`).
 
 `allocatePair` rounds the low bound up to an even port, walks a cursor in
 steps of 2 wrapping before the high bound, skips ports already in `inUse`,

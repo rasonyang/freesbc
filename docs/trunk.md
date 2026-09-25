@@ -63,7 +63,7 @@ The two sections are mutually independent: SIP can advertise one public address 
   or a self-signed fallback, optional mTLS), IP-authenticated peers, and
   registration-based trunks via outbound REGISTER with digest auth
 - **B2BUA with topology hiding** — two independent call legs with their own
-  Call-ID, From-tag and Via, and full SDP rewrite
+  Call-ID, From-tag and Via, and SDP built from scratch per leg (the SBC's own `o=`, address and port; only codec lines and direction carried over)
 - **Routing engine** — regex matching, number transformation, ordered
   failover with passive per-endpoint cooldown, and DNS SRV resolution
   (RFC 3263 priority/weight ordering, cached)

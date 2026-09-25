@@ -3,6 +3,7 @@ package trunk
 import (
 	"context"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -541,4 +542,94 @@ func TestRelayGateSerialisesAbandonment(t *testing.T) {
 	if g.do(func() { t.Error("relay ran after the gate closed") }) {
 		t.Error("do reported running after the gate closed")
 	}
+}
+
+const originFailoverCfg = `
+listen:
+  sip: [udp://127.0.0.1:13200]
+  media:
+    port_range: 13204-13207
+    public_ip: 127.0.0.1
+ring_timeout: 1s
+peers:
+  local-uac:
+    address: 127.0.0.1:5070
+    allowed_ips: [127.0.0.1/32]
+  carrier-a:
+    address: 127.0.0.1:13201
+    allowed_ips: [203.0.113.0/24]
+  carrier-b:
+    address: 127.0.0.1:13202
+    allowed_ips: [198.51.100.0/24]
+    media_latch: loose
+routes:
+  - name: out
+    from: local-uac
+    to: [carrier-a, carrier-b]
+`
+
+// sdpOriginFields returns the o= fields of an SDP body.
+func sdpOriginFields(t *testing.T, body []byte) []string {
+	t.Helper()
+	for _, l := range strings.Split(string(body), "\r\n") {
+		if strings.HasPrefix(l, "o=") {
+			if f := strings.Fields(l[2:]); len(f) == 6 {
+				return f
+			}
+		}
+	}
+	t.Fatalf("no o= line in:\n%s", body)
+	return nil
+}
+
+// audit: P2-TRK-007
+// RFC 3264 §8 / RFC 6337 §3.1: the caller sees one SDP session from the
+// SBC. Early media from carrier A (which then rings out) and the answer
+// from failover carrier B carry the same o= username and session-id, and
+// the version moves by at most one — never the carriers' own o= lines.
+func TestALegOriginStableAcrossFailover(t *testing.T) {
+	early := []byte(strings.Replace(string(testSDPBody(13208)), "o=- 1 1", "o=carrierA 111 111", 1))
+	answer := []byte(strings.Replace(string(testSDPBody(13209)), "o=- 1 1", "o=carrierB 222 222", 1))
+	ringing := make(chan struct{})
+	t.Cleanup(func() { close(ringing) })
+	startStubCarrier(t, "127.0.0.1:13201", nil, stubCarrierConfig{earlySDP: early, proceed: ringing})
+	startStubCarrier(t, "127.0.0.1:13202", answer)
+	srv := startServer(t, 13200, originFailoverCfg)
+	uac := startTestUAC(t, "127.0.0.1:13203")
+
+	var mu sync.Mutex
+	var earlyBody []byte
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sess := uac.call(t, ctx, 13200, func(res *sip.Response) {
+		if res.StatusCode == 183 && len(res.Body()) > 0 {
+			mu.Lock()
+			earlyBody = append([]byte(nil), res.Body()...)
+			mu.Unlock()
+		}
+	})
+	mu.Lock()
+	gotEarly := earlyBody
+	mu.Unlock()
+	if gotEarly == nil {
+		t.Fatal("caller never got carrier A's early media")
+	}
+	o183, o200 := sdpOriginFields(t, gotEarly), sdpOriginFields(t, sess.InviteResponse.Body())
+	if o183[0] != o200[0] || o183[1] != o200[1] {
+		t.Errorf("caller's o= changed between 183 and 200: %v vs %v", o183, o200)
+	}
+	for _, o := range [][]string{o183, o200} {
+		if o[0] == "carrierA" || o[0] == "carrierB" || o[1] == "111" || o[1] == "222" {
+			t.Errorf("caller's o= %v is a carrier's", o)
+		}
+	}
+	v183, _ := strconv.ParseUint(o183[2], 10, 64)
+	v200, _ := strconv.ParseUint(o200[2], 10, 64)
+	if v200 != v183 && v200 != v183+1 {
+		t.Errorf("o= version went %d -> %d; it may only stay or move by one", v183, v200)
+	}
+	if err := sess.Bye(ctx); err != nil {
+		t.Fatalf("bye: %v", err)
+	}
+	waitForActiveCalls(t, srv, 0, 3*time.Second)
 }

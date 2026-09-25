@@ -102,6 +102,11 @@ type call struct {
 	aSRTP *legSRTP
 	bSRTP *legSRTP
 
+	// aOrigin is the SBC's own o= identity on the A-leg, shared by every
+	// body sent to the caller (early media and the answer, across
+	// failover). Each B-leg attempt gets its own, in dialTarget.
+	aOrigin *sdpOrigin
+
 	// aSDP/bSDP are the established SDP bodies plus dialog tags for each
 	// leg; together with id/bID they are each leg's dialog ID.
 	aSDP legSDP

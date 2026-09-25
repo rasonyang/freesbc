@@ -6002,13 +6002,14 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 		t.Fatalf("answer is secure (RTP/SAVP or has a=crypto), want plain RTP/AVP for two srtp:disabled peers:\n%s", answerBody)
 	}
 
-	// Byte-for-byte identical to the plaintext rewrite path.
+	// Identical to the plaintext build path, except for the o= line: each
+	// leg's o= session-id is the SBC's own, freshly generated.
 	sideAPort := sdpAudioPort(t, answerBody)
 	wantAnswer, err := rewriteSDPCrypto(carrierAnswer, netip.MustParseAddr("127.0.0.1"), sideAPort, nil)
 	if err != nil {
 		t.Fatalf("rewriteSDPCrypto reference (answer): %v", err)
 	}
-	if string(answerBody) != string(wantAnswer) {
+	if !sdpEqualIgnoringOrigin(answerBody, wantAnswer) {
 		t.Errorf("answer body diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", answerBody, wantAnswer)
 	}
 
@@ -6027,7 +6028,7 @@ func TestBridgePlaintextUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rewriteSDPCrypto reference (offer): %v", err)
 	}
-	if string(carrierOffer.Body()) != string(wantOffer) {
+	if !sdpEqualIgnoringOrigin(carrierOffer.Body(), wantOffer) {
 		t.Errorf("b-leg offer diverges from the plaintext rewrite output:\ngot:\n%s\nwant:\n%s", carrierOffer.Body(), wantOffer)
 	}
 
