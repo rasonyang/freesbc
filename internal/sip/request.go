@@ -2,6 +2,7 @@ package sip
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -68,9 +69,11 @@ func CSeqNumber(msg sip.Message) uint32 {
 // (lr) the Request-URI is the remote target and every route is a Route
 // header; with a strict router first the Request-URI is that route and the
 // remote target goes last in the Route list. Either way the request is
-// sent to the first route. With no route set it goes to the remote target,
-// addressed to the transport source of res, where the far end
-// demonstrably is.
+// sent to the first route, over its transport parameter when it has one;
+// a first route that names a hostname is not resolved, and the request
+// goes to the transport source of res, the nearest hop's own address.
+// With no route set it goes to the remote target, addressed to the
+// transport source of res, where the far end demonstrably is.
 //
 // opts adjust it for the element sending it: OwnRecordRoute to leave out
 // the Record-Route entries that element added itself, FromListener to pin
@@ -114,7 +117,9 @@ func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header
 		if t, ok := routes[0].UriParams.Get("transport"); ok && t != "" {
 			req.SetTransport(strings.ToUpper(t))
 		}
-		req.SetDestination(uriHostPort(routes[0], req.Transport()))
+	}
+	if dest, ok := uriHostPort(routes, req.Transport()); ok {
+		req.SetDestination(dest)
 	} else {
 		req.SetDestination(res.Source())
 	}
@@ -170,14 +175,26 @@ func routeSet(res *sip.Response, isSelf func(sip.Uri) bool) []sip.Uri {
 	return rr
 }
 
-// uriHostPort is where a request routed by u over transport is sent: its
-// host and port, the port defaulting by transport.
-func uriHostPort(u sip.Uri, transport string) string {
+// uriHostPort is where a request with route set routes is sent over
+// transport: the first route's host and port, the port defaulting by
+// transport. It reports false with no route set and when the first route
+// names a host rather than an IP literal: this package never causes a DNS
+// lookup (the edge plane does none at all), and the 2xx's transport source
+// is that nearest hop's address anyway.
+func uriHostPort(routes []sip.Uri, transport string) (string, bool) {
+	if len(routes) == 0 {
+		return "", false
+	}
+	u := routes[0]
+	ip, err := netip.ParseAddr(strings.Trim(u.Host, "[]"))
+	if err != nil {
+		return "", false
+	}
 	port := u.Port
 	if port == 0 {
 		port = DefaultPort(transport)
 	}
-	return net.JoinHostPort(strings.Trim(u.Host, "[]"), strconv.Itoa(port))
+	return netip.AddrPortFrom(ip.Unmap(), uint16(port)).String(), true
 }
 
 // contactOrSource is the request target for an in-dialog request built

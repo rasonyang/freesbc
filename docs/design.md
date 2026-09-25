@@ -1239,12 +1239,17 @@ Per REGISTER:
    contains any of `` @ \t\r\n<>;,"``, the user exceeds 128 characters, the
    host contains any of `` \t\r\n<>;,"``, or the host exceeds 255 characters.
 3. `requestedExpires`: the Contact `expires` parameter wins over the
-   `Expires` header (§10.2.1); `0` marks an un-REGISTER; **absent everywhere
-   returns zero with `unregister = false`** (`register.go:371`), letting the
-   response decide. If the 200 OK carries no expiry either, `grantedExpires`
-   returns that zero and `recordBinding` treats `granted <= 0` as a
-   **removal** (`register.go:263`), so a registrar that grants no expiry
-   leaves FreeSBC with no binding and no way to deliver inbound calls.
+   `Expires` header (§10.2.1), each read as delta-seconds
+   (`fsip.DeltaSeconds`: digits only, so a negative or signed value is
+   ignored; above 2**32-1 clamped, §20.19); `0` marks an un-REGISTER;
+   **absent everywhere returns zero with `unregister = false`**
+   (`register.go:418`), letting the response decide. If the 200 OK carries
+   no expiry either, `GrantedExpires` returns that zero and `recordBinding`
+   treats `granted <= 0` as a **removal** (`register.go:299`), so a
+   registrar that grants no expiry leaves FreeSBC with no binding and no way
+   to deliver inbound calls.
+   A `Contact: *` (wildcard) is accepted only alone and with an expires of
+   `0`; anything else is **400** (§10.3 step 6) and never forwarded.
 4. Token: reuse the existing binding's token when one exists for this
    (AoR, Call-ID), else mint a fresh 12-byte CSPRNG token. The token must
    stay stable for the registration's whole lifetime, because FreeSWITCH
@@ -1252,18 +1257,18 @@ Per REGISTER:
    call.
 5. Walk `upstreamOrder(user)` under the single shared budget.
    `sip.upstreams.cooldown` is read from the store **once per REGISTER**,
-   before the loop (`register.go:78`), so a reload applies to the next
+   before the loop (`register.go:86`), so a reload applies to the next
    registration without a restart.
 
 Per attempt: `prepareForward(..., recordRoute=false)`; replace the Contact
-with `registeredContact(user, token)`; forward with `TransactionRequest`;
-pump responses.
+with `registeredContact(user, token)` (a wildcard is forwarded as `*`, see
+below); forward with `TransactionRequest`; pump responses.
 
 | Header | Treatment on REGISTER |
 |---|---|
 | Request-URI | **unchanged** — the phone computed the digest over it |
-| Contact (request) | replaced with `sip:<user>@<private advertised IP>:<port>;transport=udp;fsbc=<token>` |
-| Contact (2xx) | when the request carried a Contact: **every** Contact removed and the client's own URI restored with `expires=<granted>` — sip.js treats a Contact mismatch as a failed registration. A REGISTER with no Contact (a binding query) has the registrar's Contact list relayed verbatim (`register.go:200-202`) |
+| Contact (request) | replaced with `sip:<user>@<private advertised IP>:<port>;transport=udp;fsbc=<token>`; a wildcard `*` un-REGISTER is forwarded as `*`, because it names every binding of the AoR, other devices' included |
+| Contact (2xx) | when the request carried a Contact: **every** Contact removed and the client's own URI restored with `expires=<granted>` — sip.js treats a Contact mismatch as a failed registration. After a wildcard un-REGISTER every Contact is removed and none restored. A REGISTER with no Contact (a binding query) has the registrar's Contact list relayed verbatim (`register.go:216-221`) |
 | Via | top Via annotated with `received`/`rport`; FreeSBC's own Via prepended |
 | Route | leading Route values naming FreeSBC stripped |
 | Record-Route | **not added** |
@@ -1276,7 +1281,7 @@ the stored contact into the Request-URI of an inbound INVITE, and a leftover
 Credentials, challenges and nonces are never logged.
 
 **Failover rule**: the next node is tried whenever the attempt produced **no
-final response** (`register.go:129-150`). A node that answered only
+final response** (`register.go:145-162`). A node that answered only
 provisionally and then died is still failed over — unlike the INVITE path,
 where `responded` alone stops the series (`invite.go:326`). The cooldown
 penalty, by contrast, is applied only when the attempt produced **zero**
@@ -1286,9 +1291,13 @@ because the pool members share a registration database. After the loop:
 **504** if the budget expired, else **503**.
 
 **Binding expiry always comes from the response**, never the request:
-`grantedExpires` prefers the response's Contact `expires` parameter, then its
-`Expires` header, then the requested value. `granted <= 0` or an
-un-REGISTER removes the binding.
+`fsip.GrantedExpires` prefers the `expires` parameter of **this binding's**
+Contact — the one carrying its `fsbc` token, since the 200 lists every
+binding of the AoR (§10.3 step 8) and another device's lifetime must not be
+taken for this one — then the response's `Expires` header, then the
+requested value. Values are delta-seconds as above, so the result is never
+negative. `granted <= 0` or an un-REGISTER removes the binding; a wildcard
+un-REGISTER removes **every** binding of the AoR.
 
 `Location` holds `byToken` and `byAOR` under one `RWMutex`, with
 **compile-time** caps: `defaultMaxBindings = 20000` total and
@@ -1304,14 +1313,15 @@ stateDiagram-v2
     [*] --> Active: recordBinding -> Location.Put (2xx with granted > 0)
     Active --> Active: refresh (same AoR+Call-ID) keeps Token, updates Source/ExpiresAt
     Active --> Removed: un-REGISTER or granted <= 0 -> Location.Remove
+    Active --> Removed: Contact * un-REGISTER -> Location.Remove for every binding of the AoR
     Active --> Removed: WebSocket close -> Location.RemoveBySource
     Active --> Expired: ExpiresAt passed (invisible to lookups)
     Expired --> Removed: Location.Prune / pruneAORLocked
     Removed --> [*]
 ```
 
-Transitions: `recordBinding` (`register.go:261-286`) performs the insert and
-both removals; `Location.Put` (`location.go:97-131`) is the refresh-in-place
+Transitions: `recordBinding` (`register.go:287-322`) performs the insert and
+the removals; `Location.Put` (`location.go:97-131`) is the refresh-in-place
 path; `Binding.Expired` (`location.go:48`) is the predicate that hides an
 expired entry from `ByToken`/`ByAOR`; `Location.Prune` (`location.go:219`)
 and `pruneAORLocked` delete expired entries; `RemoveBySource`
@@ -1589,7 +1599,9 @@ the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
 carried them. A loose router first means `Route` headers and the Request-URI
 is the remote target; a strict router first becomes the Request-URI with the
 target appended as the last `Route` (§12.2.1.1). The request is sent to the
-first route, else to the 2xx's transport source. `FromListener(side.laddr)`
+first route when it names an IP literal, else to the 2xx's transport source
+(the nearest hop): a hostname route is never resolved, keeping the edge free
+of DNS. `FromListener(side.laddr)`
 pins the socket it leaves by, as `forward` pins a relayed request; without
 the pin an ACK toward a carrier behind a wildcard-bound public listener never
 arrived (`TestTeardownLeavesByPublicListenerOnWildcardBind`).
