@@ -249,7 +249,7 @@ fsnotify-driven exclusively.
    the resolver, endpoint health, `tcpMaxConns = 1024`,
    `tcpIdleTimeout = 120s`. **Binds nothing.** Dialog caches, the registrar
    and the shield are `Run`-only, which is why the accessors
-   (`IsRegistered`, `ShieldStats`, `Unban`) all nil-guard.
+   (`IsRegistered`, `ShieldStats`) all nil-guard.
 6. If `ProxyEnabled()`: `edge.New(store, log)`. Builds the topology, raises
    the process-wide UDP MTU, builds two media pools, `Location`, `Metrics`,
    two cooldown tables, the dialog table, and the DTLS identity when
@@ -2487,7 +2487,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
-| **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `unban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, `Unban`, or process exit | `banList.mu` |
+| **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
 | **rate-limit bucket** | `rateLimiter` (two per `Shield`) | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; compiled regexps and prefixes are populated before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot; `Store.mu` only for the subscriber slice |
 
@@ -2749,8 +2749,6 @@ permanent series per call."
 | `freesbc_media_ports_in_use` | Gauge | — | the **trunk** pool's `Stats()` |
 | `freesbc_media_ports_total` | Gauge | — | the **trunk** pool's `Stats()` |
 | `freesbc_peer_registered` | Gauge | `peer` | trunk `IsRegistered`, only for `register: true` peers |
-| `freesbc_shield_banned_current` | Gauge | — | trunk shield `banList.size()` (counts tracked entries, including expired-but-unpruned ones) |
-| `freesbc_shield_ban_adds_rejected_total` | Gauge | — | trunk shield ban-cap overflow counter |
 | `freesbc_shield_drops_total` | Counter | `reason` ∈ {`banned`, `scanner`, `rate`} | trunk shield drop counters |
 | `freesbc_build_info` | Gauge (always 1) | `version` | `Deps.Version` |
 | `freesbc_active_registrations` | Gauge | — | edge `Location.Count()` |
@@ -2770,17 +2768,19 @@ permanent series per call."
 
 Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
-(`shield.go:97-105`). In a deployed system `freesbc_shield_banned_current`
-and `freesbc_shield_ban_adds_rejected_total` therefore stay at 0 and
-`freesbc_shield_drops_total` reports only `reason="rate"`. The ban and scanner
-branches run on the **edge** shield (`edge.go:564`), which `internal/app`
-never wires into `admin.Deps` — `Deps.Shield` and `Deps.Unban` are set only
-when the trunk server exists (`app.go:166-193`) — so edge bans reach neither
-`/metrics` nor `DELETE /api/bans/{ip}`.
+(`shield.go:97-105`), so in a deployed system `freesbc_shield_drops_total`
+reports only `reason="rate"`. The ban and scanner branches run on the
+**edge** shield (`edge.go:564`), which `internal/app` never wires into
+`admin.Deps` (`Deps.Shield` is set only when the trunk server exists), so
+edge bans and drops do not reach `/metrics`. The ban gauges
+(`freesbc_shield_banned_current`, `freesbc_shield_ban_adds_rejected_total`)
+and the unban endpoint `DELETE /api/bans/{ip}` were removed for that reason:
+wired to the trunk shield, which never bans, they could only ever report
+nothing.
 
 The **trunk plane emits no metrics of its own**; it exposes accessors
-(`ActiveCalls`, `Calls`, `ShieldStats`, `IsRegistered`, `KillCall`,
-`Unban`) which `internal/app` wires into `admin.Deps`. There is no trunk
+(`ActiveCalls`, `Calls`, `ShieldStats`, `IsRegistered`, `KillCall`)
+which `internal/app` wires into `admin.Deps`. There is no trunk
 port-exhaustion metric and no config-reload metric.
 
 ### 13.2 Log levels
@@ -2811,7 +2811,6 @@ All routes are on one `http.ServeMux` behind `recoverMW`, which also sets
 | `/api/calls` | any | Basic | array of `{"id" (admin call ID),"call_id" (A-leg Call-ID),"from","to","started" (RFC 3339),"duration_seconds"}`; always an array |
 | `DELETE /api/calls/{id}` | DELETE | Basic | `id` is the admin call ID, or an A-leg Call-ID (kills every call carrying it); **204** killed / **404** `no such active call` |
 | `/api/peers` | any | Basic | array of `{Name,Address,Transport,SRTP,Register,Registered}` — Go field names, no JSON tags |
-| `DELETE /api/bans/{ip}` | DELETE | Basic | **204** / **404** `no such ban` (an unparseable IP yields 404) |
 | `/api/config` | GET, PUT (else 405 + `Allow: GET, PUT`) | Basic | GET: the **redacted** view; PUT: write-back |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml`, with an `ETag` = quoted SHA-256 hex |
 | `/` | any | Basic | the embedded single-file WebUI (catch-all; the explicit patterns win) |
@@ -2874,9 +2873,9 @@ everything else. Two tabs: a **Dashboard** polling `/api/status`,
 expired" banner), and a **Config** editor that loads `/api/config/raw`,
 keeps its ETag, and PUTs to `/api/config` with `If-Match`.
 
-Because the call table, kick, unban and shield accessors are **trunk-only**,
-a proxy-only deployment shows an empty call list, a no-op kick, a no-op
-unban, zeroed shield counters, and the trunk pool's (unused, defaulted)
+Because the call table, kick and shield accessors are **trunk-only**,
+a proxy-only deployment shows an empty call list, a no-op kick, zeroed
+shield drop counters, and the trunk pool's (unused, defaulted)
 port capacity. This gap is recorded in `internal/app/app.go:146-150`.
 
 ---
@@ -2941,8 +2940,8 @@ product. **Scanner heuristics are User-Agent only.**
 lives only in the shield's in-memory table, which is capped at **65536**
 entries with an overflow counter. A re-ban extends an existing ban to the
 later of the two expiries and never shortens it (P2-SHD-008). Ban keys are
-unmapped IPs, and `Unban` unmaps its argument, so `DELETE
-/api/bans/::ffff:192.0.2.1` lifts the ban on `192.0.2.1` (P2-SHD-009). On
+unmapped IPs, and every lookup unmaps its argument, so `::ffff:192.0.2.1`
+is seen as `192.0.2.1` (P2-SHD-009). On
 the edge a ban also closes the banned source's tcp/tls/ws/wss connection:
 `guard` closes the one the banning request came on, and the read filter
 closes any other on its next read (`closeStream`, P2-SHD-006). An idle
@@ -2951,7 +2950,7 @@ kernel enforcement: both were removed with P2-SHD-004 (the counter was fed
 only by the trunk's unidentified-source handler, which the pre-parse read
 filter makes unreachable, `readfilter.go:24-45`). The ban and scanner
 branches of `Check` are therefore reachable only through the **edge**
-shield — whose bans are exported to neither `/metrics` nor the unban API.
+shield, whose bans are not exported to `/metrics`, and no API lifts a ban.
 
 **Every denial is a silent drop.** A scanner never gets confirmation that the
 SBC exists. That is why `onNoRoute` is overridden at all: known peers get
@@ -3029,9 +3028,9 @@ cannot echo a secret because expansion runs after the unmarshal.
   latch semantics plus SRTP authentication.
 - The edge plane's ws/wss listeners have **no connection cap and no idle
   timeout**.
-- The edge plane's shield bans are neither visible in `/metrics` nor
-  clearable through `DELETE /api/bans/{ip}` — both are wired to the trunk
-  shield only.
+- There is **no operator unban**: a ban lapses only on expiry
+  (`auto_ban.duration`, or 1 min for a UDP socket ban) or with a restart.
+  Edge-shield bans and drops are not visible in `/metrics`.
 - Strict-mode latch arming compares the **source IP only**; there is no SSRC
   or payload-type validation.
 - There is **no DNS trust hardening**: no DNSSEC, no pinning.
@@ -3055,7 +3054,7 @@ cannot echo a secret because expansion runs after the unmarshal.
 | Edge binding | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker | the registrar's granted lifetime |
 | Edge upstream/PSTN cooldown | `Recover`, or lazy expiry | the configured cooldown (default 30 s) |
 | WebRTC leg | `WebRTCSession.Close`, establishment failure, fingerprint mismatch | the establishment deadline (30 s default) |
-| Shield ban | lazy expiry on lookup, the 1-minute prune tick, `Unban` (which also lifts the IP's socket bans), process exit | `auto_ban.duration` (default 1 h); a UDP socket ban at most 1 min |
+| Shield ban | lazy expiry on lookup, the 1-minute prune tick, process exit | `auto_ban.duration` (default 1 h); a UDP socket ban at most 1 min |
 | Rate-limit bucket | prune of buckets idle for their own refill interval; LRU eviction at 65536 buckets | the bucket's interval (1 s for `N/s`, 1 h for `N/h`) |
 | `privateSources` entry | 10-minute TTL, pruned on insert pressure | — |
 
@@ -3244,7 +3243,7 @@ Stated because the code establishes them, not as future work.
 - **No CDR.**
 - **No reload-failure metric and no trunk port-exhaustion metric.**
 - **Proxy-only admin gaps**: `/api/calls`, `DELETE /api/calls/{id}`,
-  `DELETE /api/bans/{ip}`, `freesbc_shield_*` and the media-port gauges are
+  `freesbc_shield_drops_total` and the media-port gauges are
   all wired to the trunk plane only.
 - **No IPv6 coverage.** Address handling is `netip`-based and family-agnostic
   throughout, and IPv4-mapped addresses are `Unmap`ed at every transport

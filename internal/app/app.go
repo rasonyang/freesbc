@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/netip"
 
 	"golang.org/x/sync/errgroup"
 
@@ -143,10 +142,10 @@ func Run(ctx context.Context, opts Options) error {
 // running. Either plane may be absent (a proxy-only or trunk-only
 // deployment), so every accessor is nil-guarded rather than assuming both.
 //
-// Known gap: the call table, kill-call, unban and shield accessors are
+// Known gap: the call table, kill-call and shield accessors are
 // trunk-only. A proxy-only deployment therefore reports an empty call list,
-// a no-op DELETE /api/calls/{id}, a no-op unban and zeroed shield counters
-// even though the edge plane has dialogs and a shield of its own.
+// a no-op DELETE /api/calls/{id} and zeroed shield drop counters even
+// though the edge plane has dialogs and a shield of its own.
 func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Server, edgeSrv *edge.Server, version string) admin.Deps {
 	deps := admin.Deps{
 		Ports:   pool.Stats,
@@ -163,7 +162,6 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 			return n
 		},
 		KillCall: func(string) bool { return false },
-		Unban:    func(string) bool { return false },
 		Shield:   func() admin.ShieldStats { return admin.ShieldStats{DropsByReason: map[string]int64{}} },
 		Peers:    func() []admin.PeerStatus { return nil },
 	}
@@ -179,16 +177,9 @@ func adminDeps(store *config.Store, pool *media.PlanePool, sipServer *trunk.Serv
 			return out
 		}
 		deps.KillCall = sipServer.KillCall
-		deps.Unban = func(ip string) bool {
-			addr, err := netip.ParseAddr(ip)
-			if err != nil {
-				return false
-			}
-			return sipServer.Unban(addr)
-		}
 		deps.Shield = func() admin.ShieldStats {
 			st := sipServer.ShieldStats()
-			return admin.ShieldStats{BannedCurrent: st.BannedCurrent, BanAddsRejected: st.BanAddsRejected, DropsByReason: st.DropsByReason}
+			return admin.ShieldStats{DropsByReason: st.DropsByReason}
 		}
 		deps.Peers = func() []admin.PeerStatus {
 			cfg := store.Current()

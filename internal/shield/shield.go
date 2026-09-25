@@ -214,19 +214,6 @@ func (s *Shield) Stats() Stats {
 	}
 }
 
-// Unban removes any ban on ip, including every socket ban on it, and
-// reports whether a ban existed (the admin API's DELETE /api/bans/{ip}
-// calls this). Ban keys are unmapped, so ip is too: the 4in6 form of an
-// IPv4 address lifts that address's ban (P2-SHD-009).
-func (s *Shield) Unban(ip netip.Addr) bool {
-	ip = ip.Unmap()
-	existed := s.bans.unban(ip)
-	if s.socketBans.unbanWhere(func(ap netip.AddrPort) bool { return ap.Addr() == ip }) > 0 {
-		existed = true
-	}
-	return existed
-}
-
 // Close stops the prune loop.
 func (s *Shield) Close() error {
 	s.stop()

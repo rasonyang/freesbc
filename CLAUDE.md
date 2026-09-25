@@ -51,7 +51,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 ### Security boundaries
 - Both planes install a sipgo transport read filter (`internal/sip/readfilter.go`) that runs before parsing. The trunk filter admits only peer IPs. The edge filter caps reads at 64 KiB and, on the private bind, admits only upstream IPs. A filter must never return an error, because sipgo treats that as fatal to the read loop; reject by returning `nil, nil`.
 - Shield denials are silent drops. The trunk overrides `onNoRoute` so that non-peer sources get silence instead of a 405.
-- The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, kick, unban and shield metrics are wired to the trunk plane only.
+- The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, kick and shield drop metrics are wired to the trunk plane only. There is no unban API (`DELETE /api/bans/{ip}` was removed).
 - Admin uses bcrypt Basic Auth (cost ≥ 10) and is loopback-only unless `admin.allow_remote: true` is set. `GET /api/config/raw` is unredacted on purpose.
 
 ### sipgo v1.4.3 workarounds (re-check when upgrading sipgo)

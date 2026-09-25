@@ -164,16 +164,6 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
-// Unban removes any shield ban on ip and reports whether one existed. Nil-safe: false before Run builds the
-// shield. Wired to the admin API's DELETE /api/bans/{ip}.
-func (s *Server) Unban(ip netip.Addr) bool {
-	sh := s.shield.Load()
-	if sh == nil {
-		return false
-	}
-	return sh.Unban(ip)
-}
-
 // Run builds the sipgo server, binds every listen.sip entry, and blocks
 // until ctx is cancelled. It returns the first fatal listener error (e.g.
 // a bind failure), or nil on clean shutdown.

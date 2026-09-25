@@ -78,17 +78,6 @@ func (b *banList[K]) ban(key K, dur time.Duration) bool {
 	return true
 }
 
-// unban removes any ban on key and reports whether one existed.
-func (b *banList[K]) unban(key K) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.until[key]; !ok {
-		return false
-	}
-	delete(b.until, key)
-	return true
-}
-
 // overflowed returns the cumulative number of ban additions refused at the
 // hard cap.
 func (b *banList[K]) overflowed() int64 { return b.overflow.Load() }
@@ -126,19 +115,4 @@ func (b *banList[K]) prune() {
 			delete(b.until, key)
 		}
 	}
-}
-
-// unbanWhere removes every ban whose key matches and reports how many
-// existed.
-func (b *banList[K]) unbanWhere(match func(K) bool) int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	n := 0
-	for key := range b.until {
-		if match(key) {
-			delete(b.until, key)
-			n++
-		}
-	}
-	return n
 }

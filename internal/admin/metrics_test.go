@@ -21,7 +21,7 @@ func TestMetricsExposition(t *testing.T) {
 	// deps with known values
 	s := testServerWithMetrics(t /*activeCalls*/, 3 /*ports*/, 2, 4,
 		[]PeerStatus{{Name: "carrier", Register: true, Registered: true}},
-		ShieldStats{BannedCurrent: 5, DropsByReason: map[string]int64{"rate": 7, "scanner": 0, "banned": 0}})
+		ShieldStats{DropsByReason: map[string]int64{"rate": 7, "scanner": 0, "banned": 0}})
 	body := authGET(t, s, "/metrics")
 	str := string(body)
 	for _, want := range []string{
@@ -29,7 +29,6 @@ func TestMetricsExposition(t *testing.T) {
 		"freesbc_media_ports_in_use 2",
 		"freesbc_media_ports_total 4",
 		`freesbc_peer_registered{peer="carrier"} 1`,
-		"freesbc_shield_banned_current 5",
 		`freesbc_shield_drops_total{reason="rate"} 7`,
 	} {
 		if !strings.Contains(str, want) {

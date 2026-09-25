@@ -13,14 +13,12 @@ import (
 type collector struct {
 	deps Deps
 	// descriptors
-	activeCalls     *prometheus.Desc
-	portsInUse      *prometheus.Desc
-	portsTotal      *prometheus.Desc
-	peerReg         *prometheus.Desc
-	bannedCurrent   *prometheus.Desc
-	banAddsRejected *prometheus.Desc
-	dropsTotal      *prometheus.Desc
-	buildInfo       *prometheus.Desc
+	activeCalls *prometheus.Desc
+	portsInUse  *prometheus.Desc
+	portsTotal  *prometheus.Desc
+	peerReg     *prometheus.Desc
+	dropsTotal  *prometheus.Desc
+	buildInfo   *prometheus.Desc
 
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil in a trunk-only
 	// deployment, and Collect skips the whole block then).
@@ -44,15 +42,13 @@ type collector struct {
 
 func newCollector(deps Deps) *collector {
 	return &collector{
-		deps:            deps,
-		activeCalls:     prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
-		portsInUse:      prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
-		portsTotal:      prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
-		peerReg:         prometheus.NewDesc("freesbc_peer_registered", "1 if a register:true peer is currently registered.", []string{"peer"}, nil),
-		bannedCurrent:   prometheus.NewDesc("freesbc_shield_banned_current", "Sources currently in the shield ban table.", nil, nil),
-		banAddsRejected: prometheus.NewDesc("freesbc_shield_ban_adds_rejected_total", "Total shield ban additions refused at the hard table cap.", nil, nil),
-		dropsTotal:      prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
-		buildInfo:       prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
+		deps:        deps,
+		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
+		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
+		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
+		peerReg:     prometheus.NewDesc("freesbc_peer_registered", "1 if a register:true peer is currently registered.", []string{"peer"}, nil),
+		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
+		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
 		proxyRegs:       prometheus.NewDesc("freesbc_active_registrations", "Registration bindings the edge proxy currently holds.", nil, nil),
 		proxyDialogs:    prometheus.NewDesc("freesbc_active_sip_dialogs", "Dialogs the edge proxy is currently on the path of.", nil, nil),
@@ -80,8 +76,6 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portsInUse
 	ch <- c.portsTotal
 	ch <- c.peerReg
-	ch <- c.bannedCurrent
-	ch <- c.banAddsRejected
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
@@ -113,8 +107,6 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		g(c.peerReg, v, p.Name)
 	}
 	st := c.deps.Shield()
-	g(c.bannedCurrent, float64(st.BannedCurrent))
-	g(c.banAddsRejected, float64(st.BanAddsRejected))
 	for reason, n := range st.DropsByReason {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
 	}

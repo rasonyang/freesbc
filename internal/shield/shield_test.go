@@ -191,8 +191,8 @@ func TestShieldStatsCountsDrops(t *testing.T) {
 // audit: P2-SHD-001
 // With the source port known (CheckFrom, the edge plane's path), a UDP
 // scanner verdict bans only that socket, and only briefly: another socket
-// on the same IP is untouched, the IP table stays empty, the ban lapses
-// after socketBanMax, and Unban(ip) lifts it early.
+// on the same IP is untouched, the IP table stays empty, and the ban lapses
+// after socketBanMax.
 func TestCheckFromUDPScannerBansSocketOnly(t *testing.T) {
 	s := testShield(t, shieldCfg)
 	clock := time.Unix(1_700_000_000, 0)
@@ -215,10 +215,6 @@ func TestCheckFromUDPScannerBansSocketOnly(t *testing.T) {
 	clock = clock.Add(socketBanMax)
 	if s.BannedFrom(scan, "udp") {
 		t.Fatalf("a socket ban must lapse after %v", socketBanMax)
-	}
-	s.CheckFrom(scan, "friendly-scanner", "udp")
-	if !s.Unban(scan.Addr()) || s.BannedFrom(scan, "udp") {
-		t.Fatal("Unban(ip) must lift the IP's socket bans")
 	}
 }
 
@@ -272,16 +268,14 @@ func TestEdgeShieldDoesNotExemptTrunkPeers(t *testing.T) {
 }
 
 // audit: P2-SHD-009
-// Ban keys are unmapped, so an admin unban given the 4in6 form of an IPv4
-// address must still find the ban.
-func TestUnbanUnmaps4in6(t *testing.T) {
+// Ban keys are unmapped, so a lookup by the 4in6 form of an IPv4 address
+// finds that address's ban. (The admin unban this finding was about has
+// since been removed.)
+func TestBannedUnmaps4in6(t *testing.T) {
 	s := testShield(t, shieldCfg)
-	ip := netip.MustParseAddr("198.51.100.70")
-	s.Check(ip, "friendly-scanner", "tcp")
-	if !s.Unban(netip.MustParseAddr("::ffff:198.51.100.70")) {
-		t.Fatal("Unban of the 4in6 form missed the ban")
-	}
-	if s.Banned(ip) {
-		t.Error("the ban survived the unban")
+	s.Check(netip.MustParseAddr("198.51.100.70"), "friendly-scanner", "tcp")
+	mapped := netip.MustParseAddr("::ffff:198.51.100.70")
+	if !s.Banned(mapped) || !s.BannedFrom(netip.AddrPortFrom(mapped, 5060), "tcp") {
+		t.Error("the 4in6 form of a banned IPv4 address was not seen as banned")
 	}
 }
