@@ -199,7 +199,7 @@ Created once, alive for the process lifetime:
 | per listener: closer, and `ln.Serve` | `Run` (`edge.go:272-283`) | `listenCtx` cancel / serve error |
 | `Location.Prune` ticker (30 s) | `Run` (`edge.go:297-312`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
-| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:248`) | `WebRTCSession.Start` returns |
+| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:261`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
@@ -2163,8 +2163,15 @@ on, built on `pion/sdp/v3` with **no string manipulation of SDP anywhere**.
 
 Parse limits: `MaxSize = 16 KiB`, `MaxMediaDescriptions = 16`,
 `MaxAttributes = 256` (session level and per media section),
-`MaxCodecs = 128`. Sentinels: `ErrTooLarge`, `ErrNoAudio`, `ErrNoAddress`,
+`MaxCodecs = 128`. Sentinels: `ErrTooLarge`, `ErrNoAudio`, `ErrAudioDeclined`
+(every audio section is at port 0; it wraps `ErrNoAudio`), `ErrNoAddress`,
 `ErrNoCommonCodec`, `ErrRenumbered`.
+
+In the audio section's format list a non-numeric token fails the body, while a
+number above 127 (including one above 255) or a repeated number is skipped. An
+`a=rtpmap` encoding name must be 1-64 letters, digits, `-`, `_` or `.`
+(`validEncodingName`); any other name makes that codec unusable, which is what
+lets `Describe` put codec names in log lines.
 
 Parsing selects the **first `m=audio` section whose port is non-zero**, so a
 declined stream followed by a live one still works. Connection addresses must
@@ -2174,17 +2181,19 @@ applied before media-level ones, so media wins.
 
 Only these attributes are understood: direction (`sendrecv`/`sendonly`/
 `recvonly`/`inactive`), `ice-ufrag`, `ice-pwd`, `setup`, `fingerprint`,
-`rtcp` (the port only; the optional address is discarded as topology).
-Everything else — including `candidate`, `rtcp-mux`, `ssrc`, `extmap`,
+`rtcp` (the port only; the optional address is discarded as topology),
+`rtcp-mux` (`Audio.RTCPMux`). Everything else — including `candidate`, `ssrc`, `extmap`,
 `ptime`, `crypto` — is dropped. **SDES is not parsed by this package at
 all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
-(`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with a
-length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
+(`sdp.go:557-570`) — the RFC 5245 ice-char set widened to base64url, which is
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with the
+RFC 5245 §15.4 lengths: `ice-ufrag` 4-256, `ice-pwd` 22-256. Any other byte —
+CR/LF above all — or length rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
-accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.
+accept only `sha-256`, `sha-384` and `sha-512`, each pair two hex digits
+(`isHexByte`); SHA-1 is rejected.
 `Audio.WebRTC()` requires a `TLS` proto token **and** a fingerprint **and**
 both ICE credentials.
 
@@ -2227,7 +2236,7 @@ ICE candidates can never reach FreeSWITCH.
 | DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` |
 | codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:484`), so in practice always present on a browser leg |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:575`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1) |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 

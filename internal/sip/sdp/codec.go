@@ -25,11 +25,12 @@ func HasMedia(in []Codec) bool {
 // and the ANSWER's fmtp. Both choices matter and are the whole reason the
 // proxy needs no transcoder:
 //
-//   - Offer order and offer numbers: RFC 3264 §6 requires an answerer to
-//     use the offerer's payload-type numbers, so the numbers in the offer
-//     are the numbers on the wire in both directions. Emitting them
-//     unchanged on the far leg is what lets the relay forward RTP without
-//     touching the payload-type field of a single packet.
+//   - Offer order and offer numbers: RFC 3264 §6.1 says an answerer SHOULD
+//     use the offerer's payload-type numbers (a recommendation, not a
+//     requirement), and when it does the numbers in the offer are the
+//     numbers on the wire in both directions. Emitting them unchanged on
+//     the far leg is what lets the relay forward RTP without touching the
+//     payload-type field of a single packet.
 //   - Answer fmtp: the answerer is the side that narrowed the parameters
 //     (opus ptime, maxaveragebitrate, the telephone-event range it will
 //     actually generate). That narrowed form is what must reach the
@@ -39,8 +40,9 @@ func HasMedia(in []Codec) bool {
 // that intersected down to telephone-event alone counts as nothing: it
 // would "succeed" and then carry silence), and with ErrRenumbered when a
 // codec both sides named sits on different payload numbers — some stacks
-// renumber despite the RFC, and honouring that would mean rewriting the
-// PT byte of every RTP packet.
+// use the SHOULD's latitude to renumber, and honouring that would mean
+// rewriting the PT byte of every RTP packet. Refusing is this package's
+// policy, not an RFC requirement.
 func Negotiate(offer, answer []Codec) ([]Codec, error) {
 	// One encoding may sit on several payload numbers in an offer
 	// (RFC 3264 §6.1: opus on 111 and on 96 with other parameters), so a
@@ -103,8 +105,8 @@ func offerOf(offer []Codec, key string) []Codec {
 
 // Describe renders a codec list for logs. Used in error messages, so it
 // must stay free of anything an attacker could use to forge a log line:
-// codec names are alphanumeric by construction (parseRTPMap rejects the
-// rest) and fmtp is not included.
+// a parsed codec name is letters, digits, '-', '_' and '.' only
+// (validEncodingName, enforced by parseRTPMap) and fmtp is not included.
 func Describe(cs []Codec) string {
 	if len(cs) == 0 {
 		return "(none)"

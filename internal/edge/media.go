@@ -174,6 +174,9 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		if !s.webrtcEnabled {
 			return nil, errors.New("proxy: a WebRTC offer arrived but webrtc.enabled is false")
 		}
+		if err := requireRTCPMux(offer); err != nil {
+			return nil, err
+		}
 		sess, err = s.allocateWebRTC(ctx, offer)
 	} else {
 		sess, err = s.allocateRTP(offer)
@@ -546,6 +549,18 @@ func (s *Server) anchorFor(m *mediaSession, p plane) (netip.Addr, int) {
 	return s.topo.privateMediaIP, m.privatePort
 }
 
+// requireRTCPMux refuses a browser offer without a=rtcp-mux. The WebRTC
+// leg is a single ICE component carrying RTP and RTCP together, so every
+// body toward the browser states a=rtcp-mux; an answer may do that only
+// when its offer did (RFC 5761 §5.1.1), so a non-mux offer is rejected
+// (488) rather than answered with an attribute it did not offer.
+func requireRTCPMux(offer *sdp.Session) error {
+	if !offer.Audio.RTCPMux {
+		return errors.New("proxy: WebRTC offer without a=rtcp-mux; only muxed RTCP is supported")
+	}
+	return nil
+}
+
 // setWebRTCAnswer fills in the browser-facing half of a body: the ICE-Lite
 // credentials, the DTLS role and FreeSBC's own fingerprint.
 //
@@ -589,6 +604,14 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 		return nil, nil, fmt.Errorf("%w: re-offer had %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
 	}
 	sess := d.session()
+	if toward == planePrivate && sess.webrtc != nil {
+		// The browser's re-offer is answered with the same a=rtcp-mux the
+		// initial answer carried, which RFC 5761 §5.1.1 allows only when
+		// the offer has it too.
+		if err := requireRTCPMux(offer); err != nil {
+			return nil, nil, err
+		}
+	}
 	addr, port := s.anchorFor(sess, toward)
 	id, version := d.nextOrigin(toward)
 	build := sdp.Build{
