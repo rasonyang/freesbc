@@ -1,5 +1,5 @@
 // Package shield is FreeSBC's front-door security plane: per-IP rate limiting,
-// scanner fingerprinting, and failure-threshold auto-ban. Every inbound SIP
+// scanner fingerprinting, and an in-memory ban list. Every inbound SIP
 // request passes Shield.Check before identification; denials are silent drops.
 package shield
 

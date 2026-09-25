@@ -29,7 +29,7 @@ func TestParseMinimal(t *testing.T) {
 	if c.Peers["pbx"].Transport != "udp" {
 		t.Error("defaults not applied")
 	}
-	if c.Shield.NFTables != "auto" {
+	if c.Shield.AutoBan.Duration.Std() != time.Hour {
 		t.Error("shield defaults not applied")
 	}
 }
@@ -45,6 +45,23 @@ func TestParseUnknownFieldRejectedWithLine(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "line") && !strings.Contains(err.Error(), "12") {
 		t.Errorf("error should carry position info: %q", err.Error())
+	}
+}
+
+// audit: P2-SHD-004
+// The nftables backend and the unidentified-source auto-ban counter are
+// gone, so their keys are unknown fields: a config that still sets them is
+// rejected rather than silently ignored.
+func TestParseRejectsRemovedShieldKeys(t *testing.T) {
+	for _, key := range []string{
+		"shield:\n  nftables: auto\n",
+		"shield:\n  auto_ban: { failures: 5 }\n",
+		"shield:\n  auto_ban: { window: 60s }\n",
+	} {
+		_, err := Parse([]byte(minimalYAML + key))
+		if err == nil {
+			t.Errorf("%q: removed shield key accepted", key)
+		}
 	}
 }
 
@@ -177,7 +194,7 @@ routes:
     from: pbx
     to: [pbx]
 shield:
-  auto_ban: { failures: 5, window: "60s", duration: 1h }
+  auto_ban: { duration: "60s" }
 `
 	c, err := Parse([]byte(src))
 	if err != nil {
@@ -189,8 +206,8 @@ shield:
 	if c.Listen.Media.PortRange.Min != 16384 {
 		t.Errorf("port range: %+v", c.Listen.Media.PortRange)
 	}
-	if c.Shield.AutoBan.Window.Std() != 60*time.Second {
-		t.Errorf("window: %v", c.Shield.AutoBan.Window.Std())
+	if c.Shield.AutoBan.Duration.Std() != 60*time.Second {
+		t.Errorf("duration: %v", c.Shield.AutoBan.Duration.Std())
 	}
 }
 

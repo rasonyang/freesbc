@@ -1,7 +1,8 @@
 package shield
 
 import (
-	"context"
+	"io"
+	"log/slog"
 	"net/netip"
 	"strings"
 	"testing"
@@ -21,42 +22,7 @@ func testShield(t *testing.T, yaml string) *Shield {
 	return s
 }
 
-// testShieldWithRecordingNFT builds a Shield exactly like New does, but
-// replaces the nft backend's exec with a recorder — T-02's kernel-sync
-// tests must observe whether an element add was actually enqueued, which
-// the real backend (availability-gated, real exec) can't show.
-func testShieldWithRecordingNFT(t *testing.T, yaml string) (*Shield, *recordedCmds) {
-	t.Helper()
-	cfg, err := config.Parse([]byte(yaml))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	rec := &recordedCmds{}
-	bl := newBanList()
-	bl.nft = &nftBackend{
-		log:     discard(),
-		listens: cfg.Listen.SIP,
-		run: func(ctx context.Context, args ...string) error {
-			rec.add(strings.Join(args, " "))
-			return nil
-		},
-	}
-	bl.nft.start()
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Shield{
-		store:       config.NewStore(cfg),
-		log:         discard(),
-		limiter:     newRateLimiter(),
-		peerLimiter: newRateLimiter(),
-		bans:        bl,
-		counter:     newFailCounter(),
-		stop:        cancel,
-		done:        make(chan struct{}),
-	}
-	go s.pruneLoop(ctx)
-	t.Cleanup(func() { s.Close() })
-	return s, rec
-}
+func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 const shieldCfg = `
 listen:
@@ -66,8 +32,7 @@ listen:
     public_ip: 127.0.0.1
 shield:
   rate_limit: 2/s per_ip
-  auto_ban: { failures: 3, window: 60s, duration: 1h }
-  nftables: off
+  auto_ban: { duration: 1h }
 peers:
   trunk:
     address: 203.0.113.10:5060
@@ -121,12 +86,38 @@ func TestShieldCheckAppliesPeerRateLimit(t *testing.T) {
 func TestCheckScannerInstantBan(t *testing.T) {
 	s := testShield(t, shieldCfg)
 	bad := netip.MustParseAddr("198.51.100.5")
-	if s.Check(bad, "sipvicious", "udp") != Drop {
+	if s.Check(bad, "sipvicious", "tcp") != Drop {
 		t.Fatal("scanner UA must be dropped")
 	}
 	// now banned: even a benign UA from that IP drops.
-	if s.Check(bad, "Zoiper", "udp") != Drop {
+	if s.Check(bad, "Zoiper", "tcp") != Drop {
 		t.Fatal("scanner source must be banned after the first hit")
+	}
+}
+
+// audit: P2-SHD-001
+// A scanner verdict bans only on a connection-oriented transport. Over UDP,
+// or with no transport known, the request is dropped and counted, but the
+// forgeable source address is not banned.
+func TestCheckScannerBanNeedsConnection(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	for i, tc := range []struct {
+		transport string
+		ban       bool
+	}{
+		{"udp", false}, {"", false}, {"UDP", false},
+		{"tcp", true}, {"tls", true}, {"ws", true}, {"wss", true}, {"WSS", true},
+	} {
+		src := netip.AddrFrom4([4]byte{198, 51, 100, byte(100 + i)})
+		if s.Check(src, "friendly-scanner", tc.transport) != Drop {
+			t.Fatalf("%q: scanner UA must be dropped", tc.transport)
+		}
+		if got := s.bans.banned(src); got != tc.ban {
+			t.Errorf("%q: banned = %v, want %v", tc.transport, got, tc.ban)
+		}
+	}
+	if got := s.Stats().DropsByReason["scanner"]; got != 8 {
+		t.Errorf("scanner drops = %d, want 8 (UDP drops count too)", got)
 	}
 }
 
@@ -181,10 +172,10 @@ func TestCheckRateLimitDropsButDoesNotBan(t *testing.T) {
 }
 
 func TestShieldStatsCountsDrops(t *testing.T) {
-	s := testShield(t, shieldCfg) // rate 2/s, nftables off; from earlier tasks
+	s := testShield(t, shieldCfg) // rate 2/s
 	bad := netip.MustParseAddr("198.51.100.20")
-	s.Check(bad, "sipvicious", "udp") // scanner drop (+ ban)
-	s.Check(bad, "", "udp")           // now banned → banned drop
+	s.Check(bad, "sipvicious", "tcp") // scanner drop (+ ban)
+	s.Check(bad, "", "tcp")           // now banned → banned drop
 	st := s.Stats()
 	if st.DropsByReason["scanner"] < 1 {
 		t.Errorf("scanner drops = %d, want >=1", st.DropsByReason["scanner"])
@@ -197,45 +188,100 @@ func TestShieldStatsCountsDrops(t *testing.T) {
 	}
 }
 
-func TestRecordUnidentifiedBansAtThreshold(t *testing.T) {
+// audit: P2-SHD-001
+// With the source port known (CheckFrom, the edge plane's path), a UDP
+// scanner verdict bans only that socket, and only briefly: another socket
+// on the same IP is untouched, the IP table stays empty, the ban lapses
+// after socketBanMax, and Unban(ip) lifts it early.
+func TestCheckFromUDPScannerBansSocketOnly(t *testing.T) {
 	s := testShield(t, shieldCfg)
-	bad := netip.MustParseAddr("198.51.100.7")
-	// failures: 3 → the 3rd unidentified request bans the source.
-	s.RecordUnidentified(bad)
-	s.RecordUnidentified(bad)
-	if s.Check(bad, "", "udp") != Allow {
-		t.Fatal("under threshold: still allowed")
+	clock := time.Unix(1_700_000_000, 0)
+	s.socketBans.now = func() time.Time { return clock }
+	s.limiter.now = func() time.Time { return clock }
+	scan := netip.MustParseAddrPort("198.51.100.60:5060")
+	other := netip.MustParseAddrPort("198.51.100.60:5062")
+	if s.CheckFrom(scan, "friendly-scanner", "udp") != Drop {
+		t.Fatal("scanner UA must be dropped")
 	}
-	s.RecordUnidentified(bad) // 3rd
-	if s.Check(bad, "", "udp") != Drop {
-		t.Fatal("at threshold: banned → drop")
+	if !s.BannedFrom(scan, "udp") {
+		t.Fatal("the scanner's UDP socket must be banned")
+	}
+	if s.BannedFrom(scan, "tcp") || s.bans.banned(scan.Addr()) {
+		t.Fatal("a UDP verdict must not ban the IP or its TCP side")
+	}
+	if s.CheckFrom(other, "Yealink", "udp") != Allow {
+		t.Fatal("another socket on the same IP must not be banned")
+	}
+	clock = clock.Add(socketBanMax)
+	if s.BannedFrom(scan, "udp") {
+		t.Fatalf("a socket ban must lapse after %v", socketBanMax)
+	}
+	s.CheckFrom(scan, "friendly-scanner", "udp")
+	if !s.Unban(scan.Addr()) || s.BannedFrom(scan, "udp") {
+		t.Fatal("Unban(ip) must lift the IP's socket bans")
 	}
 }
 
-// TestUDPScannerSinglePacketMemoryOnly is the T-02 (F-04) red test: the
-// single-packet scanner verdict over UDP (a forgable source) bans in memory
-// only — no kernel sync. The TCP positive control proves the same verdict
-// over a connection-based transport still reaches nft.
-func TestUDPScannerSinglePacketMemoryOnly(t *testing.T) {
-	s, rec := testShieldWithRecordingNFT(t, shieldCfg) // rate 2/s per_ip
-	bad := netip.MustParseAddr("198.51.100.40")
-	if s.Check(bad, "sipvicious", "udp") != Drop {
+// audit: P2-SHD-001
+// A forged-datagram flood fills at most the socket table; a real scanner
+// over TCP still gets its IP banned.
+func TestSocketBanFloodLeavesIPTableFree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("fills a 64k table")
+	}
+	s := testShield(t, shieldCfg)
+	base := netip.MustParseAddr("2001:db8::").As16()
+	for i := 0; i <= banCap; i++ {
+		a := base // one source per /64, so the rate limiter admits each
+		a[4], a[5], a[6], a[7] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
+		s.CheckFrom(netip.AddrPortFrom(netip.AddrFrom16(a), 5060), "friendly-scanner", "udp")
+	}
+	if s.socketBans.overflowed() == 0 {
+		t.Fatal("the flood should have filled the socket table")
+	}
+	real := netip.MustParseAddrPort("192.0.2.66:40000")
+	s.CheckFrom(real, "sipvicious", "tcp")
+	if !s.bans.banned(real.Addr()) {
+		t.Error("a real TCP scanner could not be banned after a UDP flood")
+	}
+}
+
+// audit: P2-SHD-005
+// Trunk peers are exempt only on the trunk plane. On the edge shield a
+// source inside a trunk peer's allowed_ips is an ordinary public client:
+// a scanner verdict bans it.
+func TestEdgeShieldDoesNotExemptTrunkPeers(t *testing.T) {
+	cfg, err := config.Parse([]byte(shieldCfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	edge := NewNoKernel(config.NewStore(cfg), discard())
+	t.Cleanup(func() { edge.Close() })
+	peer := netip.MustParseAddr("203.0.113.10") // shieldCfg's trunk peer
+	if edge.Check(peer, "friendly-scanner", "tcp") != Drop {
 		t.Fatal("scanner UA must be dropped")
 	}
-	if !s.bans.banned(bad) {
-		t.Fatal("UDP scanner must still be banned in memory")
-	}
-	// Give the worker a beat to run any stray enqueue, then assert the
-	// kernel never heard about it.
-	time.Sleep(100 * time.Millisecond)
-	if got := rec.count(); got != 0 {
-		t.Fatalf("nft execs = %d, want 0 (UDP single-packet scanner ban is memory-only)", got)
+	if edge.Check(peer, "Yealink", "tcp") != Drop {
+		t.Error("the edge shield exempted a trunk peer from its scanner ban")
 	}
 
-	// Positive control: the same verdict over TCP does sync to the kernel.
-	badTCP := netip.MustParseAddr("198.51.100.41")
-	if s.Check(badTCP, "sipvicious", "tcp") != Drop {
-		t.Fatal("TCP scanner must be dropped")
+	trunk := testShield(t, shieldCfg)
+	if trunk.Check(peer, "friendly-scanner", "tcp") != Allow {
+		t.Error("the trunk shield must still exempt its peers from the scanner check")
 	}
-	waitForRecords(t, rec, 1)
+}
+
+// audit: P2-SHD-009
+// Ban keys are unmapped, so an admin unban given the 4in6 form of an IPv4
+// address must still find the ban.
+func TestUnbanUnmaps4in6(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	ip := netip.MustParseAddr("198.51.100.70")
+	s.Check(ip, "friendly-scanner", "tcp")
+	if !s.Unban(netip.MustParseAddr("::ffff:198.51.100.70")) {
+		t.Fatal("Unban of the 4in6 form missed the ban")
+	}
+	if s.Banned(ip) {
+		t.Error("the ban survived the unban")
+	}
 }

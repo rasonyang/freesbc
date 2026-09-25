@@ -38,8 +38,7 @@ routes:
     to: [internal-pbx]
 shield:
   rate_limit: 20/s per_ip
-  auto_ban: { failures: 5, window: 60s, duration: 1h }
-  nftables: auto
+  auto_ban: { duration: 1h }
 admin:
   listen: 127.0.0.1:8080
   auth: { username: admin, password_hash: "x" }
@@ -58,8 +57,8 @@ admin:
 	if len(c.Routes) != 2 || c.Routes[0].Match.To != `^9(\d+)$` || c.Routes[0].Transform.To != "$1" {
 		t.Errorf("routes: %+v, %+v", c.Routes[0], c.Routes[1])
 	}
-	if c.Shield.AutoBan.Window.Std() != 60*time.Second {
-		t.Errorf("auto_ban.window: %v", c.Shield.AutoBan.Window.Std())
+	if c.Shield.AutoBan.Duration.Std() != time.Hour {
+		t.Errorf("auto_ban.duration: %v", c.Shield.AutoBan.Duration.Std())
 	}
 	if c.Admin == nil || c.Admin.Listen != "127.0.0.1:8080" {
 		t.Errorf("admin: %+v", c.Admin)
@@ -300,11 +299,8 @@ func TestWithDefaults(t *testing.T) {
 	if c.Shield.RateLimit != "20/s per_ip" {
 		t.Errorf("rate_limit default: %q", c.Shield.RateLimit)
 	}
-	if c.Shield.AutoBan.Failures != 5 || c.Shield.AutoBan.Window.Std() != 60*time.Second || c.Shield.AutoBan.Duration.Std() != time.Hour {
+	if c.Shield.AutoBan.Duration.Std() != time.Hour {
 		t.Errorf("auto_ban default: %+v", c.Shield.AutoBan)
-	}
-	if c.Shield.NFTables != "auto" {
-		t.Errorf("nftables default: %q", c.Shield.NFTables)
 	}
 	if c.RingTimeout.Std() != 60*time.Second {
 		t.Errorf("ring_timeout default: %v", c.RingTimeout.Std())

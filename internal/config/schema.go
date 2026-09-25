@@ -236,12 +236,11 @@ type ShieldConfig struct {
 	// not from rate limiting, so a spoofed peer source still has a ceiling.
 	PeerRateLimit string  `yaml:"peer_rate_limit"`
 	AutoBan       AutoBan `yaml:"auto_ban"`
-	NFTables      string  `yaml:"nftables"` // auto, on, off
 }
 
+// AutoBan holds the scanner ban's lifetime: a source the edge shield
+// fingerprints as a scanner is banned in memory for Duration.
 type AutoBan struct {
-	Failures int      `yaml:"failures"`
-	Window   Duration `yaml:"window"`
 	Duration Duration `yaml:"duration"`
 }
 
@@ -310,17 +309,8 @@ func withDefaults(c *Config) {
 	if c.Shield.PeerRateLimit == "" {
 		c.Shield.PeerRateLimit = "200/s per_ip"
 	}
-	if c.Shield.AutoBan.Failures == 0 {
-		c.Shield.AutoBan.Failures = 5
-	}
-	if c.Shield.AutoBan.Window == 0 {
-		c.Shield.AutoBan.Window = Duration(60 * time.Second)
-	}
 	if c.Shield.AutoBan.Duration == 0 {
 		c.Shield.AutoBan.Duration = Duration(time.Hour)
-	}
-	if c.Shield.NFTables == "" {
-		c.Shield.NFTables = "auto"
 	}
 	if c.RingTimeout == 0 {
 		c.RingTimeout = Duration(60 * time.Second)

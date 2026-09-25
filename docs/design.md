@@ -56,7 +56,7 @@ end-to-end.
 | B2BUA call and leg state (`trunk`), proxy dialog state (`edge`) | Trunk dialog bookkeeping — `sipgo.DialogServerCache` / `DialogClientCache` |
 | Port allocation, latching, relay loops, watchdog | SRTP transforms — `pion/srtp/v3`; DTLS handshake and key export — `pion/dtls/v3`; ICE connectivity checks — `pion/ice/v4` |
 | SDP parsing limits, codec intersection, body construction (the trunk plane also parses and writes SDP itself, `trunk/sdp.go`) | SDP syntax on the edge plane — `pion/sdp/v3` |
-| In-memory ban table, rate limiting, scanner signatures | Optional kernel enforcement — the `nft` binary, invoked by `exec` |
+| In-memory ban table, rate limiting, scanner signatures | — (there is no kernel-level ban enforcement) |
 | Config schema, validation, atomic hot-swap | YAML parsing — `goccy/go-yaml`; file-change notification — `fsnotify` |
 | Admin HTTP API, WebUI, metric collection | Metric exposition — `prometheus/client_golang` |
 | — | **All call logic on the edge plane**: FreeSWITCH decides what a call does; the edge plane decides only where a message goes and how media is anchored |
@@ -147,7 +147,7 @@ Created once, alive for the process lifetime:
 | `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:136-137`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
 | `edge.privateSources` | edge | `edge.New` | 256-entry, 10-minute TTL map of private-listener sources |
 | `media.DTLSIdentity` | media | `edge.New` when `webrtc.enabled` | one per process, shared by every WebRTC leg |
-| `shield.Shield` ×(0..2) | shield | trunk `Run` (`shield.New`), edge `Run` (`shield.NewNoKernel`) | separate instances; only the trunk one manages nftables |
+| `shield.Shield` ×(0..2) | shield | trunk `Run` (`shield.New`), edge `Run` (`shield.NewNoKernel`) | separate instances; both ban in process memory only |
 | `admin.Server` | admin | `app.go:120-122` | only when an `admin:` section exists at startup |
 
 ### 3.2 Per-unit-of-work objects
@@ -165,7 +165,7 @@ Created once, alive for the process lifetime:
 | `media.WebRTCLeg` + `media.WebRTCSession` | one browser leg | 1 muxed public socket + 1 private pair |
 | `media.SRTPContext` | one direction of one leg | `atomic.Pointer` slots on the session |
 | port reservation (`PlanePool.inUse`) | one RTP even port | released by `Session.Close` / `WebRTCLeg.Close` |
-| shield ban entry, rate-limit bucket, fail-counter slice | one source IP | the owning `Shield` |
+| shield ban entry, rate-limit bucket | one source IP (a UDP socket ban: one IP:port; a rate-limit bucket: an IPv4 address or an IPv6 /64) | the owning `Shield` |
 | `*config.Config` snapshot | one publication | immutable once stored |
 
 ### 3.3 Goroutine inventory
@@ -191,7 +191,6 @@ Created once, alive for the process lifetime:
 | per forked B-leg 2xx: ACK + BYE | `forkWatch.handleLocked` (`forks.go`) | the BYE's final response or its 5 s `byeContext` |
 | per session-timer leg the SBC refreshes: `refreshLoop` | `startRefreshers` (`sessiontimer.go`) | the call's kick context, cancelled by `endCall` |
 | shield prune loop | `shield.New` | `Shield.Close` |
-| nftables worker | `nftBackend.start` | backend close (drops queued bans) |
 
 **Edge plane**
 
@@ -342,7 +341,7 @@ There is **no reload-failure metric**.
 |---|---|
 | `peers.*` (address, allowed_ips, auth, srtp, transport, quotas) — read per packet in the trunk read filter and per call in the B2BUA | The listener set: `listen.sip` / `sip.bind_ip`, `sip.public.*`, `sip.private.bind` |
 | `routes` | Trunk dialog-cache Contact (resolved once in `trunk.Server.Run`) |
-| `shield.rate_limit`, `shield.peer_rate_limit`, `shield.auto_ban.*` | `shield.nftables` mode and the nft rule port scope (fixed at construction) |
+| `shield.rate_limit`, `shield.peer_rate_limit`, `shield.auto_ban.duration` | — |
 | `admin.auth.username` / `password_hash` (effective on the next request) | `admin.listen`, `admin.tls_cert`, `admin.tls_key`; the **existence** of the `admin:` section |
 | RTP port ranges and bind IPs, for **new** sessions only | Edge topology: upstream nodes, PSTN gateways/routes/match, `webrtc.*`, DTLS identity |
 | `listen.media.rtp_timeout`, for new sessions | Outbound per-peer TLS material (`buildClientTLSConfig`, once at trunk `Run`) |
@@ -379,8 +378,7 @@ sockets are still open**, because sipgo reuses a pooled UDP listener
 connection for outbound requests; closing listeners concurrently made the
 un-REGISTER fail with `net.ErrClosed`. Each un-REGISTER has its own ~2 s
 budget from `context.Background()`, independent of the already-cancelled run
-context. `defer sh.Close()` on the shield fires after all of this, so no
-in-flight `Check` can race the nftables teardown.
+context. `defer sh.Close()` on the shield fires after all of this.
 
 **Edge**: `listenCancel()` → each listener's watcher closes its socket →
 `wg.Wait()` → `s.dialogs.closeAll()`, which ends every dialog and therefore
@@ -389,10 +387,8 @@ closes every media session. There is no BYE-on-shutdown; calls are dropped.
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout.
 In-flight HTTP requests are drained up to that budget.
 
-**Shield.Close**: cancel the prune loop, wait for it, then (trunk only) stop
-the nftables worker — dropping whatever bans are still queued — and run
-`nft delete table inet freesbc` under a 2 s timeout, which removes every
-kernel ban.
+**Shield.Close**: cancel the prune loop and wait for it. Bans are in memory
+only, so none survive the process.
 
 Exit codes: 0 on a clean shutdown, 1 on any fatal component error or a bad
 config at startup, 2 on a usage error.
@@ -482,10 +478,7 @@ error. Advertised addresses may never be the unspecified address.
 |---|---|
 | `shield.rate_limit` | `"20/s per_ip"` |
 | `shield.peer_rate_limit` | `"200/s per_ip"` |
-| `shield.auto_ban.failures` | `5` |
-| `shield.auto_ban.window` | `60s` |
 | `shield.auto_ban.duration` | `1h` |
-| `shield.nftables` | `"auto"` (`auto\|on\|off`) |
 
 Rate-limit grammar: `"<n>/<s|m|h> [per_ip]"`; the only permitted second field
 is the literal `per_ip`. There are no ceilings on `n` or floors on the
@@ -546,9 +539,13 @@ which trims whitespace and honours YAML quoting.
 
 ### 6.1 Ingress
 
-**Transports.** `udp`, `tcp`, `tls` only. TCP and TLS listeners share one
-`atomic.Int64` connection counter across *all* such listeners, capped at
-`tcpMaxConns = 1024`; an over-cap connection is closed and the accept loop
+**Transports.** `udp`, `tcp`, `tls` only. A TCP/TLS connection whose
+source IP matches no peer's `allowed_ips` is closed at accept, before any
+TLS handshake and before it is counted, by the same predicate the read
+filter uses (`fromPeer`, `readfilter.go:30-45`; P2-TRK-001). TCP and TLS
+listeners share one `atomic.Int64` connection counter across *all* such
+listeners, capped at `tcpMaxConns = 1024`, which therefore only peers can
+occupy; an over-cap connection is closed and the accept loop
 retries rather than surfacing an error to sipgo (whose `Serve` treats an
 Accept error as fatal to the listener). Every accepted stream connection is
 wrapped in `idleTimeoutConn`, which refreshes a `SetReadDeadline(now + 120s)`
@@ -601,17 +598,16 @@ REGISTER, SUBSCRIBE, NOTIFY, MESSAGE or REFER handler.
 | **OPTIONS** | identified peers get an unconditional **200 OK**, in or out of dialog, with no Allow/Accept/Supported header and no body |
 | **CANCEL matching a live INVITE transaction** | handled entirely inside sipgo: 200 to the CANCEL, the INVITE transaction FSM drives 487, and `tx.OnCancel` ends the dialog with `ErrTransactionCanceled`, cancelling `aLeg.Context()` |
 | **CANCEL matching nothing** | `onNoRoute`: identify first (unknown source → silence), then **481 Call/Transaction Does Not Exist** (RFC 3261 §9.2) |
-| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:677-699`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
+| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:645-666`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
 | **`Require: 100rel`** | **420 Bad Extension** + `Unsupported: 100rel`, before routing or dialog creation |
 | **`Session-Expires` below `min_se`** | **422 Session Interval Too Small** + `Min-SE`, before routing or dialog creation |
 
 Every handler identifies first — not only INVITE and `onNoRoute` but also
 `onOptions`, `onAck` and `onBye` — and an unidentified source is dropped
-silently by `dropUnidentified` (`server.go:461-471`), which also feeds
-`shield.RecordUnidentified`, the auto-ban failure counter. On udp/tcp/tls that
+silently: the handler returns without a response. On udp/tcp/tls that
 branch is unreachable in practice: the pre-parse read filter already dropped
-every byte from a source matching no peer, so nothing unidentified survives to
-be counted (`server.go:448-452`, `readfilter.go:22-33`).
+every byte from a source matching no peer (`server.go:443-446`,
+`readfilter.go:24-45`).
 
 `onNoRoute` is overridden precisely so sipgo's default 405 cannot confirm the
 SBC's existence to an unauthorised source: known peers get 405, unknown
@@ -646,7 +642,7 @@ RFC 3261's core compact names. Delta-seconds above 2^32-1 are clamped to it
 ```
 tx = &finalTx{tx}                             // records the first final response
 defer recoverCall(req, guard)                 // per-call panic umbrella: 500 / BYE
-identify(req); !ok -> dropUnidentified, silent return
+identify(req); !ok -> silent return
 From()/To()/CallID() nil -> 400
 [in-dialog branch, §6.2]
 beginInvite(Call-ID, From-tag, CSeq); dup -> 482; defer done
@@ -2491,8 +2487,8 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held across the whole bind sweep |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
-| **shield ban entry** | `banList` | `ban(ip, dur, kernel)` from `Check`'s scanner branch or `RecordUnidentified` | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** with an overflow counter; a refused ban also skips the kernel drop; the in-memory table is always authoritative | `ban`, `unban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, `Unban`, or process exit | `banList.mu`; the nft exec is enqueued **outside** the mutex |
-| **rate-limit bucket** | `rateLimiter` (two per `Shield`) | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops per-IP buckets idle ≥ 1 minute; the global bucket is never pruned; **no cap on the map** | `rateLimiter.mu` |
+| **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `unban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, `Unban`, or process exit | `banList.mu` |
+| **rate-limit bucket** | `rateLimiter` (two per `Shield`) | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; compiled regexps and prefixes are populated before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot; `Store.mu` only for the subscriber slice |
 
 ---
@@ -2547,7 +2543,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | `media.latch.mu` (×4 per session) | mode, expected, remote, latched |
 | `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
-| `shield.banList.mu`, two `rateLimiter.mu`, `failCounter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
+| `shield.banList.mu`, two `rateLimiter.mu`, `Shield.rlMu`/`prlMu` | their respective tables and cached rate-limit parses |
 | `admin.authLimiter.mu` | the per-IP auth-failure window |
 | `config.Store.mu` | the subscriber slice only |
 
@@ -2596,10 +2592,6 @@ spin.
   handler returns once a final response is relayed; the dialog and its media
   are then owned by the table and reclaimed by the per-dialog media watcher
   goroutine, `teardown`, or `closeAll`.
-- **`Shield.Unban` blocks the calling goroutine on a `nft` fork+exec** for up
-  to 2 s, and it is called synchronously from the admin HTTP handler,
-  deliberately bypassing the ban worker queue so an operator unban works
-  under saturation.
 
 ### 11.5 Panic containment
 
@@ -2683,38 +2675,15 @@ Record-Route (`topology.go:325`), defaulting to the bind port.
   1300 bytes, and the RFC's remedy — switch to TCP — is unavailable when both
   ends are UDP.
 
-### 12.4 nftables backend
+### 12.4 No kernel firewall integration
 
-Optional, best-effort, and **never fatal**. Only the trunk plane's shield
-manages the kernel; the edge plane uses `shield.NewNoKernel`, because the
-edge's public listeners are not in `config.Listeners()` (the list the rules
-are derived from), so a second kernel-managing shield would write rules for
-the wrong ports or fight the trunk's over the same table.
-
-| Mode | Behaviour |
-|---|---|
-| `off` | nft is never invoked |
-| `on` | a missing `nft` binary or a setup failure logs an **error** and degrades to in-process bans |
-| `auto` (default) | the same, silently |
-
-Setup (each command under a **2 s** timeout): delete any existing
-`inet freesbc` table, create it, create the `banned4`/`banned6` timeout sets,
-create an `input` chain at filter hook priority -1, then add drop rules
-scoped to **`udp dport`/`tcp dport` over the configured SIP listen ports**
-(TLS rides TCP at the kernel layer). With no ports, no drop rules are
-installed at all and only in-memory bans apply. The port scope is captured at
-construction; a reloaded listener set does not rebuild the rules.
-
-Ban syncing runs through a single worker goroutine with a 256-entry queue; a
-full queue drops the kernel sync and logs at Debug, while the in-memory ban
-still applies. Unban runs **synchronously**, bypassing the queue. Shutdown
-drops whatever is still queued and deletes the whole table, so kernel bans do
-not survive a restart.
-
-Deployment assumptions: `nft` is on `PATH`, the process may manage nftables
-(CAP_NET_ADMIN), and the table name `inet freesbc` is exclusively this
-instance's in its network namespace — setup deletes it unconditionally, so
-two FreeSBC processes in one namespace fight over it.
+FreeSBC manages no kernel firewall state. The nftables backend (the
+`inet freesbc` table, `shield.nftables`, and the CAP_NET_ADMIN it needed)
+was removed with P2-SHD-004: it hung off the trunk shield, whose ban branch
+is unreachable because the trunk read filter admits only configured peers
+and peers are exempt from bans. Every ban lives in the shield's in-memory
+table (§14.1). A deployment that wants kernel-level drops puts its own
+firewall in front of FreeSBC.
 
 ### 12.5 TLS
 
@@ -2745,10 +2714,8 @@ IP verification rejects it.
 | Each peer's `allowed_ips` is narrowed to its real prefixes | **Partly enforced**: non-empty, canonicalised, no wider than IPv4 /8 or IPv6 /32. `0.0.0.0/0` is rejected; a /8 is not |
 | `admin.listen` binds loopback | **Enforced**, opt out with `admin.allow_remote: true` |
 | Remote admin is fronted by TLS | **Warned, not enforced** |
-| The process runs non-root with CAP_NET_BIND_SERVICE (+CAP_NET_ADMIN for nftables) | **Not enforced, no unit file shipped** |
+| The process runs non-root with CAP_NET_BIND_SERVICE | **Not enforced, no unit file shipped** |
 | Config file mode 0600 | **Not enforced**; the admin write-back preserves the existing file's mode |
-| `nft` present and manageable | **Auto-detected, degrades** |
-| The nft table `inet freesbc` is ours alone | **Assumed, and deleted unconditionally at setup** |
 | A single routable media address (no TURN) | **Assumed**; the fallback is the first specific `listen.sip` host, else 127.0.0.1 + WARN |
 | Advertised addresses are routable from their own side | **Enforced when the bind is a wildcard** |
 | Media pools do not overlap | **Enforced** across `rtp.public`, `rtp.private` and the trunk range |
@@ -2803,10 +2770,10 @@ permanent series per call."
 
 Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
-(`shield.go:109-118`). In a deployed system `freesbc_shield_banned_current`
+(`shield.go:97-105`). In a deployed system `freesbc_shield_banned_current`
 and `freesbc_shield_ban_adds_rejected_total` therefore stay at 0 and
 `freesbc_shield_drops_total` reports only `reason="rate"`. The ban and scanner
-branches run on the **edge** shield (`edge.go:559`), which `internal/app`
+branches run on the **edge** shield (`edge.go:564`), which `internal/app`
 never wires into `admin.Deps` — `Deps.Shield` and `Deps.Unban` are set only
 when the trunk server exists (`app.go:166-193`) — so edge bans reach neither
 `/metrics` nor `DELETE /api/bans/{ip}`.
@@ -2820,10 +2787,10 @@ port-exhaustion metric and no config-reload metric.
 
 | Level | Examples |
 |---|---|
-| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic; nftables `on`-mode failures |
+| `Error` | SIP handler panic (+ stack); failures to respond (OPTIONS, 481 BYE, 405, session-timer refresh); B-leg INVITE/ACK/respond failures; early-media SDP failures; B-leg waiter panic; teardown ACK/BYE failures; `"bridge call panic; call dropped"`; edge `"proxy handler panic"`; edge `"registration binding rejected"`; media relay panic |
 | `Warn` | `"TLS listener using self-signed certificate"`; the one-shot `"no advertised address configured"` fallback; `"SDES key negotiated over non-TLS signaling transport"` (once per secure leg); `"register failed"`; edge upstream/PSTN failover warnings; `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"config written via admin API"`; the plaintext-admin startup warning; `shield banned scanner` |
 | `Info` | `"sip server listening"`, `"edge proxy listening"`, `"freesbc started"`, `"shutting down"`, `"media plane ready"`, `"config reloaded"`; `"registered"` with granted and refresh interval; `"rejected invite"` with code/reason/source; `"declined Require: 100rel"`; `"rejected low Session-Expires"`; `"b-leg not answered"`; edge `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"dialing pstn gateway"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"call ended"` with media stats |
-| `Debug` | dialog ACK/BYE bookkeeping; `"method not implemented"`; `"skipping unregistered target"`; `"b-leg auth challenge unsatisfied"`; `"tcp connection limit reached"`; `"un-register failed"`; `"registration challenged"`; dropped unroutable responses; `"in-dialog request without a dialog record; hashing upstream"`; shield rate-limit drops; nft queue-full and exec failures |
+| `Debug` | dialog ACK/BYE bookkeeping; `"method not implemented"`; `"skipping unregistered target"`; `"b-leg auth challenge unsatisfied"`; `"tcp connection limit reached"`; `"un-register failed"`; `"registration challenged"`; dropped unroutable responses; `"in-dialog request without a dialog record; hashing upstream"`; shield rate-limit drops |
 
 sipgo's transport, transaction and server layers log through the same logger
 with `caller=sipgo`. Credentials, digest nonces, ICE passwords and DTLS
@@ -2924,8 +2891,9 @@ any log. The trunk's filter accepts only bytes whose source IP matches a
 configured peer's `allowed_ips` (no size cap). The edge's filter enforces a
 **64 KiB** size cap on every read; for reads arriving on the private bind it
 requires an upstream source IP, and for public reads it drops a source the
-edge shield has banned (so a ban stays silent even for what sipgo would
-answer before any handler). Neither filter ever returns an error,
+edge shield has banned — its IP, or on UDP its exact socket
+(`Shield.BannedFrom`) — so a ban stays silent even for what sipgo would
+answer before any handler. Neither filter ever returns an error,
 because sipgo treats a filter error as fatal to the whole read loop.
 
 **Peer allowlist (trunk).** Identification is the transport source IP and
@@ -2934,21 +2902,34 @@ to be non-empty and no wider than IPv4 /8 or IPv6 /32.
 
 **TCP/TLS connection limits (trunk).** A shared cap of 1024 concurrent
 connections across all stream listeners and a 120 s idle read deadline per
-connection.
+connection. A connection from a non-peer is closed at accept and never
+counted, so non-peers cannot exhaust the cap (P2-TRK-001).
 
 **Shield.** Every request that is not from the edge's private plane runs
-through `Check`:
+through `Check` (trunk) or `CheckFrom` (edge, which also knows the source
+port):
 
-1. A **configured peer** skips the ban table and the scanner check entirely
-   but is still subject to the looser `shield.peer_rate_limit`
-   (default `200/s per_ip`).
+1. On the **trunk** shield only, a **configured peer** skips the ban table
+   and the scanner check entirely but is still subject to the looser
+   `shield.peer_rate_limit` (default `200/s per_ip`). The edge shield
+   (`NewNoKernel`) exempts nobody: a source inside a trunk peer's
+   `allowed_ips` is an ordinary public client there (P2-SHD-005).
 2. A banned source is dropped.
 3. `shield.rate_limit` (default `20/s per_ip`) — a token bucket whose
-   capacity equals the rate, per source IP.
-4. A **scanner User-Agent** is dropped **and** instantly banned — but only
-   after the rate limiter has had its say, because the User-Agent is a
-   client-controlled "ban me" signal that must not be allowed to skip the
-   limiter.
+   capacity equals the rate, per source: an IPv4 address (4in6 unmapped)
+   or an IPv6 /64. The buckets are an LRU capped at 65536 (P2-SHD-002).
+4. A **scanner User-Agent** is dropped — but only after the rate limiter
+   has had its say, because the User-Agent is a client-controlled "ban me"
+   signal that must not be allowed to skip the limiter. What else happens
+   depends on the transport (P2-SHD-001):
+   - **tcp, tls, ws, wss**: the source IP is banned for
+     `shield.auto_ban.duration`. A handshake proved the source address.
+   - **udp**: only the exact source socket (IP:port) is banned, in a
+     separate table, for at most **1 minute** (`socketBanMax`). One forged
+     datagram therefore cannot lock out a victim's IP, and a forged flood
+     that fills the socket table cannot stop real scanners' IPs from being
+     banned.
+   - **unknown transport, or `Check` without a port**: drop only.
 
 Signatures are 11 exact substrings (`friendly-scanner`, `sipvicious`,
 `sipcli`, `sip-scan`, `sundayddr`, `vaxsipuseragent`, `sipsak`, `iwar`,
@@ -2956,34 +2937,25 @@ Signatures are 11 exact substrings (`friendly-scanner`, `sipvicious`,
 specific, with no bare "scanner" substring that could match a legitimate
 product. **Scanner heuristics are User-Agent only.**
 
-**Auto-ban.** An unidentified-source request feeds a per-IP sliding window
-(`auto_ban.failures` within `auto_ban.window` → ban for
-`auto_ban.duration`; defaults 5 / 60 s / 1 h). The ban table is capped at
-**65536** entries with an overflow counter; a refused ban also skips the
-kernel drop.
-
-In the running system that counter is never fed. `RecordUnidentified` has one
-non-test caller, `trunk.dropUnidentified` (`server.go:467`), and the trunk's
-pre-parse read filter already drops every byte from a source matching no peer
-on every transport (`readfilter.go:22-33`), so no request reaches it. The edge
-plane never calls `RecordUnidentified` at all. `shield.auto_ban.*` therefore
-configures a path only the unit tests exercise, and the ban and scanner
-branches of `Check` are reachable only through the **edge** shield — whose
-bans are exported to neither `/metrics` nor the unban API.
+**Bans.** A scanner ban lasts `shield.auto_ban.duration` (default 1 h) and
+lives only in the shield's in-memory table, which is capped at **65536**
+entries with an overflow counter. A re-ban extends an existing ban to the
+later of the two expiries and never shortens it (P2-SHD-008). Ban keys are
+unmapped IPs, and `Unban` unmaps its argument, so `DELETE
+/api/bans/::ffff:192.0.2.1` lifts the ban on `192.0.2.1` (P2-SHD-009). On
+the edge a ban also closes the banned source's tcp/tls/ws/wss connection:
+`guard` closes the one the banning request came on, and the read filter
+closes any other on its next read (`closeStream`, P2-SHD-006). An idle
+connection opened before the ban stays open until it next sends. There is no failure-count auto-ban and no
+kernel enforcement: both were removed with P2-SHD-004 (the counter was fed
+only by the trunk's unidentified-source handler, which the pre-parse read
+filter makes unreachable, `readfilter.go:24-45`). The ban and scanner
+branches of `Check` are therefore reachable only through the **edge**
+shield — whose bans are exported to neither `/metrics` nor the unban API.
 
 **Every denial is a silent drop.** A scanner never gets confirmation that the
 SBC exists. That is why `onNoRoute` is overridden at all: known peers get
 405, unknown sources get silence.
-
-**Kernel bans are scoped and reversible.** Rules match only `udp dport` /
-`tcp dport` over the configured SIP listen ports. A **single-packet UDP
-scanner verdict is memory-only and never reaches nftables** — a forgeable
-datagram must not kernel-blackhole a third party — while a multi-packet
-auto-ban would sync regardless of transport, if the auto-ban counter were ever
-fed (see above). `DELETE /api/bans/{ip}` lifts a ban
-from both the memory table and the kernel set, synchronously. The in-memory
-table is always authoritative; nftables is an accelerator, never a
-dependency.
 
 **Message and body limits.** Edge reads are capped at 64 KiB; edge SDP is
 capped at 16 KiB with at most 16 media sections, 256 attributes per level and
@@ -3083,10 +3055,9 @@ cannot echo a secret because expansion runs after the unmarshal.
 | Edge binding | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker | the registrar's granted lifetime |
 | Edge upstream/PSTN cooldown | `Recover`, or lazy expiry | the configured cooldown (default 30 s) |
 | WebRTC leg | `WebRTCSession.Close`, establishment failure, fingerprint mismatch | the establishment deadline (30 s default) |
-| Shield ban | lazy expiry on lookup, the 1-minute prune tick, `Unban`, process exit | `auto_ban.duration` (default 1 h) |
-| Rate-limit bucket | prune of buckets idle ≥ 1 minute | — |
+| Shield ban | lazy expiry on lookup, the 1-minute prune tick, `Unban` (which also lifts the IP's socket bans), process exit | `auto_ban.duration` (default 1 h); a UDP socket ban at most 1 min |
+| Rate-limit bucket | prune of buckets idle for their own refill interval; LRU eviction at 65536 buckets | the bucket's interval (1 s for `N/s`, 1 h for `N/h`) |
 | `privateSources` entry | 10-minute TTL, pruned on insert pressure | — |
-| nft table | `close()` deletes the whole table at shutdown | — |
 
 ### 15.2 Timeouts, in one place
 
@@ -3116,7 +3087,6 @@ cannot echo a secret because expansion runs after the unmarshal.
 | config reload debounce | 200 ms | fsnotify coalescing |
 | admin read-header / read / write / idle | 5 / 30 / 30 / 30 s | HTTP |
 | admin shutdown drain | 5 s | in-flight HTTP requests |
-| nft exec | 2 s | each `nft` invocation |
 
 ### 15.3 Component fatal errors
 
@@ -3265,8 +3235,8 @@ Stated because the code establishes them, not as future work.
 - **No SIGHUP.** Reload is fsnotify-only.
 - **No certificate hot rotation** for any TLS surface, and no listener
   rebinding on reload.
-- **No hot reload of the `admin:` section's existence**, of `admin.listen`,
-  of the nftables mode or of the nft rule port scope.
+- **No hot reload of the `admin:` section's existence** or of
+  `admin.listen`.
 - **No persistence and no clustering.** A restart drops every call, dialog,
   binding and ban.
 - **No `listen.media.public_ip: auto` discovery.** `"auto"` validates but
@@ -3294,7 +3264,7 @@ Stated because the code establishes them, not as future work.
 | `internal/sip` | reusable SIP primitives only: safe header accessors, transport-source parsing with `Unmap`, default ports, branch/token generation, `BuildCancel`/`TeardownRequest`, the read-filter wrapper, self-signed TLS generation | policy, workflow, or state. Its doc calls it "a transcription of RFC 3261/3264 with no policy of its own" |
 | `internal/sip/sdp` | the bounded typed parse, codec intersection, and body construction from scratch | copying anything from another leg's body; SDES (`a=crypto` is not parsed here); DNS |
 | `internal/media` | port pools, latching, the payload-agnostic relay, SRTP contexts and transforms, the silence watchdog, the ICE-lite/DTLS-SRTP browser leg, packet/byte counters | SIP, SDP, or any protocol above UDP. Its doc: "It knows nothing about SIP" |
-| `internal/shield` | the ban table, per-IP token buckets, scanner signatures, the unidentified-source failure counter, the optional nftables backend | being a hard dependency of anything; the in-memory table is always authoritative and nftables is an accelerator |
+| `internal/shield` | the in-memory ban table, per-IP token buckets, scanner signatures | kernel firewall state (there is no nftables backend); being a hard dependency of anything |
 | `internal/trunk` | B2BUA call and leg state, peer identification, routing and number transformation, failover and endpoint cooldown, outbound registration, DNS/SRV resolution, per-leg SDES policy and SDP rewriting, the trunk listener limits | proxy dialogs, registrations, bindings, upstream routing; any edge concept |
 | `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the registration binding table, upstream and PSTN routing with cooldown, plane classification, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | B2BUA call state; carrier peers; DNS; any trunk concept |
 | `internal/admin` | HTTP routing, Basic auth and its limiter, the Prometheus registry and collector, the redacted config view, the raw config round-trip, the embedded WebUI | reading plane state directly — everything arrives through `admin.Deps` closures built in `internal/app` |

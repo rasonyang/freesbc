@@ -119,8 +119,8 @@ func TestAuditReBanDoesNotShorten(t *testing.T) {
 	clock := time.Unix(1_700_000_000, 0)
 	b.now = func() time.Time { return clock }
 	ip := netip.MustParseAddr("198.51.100.40")
-	b.ban(ip, time.Hour, false)
-	b.ban(ip, time.Minute, false)
+	b.ban(ip, time.Hour)
+	b.ban(ip, time.Minute)
 	clock = clock.Add(2 * time.Minute)
 	if !b.banned(ip) {
 		t.Errorf("a 1 h ban was cut to 1 min by a later shorter ban")

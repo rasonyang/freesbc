@@ -1,6 +1,8 @@
 package trunk
 
 import (
+	"net"
+
 	"github.com/emiago/sipgo/sip"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
@@ -21,14 +23,23 @@ import (
 // message sizes are its own business.
 func (s *Server) preParseFilter() sip.TransportReadFilter {
 	return fsip.ReadFilter(0, func(info sip.TransportReadProps) bool {
-		addr, ok := fsip.ParseHostPortAddr(info.RemoteAddr.String())
-		if !ok {
-			return false
-		}
-		// Same gate as the per-request one (identify → IdentifyPeer), by
-		// construction: one matcher, so the two cannot drift apart. The
-		// filter needs only the boolean, not the winning peer.
-		_, _, ok = IdentifyPeer(s.store.Current(), addr)
-		return ok
+		return s.fromPeer(info.RemoteAddr)
 	})
+}
+
+// fromPeer reports whether remote's IP matches some peer's allowed_ips in
+// the current config. It is the gate both the read filter and the TCP/TLS
+// accept path (tcpLimitListener.admit) use. Same gate as the per-request
+// one (identify → IdentifyPeer), by construction: one matcher, so they
+// cannot drift apart. Only the boolean is needed, not the winning peer.
+func (s *Server) fromPeer(remote net.Addr) bool {
+	if remote == nil {
+		return false
+	}
+	addr, ok := fsip.ParseHostPortAddr(remote.String())
+	if !ok {
+		return false
+	}
+	_, _, ok = IdentifyPeer(s.store.Current(), addr)
+	return ok
 }

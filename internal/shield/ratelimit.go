@@ -1,31 +1,54 @@
 package shield
 
 import (
+	"container/list"
 	"math"
 	"net/netip"
 	"sync"
 	"time"
 )
 
+// bucketCap is the hard ceiling on per-source buckets, the same bound as
+// the ban table (banCap): a flood of distinct sources must not grow the
+// map without bound. At the cap the least recently used bucket is evicted.
+const bucketCap = banCap
+
 // bucket is a token bucket: tokens refill continuously toward capacity.
+// interval is the refill interval the bucket was last used with, so prune
+// can tell when it has refilled to full without knowing the config.
 type bucket struct {
-	tokens float64
-	last   time.Time
+	key      netip.Addr
+	tokens   float64
+	last     time.Time
+	interval time.Duration
 }
 
-// rateLimiter is a per-source-IP (or single global) token-bucket limiter.
+// rateLimiter is a per-source (or single global) token-bucket limiter.
 // The rate/interval/perIP parameters are passed per call so a hot-reloaded
 // config takes effect without rebuilding the limiter (only the buckets carry
-// state). now is injectable for tests.
+// state). Per-source buckets are keyed by bucketKey (an IPv6 source by its
+// /64) and held in an LRU capped at bucketCap. now is injectable for tests.
 type rateLimiter struct {
 	mu      sync.Mutex
-	buckets map[netip.Addr]*bucket
+	buckets map[netip.Addr]*list.Element // of *bucket
+	lru     *list.List                   // front = most recently used
 	global  *bucket
 	now     func() time.Time
 }
 
 func newRateLimiter() *rateLimiter {
-	return &rateLimiter{buckets: make(map[netip.Addr]*bucket), now: time.Now}
+	return &rateLimiter{buckets: make(map[netip.Addr]*list.Element), lru: list.New(), now: time.Now}
+}
+
+// bucketKey is the per-source bucket key: an IPv4 address (4in6 unmapped)
+// as is, an IPv6 address by its /64. One IPv6 host is normally given a
+// whole /64, so keying by address would hand one host unlimited buckets.
+func bucketKey(src netip.Addr) netip.Addr {
+	src = src.Unmap()
+	if src.Is6() {
+		return netip.PrefixFrom(src.WithZone(""), 64).Masked().Addr()
+	}
+	return src
 }
 
 // allow consumes one token for src and reports whether it was available.
@@ -39,10 +62,18 @@ func (r *rateLimiter) allow(src netip.Addr, rate int, interval time.Duration, pe
 	now := r.now()
 	var b *bucket
 	if perIP {
-		b = r.buckets[src]
-		if b == nil {
-			b = &bucket{tokens: float64(rate), last: now}
-			r.buckets[src] = b
+		key := bucketKey(src)
+		if e := r.buckets[key]; e != nil {
+			r.lru.MoveToFront(e)
+			b = e.Value.(*bucket)
+		} else {
+			if r.lru.Len() >= bucketCap {
+				oldest := r.lru.Back()
+				r.lru.Remove(oldest)
+				delete(r.buckets, oldest.Value.(*bucket).key)
+			}
+			b = &bucket{key: key, tokens: float64(rate), last: now}
+			r.buckets[key] = r.lru.PushFront(b)
 		}
 	} else {
 		if r.global == nil {
@@ -52,6 +83,7 @@ func (r *rateLimiter) allow(src netip.Addr, rate int, interval time.Duration, pe
 	}
 	elapsed := now.Sub(b.last).Seconds()
 	b.last = now
+	b.interval = interval
 	b.tokens = math.Min(float64(rate), b.tokens+elapsed*float64(rate)/interval.Seconds())
 	if b.tokens >= 1 {
 		b.tokens--
@@ -60,19 +92,22 @@ func (r *rateLimiter) allow(src netip.Addr, rate int, interval time.Duration, pe
 	return false
 }
 
-// prune drops per-IP buckets that have refilled to (near) full — an idle
-// bucket carries no state (a fresh one starts full), so removing it is safe
-// and bounds memory under a spoofed-source flood. Call periodically.
+// prune drops per-source buckets that have been idle for at least their own
+// refill interval: such a bucket has refilled to full, and a fresh one
+// starts full, so removing it loses no state. A partly drained bucket is
+// kept, so an N/h limit is not reset by an idle minute. Call periodically.
 func (r *rateLimiter) prune() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	for ip, b := range r.buckets {
-		// refill to now, then drop if full.
-		// (recomputing here avoids needing a stored rate — a bucket last
-		// touched long ago is full regardless of rate.)
-		if now.Sub(b.last) >= time.Minute {
-			delete(r.buckets, ip)
+	// A full walk (buckets can carry different intervals), bounded by
+	// bucketCap and run once a minute.
+	for e := r.lru.Back(); e != nil; {
+		prev := e.Prev()
+		if b := e.Value.(*bucket); now.Sub(b.last) >= b.interval {
+			r.lru.Remove(e)
+			delete(r.buckets, b.key)
 		}
+		e = prev
 	}
 }

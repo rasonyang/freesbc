@@ -128,9 +128,7 @@ listen:
 shield:
   rate_limit: 20/s per_ip       # public clients come from arbitrary addresses,
   auto_ban:                     #   so the abuse plane matters here
-    failures: 5
-    window: 60s
-    duration: 1h
+    duration: 1h                # how long a scanner source stays banned (in memory)
 
 # admin:
 #   listen: 127.0.0.1:8080

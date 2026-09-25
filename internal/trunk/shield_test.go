@@ -14,15 +14,13 @@ import (
 // excludes loopback (10.0.0.0/8 instead of 127.0.0.1/32), so every request
 // sent by these tests (all originate from 127.0.0.1) is an unidentified
 // source as far as identify()/isConfiguredPeer are concerned — exactly the
-// population the shield's auto-ban and scanner checks are meant to catch.
-// auto_ban.failures is small (3) so the tests don't need many round trips.
+// population the shield's scanner check is meant to catch.
 const unidentifiedShieldCfg = `
 listen:
   sip: [udp://127.0.0.1:%d]
 shield:
   rate_limit: 100/s per_ip
-  auto_ban: { failures: 3, window: 60s, duration: 1h }
-  nftables: off
+  auto_ban: { duration: 1h }
 peers:
   remote:
     address: 203.0.113.10:5060
@@ -41,8 +39,7 @@ listen:
   sip: [udp://127.0.0.1:%d]
 shield:
   rate_limit: 2/s per_ip
-  auto_ban: { failures: 3, window: 60s, duration: 1h }
-  nftables: off
+  auto_ban: { duration: 1h }
 peers:
   local-uac:
     address: 127.0.0.1:5070
@@ -53,17 +50,13 @@ routes:
     to: [local-uac]
 `
 
-// TestShieldBansAfterFailures drives `failures` unidentified OPTIONS
-// requests from one source and asserts both halves of the T-01 boundary:
-// the client hears nothing, and the shield is never fed — pre-parse
-// filtering drops the bytes before dropUnidentified/RecordUnidentified
-// could run, so no auto-ban exists for this source (Check returns Allow,
-// all drop counters zero). Before T-01 this test asserted the opposite —
-// that the Nth unidentified failure within the window auto-banned the
-// source via dropUnidentified's RecordUnidentified wiring. That path is
-// now unreachable over the wire (non-peer bytes never become requests),
-// and the shield-side auto-ban logic is covered by the shield package's
-// own TestRecordUnidentifiedBansAtThreshold.
+// TestShieldBansAfterFailures drives unidentified OPTIONS requests from one
+// source and asserts both halves of the T-01 boundary: the client hears
+// nothing, and the shield is never fed — pre-parse filtering drops the
+// bytes before any handler runs, so no ban exists for this source (Check
+// returns Allow, all drop counters zero). The unidentified-source auto-ban
+// counter this test once exercised was deleted with the nftables backend
+// (P2-SHD-004).
 func TestShieldBansAfterFailures(t *testing.T) {
 	const port = 11700
 	srv := startServer(t, port, fmt.Sprintf(unidentifiedShieldCfg, port))
