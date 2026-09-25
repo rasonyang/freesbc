@@ -542,7 +542,7 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 	if !s.ack2xx(res, from) {
 		return
 	}
-	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1)
+	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1, s.teardownOpts(from)...)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	clTx, err := s.client.TransactionRequest(ctx, bye, noBuild)
@@ -560,12 +560,20 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 
 // ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself.
 func (s *Server) ack2xx(res *sip.Response, from side) bool {
-	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res))
+	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res), s.teardownOpts(from)...)
 	if err := s.client.WriteRequest(ack, noBuild); err != nil {
 		s.log.Debug("ack unanchorable answer", "err", err)
 		return false
 	}
 	return true
+}
+
+// teardownOpts routes FreeSBC's own ACK/BYE for a dialog it tears down:
+// out of the listener on side from, exactly as forward pins a relayed
+// request, and along the route set beyond FreeSBC's own Record-Route
+// entries (the INVITE carried them, so the 2xx lists them too).
+func (s *Server) teardownOpts(from side) []fsip.TeardownOption {
+	return []fsip.TeardownOption{fsip.FromListener(from.laddr), fsip.OwnRecordRoute(s.topo.isSelf)}
 }
 
 // commit confirms the dialog an answered INVITE established and hands its

@@ -199,7 +199,7 @@ Created once, alive for the process lifetime:
 | per listener: closer, and `ln.Serve` | `Run` (`edge.go:272-283`) | `listenCtx` cancel / serve error |
 | `Location.Prune` ticker (30 s) | `Run` (`edge.go:297-312`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:659`) | session `Done` closed |
-| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:248`) | `WebRTCSession.Start` returns |
+| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:261`) | `WebRTCSession.Start` returns |
 | `ackThenBye` cleanup | several INVITE paths | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
@@ -1137,10 +1137,17 @@ inbound-only, so its outbound path is the client's own pooled connection and
 `laddr` stays zero. `side.via(branch)` adds an empty `rport` parameter on
 **UDP only** (RFC 3581). `side.recordRoute()` always carries `lr`.
 
-**Read filter** (`fsip.ReadFilter(64 KiB, accept)`): anything larger than
-**64 KiB** is dropped before the parser. The `accept` policy captures the
-private bind address **once at `Run` time**; a read whose local address is
-not that bind is accepted unconditionally (the public plane has no source
+**Read filter** (`fsip.ReadFilter(fsip.MaxReadSize, accept)`): a read larger
+than **24 KiB** is dropped before the parser. The cap sits below sipgo's
+32 KiB read buffer (`TransportBufferReadSize`), which bounds every read, so it
+can fire: an oversized datagram or WebSocket frame arrives truncated to 32 KiB
+and is dropped here rather than parsed as a partial message (a cap at or above
+the buffer, as the earlier 64 KiB one was, never fires). The `accept` policy
+captures the private bind address **once at `Run` time**. A read is on the
+private listener only when its transport is UDP **and** its local address is
+that bind (`fsip.SameListener`; a wildcard bind matches any host on its port);
+a WS/WSS read on the same port number is a public read. A read that is not on
+the private listener is accepted unconditionally (the public plane has no source
 allowlist — phones and browsers have no fixed address), and a read that *is*
 on the private bind must come from an upstream IP, else it is dropped. On
 accept it records the exact `addr:port` in `privateSources`.
@@ -1194,7 +1201,8 @@ no DNS anywhere in the edge plane.
 
 `isSelf(uri)` compares host and port only, ignoring parameters, defaulting a
 missing port to **5060**; `isSelfVia` defaults instead to
-`fsip.DefaultPort(transport)`.
+`fsip.DefaultPort(transport)`: 5060 for UDP/TCP, 5061 for TLS, and the
+RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 
 ### 7.3 Method dispatch
 
@@ -1538,11 +1546,11 @@ it answers 200 to the CANCEL, fires the `OnCancel` hook
 transaction's lock**, and only after the hook returns finalises the INVITE
 server transaction with **487** toward the requester itself. The hook
 therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
-(`invite_leg.go:609-620`), which **synchronously** marks the record
+(`invite_leg.go:617-628`), which **synchronously** marks the record
 cancelled (`cancelSeries`, `dialog.go:528-547`) — from that instant
 `confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
 relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
-to a goroutine (`sendCancel`, `invite_leg.go:634-650`). `sendCancel` builds
+to a goroutine (`sendCancel`, `invite_leg.go:642-658`). `sendCancel` builds
 the CANCEL from the **forwarded** request so it carries that branch, sends
 it on a **5 s** context, and cancels the series context as soon as it is on
 the wire (which is what releases the media promptly instead of waiting on
@@ -1574,9 +1582,21 @@ layer (RFC 3261 §17.1.1.3, `invite_leg.go:497-535`). The same helper serves
 all three call paths, not only PSTN. A 2xx that arrives after the caller
 cancelled is never relayed or confirmed: it is ACKed and BYEd.
 
+**FreeSBC's own ACK/BYE.** `ackThenBye` builds both with
+`fsip.TeardownRequest` (`request.go`), which follows the dialog's route set:
+the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
+`OwnRecordRoute(topo.isSelf)` at FreeSBC's own entries, since the INVITE
+carried them. A loose router first means `Route` headers and the Request-URI
+is the remote target; a strict router first becomes the Request-URI with the
+target appended as the last `Route` (§12.2.1.1). The request is sent to the
+first route, else to the 2xx's transport source. `FromListener(side.laddr)`
+pins the socket it leaves by, as `forward` pins a relayed request; without
+the pin an ACK toward a carrier behind a wildcard-bound public listener never
+arrived (`TestTeardownLeavesByPublicListenerOnWildcardBind`).
+
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
-(`invite_leg.go:655-660`): it CANCELs the pending branch (RFC 3261 §16.8)
+(`invite_leg.go:663-668`): it CANCELs the pending branch (RFC 3261 §16.8)
 and drains for its 487, and `giveUp` (`invite.go:348-359`) then sends the
 caller **408 Request Timeout** (§16.7 step 6). `giveUp` is the one place a
 caller's missing final is synthesised: nothing when its own CANCEL already
@@ -2163,8 +2183,15 @@ on, built on `pion/sdp/v3` with **no string manipulation of SDP anywhere**.
 
 Parse limits: `MaxSize = 16 KiB`, `MaxMediaDescriptions = 16`,
 `MaxAttributes = 256` (session level and per media section),
-`MaxCodecs = 128`. Sentinels: `ErrTooLarge`, `ErrNoAudio`, `ErrNoAddress`,
+`MaxCodecs = 128`. Sentinels: `ErrTooLarge`, `ErrNoAudio`, `ErrAudioDeclined`
+(every audio section is at port 0; it wraps `ErrNoAudio`), `ErrNoAddress`,
 `ErrNoCommonCodec`, `ErrRenumbered`.
+
+In the audio section's format list a non-numeric token fails the body, while a
+number above 127 (including one above 255) or a repeated number is skipped. An
+`a=rtpmap` encoding name must be 1-64 letters, digits, `-`, `_` or `.`
+(`validEncodingName`); any other name makes that codec unusable, which is what
+lets `Describe` put codec names in log lines.
 
 Parsing selects the **first `m=audio` section whose port is non-zero**, so a
 declined stream followed by a live one still works. Connection addresses must
@@ -2174,17 +2201,19 @@ applied before media-level ones, so media wins.
 
 Only these attributes are understood: direction (`sendrecv`/`sendonly`/
 `recvonly`/`inactive`), `ice-ufrag`, `ice-pwd`, `setup`, `fingerprint`,
-`rtcp` (the port only; the optional address is discarded as topology).
-Everything else — including `candidate`, `rtcp-mux`, `ssrc`, `extmap`,
+`rtcp` (the port only; the optional address is discarded as topology),
+`rtcp-mux` (`Audio.RTCPMux`). Everything else — including `candidate`, `ssrc`, `extmap`,
 `ptime`, `crypto` — is dropped. **SDES is not parsed by this package at
 all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
-(`sdp.go:410-422`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with a
-length of 4-256; any other byte — CR/LF above all — rejects the whole token, because
+(`sdp.go:557-570`) — the RFC 5245 ice-char set widened to base64url, which is
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with the
+RFC 5245 §15.4 lengths: `ice-ufrag` 4-256, `ice-pwd` 22-256. Any other byte —
+CR/LF above all — or length rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
-accept only `sha-256`, `sha-384` and `sha-512`; SHA-1 is rejected.
+accept only `sha-256`, `sha-384` and `sha-512`, each pair two hex digits
+(`isHexByte`); SHA-1 is rejected.
 `Audio.WebRTC()` requires a `TLS` proto token **and** a fingerprint **and**
 both ICE credentials.
 
@@ -2195,9 +2224,21 @@ payload-type numbers**. The `sdp` package holds no codec policy of its own
 (`sdp.go:8-10`); it only parses, intersects and renders. `Negotiate(offer, answer)` returns the intersection in **offer
 order with offer payload numbers and answer FMTP**, fails with
 `ErrNoCommonCodec` when nothing usable is shared or only `telephone-event`
-is, and fails with `ErrRenumbered` when a codec both sides named sits on
-different payload numbers — honouring that would mean rewriting every RTP
-packet's PT byte.
+is, and fails with `ErrRenumbered` when the answer puts an offered encoding
+on a payload number the offer never gave that encoding — honouring that
+would mean rewriting every RTP packet's PT byte. Codecs are matched on the
+offered payload number first, so an offer that carries one encoding on
+several numbers (RFC 3264 §6.1, e.g. opus on 111 and on 96) is not
+mistaken for a renumbering.
+
+`a=fmtp` is **never copied** from the other leg. Parse keeps only the
+parameters on a per-codec allowlist (`fmtpAllow` in `fmtp.go`: opus per
+RFC 7587, AMR/AMR-WB, G.729 `annexb`, iLBC `mode`, G.722.1 `bitrate`, and
+the RFC 4733 event list for `telephone-event`), each checked against a
+typed value, and re-renders them as `name=value;name=value`. Unknown
+parameters, malformed values and codecs with no entry lose their fmtp.
+`Build` runs the same filter again before it writes an `a=fmtp` line, so
+free text, addresses and bare CRs from one leg cannot reach the other.
 
 `sdp.Build` constructs bodies from scratch; **nothing is copied from the
 other leg's body**. That is what makes the two structural guarantees hold:
@@ -2213,17 +2254,22 @@ ICE candidates can never reach FreeSWITCH.
 | `m=audio` proto | `RTP/AVP` | `UDP/TLS/RTP/SAVPF` |
 | ICE | — | `a=ice-lite`, `a=ice-ufrag`, `a=ice-pwd`, one `a=candidate:1 1 UDP <prio> <Address> <Port> typ host`, `a=end-of-candidates` |
 | DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` |
-| codecs | `a=rtpmap` per codec, `a=fmtp` verbatim | same |
+| codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:155-157`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:484`), so in practice always present on a browser leg |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:575`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1) |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 
-`MarshalDeclining(offer)` appends `offer.MediaCount - 1` declined sections so
-the answer preserves the offer's section count (RFC 3264 §6); a declined
-section is `m=audio 0 RTP/AVP 0` with **no attributes and no connection
-line**, which is what keeps a peer's keys, candidates and addresses from
-riding along.
+`MarshalDeclining(offer)` answers with one `m=` line per offered section **in
+the offer's order** (RFC 3264 §6): the live audio sits at `offer.AudioIndex`
+and every other section is declined at port 0 with the offer's media type and
+transport. Parse keeps those two per section (`Session.Sections`) only after
+normalising them: the media type must be letters only (else `audio`) and the
+transport must be on a fixed list (else `RTP/AVP`). A declined section's
+format is a constant per transport (`0`, `webrtc-datachannel`, `t38`, `*`),
+and it has **no attributes and no connection line**, which is what keeps a
+peer's keys, candidates and addresses from riding along. Offers are built
+with `Marshal`, which emits the audio section alone.
 
 The single host candidate's priority is `iceLitePriority = 126<<24 |
 65535<<8 | 255`.
@@ -2306,7 +2352,7 @@ sequenceDiagram
     participant FS as FreeSWITCH (upstream node)
 
     P->>G: REGISTER sip:example.com (To: 1001@example.com, Contact: phone, Expires: 600)
-    Note over G: readFilter (64 KiB, public accept) -> guard: shield.Check -> onRegister
+    Note over G: readFilter (24 KiB, public accept) -> guard: shield.Check -> onRegister
     Note over G: aorOf(To), token = existing or NewToken(), ctx = 32s series budget
     G->>FS: REGISTER (R-URI unchanged, Via with received/rport, Contact sip:1001@privAdv with transport=udp and fsbc=TOKEN)
     FS-->>G: 401 Unauthorized + WWW-Authenticate
@@ -2706,8 +2752,10 @@ The two are independent everywhere.
 
 **Trunk plane.** Signalling binds `listen.sip` entries (or the single
 `sip.bind_ip:sip.bind_port` listener, which replaces the list). Media binds
-`rtp.bind_ip` (the zero address = every interface) over the configured port
-range. Advertised addresses are resolved **per call**
+`rtp.bind_ip` (unset = every interface) over the configured port range. An
+unparseable `bind_ip` (unreachable after validation) is an error from
+`fsip.ParseBindIP`, never every interface: the media pool then allocates
+nothing (503). Advertised addresses are resolved **per call**
 (`advertisedIP(cfg, preferred)`), in this order:
 
 1. the `preferred` literal (`sip.advertised_ip` for signalling,
@@ -2980,7 +3028,8 @@ port capacity. This gap is recorded in `internal/app/app.go:146-150`.
 runs before the SIP parser, the transaction layer, the connection pool and
 any log. The trunk's filter accepts only bytes whose source IP matches a
 configured peer's `allowed_ips` (no size cap). The edge's filter enforces a
-**64 KiB** size cap on every read; for reads arriving on the private bind it
+**24 KiB** size cap on every read (`fsip.MaxReadSize`, below sipgo's 32 KiB
+read buffer so it can fire); for reads arriving on the private bind it
 requires an upstream source IP, and for public reads it drops a source the
 edge shield has banned — its IP, or on UDP its exact socket
 (`Shield.BannedFrom`) — so a ban stays silent even for what sipgo would
@@ -3048,7 +3097,7 @@ shield, whose bans are not exported to `/metrics`, and no API lifts a ban.
 SBC exists. That is why `onNoRoute` is overridden at all: known peers get
 405, unknown sources get silence.
 
-**Message and body limits.** Edge reads are capped at 64 KiB; edge SDP is
+**Message and body limits.** Edge reads are capped at 24 KiB; edge SDP is
 capped at 16 KiB with at most 16 media sections, 256 attributes per level and
 128 payload types; REGISTER AoR user parts are capped at 128 characters and
 hosts at 255, with a character allowlist that excludes CR/LF; `fsbc` tokens

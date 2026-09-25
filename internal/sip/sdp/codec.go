@@ -25,11 +25,12 @@ func HasMedia(in []Codec) bool {
 // and the ANSWER's fmtp. Both choices matter and are the whole reason the
 // proxy needs no transcoder:
 //
-//   - Offer order and offer numbers: RFC 3264 §6 requires an answerer to
-//     use the offerer's payload-type numbers, so the numbers in the offer
-//     are the numbers on the wire in both directions. Emitting them
-//     unchanged on the far leg is what lets the relay forward RTP without
-//     touching the payload-type field of a single packet.
+//   - Offer order and offer numbers: RFC 3264 §6.1 says an answerer SHOULD
+//     use the offerer's payload-type numbers (a recommendation, not a
+//     requirement), and when it does the numbers in the offer are the
+//     numbers on the wire in both directions. Emitting them unchanged on
+//     the far leg is what lets the relay forward RTP without touching the
+//     payload-type field of a single packet.
 //   - Answer fmtp: the answerer is the side that narrowed the parameters
 //     (opus ptime, maxaveragebitrate, the telephone-event range it will
 //     actually generate). That narrowed form is what must reach the
@@ -39,23 +40,38 @@ func HasMedia(in []Codec) bool {
 // that intersected down to telephone-event alone counts as nothing: it
 // would "succeed" and then carry silence), and with ErrRenumbered when a
 // codec both sides named sits on different payload numbers — some stacks
-// renumber despite the RFC, and honouring that would mean rewriting the
-// PT byte of every RTP packet.
+// use the SHOULD's latitude to renumber, and honouring that would mean
+// rewriting the PT byte of every RTP packet. Refusing is this package's
+// policy, not an RFC requirement.
 func Negotiate(offer, answer []Codec) ([]Codec, error) {
-	byKey := make(map[string]Codec, len(answer))
-	for _, c := range answer {
-		if _, dup := byKey[c.key()]; !dup {
-			byKey[c.key()] = c
+	// One encoding may sit on several payload numbers in an offer
+	// (RFC 3264 §6.1: opus on 111 and on 96 with other parameters), so a
+	// codec is matched by its offered number first. An answer codec is
+	// renumbered only when its encoding was offered and none of the
+	// numbers the offer gave that encoding is the one it answered on.
+	offered := make(map[string]bool, len(offer)) // key
+	offeredAt := make(map[ptKey]bool, len(offer))
+	for _, o := range offer {
+		offered[o.key()] = true
+		offeredAt[ptKey{o.PayloadType, o.key()}] = true
+	}
+	byPT := make(map[uint8]Codec, len(answer))
+	for _, a := range answer {
+		if offeredAt[ptKey{a.PayloadType, a.key()}] {
+			if _, dup := byPT[a.PayloadType]; !dup {
+				byPT[a.PayloadType] = a
+			}
+			continue
+		}
+		if offered[a.key()] {
+			return nil, fmt.Errorf("%w: offered %s, answered %s", ErrRenumbered, Describe(offerOf(offer, a.key())), a)
 		}
 	}
 	var out []Codec
 	for _, o := range offer {
-		a, ok := byKey[o.key()]
-		if !ok {
+		a, ok := byPT[o.PayloadType]
+		if !ok || a.key() != o.key() {
 			continue
-		}
-		if a.PayloadType != o.PayloadType {
-			return nil, fmt.Errorf("%w: offered %s, answered %s", ErrRenumbered, o, a)
 		}
 		merged := o
 		merged.FMTP = a.FMTP
@@ -70,10 +86,27 @@ func Negotiate(offer, answer []Codec) ([]Codec, error) {
 	return out, nil
 }
 
+// ptKey is one offered (payload number, encoding) pair.
+type ptKey struct {
+	pt  uint8
+	key string
+}
+
+// offerOf is the offered codecs of one encoding, for the renumber error.
+func offerOf(offer []Codec, key string) []Codec {
+	var out []Codec
+	for _, o := range offer {
+		if o.key() == key {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // Describe renders a codec list for logs. Used in error messages, so it
 // must stay free of anything an attacker could use to forge a log line:
-// codec names are alphanumeric by construction (parseRTPMap rejects the
-// rest) and fmtp is not included.
+// a parsed codec name is letters, digits, '-', '_' and '.' only
+// (validEncodingName, enforced by parseRTPMap) and fmtp is not included.
 func Describe(cs []Codec) string {
 	if len(cs) == 0 {
 		return "(none)"

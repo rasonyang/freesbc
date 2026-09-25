@@ -17,10 +17,13 @@
 //
 // Scope is audio only and transcoding-free (spec §5): the proxy relays RTP
 // payloads byte-for-byte, so payload-type numbers must survive end to end.
-// The rule that makes that work is offer/answer's own: an answerer uses
-// the offerer's payload-type numbers. The proxy therefore forwards the
-// public offer's codec list — numbers included — into the offer it makes
-// upstream, and forwards the upstream answer's list back out unchanged.
+// What makes that work is offer/answer's own recommendation: an answerer
+// SHOULD use the offerer's payload-type numbers (RFC 3264 §6.1). The proxy
+// therefore forwards the public offer's codec list — numbers included —
+// into the offer it makes upstream, and forwards the upstream answer's list
+// back out unchanged. An answerer that uses its SHOULD-level freedom to
+// renumber is refused (ErrRenumbered, a 488 on the edge) rather than
+// bridged, because bridging it would mean rewriting every packet's PT.
 package sdp
 
 import (
@@ -60,6 +63,11 @@ var (
 	ErrTooLarge  = errors.New("sdp: body exceeds size limit")
 	ErrNoAudio   = errors.New("sdp: no audio media section")
 	ErrNoAddress = errors.New("sdp: no usable connection address")
+	// ErrAudioDeclined is returned by Parse when the body has audio
+	// sections but every one is declined (port 0): a legitimate RFC 3264
+	// §6 rejection of the stream, as opposed to a body with no audio at
+	// all. It wraps ErrNoAudio, so errors.Is(err, ErrNoAudio) matches both.
+	ErrAudioDeclined = fmt.Errorf("%w: audio section declined (port 0)", ErrNoAudio)
 	// ErrNoCommonCodec is returned by Negotiate when two codec lists share
 	// nothing usable — the call must be rejected (488), never transcoded.
 	ErrNoCommonCodec = errors.New("sdp: no common codec")
@@ -81,16 +89,19 @@ const (
 )
 
 // Codec is one payload type of an audio section, as offered or answered.
-// FMTP is carried verbatim: the proxy never rewrites codec parameters
-// because it never transcodes, so whatever the two endpoints agree on
-// (opus stereo, useinbandfec, telephone-event event ranges) must reach the
-// far side exactly as written.
+//
+// FMTP is never the other leg's text. Parse keeps only the parameters on a
+// per-codec allowlist (fmtp.go), validated against a type and re-rendered
+// canonically, and Build applies the same filter again before writing an
+// a=fmtp line. What the two endpoints agree on (opus stereo, useinbandfec,
+// telephone-event event ranges) still reaches the far side; free text,
+// addresses and line breaks do not.
 type Codec struct {
 	PayloadType uint8
 	Name        string // as written, e.g. "opus", "PCMU", "telephone-event"
 	ClockRate   uint32
 	Channels    int    // 0 when the rtpmap omitted it
-	FMTP        string // the a=fmtp value, without the payload type
+	FMTP        string // canonical allowlisted fmtp parameters, without the payload type
 }
 
 // key is the transcoding-free identity of a codec: two codecs are the same
@@ -151,6 +162,9 @@ type Audio struct {
 
 	// RTCPPort is an explicit a=rtcp port, or 0 when absent.
 	RTCPPort int
+	// RTCPMux reports a=rtcp-mux (RFC 5761). An answer may carry
+	// a=rtcp-mux only when its offer did (RFC 5761 §5.1.1).
+	RTCPMux bool
 
 	// ICE/DTLS attributes. Zero values mean "not a WebRTC offer".
 	ICEUfrag    string
@@ -176,11 +190,29 @@ func (a *Audio) WebRTC() bool {
 // Session is a parsed SDP body: the audio section the proxy relays, plus
 // what it needs to build a matching body for the other leg.
 type Session struct {
-	// Audio is the first audio m= section. Parse fails when there is none.
+	// Audio is the first live audio m= section. Parse fails when there is
+	// none.
 	Audio *Audio
 	// MediaCount is how many m= sections the body had, including the ones
 	// the proxy declines.
 	MediaCount int
+	// AudioIndex is the position of Audio among the body's m= sections.
+	// An answer must put its live audio section at the same index
+	// (RFC 3264 §6).
+	AudioIndex int
+	// Sections is the media type and transport of every m= section, in
+	// order, so an answer can decline each one with a matching m= line.
+	// Both are normalised (see Section); nothing else is kept.
+	Sections []Section
+}
+
+// Section is what an answer needs to decline one offered m= section: its
+// media type and transport protocol. Both are checked against a fixed
+// grammar before they are kept, because they are echoed into the body
+// built for the other leg.
+type Section struct {
+	Media string   // "audio", "video", ...: letters only, lower-cased
+	Proto []string // e.g. ["RTP","AVP"]; one of knownProtos
 }
 
 // ErrNotUnicast reports a connection address that can never be a unicast
@@ -224,18 +256,28 @@ func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 	}
 
 	var md *pionsdp.MediaDescription
-	for _, m := range sd.MediaDescriptions {
+	audioIndex, declinedAudio := 0, false
+	sections := make([]Section, 0, len(sd.MediaDescriptions))
+	for i, m := range sd.MediaDescriptions {
 		if len(m.Attributes) > MaxAttributes {
 			return nil, fmt.Errorf("%w: %d media attributes", ErrTooLarge, len(m.Attributes))
 		}
+		sections = append(sections, section(m))
 		// The FIRST audio section is the one relayed; a declined (port 0)
 		// section is skipped so a body that offers a dead audio stream
 		// followed by a live one still works.
-		if md == nil && m.MediaName.Media == "audio" && m.MediaName.Port.Value != 0 {
-			md = m
+		if md == nil && m.MediaName.Media == "audio" {
+			if m.MediaName.Port.Value == 0 {
+				declinedAudio = true
+			} else {
+				md, audioIndex = m, i
+			}
 		}
 	}
 	if md == nil {
+		if declinedAudio {
+			return nil, ErrAudioDeclined
+		}
 		return nil, ErrNoAudio
 	}
 	if len(md.MediaName.Formats) > MaxCodecs {
@@ -259,7 +301,40 @@ func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 		return nil, errors.New("sdp: audio section has no payload types")
 	}
 
-	return &Session{Audio: a, MediaCount: len(sd.MediaDescriptions)}, nil
+	return &Session{
+		Audio:      a,
+		MediaCount: len(sd.MediaDescriptions),
+		AudioIndex: audioIndex,
+		Sections:   sections,
+	}, nil
+}
+
+// knownProtos is every transport an answer may echo when it declines a
+// section. An unknown one is answered as RTP/AVP: the proto of a rejected
+// stream is moot, and echoing an unvetted token would carry the other
+// leg's text across.
+var knownProtos = map[string]bool{
+	"RTP/AVP": true, "RTP/AVPF": true, "RTP/SAVP": true, "RTP/SAVPF": true,
+	"UDP/TLS/RTP/SAVP": true, "UDP/TLS/RTP/SAVPF": true,
+	"TCP/TLS/RTP/SAVP": true, "TCP/TLS/RTP/SAVPF": true,
+	"TCP/DTLS/RTP/SAVP": true, "TCP/DTLS/RTP/SAVPF": true,
+	"UDP/DTLS/SCTP": true, "TCP/DTLS/SCTP": true, "DTLS/SCTP": true,
+	"udptl": true, "TCP/MSRP": true, "TCP/TLS/MSRP": true,
+	"UDP/BFCP": true, "TCP/BFCP": true, "TCP/TLS/BFCP": true,
+	"TCP": true, "UDP": true,
+}
+
+// section normalises one m= line into what a declining answer echoes.
+func section(m *pionsdp.MediaDescription) Section {
+	media := strings.ToLower(m.MediaName.Media)
+	if media == "" || len(media) > 32 || strings.IndexFunc(media, func(r rune) bool { return r < 'a' || r > 'z' }) >= 0 {
+		media = "audio"
+	}
+	proto := []string{"RTP", "AVP"}
+	if knownProtos[strings.Join(m.MediaName.Protos, "/")] {
+		proto = append([]string(nil), m.MediaName.Protos...)
+	}
+	return Section{Media: media, Proto: proto}
 }
 
 func parseConnection(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescription, a *Audio, opts ParseOptions) error {
@@ -303,9 +378,11 @@ func parseAttributes(sd *pionsdp.SessionDescription, md *pionsdp.MediaDescriptio
 			case "sendrecv", "sendonly", "recvonly", "inactive":
 				a.Direction = Direction(at.Key)
 			case "ice-ufrag":
-				a.ICEUfrag = sanitizeICEToken(v)
+				a.ICEUfrag = sanitizeICEToken(v, minICEUfrag)
 			case "ice-pwd":
-				a.ICEPwd = sanitizeICEToken(v)
+				a.ICEPwd = sanitizeICEToken(v, minICEPwd)
+			case "rtcp-mux":
+				a.RTCPMux = true
 			case "setup":
 				switch v {
 				case "active", "passive", "actpass", "holdconn":
@@ -354,19 +431,22 @@ func parseCodecs(md *pionsdp.MediaDescription) ([]Codec, error) {
 	var out []Codec
 	seen := map[uint8]bool{}
 	for _, f := range md.MediaName.Formats {
-		n, err := strconv.ParseUint(strings.TrimSpace(f), 10, 8)
-		if err != nil {
+		f = strings.TrimSpace(f)
+		if f == "" || strings.IndexFunc(f, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
 			return nil, fmt.Errorf("sdp: bad payload type %q", f)
 		}
-		pt := uint8(n)
-		if pt > 127 || seen[pt] {
-			// >127 is outside the RTP payload-type space; a duplicate is
+		n, err := strconv.ParseUint(f, 10, 8)
+		if err != nil || n > 127 || seen[uint8(n)] {
+			// A number above 127 (including one too large for a byte) is
+			// outside the RTP payload-type space; a duplicate is
 			// malformed. Skip rather than fail: the rest of the list may
-			// still be a perfectly usable offer.
+			// still be a perfectly usable offer. Only a format that is not
+			// a number at all fails the body.
 			continue
 		}
+		pt := uint8(n)
 		seen[pt] = true
-		c := Codec{PayloadType: pt, FMTP: fmtp[pt]}
+		c := Codec{PayloadType: pt}
 		if m, ok := rtpmap[pt]; ok {
 			name, rate, ch, ok := parseRTPMap(m)
 			if !ok {
@@ -378,6 +458,7 @@ func parseCodecs(md *pionsdp.MediaDescription) ([]Codec, error) {
 		} else {
 			continue // dynamic payload type with no rtpmap: unusable
 		}
+		c.FMTP = canonicalFMTP(c.Name, fmtp[pt])
 		out = append(out, c)
 	}
 	return out, nil
@@ -403,7 +484,7 @@ func parseRTPMap(v string) (name string, rate uint32, channels int, ok bool) {
 		return "", 0, 0, false
 	}
 	name = strings.TrimSpace(parts[0])
-	if name == "" || len(name) > 64 {
+	if !validEncodingName(name) {
 		return "", 0, 0, false
 	}
 	r, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
@@ -441,12 +522,40 @@ func staticPayload(pt uint8) (staticEntry, bool) {
 	return staticEntry{}, false
 }
 
+// validEncodingName reports whether an rtpmap encoding name is 1-64 bytes
+// of letters, digits, '-', '_' and '.'. Every registered audio encoding
+// name fits ("PCMU", "telephone-event", "AMR-WB", "G7221"); the name is
+// re-rendered into the body built for the other leg and into log lines,
+// so anything else — spaces, CR/LF, quotes — makes the codec unusable.
+func validEncodingName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !alnum && c != '-' && c != '_' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// ICE credential lengths, RFC 5245 §15.4: ice-ufrag is 4-256 ice-chars,
+// ice-pwd 22-256.
+const (
+	minICEUfrag = 4
+	minICEPwd   = 22
+	maxICEToken = 256
+)
+
 // sanitizeICEToken keeps only the RFC 5245 ice-char set. An ICE ufrag or
 // password is copied into the SDP the proxy generates for the other leg
 // (and compared against STUN attributes), so anything outside the allowed
-// alphabet — CR/LF above all — is dropped rather than echoed.
-func sanitizeICEToken(v string) string {
-	if len(v) < 4 || len(v) > 256 {
+// alphabet — CR/LF above all — is dropped rather than echoed, as is a
+// token shorter than minLen or longer than maxICEToken.
+func sanitizeICEToken(v string, minLen int) string {
+	if len(v) < minLen || len(v) > maxICEToken {
 		return ""
 	}
 	for i := 0; i < len(v); i++ {
@@ -493,10 +602,12 @@ func parseFingerprint(v string) (Fingerprint, bool) {
 	return Fingerprint{Hash: hash, Value: strings.ToUpper(val)}, true
 }
 
+// isHexByte reports whether s is all hex digits (RFC 8122 §5 UHEX, either
+// case).
 func isHexByte(s string) bool {
 	for i := 0; i < len(s); i++ {
-		c := s[i] | 0x20
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
 			return false
 		}
 	}

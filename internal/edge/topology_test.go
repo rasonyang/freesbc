@@ -595,20 +595,24 @@ func TestResolvePSTNRoute(t *testing.T) {
 	}
 }
 
-func TestSameAddr(t *testing.T) {
+// The read filter's private-listener test: the address comparison treats a
+// wildcard bind as any host on its port, and a read on another transport
+// never matches the UDP private bind.
+func TestSameListener(t *testing.T) {
 	cases := []struct {
-		a, b string
-		want bool
+		tr, a, b string
+		want     bool
 	}{
-		{"10.0.0.1:5060", "10.0.0.1:5060", true},
-		{"0.0.0.0:5060", "10.0.0.1:5060", true}, // wildcard listener
-		{"10.0.0.1:5060", "0.0.0.0:5060", true},
-		{"10.0.0.1:5060", "10.0.0.2:5060", false},
-		{"0.0.0.0:5060", "10.0.0.1:5061", false}, // different port
+		{"udp", "10.0.0.1:5060", "10.0.0.1:5060", true},
+		{"udp", "0.0.0.0:5060", "10.0.0.1:5060", true}, // wildcard listener
+		{"udp", "10.0.0.1:5060", "0.0.0.0:5060", true},
+		{"udp", "10.0.0.1:5060", "10.0.0.2:5060", false},
+		{"udp", "0.0.0.0:5060", "10.0.0.1:5061", false}, // different port
+		{"ws", "10.0.0.1:5060", "0.0.0.0:5060", false},  // different transport
 	}
 	for _, c := range cases {
-		if got := fsip.SameAddr(c.a, c.b); got != c.want {
-			t.Errorf("fsip.SameAddr(%q,%q) = %v, want %v", c.a, c.b, got, c.want)
+		if got := fsip.SameListener(c.tr, c.a, "udp", c.b); got != c.want {
+			t.Errorf("fsip.SameListener(%s %q, udp %q) = %v, want %v", c.tr, c.a, c.b, got, c.want)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package sip
 
 import (
+	"fmt"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -31,18 +32,21 @@ func GrantedExpires(res *sip.Response, requested time.Duration) time.Duration {
 	return requested
 }
 
-// ParseBindIP turns a configured bind address into a netip.Addr, or the
-// zero Addr (every interface) when unset or unparseable. Only the bind
-// plane — the advertised SDP address lives on the signaling side; the two
-// stay independent so NAT/VPN deployments can bind privately and advertise
+// ParseBindIP turns a configured bind address into a netip.Addr. An unset
+// address is the zero Addr (every interface) with no error. An address
+// that does not parse is an error, never every interface: the caller asked
+// for one address, and binding all of them would expose a socket on
+// interfaces it was meant to stay off. Only the bind plane — the
+// advertised SDP address lives on the signaling side; the two stay
+// independent so NAT/VPN deployments can bind privately and advertise
 // publicly.
-func ParseBindIP(s string) netip.Addr {
+func ParseBindIP(s string) (netip.Addr, error) {
 	if s == "" {
-		return netip.Addr{}
+		return netip.Addr{}, nil
 	}
 	ip, err := netip.ParseAddr(s)
 	if err != nil {
-		return netip.Addr{}
+		return netip.Addr{}, fmt.Errorf("sip: bind address %q: %w", s, err)
 	}
-	return ip
+	return ip, nil
 }

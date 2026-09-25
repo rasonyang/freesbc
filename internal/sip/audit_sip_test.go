@@ -55,8 +55,13 @@ func TestAuditGrantedExpiresRejectsNegativeAndOverflow(t *testing.T) {
 // The edge read filter caps reads at 64 KiB (edge/edge.go:459-469), but
 // every sipgo transport reads into a TransportBufferReadSize buffer, so the
 // cap can never be exceeded and the reject branch is dead.
+//
+// The cap checked is the one the edge passes to ReadFilter (MaxReadSize,
+// edge.go's maxMessageSize). It was the literal 64 KiB, which no fix could
+// satisfy: TransportBufferReadSize is a uint16, so it can never exceed
+// 65536, including under the fix the finding recommends (lower the cap).
 func TestAuditReadFilterCapIsReachable(t *testing.T) {
-	const edgeCap = 64 << 10
+	const edgeCap = MaxReadSize
 	if int(sip.TransportBufferReadSize) <= edgeCap {
 		t.Errorf("sipgo reads at most %d bytes per read; the %d-byte filter cap can never fire",
 			sip.TransportBufferReadSize, edgeCap)
@@ -116,8 +121,8 @@ func FuzzAuditSIPMessageHelpers(f *testing.F) {
 		if out, err := filter(props, data); err != nil || (out == nil && len(data) <= 64<<10) {
 			t.Fatalf("ReadFilter returned (%v, %v) for an in-cap read", out == nil, err)
 		}
-		_ = SameAddr(string(data), "0.0.0.0:5060")
-		_ = ParseBindIP(string(data))
+		_ = sameAddr(string(data), "0.0.0.0:5060")
+		_, _ = ParseBindIP(string(data))
 		msg, err := sip.NewParser().ParseSIP(data)
 		if err != nil {
 			return
@@ -142,7 +147,7 @@ func FuzzAuditSIPMessageHelpers(f *testing.F) {
 		case *sip.Response:
 			_ = Forwardable(m)
 			_ = GrantedExpires(m, time.Hour)
-			_ = ContactOrSource(m)
+			_ = contactOrSource(m)
 			via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP", Host: "10.0.0.1", Port: 5060, Params: sip.NewParams()}
 			_ = TeardownRequest(sip.BYE, m, via, CSeqNumber(m)+1).String()
 			_ = m.String()

@@ -473,11 +473,11 @@ func (c *closeNotifyConn) Close() error {
 	return err
 }
 
-// maxMessageSize caps an inbound SIP message before the parser sees it
-// (spec §16). Real requests — even a WebRTC INVITE with a full candidate
-// list — stay well under 8 KiB; 64 KiB is a generous ceiling that still
-// bounds what one datagram or one WebSocket frame can cost.
-const maxMessageSize = 64 << 10
+// maxMessageSize caps an inbound read before the parser sees it (spec
+// §16): one UDP datagram or one WebSocket frame. It is fsip.MaxReadSize,
+// which sits below sipgo's read buffer so the cap can actually fire; see
+// its comment for why that matters.
+const maxMessageSize = fsip.MaxReadSize
 
 // readFilter is the transport-layer trust boundary. It runs before the SIP
 // parser on every read. The size cap and the rule that a filter must never
@@ -491,7 +491,9 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		// dropped before it can become a request — this is what keeps the
 		// upstream-trusted path (see topology.fromUpstream) from being
 		// reachable by a spoofed source on a public listener.
-		if info.LocalAddr == nil || !fsip.SameAddr(info.LocalAddr.String(), privateAddr) {
+		// The private listener is UDP only; a stream read on the same port
+		// number is a public client on a different port space.
+		if info.LocalAddr == nil || !fsip.SameListener(info.Transport, info.LocalAddr.String(), "udp", privateAddr) {
 			// A public read. A source the shield has banned gets nothing
 			// back at all: guard would drop its requests silently, but
 			// sipgo answers some messages on its own before any handler

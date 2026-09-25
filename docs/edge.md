@@ -200,6 +200,19 @@ These are structural rather than scheduled.
   SIP/UDP phones, not WebRTC clients. Browser-originated calls are
   unaffected.
 - **Offerless INVITE is refused (488)** in both directions.
+- **An answer that renumbers a payload type is refused (488).** RFC 3264
+  §6.1 says an answerer SHOULD reuse the offer's numbers; it does not
+  require it. FreeSBC relays RTP without rewriting the payload-type byte, so
+  an answer that moves an offered codec to a number the offer never gave it
+  (`sdp.ErrRenumbered`) fails the call rather than being bridged.
+- **A browser offer without `a=rtcp-mux` is refused (488).** The WebRTC leg
+  is a single ICE component carrying RTP and RTCP together, and RFC 5761
+  §5.1.1 lets an answer say `a=rtcp-mux` only when the offer did. Every
+  current browser offers it.
+- **`a=fmtp` carries only allowlisted parameters.** Codec parameters cross
+  legs re-rendered from a per-codec allowlist (opus, telephone-event events,
+  and a few others); anything else in an fmtp line is dropped, so the far
+  side uses the codec's defaults for it.
 - **One media session per call.** Dialogs are identified by Call-ID and both
   tags, and each early dialog of a forking far end gets its own answer; the
   anchored media follows the fork that answered last and, once one sends a

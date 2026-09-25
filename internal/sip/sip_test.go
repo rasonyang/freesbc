@@ -110,28 +110,53 @@ func TestParseHostPortAddrAndAddrOf(t *testing.T) {
 	}
 }
 
-// TestSameAddrExactMatch covers only the exact-host cases. How a wildcard
-// host or a differing transport should compare is open (audit P2-SIP-004)
-// and deliberately not pinned here.
+// TestSameAddrExactMatch covers the exact-host cases of the address-only
+// comparison; TestSameListener pins wildcard and transport handling.
 func TestSameAddrExactMatch(t *testing.T) {
-	if !SameAddr("192.0.2.1:5060", "192.0.2.1:5060") {
+	if !sameAddr("192.0.2.1:5060", "192.0.2.1:5060") {
 		t.Error("identical addresses must match")
 	}
-	if SameAddr("192.0.2.1:5060", "192.0.2.1:5061") {
+	if sameAddr("192.0.2.1:5060", "192.0.2.1:5061") {
 		t.Error("different ports must not match")
 	}
-	if SameAddr("192.0.2.1:5060", "192.0.2.2:5060") {
+	if sameAddr("192.0.2.1:5060", "192.0.2.2:5060") {
 		t.Error("different concrete hosts must not match")
 	}
-	if !SameAddr("garbage", "garbage") || SameAddr("garbage", "other") {
+	if !sameAddr("garbage", "garbage") || sameAddr("garbage", "other") {
 		t.Error("unparseable inputs must fall back to string equality")
 	}
 }
 
-// TestDefaultPort pins the RFC 3261 defaults. The wss mapping is left to
-// audit P2-SIP-007.
+// audit: P2-SIP-004
+// A read belongs to a listener only when the transport and the address both
+// match. A wildcard bind matches any host on its port, but only for its own
+// transport: a WebSocket (TCP) read on the private UDP bind's port number
+// is a public client, not FreeSWITCH.
+func TestSameListener(t *testing.T) {
+	for _, tc := range []struct {
+		tr, local, bindTr, bind string
+		want                    bool
+	}{
+		{"udp", "10.0.0.1:5060", "udp", "10.0.0.1:5060", true},
+		{"UDP", "10.0.0.1:5060", "udp", "0.0.0.0:5060", true},
+		{"udp", "[::1]:5060", "udp", "[::]:5060", true},
+		{"udp", "10.0.0.1:5061", "udp", "0.0.0.0:5060", false},
+		{"ws", "10.0.0.1:5060", "udp", "0.0.0.0:5060", false},
+		{"wss", "10.0.0.1:5060", "udp", "10.0.0.1:5060", false},
+		{"tcp", "10.0.0.1:5060", "udp", "10.0.0.1:5060", false},
+		{"udp", "10.0.0.2:5060", "udp", "10.0.0.1:5060", false},
+	} {
+		if got := SameListener(tc.tr, tc.local, tc.bindTr, tc.bind); got != tc.want {
+			t.Errorf("SameListener(%s %s, %s %s) = %v, want %v", tc.tr, tc.local, tc.bindTr, tc.bind, got, tc.want)
+		}
+	}
+}
+
+// audit: P2-SIP-007
+// TestDefaultPort pins the RFC 3261 defaults and RFC 7118 §5's HTTP ports
+// for SIP over WebSocket: 80 for ws, 443 for wss.
 func TestDefaultPort(t *testing.T) {
-	for tr, want := range map[string]int{"udp": 5060, "TCP": 5060, "tls": 5061, "TLS": 5061, "ws": 80, "": 5060} {
+	for tr, want := range map[string]int{"udp": 5060, "TCP": 5060, "tls": 5061, "TLS": 5061, "ws": 80, "wss": 443, "WSS": 443, "": 5060} {
 		if got := DefaultPort(tr); got != want {
 			t.Errorf("DefaultPort(%q) = %d, want %d", tr, got, want)
 		}
@@ -264,6 +289,25 @@ func TestReadFilter(t *testing.T) {
 	}
 }
 
+// audit: P2-SIP-002
+// The cap planes use must be reachable: sipgo reads into a buffer of
+// TransportBufferReadSize bytes, so a cap at or above it never fires. A
+// read longer than the cap and no longer than that buffer is dropped.
+func TestMaxReadSizeReachable(t *testing.T) {
+	if MaxReadSize >= int(sip.TransportBufferReadSize) {
+		t.Fatalf("MaxReadSize %d >= sipgo read buffer %d: the cap can never fire", MaxReadSize, sip.TransportBufferReadSize)
+	}
+	f := ReadFilter(MaxReadSize, nil)
+	big := make([]byte, int(sip.TransportBufferReadSize))
+	if got, err := f(sip.TransportReadProps{}, big); got != nil || err != nil {
+		t.Errorf("a full-buffer read passed the cap: %d bytes, %v", len(got), err)
+	}
+	ok := make([]byte, MaxReadSize)
+	if got, err := f(sip.TransportReadProps{}, ok); len(got) != MaxReadSize || err != nil {
+		t.Errorf("a read at the cap was dropped: %d bytes, %v", len(got), err)
+	}
+}
+
 func TestGrantedExpires(t *testing.T) {
 	const base = "SIP/2.0 200 OK\r\n" +
 		"Via: SIP/2.0/UDP 198.51.100.1:5060;branch=z9hG4bK-r1\r\n" +
@@ -288,14 +332,20 @@ func TestGrantedExpires(t *testing.T) {
 	}
 }
 
-// TestParseBindIP pins the valid-input cases. The fallback for an
-// unparseable value is audit P2-SIP-008's to decide.
+// audit: P2-SIP-008
+// An unset bind address is every interface; an unparseable one is an
+// error, never every interface.
 func TestParseBindIP(t *testing.T) {
-	if got := ParseBindIP(""); got.IsValid() {
-		t.Errorf("ParseBindIP(\"\") = %v, want the zero Addr", got)
+	if got, err := ParseBindIP(""); got.IsValid() || err != nil {
+		t.Errorf("ParseBindIP(\"\") = %v, %v; want the zero Addr, nil", got, err)
 	}
-	if got := ParseBindIP("10.1.2.3"); got != netip.MustParseAddr("10.1.2.3") {
-		t.Errorf("ParseBindIP(10.1.2.3) = %v", got)
+	if got, err := ParseBindIP("10.1.2.3"); got != netip.MustParseAddr("10.1.2.3") || err != nil {
+		t.Errorf("ParseBindIP(10.1.2.3) = %v, %v", got, err)
+	}
+	for _, bad := range []string{"10.1.2", "eth0", "10.1.2.3:5060", " 10.1.2.3"} {
+		if got, err := ParseBindIP(bad); err == nil || got.IsValid() {
+			t.Errorf("ParseBindIP(%q) = %v, %v; want an error and no address", bad, got, err)
+		}
 	}
 }
 
@@ -369,11 +419,77 @@ func TestTeardownRequestAndContactOrSource(t *testing.T) {
 
 	// Without a Contact the target falls back to the transport source.
 	RemoveHeaders(res, "Contact")
-	if u := ContactOrSource(res); u.Host != "192.0.2.10" || u.Port != 5060 {
-		t.Errorf("ContactOrSource(no Contact) = %s, want the source", u.String())
+	if u := contactOrSource(res); u.Host != "192.0.2.10" || u.Port != 5060 {
+		t.Errorf("contactOrSource(no Contact) = %s, want the source", u.String())
 	}
 	res.SetSource("not-a-hostport")
-	if u := ContactOrSource(res); u.Host != "not-a-hostport" {
-		t.Errorf("ContactOrSource(bad source) = %s", u.String())
+	if u := contactOrSource(res); u.Host != "not-a-hostport" {
+		t.Errorf("contactOrSource(bad source) = %s", u.String())
+	}
+}
+
+// audit: P2-SIP-005
+// The teardown follows the route set: loose routers become Route headers
+// and the request goes to the first of them; a strict router becomes the
+// Request-URI with the remote target appended as the last Route; the
+// element's own Record-Route entries and everything below them are left
+// out; FromListener pins the local socket.
+func TestTeardownRequestRouteSet(t *testing.T) {
+	const rr200 = "SIP/2.0 200 OK\r\n" +
+		"Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-rr\r\n" +
+		"Record-Route: <sip:198.51.100.7:5080;lr>\r\n" +
+		"Record-Route: <sip:198.51.100.8;lr>, <sip:192.0.2.1:5060;lr>\r\n" +
+		"Record-Route: <sip:192.0.2.1:5062;lr>\r\n" +
+		"Record-Route: <sip:203.0.113.3;lr>\r\n" +
+		"From: <sip:a@x>;tag=a\r\nTo: <sip:b@y>;tag=b\r\nCall-ID: rr-1\r\nCSeq: 1 INVITE\r\n" +
+		"Contact: <sip:b@198.51.100.1:5070>\r\nContent-Length: 0\r\n\r\n"
+	via := sip.NewHeader("Via", "SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-t")
+	routes := func(r *sip.Request) string {
+		var out []string
+		for _, h := range r.GetHeaders("Route") {
+			out = append(out, h.Value())
+		}
+		return strings.Join(out, ",")
+	}
+
+	res := parseResponse(t, rr200)
+	res.SetSource("198.51.100.1:5070")
+	ack := TeardownRequest(sip.ACK, res, via, 1)
+	if got, want := routes(ack), "<sip:203.0.113.3;lr>,<sip:192.0.2.1:5062;lr>,<sip:192.0.2.1:5060;lr>,<sip:198.51.100.8;lr>,<sip:198.51.100.7:5080;lr>"; got != want {
+		t.Errorf("full route set = %s, want %s", got, want)
+	}
+	if ack.Recipient.Host != "198.51.100.1" || ack.Destination() != "203.0.113.3:5060" {
+		t.Errorf("loose routing: R-URI %s, destination %s", ack.Recipient.String(), ack.Destination())
+	}
+
+	self := func(u sip.Uri) bool { return u.Host == "192.0.2.1" }
+	laddr := sip.Addr{IP: net.ParseIP("192.0.2.1"), Port: 5060}
+	bye := TeardownRequest(sip.BYE, res, via, 2, OwnRecordRoute(self), FromListener(laddr))
+	if got, want := routes(bye), "<sip:198.51.100.8;lr>,<sip:198.51.100.7:5080;lr>"; got != want {
+		t.Errorf("route set beyond own entries = %s, want %s", got, want)
+	}
+	if bye.Destination() != "198.51.100.8:5060" {
+		t.Errorf("destination = %s, want the first route beyond self", bye.Destination())
+	}
+	if bye.Laddr.String() != laddr.String() {
+		t.Errorf("Laddr = %v, want %v", bye.Laddr, laddr)
+	}
+
+	strict := parseResponse(t, strings.Replace(rr200, "Record-Route: <sip:198.51.100.7:5080;lr>\r\n", "", 1))
+	strict = parseResponse(t, strings.Replace(strict.String(), "<sip:198.51.100.8;lr>", "<sip:198.51.100.8;transport=tcp>", 1))
+	strict.SetSource("198.51.100.1:5070")
+	bye = TeardownRequest(sip.BYE, strict, via, 2, OwnRecordRoute(self))
+	if bye.Recipient.Host != "198.51.100.8" || routes(bye) != "<sip:b@198.51.100.1:5070>" {
+		t.Errorf("strict routing: R-URI %s, Route %s", bye.Recipient.String(), routes(bye))
+	}
+	if bye.Destination() != "198.51.100.8:5060" || bye.Transport() != "TCP" {
+		t.Errorf("strict routing destination = %s over %s, want 198.51.100.8:5060 over TCP", bye.Destination(), bye.Transport())
+	}
+
+	// No Record-Route: the remote target at the 2xx's source, as before.
+	plain := parseResponse(t, test200)
+	plain.SetSource("192.0.2.10:5060")
+	if b := TeardownRequest(sip.BYE, plain, via, 2, OwnRecordRoute(self)); routes(b) != "" || b.Destination() != "192.0.2.10:5060" {
+		t.Errorf("no route set: Route %q, destination %s", routes(b), b.Destination())
 	}
 }

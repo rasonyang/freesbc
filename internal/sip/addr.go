@@ -55,11 +55,32 @@ func AddrOf(a net.Addr) (netip.Addr, bool) {
 	return ParseHostPortAddr(a.String())
 }
 
-// SameAddr compares two "host:port" strings, treating a wildcard host as
+// SameListener reports whether a read that arrived on transport at local
+// address local belongs to the listener bound with bindTransport at bind.
+//
+// Both the transport and the address must match. Transport matters because
+// different transports keep separate port spaces: a WebSocket connection
+// accepted on TCP port 5060 is not a read on a UDP listener bound to 5060.
+// Once the transport is known to be the same, a wildcard bind host is
+// equal to any host on its port (sameAddr): the kernel lets only one
+// socket of a transport own that port, so the read can have arrived on no
+// other listener. "ws" and "wss" are carried over TCP and so compare equal
+// to "tcp" and "tls" only by name, not by port space; they never match
+// "udp".
+func SameListener(transport, local, bindTransport, bind string) bool {
+	if !strings.EqualFold(transport, bindTransport) {
+		return false
+	}
+	return sameAddr(local, bind)
+}
+
+// sameAddr compares two "host:port" strings, treating a wildcard host as
 // equal to any host on the same port — a listener bound to 0.0.0.0 reports
 // its own address that way while individual reads report the concrete
-// local address the packet arrived on.
-func SameAddr(a, b string) bool {
+// local address the packet arrived on. It compares addresses only; to ask
+// whether a read arrived on a given listener, use SameListener, which also
+// compares the transport.
+func sameAddr(a, b string) bool {
 	ah, ap, err1 := net.SplitHostPort(a)
 	bh, bp, err2 := net.SplitHostPort(b)
 	if err1 != nil || err2 != nil {
@@ -80,14 +101,16 @@ func SameAddr(a, b string) bool {
 
 // DefaultPort is the conventional port for a transport, used when a Via or
 // a configured peer address omits one: RFC 3261 §19.1.2 and RFC 3263 §4.1
-// give 5061 to the TLS-protected transports and 5060 to the rest, and
-// RFC 7118 §5 puts plain SIP-over-WebSocket on the HTTP port.
+// give 5061 to TLS and 5060 to UDP and TCP, and RFC 7118 §5 puts
+// SIP-over-WebSocket on the HTTP ports: 80 for ws and 443 for wss.
 func DefaultPort(transport string) int {
 	switch strings.ToLower(transport) {
-	case "tls", "wss":
+	case "tls":
 		return 5061
 	case "ws":
 		return 80
+	case "wss":
+		return 443
 	default:
 		return 5060
 	}
