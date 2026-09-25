@@ -594,14 +594,14 @@ REGISTER, SUBSCRIBE, NOTIFY, MESSAGE or REFER handler.
 | Method / event | Handling |
 |---|---|
 | **INVITE, no To-tag** | full bridge (§6.3) |
-| **INVITE, no To-tag, same Call-ID + From-tag + CSeq as an INVITE still being handled** | merged request (RFC 3261 §8.2.2.2): **482 Loop Detected**, before quota or routing (`beginInvite`, `calls.go:261-276`) |
-| **INVITE, To-tag present** | in-dialog branch, matched on Call-ID + both tags (`lookupDialog`, `calls.go:229-238`): the caller's own dialog whose INVITE is still being handled (ACKed but not yet published by `registerCall`; `settingUp`) → **500** + `Retry-After: 1` (RFC 3261 §14.2), so the UA retries instead of ending the dialog; otherwise no live dialog (an unknown Call-ID, or a live Call-ID with other tags) → **481** (RFC 3261 §12.2.2); session-timer refresh → **200 + the SBC's own established answer**; any other re-INVITE on a live dialog (hold/resume, a media change) → **488 Not Acceptable Here** (RFC 3261 §14.2), and the call stays up |
+| **INVITE, no To-tag, same Call-ID + From-tag + CSeq as an INVITE still being handled** | merged request (RFC 3261 §8.2.2.2): **482 Loop Detected**, before quota or routing (`beginInvite`, `calls.go:269-284`) |
+| **INVITE, To-tag present** | in-dialog branch, matched on Call-ID + both tags (`lookupDialog`, `calls.go:237-246`): the caller's own dialog whose INVITE is still being handled (ACKed but not yet published by `registerCall`; `settingUp`) → **500** + `Retry-After: 1` (RFC 3261 §14.2), so the UA retries instead of ending the dialog; otherwise no live dialog (an unknown Call-ID, or a live Call-ID with other tags) → **481** (RFC 3261 §12.2.2); session-timer refresh → **200 + the SBC's own established answer**; any other re-INVITE on a live dialog (hold/resume, a media change) → **488 Not Acceptable Here** (RFC 3261 §14.2), and the call stays up |
 | **ACK** | `dialogSrv.ReadAck`; "no such dialog" is expected for rejected INVITEs and only Debug-logged |
 | **BYE** | `dialogSrv.ReadBye`, then `dialogCli.ReadBye`; **481** only if both report no matching dialog; any other error is Debug-logged |
 | **OPTIONS** | identified peers get an unconditional **200 OK**, in or out of dialog, with no Allow/Accept/Supported header and no body |
 | **CANCEL matching a live INVITE transaction** | handled entirely inside sipgo: 200 to the CANCEL, the INVITE transaction FSM drives 487, and `tx.OnCancel` ends the dialog with `ErrTransactionCanceled`, cancelling `aLeg.Context()` |
 | **CANCEL matching nothing** | `onNoRoute`: identify first (unknown source → silence), then **481 Call/Transaction Does Not Exist** (RFC 3261 §9.2) |
-| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:661-683`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
+| **UPDATE, INFO, PRACK, REFER, NOTIFY, MESSAGE, SUBSCRIBE, inbound REGISTER** | `onNoRoute` (`server.go:677-699`): identify first (unknown source → silence), then **405 Method Not Allowed** + `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS` (RFC 3261 §21.4.6) |
 | **`Require: 100rel`** | **420 Bad Extension** + `Unsupported: 100rel`, before routing or dialog creation |
 | **`Session-Expires` below `min_se`** | **422 Session Interval Too Small** + `Min-SE`, before routing or dialog creation |
 
@@ -622,25 +622,25 @@ is single-use and re-entering it corrupts the dialog's To-tag. A refresh
 whose `Session-Expires` is below `min_se` gets **422** + `Min-SE`, as the
 initial INVITE does. Otherwise the 200 echoes the requested
 `Session-Expires` with the refresher parameter echoed off the request
-(`refresherOf`, `timers.go:208-213`, defaulting to `uac`), plus
+(`refresherOf`, `timers.go:311-316`, defaulting to `uac`), plus
 `Supported: timer`, `Require: timer` when the request said
 `Supported: timer` (RFC 4028 §9), a Contact rebuilt for the re-INVITE's own
 transport, and `Content-Type: application/sdp`. The 200 goes out on the raw
 transaction, which bypasses `DialogServerSession.WriteResponse`'s
 retransmit-until-ACK loop, so `respond2xxUntilAck`
-(`sessiontimer.go:267-293`) retransmits it itself at T1 doubling to T2 until
+(`sessiontimer.go:267-292`) retransmits it itself at T1 doubling to T2 until
 the ACK arrives or 64·T1 pass (RFC 3261 §13.3.1.4); `onAck` stops it
 (`ackReceived`) before handing any other ACK to `dialogSrv`. The handler
 goroutine blocks for that time.
 
 Header names are matched in long and compact form (`x` = Session-Expires,
-`k` = Supported; `headersNamed`, `timers.go:23-29`), since sipgo expands only
+`k` = Supported; `headersNamed`, `timers.go:24-30`), since sipgo expands only
 RFC 3261's core compact names. Delta-seconds above 2^32-1 are clamped to it
 (`headerSeconds`, RFC 3261 §25.1).
 
 ### 6.3 Initial INVITE — control flow
 
-`onInvite` (`b2bua.go:127-505`) runs on sipgo's per-request goroutine and
+`onInvite` (`b2bua.go:135-537`) runs on sipgo's per-request goroutine and
 **blocks there for the entire call**.
 
 ```
@@ -677,8 +677,8 @@ Defer unwind on return, LIFO: `endCall` → `killCancel` → `bLeg.Close` →
 `sess.Close` → `aLeg.Close` → quota `release` → merged-request `done` →
 `recoverCall`.
 
-`recoverCall` (`b2bua.go:1793-1799`) logs a panic and then finishes the call
-on the wire (`cleanupAfterPanic`, `b2bua.go:1806-1836`): every response on
+`recoverCall` (`b2bua.go:1822-1828`) logs a panic and then finishes the call
+on the wire (`cleanupAfterPanic`, `b2bua.go:1835-1857`): every response on
 the INVITE, raw or through the A-leg dialog, goes through `finalTx`, so an
 INVITE that got no final response is answered **500**; an A-leg that was
 answered 2xx gets a BYE; and a B-leg the carrier answered (`c.bLeg` is set
@@ -778,7 +778,7 @@ The dial loop runs at most twice, bounded by a `retried422` flag:
   and `attemptCtx` are passed as **arguments, not captured**, to keep the
   compiler from sharing the captured cell with `dialTarget`'s return slot
   (a real `-race` finding). Its `OnResponse` callback runs entirely inside
-  the attempt's `relayGate` (`b2bua.go:1408`): it does nothing once the gate
+  the attempt's `relayGate` (`b2bua.go:1435`): it does nothing once the gate
   is closed, and otherwise enforces digest-realm pinning, records
   `responded`, and relays provisionals.
 - The main `select` races `waited` against `attemptCtx.Done()`. On the ring
@@ -826,7 +826,7 @@ Post-answer (2xx), every path is non-retryable except one:
   for the **caller's actual transport**, `Supported: timer`, and — only when
   the caller said `Supported: timer` — `Session-Expires: <negotiated>;refresher=<r>`
   and `Require: timer` (`aLegSessionTimer`, `sessiontimer.go:46-64`; §6.13).
-  The negotiated value is `negotiateSE` (`timers.go:122-135`): the smaller
+  The negotiated value is `negotiateSE` (`timers.go:225-238`): the smaller
   of the caller's requested `Session-Expires` and `session_expires`, floored
   at the larger of `min_se` and the caller's own `Min-SE` (RFC 4028 §9). `Respond` blocks until the A-leg ACK arrives
   (sipgo retransmits the 2xx up to 64×T1).
@@ -856,7 +856,7 @@ a losing target's stale contexts and the call would go silent.
 ### 6.7 SDP handling
 
 The trunk plane **builds** every body it sends; it never edits the peer's
-(`sdp.go`). A small, tolerant line parser (`parseSDP`, `sdp.go:68-121`) reads
+(`sdp.go`). A small, tolerant line parser (`parseSDP`, `sdp.go:68-122`) reads
 the peer's body: it accepts CRLF or bare LF and any media type (`m=image` for
 T.38 included), ignores line types it does not use, and fails only on a body
 that is not SDP at all. It is neither `pion/sdp` (which rejects `m=image`) nor
@@ -865,12 +865,12 @@ carriers and must not refuse a body on size or codec policy the peers agreed
 between themselves. `validAudioSDP` requires a non-declined `m=audio` section
 with at least one RTP payload type (0-127).
 
-`sdpOrigin.build(src, mediaIP, rtpPort, crypto)` (`sdp.go:296-351`) writes the
+`sdpOrigin.build(src, mediaIP, rtpPort, crypto)` (`sdp.go:296-350`) writes the
 body for one leg from the other leg's body, out of an allow-list:
 
 1. `v=0`, `o=FreeSBC <session-id> <version> IN IP4|IP6 <mediaIP>`,
    `s=FreeSBC`, `c=` at the SBC's advertised media address, `t=0 0`. The `o=`
-   identity is the SBC's own per leg (`sdpOrigin`, `sdp.go:267-283`): one
+   identity is the SBC's own per leg (`sdpOrigin`, `sdp.go:267-282`): one
    random session-id for the life of the leg, and a version that moves by one
    each time the body the SBC sends on that leg changes (RFC 3264 §8). The
    A-leg's origin lives on the call (`call.aOrigin`), so the caller sees one
@@ -881,7 +881,7 @@ body for one leg from the other leg's body, out of an allow-list:
    - `a=rtpmap` for the relayed payload types, rebuilt from their parsed
      parts;
    - `a=fmtp` for them, keeping only allow-listed `name=value` parameters
-     (`fmtpParams`, `sdp.go:460-475`: the parameters G.729, G.723.1, iLBC,
+     (`fmtpParams`, `sdp.go:460-472`: the parameters G.729, G.723.1, iLBC,
      AMR/AMR-WB, Opus, EVS, G.722.1, Speex and SILK define) and the bare
      number lists telephone-event and RED use, with every number at most 255;
    - `a=ptime`, `a=maxptime`;
@@ -1041,12 +1041,12 @@ stateDiagram-v2
 
 Transitions, with the function that performs each:
 `callDialing` is set inline when the `call` literal is built in `onInvite`
-(`b2bua.go:417`); the call exists only as that function's local variable and
+(`b2bua.go:450`); the call exists only as that function's local variable and
 is in no map, so `/api/calls` cannot list it and `KillCall` cannot find it.
-`callBridged` is set **only** by `registerCall` (`calls.go:168`), under the
+`callBridged` is set **only** by `registerCall` (`calls.go:176`), under the
 lock that mints the call's admin ID and inserts the call into
 `calls[adminID]` and into the `legs` lists under its A-leg and B-leg
-Call-IDs. `callEnded` is set **only** by `endCall` (`calls.go:190`), under the
+Call-IDs. `callEnded` is set **only** by `endCall` (`calls.go:198`), under the
 same lock that removes exactly this call's entries.
 
 The store is keyed by dialog, not by Call-ID. `calls` is keyed by a random
@@ -1073,8 +1073,8 @@ stateDiagram-v2
     ByeBoth2 --> [*]
 ```
 
-Each arm is one case of the `select` at `b2bua.go:488-504`; `byeBoth`
-(`b2bua.go:512-519`) sends both BYEs. Every outbound BYE gets its own
+Each arm is one case of the `select` at `b2bua.go:524-536`; `byeBoth`
+(`b2bua.go:544-547`) sends both BYEs. Every outbound BYE gets its own
 **5 s** `byeContext`.
 
 ### 6.12 KillCall
@@ -2479,7 +2479,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 
 | Entity | Owner | Created where | Transitions | Invariants | Who may mutate | Cleanup trigger | Concurrency protection |
 |---|---|---|---|---|---|---|---|
-| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls` (by admin ID) and `legs` (per leg, by Call-ID + tags) | `b2bua.go:411-418` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:480-481`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
+| **trunk call** (`*trunk.call`) | the `onInvite` goroutine that built it; published into `Server.calls` (by admin ID) and `legs` (per leg, by Call-ID + tags) | `b2bua.go:443-451` | `callDialing → callBridged → callEnded` | every field is written before `registerCall` publishes; only a bridged call is visible to `/api/calls` and `KillCall` | only its own `onInvite` goroutine; `state` only under `callMu` | `defer endCall(c)`, registered immediately after `registerCall` (`b2bua.go:513-514`), so it runs on any return **of a published call**; a call that fails in `placeCall` was never published and unwinds through the `Close`/quota-`release` defers only | `Server.callMu` for the maps and `state`; single-goroutine discipline for the rest |
 | **trunk leg** (`aLeg *DialogServerSession`, `bLeg *DialogClientSession`) | same `onInvite` goroutine | `dialogSrv.ReadInvite` / `dialogCli.Invite` | sipgo-internal dialog FSM; contexts cancel on BYE/CANCEL/error | sipgo objects are **single-use**: `ReadInvite` must not be re-entered for the same dialog | `onInvite`, plus the B-leg waiter until the attempt's `relayGate` closes | `defer aLeg.Close()` / `defer bLeg.Close()` | no lock; the `relayGate` fences the waiter, and `bLeg`/`attemptCtx` are passed as goroutine arguments |
 | **trunk upstream registration** | `Registrar`; one goroutine per peer | `reconcile` (`register.go:309-372`) | unregistered ⇄ registered, with backoff; terminal `unregister` on cancel | `setRegisteredGen` writes only when the generation still matches, so a superseded goroutine cannot clobber the replacement | its own goroutine; the registrar under `mu` | config publication (peer removed/changed) or `stopAll` at shutdown | `Registrar.mu` (RWMutex) over `state`, `running`, `epoch`; the old goroutine is awaited **outside** the lock |
 | **endpoint health / cooldown (trunk)** | `endpointHealth` | `NewServer` | absent ⇄ `until[key]` | lazy expiry, no sweeper; skip-if-alternatives, never a hard block; keyed per `host:port/transport` | `Penalize` (dial failure), `Recover` (bridged success) | only `Recover`; entries are otherwise never removed | `endpointHealth.mu` |
