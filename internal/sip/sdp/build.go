@@ -54,7 +54,8 @@ type Build struct {
 	Fingerprint *Fingerprint
 	// Setup is the DTLS role this side takes: "passive" when the proxy is
 	// the DTLS server (the normal answer to a browser's actpass), "active"
-	// when it is the client.
+	// when it is the client, and "actpass" in the proxy's own initial
+	// offer to a browser, which leaves the choice to the answerer.
 	Setup string
 }
 

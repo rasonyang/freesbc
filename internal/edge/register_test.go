@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -66,9 +67,19 @@ func newWSClient(t *testing.T) *client {
 	return newClientBase(t, "ws")
 }
 
-func newClientBase(t *testing.T, transport string) *client {
+// newWSSClient is newWSClient over TLS. It trusts any certificate: the
+// harness's wss listener serves the proxy's self-signed fallback.
+func newWSSClient(t *testing.T) *client {
 	t.Helper()
-	ua, err := sipgo.NewUA()
+	return newClientBase(t, "wss", sipgo.WithUserAgenTLSConfig(&tls.Config{
+		InsecureSkipVerify: true, // test client against a self-signed listener
+		MinVersion:         tls.VersionTLS12,
+	}))
+}
+
+func newClientBase(t *testing.T, transport string, opts ...sipgo.UserAgentOption) *client {
+	t.Helper()
+	ua, err := sipgo.NewUA(opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,9 +134,9 @@ func (c *client) setAnswer(f func(req *sip.Request, tx sip.ServerTransaction)) {
 // which is the whole reason the proxy must rewrite it before FreeSWITCH
 // ever sees it.
 func (c *client) contactURI(user string) sip.Uri {
-	if c.transport == "ws" {
+	if c.transport == "ws" || c.transport == "wss" {
 		params := sip.NewParams()
-		params.Add("transport", "ws")
+		params.Add("transport", c.transport)
 		return sip.Uri{User: user, Host: "abcd1234.invalid", UriParams: params}
 	}
 	host, portStr, _ := net.SplitHostPort(c.local)

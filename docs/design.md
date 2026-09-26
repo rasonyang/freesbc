@@ -205,7 +205,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | per listener: closer, and `ln.Serve` | `Run` (`edge.go:303-313`) | `listenCtx` cancel / serve error |
 | `Location.Prune` ticker (30 s) | `Run` (`edge.go:340-355`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:745`) | session `Done` closed |
-| WebRTC establishment + fingerprint verification | `allocateWebRTC` (`media.go:303`) | `WebRTCSession.Start` returns |
+| WebRTC establishment + fingerprint verification | `startWebRTC` (`media.go:319`), from `allocateWebRTC` or `startOfferedWebRTC` | `WebRTCSession.Start` returns |
 | `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:112-118`); `ack2xx` also from the re-INVITE relay (`indialog.go:90`) | its 5 s BYE context / after one write |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go`, `invite_leg.go`) | its 5 s CANCEL context |
 | `sendMiddleBye` ×2 (media ended a confirmed dialog) | `byeBothEnds` (`indialog.go:435-440`) | its 5 s BYE context |
@@ -1933,6 +1933,13 @@ Reached whenever an INVITE carries a To tag.
    DTLS-SRTP block as its answers — `UDP/TLS/RTP/SAVPF`, the ICE-Lite
    credentials, the fingerprint and the DTLS role already in use (RFC 5763
    §5, RFC 8842 §5.3) — so it describes the stream the browser already has.
+   This holds whichever side made the initial offer: on a call FreeSWITCH
+   placed to a browser (§7.12, `buildPublicOffer`) the initial offer said
+   `a=setup:actpass`, and from the browser's answer on the leg's
+   `DTLSSetup` is the negotiated role (`passive` when the browser answered
+   `active`, `active` when it answered `passive`), so every later body —
+   re-offer or answer — carries that role, never `actpass` again (RFC 8842
+   §5.5).
    A re-offer that cannot be rebuilt (no relayable codec, or a browser
    re-offer without `a=rtcp-mux`) is refused through `rejectMedia`
    (**488**).
@@ -1974,7 +1981,7 @@ any gateway**.
 
 Per call: the public side must be `udp` (else 503); the gateway list is
 `orderByAvailability`'s **available** half against `pstnCooldown`
-(`invite.go:600` discards the cooled half), so a cooling gateway is dropped
+(`invite.go:612` discards the cooled half), so a cooling gateway is dropped
 rather than tried at the tail as an upstream node would be (§7.6) — unless
 every candidate is cooling, in which case the route's own order is dialled
 unchanged (`topology.go:559-561`); the whole call is
@@ -2055,7 +2062,7 @@ simpler `final == nil && !responded && clTx.Err() != nil` retry rule in
 |---|---|
 | `inviteToUpstream` | **503 Service Unavailable**; **408** at the backstop; nothing after the caller's own CANCEL; **487** after an orphan CANCEL |
 | `inviteToPSTN` | 488 / last real code / 408 / 503, in that order; a 6xx that raced an expiry CANCEL is sent as is; **408** at the backstop; nothing after FreeSWITCH's CANCEL; **487** after an orphan CANCEL |
-| `inviteToClient` | a client that never gives a final is answered for it: **408** when its INVITE timed out (Timer B) or the backstop expired, **480** when its transport failed. Before forwarding: **404** (no binding), **480** (the binding's transport has no public side, or the forward itself failed), **488** (offerless, or an answer that cannot be anchored) and **483**; **482** when the INVITE merges with one in progress |
+| `inviteToClient` | a client that never gives a final is answered for it: **408** when its INVITE timed out (Timer B) or the backstop expired, **480** when its transport failed. Before forwarding: **404** (no binding), **480** (the binding's transport has no public side, or the forward itself failed), **488** (offerless; a ws/wss client while `webrtc.enabled` is false, logged as "rejecting call to WebSocket client"; or an answer that cannot be anchored, including a browser answer to a DTLS-SRTP offer that is not a WebRTC body with `a=rtcp-mux`) and **483**; **482** when the INVITE merges with one in progress |
 
 On the upstream and client paths the pump's own **488** (an answer that
 cannot be anchored) is the caller's one final: `pumpResult.finalised` stops
@@ -2411,20 +2418,20 @@ stateDiagram-v2
     legClosed --> [*]
 ```
 
-Transitions: `NewWebRTCLeg` (`webrtcleg.go:192-239`) leaves the state at the
-zero value `legAllocated`; `Start` (`webrtcleg.go:273-298`) claims
+Transitions: `NewWebRTCLeg` (`webrtcleg.go:212-264`) leaves the state at the
+zero value `legAllocated`; `Start` (`webrtcleg.go:384-417`) claims
 `legAllocated → legEstablishing` under `mu` and spawns `establish` — a second
 `Start`, or a `Start` after `Close`, is a no-op, so no second ICE agent can
 be built over the same socket; that goroutine sets `legFailed` and
-immediately calls `Close` on error (`webrtcleg.go:293-294`) or
-`legEstablished` on success (`:297`); `Close` (`webrtcleg.go:693`) sets
+immediately calls `Close` on error (`webrtcleg.go:410-411`) or
+`legEstablished` on success (`:414`); `Close` (`webrtcleg.go:810`) sets
 `legClosed`, which `set` (`:124-126`) treats as terminal. The first error
 recorded wins, and a leg closed before it was established is retroactively
 stamped with `"webrtc leg closed before it was established"`.
 
 `Close` during establishment releases everything: it cancels `establish`'s
 context and snapshots the mux/agent/demux handles once, and `establish`
-hands every handle it creates to the leg through `keep` (`webrtcleg.go:310`),
+hands every handle it creates to the leg through `keep` (`webrtcleg.go:427`),
 which refuses once the state is `legClosed` — `establish` then closes that
 handle itself and returns. The DTLS connection is tied to the leg's `closed`
 channel as soon as its handshake succeeds, so a keying failure after the
@@ -2480,6 +2487,22 @@ handshake no longer leaks it.
 `a=setup:passive`. `actpass`, `active` and an absent `a=setup` all make
 FreeSBC the DTLS **server**, advertised as `a=setup:passive` — the
 conventional pick for a gateway with a stable address (RFC 5763 §5).
+
+**Offerer leg** (a call FreeSWITCH places to a browser, §8.9): built with
+`WebRTCLegConfig.Offerer`, it has its socket and local ICE credentials but
+no remote half, and `DTLSSetup` reports `actpass` for the offer. The
+browser's answer supplies the remote ICE credentials, fingerprint and role
+through `SetRemote` (`webrtcleg.go:320`) — `active` or an absent
+`a=setup` makes FreeSBC the DTLS server, `passive` the client, and
+`actpass`/`holdconn` are refused as roles an answer may not take; a
+restated identical remote is a no-op and a different one
+`ErrRemoteMismatch`. `SetRemote` is accepted only in `legAllocated`, under
+`mu`, which is also the happens-before edge to `establish`'s reads.
+`Start` on an offerer leg whose remote was never supplied fails it at once
+with `ErrICEFailed` and closes it, rather than running ICE against empty
+credentials until the deadline. From `SetRemote` on, `DTLSSetup` reports
+the negotiated role, and the rest of the lifecycle is the same as for a
+browser-originated leg.
 
 **Fingerprint verification** is the only binding between the signalling
 identity and the media path, and **media is gated on it**: the leg's
@@ -2549,7 +2572,7 @@ all**; only the trunk plane handles `a=crypto`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sanitizeICEToken`, `internal/sip/sdp/sdp.go:557-570`) — the RFC 5245 ice-char set widened to base64url, which is
-the alphabet FreeSBC's own credentials use (`webrtcleg.go:739-746`) — with the
+the alphabet FreeSBC's own credentials use (`webrtcleg.go:856-863`) — with the
 RFC 5245 §15.4 lengths: `ice-ufrag` 4-256, `ice-pwd` 22-256. Any other byte —
 CR/LF above all — or length rejects the whole token, because
 the token is copied into the SDP generated for the other leg. Fingerprints
@@ -2594,10 +2617,10 @@ ICE candidates can never reach FreeSWITCH.
 | `t=` | `0 0` | same |
 | `m=audio` proto | `RTP/AVP` | `UDP/TLS/RTP/SAVPF` |
 | ICE | — | `a=ice-lite`, `a=ice-ufrag`, `a=ice-pwd`, one `a=candidate:1 1 UDP <prio> <Address> <Port> typ host`, `a=end-of-candidates` |
-| DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` |
+| DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` (the leg's `DTLSSetup`: `actpass` in FreeSBC's initial offer to a browser, otherwise `active`/`passive`) |
 | codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:177-179`) | only when `RTCPMux`, which `setWebRTCAnswer` always sets alongside `DTLS` (`edge/media.go:599`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1) |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:178-180`) | only when `RTCPMux`, which `setWebRTCBlock` always sets alongside `DTLS` (`edge/media.go:739`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1), and in FreeSBC's own offer to a browser because a browser answer without it is refused 488 (`checkOfferedWebRTC`) |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 
@@ -2648,13 +2671,27 @@ whose correctness rests on "this leg is never WebRTC" states the invariant.
   media as a hijack; an answer restating the same address leaves the latch
   alone. Only the callee-facing side is ever pointed by an answer: the
   caller's side keeps the address its offer seeded.
-- **FreeSWITCH → public client** (`buildPublicOffer`): the mirror image of
-  `buildUpstreamOffer`, with one structural limitation: the public leg
-  **cannot** be WebRTC here, because a DTLS-SRTP offer requires the
-  answerer's fingerprint and ICE credentials and an offer by definition has
-  not seen them. FreeSBC offers plain RTP even to a WebSocket client. A
-  client or carrier answer is always handled on the plain relay (`rtpLeg()`
-  is checked).
+- **FreeSWITCH → public client** (`buildPublicOffer`, `media.go:607`): the
+  mirror image of `buildUpstreamOffer`, branching on the target binding's
+  transport. A UDP phone and a PSTN gateway get the plain RTP↔RTP relay and
+  an `RTP/AVP` offer; their answers are handled on the plain relay
+  (`rtpLeg()` is checked). A client registered over **ws or wss**
+  (`isBrowserTransport`; one branch for both) is a browser: it gets an
+  offerer `WebRTCLeg` on the public pool plus a private RTP pair
+  (`allocateOfferedWebRTC`), the private side seeded from FreeSWITCH's
+  offer, and a DTLS-SRTP offer built by `setWebRTCBlock` —
+  `UDP/TLS/RTP/SAVPF`, `a=ice-lite`, one host candidate at
+  `publicMediaIP`, FreeSBC's fingerprint, `a=rtcp-mux`,
+  `a=setup:actpass`. Nothing starts until the browser answers:
+  `negotiateFork` requires a WebRTC answer with `a=rtcp-mux` and an
+  answerer's role (`checkOfferedWebRTC`, else 488), and
+  `startOfferedWebRTC` hands its credentials, fingerprint and role to the
+  leg (`SetRemote`) and starts it through `startWebRTC` — the same
+  establishment goroutine, 30 s deadline, fingerprint re-check and
+  `webrtc media established` log as a browser-originated call. With
+  `webrtc.enabled` false no DTLS-SRTP offer can be built, so
+  `inviteToClient` answers a call to a ws/wss client **488** before
+  allocating anything, with a warning log.
 - **In-dialog rebuild**: `anchorFor` returns the session's existing address
   and port — nothing allocates. Direction passes through **unreversed**,
   because FreeSBC is a relay in the middle: a caller putting the call on hold
@@ -2812,7 +2849,7 @@ sequenceDiagram
     FS-->>H: 180 Ringing
     H-->>B: 180 (Contact rewritten to the public side)
     FS-->>H: 200 OK (SDP answer)
-    Note over H: forkAnswer -> negotiateFork: Negotiate, public answer with the ICE/DTLS block (setWebRTCAnswer), followFork -> pointMedia: SetPrivateRemote
+    Note over H: forkAnswer -> negotiateFork: Negotiate, public answer with the ICE/DTLS block (setWebRTCBlock), followFork -> pointMedia: SetPrivateRemote
     Note over H: commit -> dialog.confirm (before the 2xx is relayed) -> media watcher goroutine started
     H-->>B: 200 OK (a=ice-lite, a=candidate host, a=fingerprint sha-256, a=setup:passive, a=rtcp-mux)
     B->>H: ACK (onAck forwards it statelessly to FS)
@@ -2839,7 +2876,7 @@ sequenceDiagram
     Hp->>FS: INVITE upstream (anchored)
     FS->>Hc: INVITE sip:1001@privAdv with fsbc=TOKEN (arrives on the private listener)
     Note over Hc: arrivedOnPrivate -> inviteToClient, resolveTarget(token) -> Binding
-    Hc->>Hc: buildPublicOffer (plain RTP at publicMediaIP:publicPort)
+    Hc->>Hc: buildPublicOffer (plain RTP at publicMediaIP:publicPort for a UDP phone; a DTLS-SRTP offer, a=setup:actpass, for a ws/wss browser)
     Hc->>P: INVITE sip:1001@ the binding.Source address (R-URI carries no token, Contact = public side, double Record-Route)
     P-->>Hc: 180 Ringing
     Hc-->>FS: 180
@@ -2969,7 +3006,7 @@ If neither dialog cache knows the Call-ID, `onBye` answers **481**.
 | **media Session** | the signalling plane that allocated it (trunk `call`, edge `dialog`) | `PlanePool.Allocate` / `AllocateAcross` | `sessAllocated → sessRunning → sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetSRTP`, `SetRemote`, `SetExpectedRemote`, `SetLatchMode`, `Relatch` from the signalling goroutine; `Close` from anywhere | `defer sess.Close()` (trunk), `dialog.end()` (edge), the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `srtpIn`/`srtpOut atomic.Pointer`, `lastRx [2]atomic.Int64` (one per sending side), per-latch `mu` |
 | **port allocation** | `PlanePool.inUse` | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
 | **SRTP context** | one direction of one leg of a session | `NewSRTPContext` (SDES) / `newSRTPContextFromKeys` (DTLS) | installed → replaced → dropped (plaintext outcome installs `nil`) | keys are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | `Session.SetSRTP`; the leg's `deriveSRTP` sets them exactly once | replaced by a later answer, or dropped with the session | `atomic.Pointer` slots + `SRTPContext.mu` serialising pion's lockless context |
-| **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
+| **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` or (offerer leg) `allocateOfferedWebRTC` | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
 | **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) | `ban(key, dur)` from `CheckFrom`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table with an overflow counter; a socket ban lasts at most 1 min | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
 | **rate-limit bucket** | `rateLimiter` (two per `Shield`) | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; compiled regexps and prefixes are populated before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot; `Store.mu` only for the subscriber slice |
@@ -3767,11 +3804,9 @@ Stated because the code establishes them, not as future work.
 - **No DTLS re-keying and no ICE restart.** Keys are derived once per leg; a
   renegotiating browser has its DTLS records absorbed, not applied.
 - **No rtcp-mux on the plain relay path.** Only the WebRTC leg muxes.
-- **No inbound call to a WebRTC client.** `buildPublicOffer` always offers
-  plain RTP, because a DTLS-SRTP *offer* would need the answerer's
-  fingerprint and ICE credentials, which an offerer has not seen. A browser
-  rejects that offer, so FreeSWITCH-originated calls reach SIP/UDP phones,
-  not WebRTC clients.
+- **A call to a browser needs `webrtc.enabled`.** FreeSWITCH-originated
+  calls to a ws/wss client are offered DTLS-SRTP (§8.9); without WebRTC
+  enabled they are refused 488.
 - **No RTCP accounting.** RTCP is relayed but never counted, inspected or
   rewritten; there are no drop or authentication-failure counters.
 - **One media session per call** on the edge plane. Early dialogs from a

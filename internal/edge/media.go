@@ -298,8 +298,27 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 	// Establishment runs on its own context, not the request's: the
 	// INVITE transaction finishes as soon as the answer is sent, long
 	// before the browser has finished ICE.
-	leg.Start(context.WithoutCancel(ctx), 0)
-	fingerprint := a.Fingerprint
+	s.startWebRTC(context.WithoutCancel(ctx), sess, a.Fingerprint)
+	return &mediaSession{
+		webrtc:      sess,
+		publicPort:  sess.PublicPort(),
+		privatePort: sess.PrivateRTPPort(),
+	}, nil
+}
+
+// startWebRTC starts a browser leg's ICE/DTLS establishment (bounded by
+// the leg's 30 s default deadline) and, in the background, waits for it:
+// on success the relay runs and "webrtc media established" is logged; on
+// failure the session is closed, which ends the dialog through its Done
+// channel, and the failure is counted. It is the one establishment path
+// for both directions of a browser call — the browser's own offer
+// (allocateWebRTC) and the browser's answer to FreeSBC's offer
+// (startOfferedWebRTC).
+//
+// fingerprint is the browser's signalled a=fingerprint.
+func (s *Server) startWebRTC(ctx context.Context, sess *media.WebRTCSession, fingerprint *sdp.Fingerprint) {
+	leg := sess.Leg()
+	leg.Start(ctx, 0)
 	go func() {
 		if err := sess.Start(context.Background()); err != nil {
 			s.log.Warn("webrtc leg failed", "err", err)
@@ -327,11 +346,73 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 			"rtp_public_port", sess.PublicPort(),
 			"rtp_private_port", sess.PrivateRTPPort())
 	}()
-	return &mediaSession{
-		webrtc:      sess,
-		publicPort:  sess.PublicPort(),
-		privatePort: sess.PrivateRTPPort(),
-	}, nil
+}
+
+// allocateOfferedWebRTC builds the browser leg for a call placed TO a
+// browser: an offerer leg on the public pool and its private RTP pair.
+// Nothing is started — the browser's ICE credentials, DTLS role and
+// fingerprint arrive only in its answer, and startOfferedWebRTC takes it
+// from there. Until then the leg has its socket and local credentials,
+// which is all the offer needs.
+func (s *Server) allocateOfferedWebRTC() (*media.WebRTCSession, error) {
+	leg, err := media.NewWebRTCLeg(s.pubPool, media.WebRTCLegConfig{
+		AdvertisedIP: s.topo.publicMediaIP,
+		Offerer:      true,
+		Identity:     s.identity,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sess, err := media.NewWebRTCSession(leg, s.privPool, media.WebRTCSessionConfig{
+		PrivateLatch: media.LatchStrict,
+		Log:          s.log,
+	})
+	if err != nil {
+		_ = leg.Close()
+		return nil, err
+	}
+	return sess, nil
+}
+
+// errNotWebRTCAnswer maps to 488 (every negotiateFork error does): a
+// browser answered FreeSBC's DTLS-SRTP offer with something else.
+var errNotWebRTCAnswer = errors.New("proxy: answer to a WebRTC offer is not a DTLS-SRTP answer with a=rtcp-mux")
+
+// checkOfferedWebRTC validates a browser's answer to FreeSBC's DTLS-SRTP
+// offer: it must be a complete WebRTC body (ICE credentials, fingerprint,
+// secure profile), with a=rtcp-mux — the leg is one ICE component, so an
+// answer that declined the mux FreeSBC offered cannot be served — and a
+// DTLS role an answer may take.
+func checkOfferedWebRTC(answer *sdp.Session) error {
+	a := answer.Audio
+	if !a.WebRTC() || !a.RTCPMux {
+		return errNotWebRTCAnswer
+	}
+	switch a.Setup {
+	case "", "active", "passive":
+		return nil
+	}
+	return fmt.Errorf("%w: a=setup:%s", errNotWebRTCAnswer, a.Setup)
+}
+
+// startOfferedWebRTC hands a browser's answer to the offerer leg and
+// starts establishment. The answer's a=setup picks the DTLS role: active
+// (what an answerer to actpass normally picks) makes FreeSBC the DTLS
+// server, passive makes it the client. A fork restating the remote the
+// leg already has is a no-op; one naming a different remote is refused,
+// since one leg carries one association.
+func (s *Server) startOfferedWebRTC(sess *media.WebRTCSession, answer *sdp.Session) error {
+	a := answer.Audio
+	r := media.WebRTCRemote{Ufrag: a.ICEUfrag, Pwd: a.ICEPwd, Setup: a.Setup}
+	if a.Fingerprint != nil {
+		r.FingerprintHash, r.FingerprintValue = a.Fingerprint.Hash, a.Fingerprint.Value
+	}
+	if err := sess.Leg().SetRemote(r); err != nil {
+		return fmt.Errorf("proxy: browser answer: %w", err)
+	}
+	// Start is a no-op on a leg already started by an earlier answer.
+	s.startWebRTC(context.Background(), sess, a.Fingerprint)
+	return nil
 }
 
 // forkAnswer returns the body the caller is sent with one response of a
@@ -387,11 +468,19 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		return nil, negotiateError(err)
 	}
 	sess := l.offer.sess()
-	if l.callee != calleeUpstream {
-		// A client or carrier leg is always the plain RTP relay (an inbound
-		// call is never offered to a browser as WebRTC) — checked rather
-		// than assumed, because reaching into the wrong leg would be a nil
-		// dereference on the call path.
+	// offeredWebRTC is a call FreeSBC offered to a browser as DTLS-SRTP:
+	// this answer is the browser's, and it is what starts the leg.
+	offeredWebRTC := l.callee == calleeClient && sess.webrtc != nil
+	switch {
+	case offeredWebRTC:
+		if err := checkOfferedWebRTC(answer); err != nil {
+			return nil, err
+		}
+	case l.callee != calleeUpstream:
+		// A carrier leg, and a client leg that was not offered WebRTC, is
+		// always the plain RTP relay — checked rather than assumed,
+		// because reaching into the wrong leg would be a nil dereference
+		// on the call path.
 		if _, err := sess.rtpLeg(); err != nil {
 			return nil, err
 		}
@@ -418,14 +507,19 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		SessionVersion: version,
 	}
 	if callerPlane == planePublic && sess.webrtc != nil {
-		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
+		s.setWebRTCBlock(&build, sess.webrtc.Leg())
 	}
 	body, err := build.MarshalDeclining(offer)
 	if err != nil {
 		return nil, err
 	}
+	if offeredWebRTC {
+		if err := s.startOfferedWebRTC(sess.webrtc, answer); err != nil {
+			return nil, err
+		}
+	}
 	d.setForkAnswer(f, body, agreed, remote, rtcp)
-	if l.callee.calleePlane() == planePublic {
+	if l.callee.calleePlane() == planePublic && sess.rtp != nil {
 		// The answering phone or gateway: rank its media by the address
 		// FreeSBC sent the INVITE to, as allocateRTP does for a caller.
 		if to, err := netip.ParseAddrPort(l.calleeRemote); err == nil {
@@ -499,14 +593,18 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 // FROM FreeSWITCH: the private body is the offer, and the client sees a
 // constructed public one.
 //
-// The public leg cannot be WebRTC here: a DTLS-SRTP offer requires the
-// answerer's fingerprint and ICE credentials to be known, and an offer by
-// definition has not seen them. Browser-terminated inbound calls are
-// therefore relayed as... they are not: FreeSBC offers plain RTP to a UDP
-// phone and, for a WebSocket client, still offers plain RTP — which a
-// browser will reject. That limitation is documented in the README and is
-// what a future re-INVITE/offerless-INVITE path would address.
-func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, error) {
+// toBrowser selects the public leg's shape. A UDP phone (and a PSTN
+// gateway) gets a plain RTP↔RTP relay and an RTP/AVP offer. A client
+// registered over ws or wss is a browser, which accepts only DTLS-SRTP: it
+// gets an offerer WebRTC leg on the public pool and an offer with the
+// browser-facing block — UDP/TLS/RTP/SAVPF, a=ice-lite, one host
+// candidate at the public media address, FreeSBC's a=fingerprint,
+// a=rtcp-mux and a=setup:actpass. That leg is allocated here, so the offer
+// carries its local credentials and socket, but it starts only when the
+// browser's answer arrives (negotiateFork → startOfferedWebRTC). The
+// caller must not ask for a browser leg while webrtc.enabled is false:
+// there is no DTLS identity to offer (inviteToClient refuses with 488).
+func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (*offerResult, error) {
 	offer, err := s.parseSDP(offerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: upstream offer: %w", err)
@@ -518,29 +616,49 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 	if !d.open() {
 		return nil, errShuttingDown
 	}
-	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
-		// Same policy as allocateRTP: the public leg (the answering phone)
-		// latches loosely so a hard-NAT phone's real RTP source — which
-		// may differ from the IP it signalled — can fix the
-		// send-destination, below any source signalling vouches for
-		// (negotiateFork records the phone's SIP address); the private
-		// FreeSWITCH leg stays strict.
-		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
-	})
-	if err != nil {
-		return nil, err
-	}
-	// The upstream offer is on side B (private).
+	// The upstream offer is the private side's remote.
 	remote := netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.Port))
-	sess.SetRemote(media.SideB, remote)
-	if offer.Audio.RTCPPort > 0 {
-		sess.SetRTCPRemote(media.SideB, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.RTCPPort)))
-	}
-	ms := &mediaSession{
-		rtp:         sess,
-		publicPort:  sess.RTPPort(media.SideA),
-		privatePort: sess.RTPPort(media.SideB),
-		codecs:      codecs,
+	var ms *mediaSession
+	if toBrowser {
+		if !s.webrtcEnabled {
+			return nil, errWebRTCDisabled
+		}
+		sess, err := s.allocateOfferedWebRTC()
+		if err != nil {
+			return nil, err
+		}
+		// RTCP rides RTP+1 on the private side (SetPrivateRemote), as it
+		// does for a browser's own call.
+		sess.SetPrivateRemote(remote)
+		ms = &mediaSession{
+			webrtc:      sess,
+			publicPort:  sess.PublicPort(),
+			privatePort: sess.PrivateRTPPort(),
+			codecs:      codecs,
+		}
+	} else {
+		sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
+			// Same policy as allocateRTP: the public leg (the answering
+			// phone) latches loosely so a hard-NAT phone's real RTP
+			// source — which may differ from the IP it signalled — can fix
+			// the send-destination, below any source signalling vouches
+			// for (negotiateFork records the phone's SIP address); the
+			// private FreeSWITCH leg stays strict.
+			Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
+		})
+		if err != nil {
+			return nil, err
+		}
+		sess.SetRemote(media.SideB, remote)
+		if offer.Audio.RTCPPort > 0 {
+			sess.SetRTCPRemote(media.SideB, netip.AddrPortFrom(offer.Audio.Address, uint16(offer.Audio.RTCPPort)))
+		}
+		ms = &mediaSession{
+			rtp:         sess,
+			publicPort:  sess.RTPPort(media.SideA),
+			privatePort: sess.RTPPort(media.SideB),
+			codecs:      codecs,
+		}
 	}
 	ms.seedApplied(planePrivate, remote)
 	// From here the session belongs to the dialog: every failure below
@@ -549,18 +667,35 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte) (*offerResult, er
 		return nil, err
 	}
 	id, version := d.nextOrigin(planePublic)
-	body, err := sdp.Build{
+	build := sdp.Build{
 		Address:        s.topo.publicMediaIP,
 		Port:           ms.publicPort,
 		Codecs:         codecs,
 		Direction:      offer.Audio.Direction,
 		SessionID:      id,
 		SessionVersion: version,
-	}.Marshal()
+	}
+	if ms.webrtc != nil {
+		// The leg has no remote yet, so its DTLSSetup is actpass.
+		s.setWebRTCBlock(&build, ms.webrtc.Leg())
+	}
+	body, err := build.Marshal()
 	if err != nil {
 		return nil, err
 	}
 	return &offerResult{dialog: d, sdp: body, offer: offer}, nil
+}
+
+// errWebRTCDisabled: a call to a browser needs a DTLS-SRTP offer, which
+// cannot be built without webrtc.enabled (there is no DTLS identity).
+var errWebRTCDisabled = errors.New("proxy: the client is a WebSocket (browser) client and webrtc.enabled is false, so no DTLS-SRTP offer can be built")
+
+// isBrowserTransport reports whether a client registered over this public
+// transport is a browser, which accepts only DTLS-SRTP media. ws and wss
+// are one case: whether TLS was terminated by FreeSBC (wss) or by a
+// reverse proxy in front of it (ws) says nothing about the media.
+func isBrowserTransport(transport string) bool {
+	return transport == "ws" || transport == "wss"
 }
 
 // anchorFor is the address and port this session presents on one plane —
@@ -585,16 +720,21 @@ func requireRTCPMux(offer *sdp.Session) error {
 	return nil
 }
 
-// setWebRTCAnswer fills in the browser-facing half of a body: the ICE-Lite
+// setWebRTCBlock fills in the browser-facing half of a body: the ICE-Lite
 // credentials, the DTLS role and FreeSBC's own fingerprint.
 //
 // Every in-dialog body toward the browser — the answer to its re-offer and
 // a re-offer FreeSWITCH makes to it — must restate exactly these values:
 // changing any of them would look like an ICE restart or a new DTLS
 // association and tear down the media path the session is still using.
-// That is why the initial answer and every in-dialog body are built by the
-// same function rather than side by side.
-func (s *Server) setWebRTCAnswer(build *sdp.Build, leg *media.WebRTCLeg) {
+// That is why the initial body (FreeSBC's answer to a browser's offer, or
+// its offer to a browser) and every in-dialog body are built by the same
+// function rather than side by side.
+//
+// The DTLS role is the leg's DTLSSetup: actpass in the initial offer to a
+// browser, whose answer has not picked a role yet; after that, and in
+// every answer, the role the leg actually plays (active or passive).
+func (s *Server) setWebRTCBlock(build *sdp.Build, leg *media.WebRTCLeg) {
 	ufrag, pwd := leg.LocalCredentials()
 	build.DTLS, build.RTCPMux = true, true
 	build.ICEUfrag, build.ICEPwd = ufrag, pwd
@@ -655,7 +795,7 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 		// already in use (RFC 5763 §5, RFC 8842 §5.3). A plain RTP/AVP
 		// re-offer would be refused, or taken as a request to drop the
 		// secure transport.
-		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
+		s.setWebRTCBlock(&build, sess.webrtc.Leg())
 	}
 	out, err := build.Marshal()
 	if err != nil {
@@ -691,7 +831,7 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byt
 		SessionVersion: version,
 	}
 	if toward == planePublic && sess.webrtc != nil {
-		s.setWebRTCAnswer(&build, sess.webrtc.Leg())
+		s.setWebRTCBlock(&build, sess.webrtc.Leg())
 	}
 	out, err := build.MarshalDeclining(offer)
 	if err != nil {
