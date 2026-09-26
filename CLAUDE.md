@@ -66,9 +66,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 
 ## Test environment gotchas
 
-- 24 tests fail on loopback addresses that macOS does not configure (Linux routes all of 127/8):
-  - trunk: `TestPreParseFilterDropsNonPeerBytes`, `TestPreParseFilterAllowsPeerBytes` (which also binds 127.0.0.9), `TestRefreshReInviteWrongTagsGet481`, and `TestBridgeNATBindAdvertisedTopology` (which fails only after a ~32 s Timer_B);
-  - edge: every test on a harness whose fake FreeSWITCH binds 127.0.0.2 (`startHarnessPSTN`, `startHarnessPSTNGateways`, or `startHarnessCfg` with upstream 127.0.0.2): 16 of the 17 `TestPSTN*` tests (`TestPSTNUnconfiguredFallsBackTo404` is unaffected), `TestAuditPSTN6xxStopsFailover`, `TestAuditPSTNProvisionalInDrainNotFinal`, `TestReloadRemovingPSTNKeepsAttemptBudget` and `TestTeardownLeavesByPublicListenerOnWildcardBind`.
+- 4 trunk tests fail on loopback addresses that macOS does not configure (Linux routes all of 127/8): `TestPreParseFilterDropsNonPeerBytes`, `TestPreParseFilterAllowsPeerBytes` (which also binds 127.0.0.9), `TestRefreshReInviteWrongTagsGet481`, and `TestBridgeNATBindAdvertisedTopology` (which fails only after a ~32 s Timer_B). The edge suite runs entirely on 127.0.0.1 and passes on macOS.
 
   Two more bind 127.0.0.2 but skip, not fail, when it is missing: `TestAuditTCPCapExhaustedByNonPeers` (trunk) and `TestAuditMED006LooseLatchFirstPacketHijack` (media).
 

@@ -174,16 +174,16 @@ func startHarness(t *testing.T, webrtc bool) *harness {
 // address — a shape some transport-pool behaviour only distinguishes by
 // the socket's local address, so the suite needs both forms.
 func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
-	return startHarnessCfg(t, webrtc, pubBindIP, "127.0.0.1", nil)
+	return startHarnessCfg(t, webrtc, pubBindIP, nil)
 }
 
-// startHarnessCfg is startHarness with the upstream's IP and an optional
-// sip.pstn block chosen by the caller. pstn, when non-nil, is called with
-// the public UDP port once it is allocated and must return the YAML for
-// the sip.pstn section ("" disables the trunk).
-func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, pstn func(pubUDP int) string) *harness {
+// startHarnessCfg is startHarnessOn with an optional sip.pstn block chosen
+// by the caller. pstn, when non-nil, is called with the public UDP port
+// once it is allocated and must return the YAML for the sip.pstn section
+// ("" disables the trunk).
+func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string) *harness {
 	t.Helper()
-	return startHarnessWith(t, webrtc, pubBindIP, upstreamIP, pstn, false)
+	return startHarnessWith(t, webrtc, pubBindIP, pstn, false)
 }
 
 // startHarnessWSS is startHarness with a wss listener as well, serving
@@ -191,10 +191,13 @@ func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, ps
 // (newWSSClient skips verification).
 func startHarnessWSS(t *testing.T, webrtc bool) *harness {
 	t.Helper()
-	return startHarnessWith(t, webrtc, "127.0.0.1", "127.0.0.1", nil, true)
+	return startHarnessWith(t, webrtc, "127.0.0.1", nil, true)
 }
 
-func startHarnessWith(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, pstn func(pubUDP int) string, wss bool) *harness {
+// startHarnessWith builds every harness variant. The fake FreeSWITCH, like
+// every other test endpoint, lives on 127.0.0.1, so the suite needs no
+// loopback alias (macOS configures only 127.0.0.1).
+func startHarnessWith(t *testing.T, webrtc bool, pubBindIP string, pstn func(pubUDP int) string, wss bool) *harness {
 	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
@@ -227,7 +230,7 @@ sip:
 %s  private:
     bind: "127.0.0.1:%d"
   upstream:
-    address: %s:%d
+    address: 127.0.0.1:%d
 %s
 rtp:
   public:  {bind_ip: 127.0.0.1, advertised_ip: 127.0.0.1, port_min: %d, port_max: %d}
@@ -242,7 +245,7 @@ shield:
   # 20/s per_ip would throttle the harness itself rather than the code
   # under test. The rate limiter has its own tests in package shield.
   rate_limit: "5000/s per_ip"
-`, pubBindIP, pubUDP, pubWS, wssBlock, priv, upstreamIP, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+`, pubBindIP, pubUDP, pubWS, wssBlock, priv, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -261,7 +264,7 @@ shield:
 		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
 		publicWSS:  publicWSS,
 		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
-		upstream:   fmt.Sprintf("%s:%d", upstreamIP, up),
+		upstream:   fmt.Sprintf("127.0.0.1:%d", up),
 		done:       make(chan struct{}),
 	}
 	h.fs = startFakeSwitch(t, h.upstream)
@@ -291,14 +294,10 @@ shield:
 // FreeSWITCH-bridged calls get forwarded to. It returns the carrier switch
 // so a test can install its answer hooks and assert on what it receives.
 //
-// The upstream FreeSWITCH is placed on 127.0.0.2 rather than loopback's
-// 127.0.0.1: the proxy classifies a PSTN bridge by the request's SOURCE
-// being the upstream, and the classification's other half is a Request-URI
-// a phone could just as well dial — all on one loopback address, the
-// source gate could never be exercised, because the upstream and every
-// client would be the same IP. Splitting them makes "the upstream bridged
-// it" and "a phone dialed it" distinguishable, which is exactly the
-// distinction the feature depends on.
+// The upstream FreeSWITCH shares 127.0.0.1 with every client, so on this
+// harness any 127.0.0.1 source counts as the upstream: the proxy's
+// "source is the upstream" gate compares the IP only. That gate is checked
+// directly, without sockets, by TestPSTNMatchFromNonUpstreamFallsThrough.
 func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 	t.Helper()
 	// The carrier gateway address must be in the config, so its port is
@@ -306,7 +305,7 @@ func startHarnessPSTN(t *testing.T) (*harness, *fakeSwitch) {
 	// is up, since the proxy never pings a peer-to-peer gateway (there is
 	// nothing to ping: no registration, no keepalives).
 	carrierAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessCfg(t, false, "127.0.0.1", "127.0.0.2", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
 		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, pubUDP)
 	})
 	carrier := startFakeSwitch(t, carrierAddr)
@@ -351,7 +350,7 @@ func startHarnessPSTNGateways(t *testing.T, attemptTimeout, routesYAML string, g
 	if attemptTimeout != "" {
 		budget = "    attempt_timeout: " + attemptTimeout + "\n"
 	}
-	h := startHarnessCfg(t, false, "127.0.0.1", "127.0.0.2", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "127.0.0.1", func(pubUDP int) string {
 		return fmt.Sprintf("  pstn:\n    match: 127.0.0.1:%d\n%s    gateways:\n%s    routes:\n%s",
 			pubUDP, budget, gateways.String(), routesYAML)
 	})
@@ -982,9 +981,8 @@ func (f *fakeSwitch) callRequest(ruri sip.Uri, dest, body string, extra ...sip.H
 	req.SetTransport("UDP")
 	req.SetDestination(dest)
 	// Send from the switch's own listening socket, so the proxy sees the
-	// configured upstream address as the source. A switch that lives on
-	// another loopback address (startHarnessPSTN's 127.0.0.2) must source
-	// from there too — the proxy's private plane trusts exactly that IP.
+	// configured upstream address as the source: the proxy's private plane
+	// trusts exactly that address.
 	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
 	return req
 }

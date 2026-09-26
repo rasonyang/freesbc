@@ -151,7 +151,7 @@ go vet ./...
 go test ./... -race
 ```
 
-Some trunk and edge tests bind `127.0.0.2`, and one trunk test also binds `127.0.0.9`. Linux routes all of `127.0.0.0/8` to loopback; on macOS add both aliases first (`sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up`) or those tests fail.
+Some trunk tests bind `127.0.0.2`, and one trunk test also binds `127.0.0.9`. Linux routes all of `127.0.0.0/8` to loopback; on macOS add both aliases first (`sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up`) or those tests fail.
 
 ## Layout
 
