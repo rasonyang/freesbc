@@ -53,14 +53,14 @@ rtp:
   private: { bind_ip: 10.77.0.2, port_min: 40000, port_max: 49999 }
 ```
 
-Then validate and run:
+Then validate and run. Both local copies, `sbc.yaml` and `edge.yaml`, are gitignored, since they may hold credentials and real addresses:
 
 ```sh
 ./freesbc check -c sbc.yaml    # validate: errors name the line and field (use edge.yaml for the edge deployment)
 ./freesbc run   -c sbc.yaml
 ```
 
-The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (upstreams, PSTN gateways, WebRTC), the edge media planes (`rtp.public`/`rtp.private`), which planes run and the `admin` listener are read once at startup and need a restart; a reload that edits them is logged as a warning listing the keys, and the running process keeps its startup values.
+The config file is watched: edits are validated and hot-swapped atomically. A bad edit never takes down the process — the previous config stays active and the error is logged. Listener sockets, TLS certificates, the edge topology (`network`, upstreams, PSTN gateways/routes/match, WebRTC), the edge media planes (`rtp.public`/`rtp.private`), which planes run and the `admin` listener are read once at startup and need a restart; a reload that edits them is logged as a warning listing the keys, and the running process keeps its startup values.
 
 On SIGINT/SIGTERM the trunk plane refuses new calls (503), sends a BYE on both legs of every live call and waits up to 12 s for them before it un-registers and closes its listeners; edge-proxy calls are dropped with their media released. A second SIGINT/SIGTERM exits at once.
 
@@ -131,10 +131,10 @@ FreeSBC targets small/medium businesses and ITSPs running a single node; hundred
 Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its own right — the edge proxy PROXIES registrations to FreeSWITCH rather than owning users or credentials. See the [design doc](docs/design.md).
 
 - **No transcoding**, on either plane — left to the softswitch behind.
-- Session timers are negotiated, but no timer tears a call down on session expiry.
+- Session timers are negotiated, but no timer tears a call down on session expiry (on the trunk plane, a refresh the SBC itself sends that fails does end the call).
 - The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
 - The admin API lists edge-proxy dialogs alongside trunk calls, but teardown (`DELETE /api/calls/{id}`) covers trunk-plane calls only.
-- The edge proxy has further structural limits — inbound calls to browsers, offerless INVITE, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
+- The edge proxy has further structural limits — inbound calls to browsers, offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
 
 ## Roadmap
 
@@ -151,7 +151,7 @@ go vet ./...
 go test ./... -race
 ```
 
-Some trunk and edge tests bind `127.0.0.2`. Linux routes all of `127.0.0.0/8` to loopback; on macOS add the alias first (`sudo ifconfig lo0 alias 127.0.0.2 up`) or those tests fail.
+Some trunk and edge tests bind `127.0.0.2`, and one trunk test also binds `127.0.0.9`. Linux routes all of `127.0.0.0/8` to loopback; on macOS add both aliases first (`sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up`) or those tests fail.
 
 ## Layout
 
