@@ -60,7 +60,7 @@ configuration, and the "Edge proxy plane" section of
 | Area | Behaviour |
 |---|---|
 | Transports | Public UDP / WS / WSS; upstream UDP. WS↔UDP is real interworking, with the WebSocket connection bound to the registration. |
-| Methods | REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO. OPTIONS is answered locally rather than multiplied onto FreeSWITCH. |
+| Methods | REGISTER, INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, NOTIFY. OPTIONS is answered locally rather than multiplied onto FreeSWITCH. NOTIFY from FreeSWITCH is forwarded whatever its `Event` (for example BroadSoft `talk`/`hold` remote call control), including on an early dialog. |
 | REGISTER | Proxied verbatim, digest and all. The Contact is rewritten toward FreeSWITCH (so inbound calls route back through the SBC) and restored on the way back (so sip.js accepts the registration). The binding expiry follows the registrar's grant for this device's own Contact, not the client's request. A `Contact: *` un-REGISTER is forwarded as `*` and removes every binding of the AoR. |
 | SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
 | Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
@@ -245,11 +245,18 @@ These are structural rather than scheduled.
   with `Require: 100rel` with `420 Bad Extension`. Provisional responses
   are therefore never reliable, and session timers (`Supported: timer`
   still passes) are refreshed with re-INVITE.
-- **SUBSCRIBE/NOTIFY (and MESSAGE, REFER, PUBLISH) are answered
-  405, not proxied.** FreeSWITCH sends a NOTIFY for message-waiting
-  indication after a registration; MWI and BLF therefore do not reach
-  phones through the proxy. The event framework is
-  not implemented.
+- **SUBSCRIBE (and MESSAGE, REFER, PUBLISH) is answered 405, not
+  proxied.** NOTIFY is proxied: an in-dialog NOTIFY in either direction
+  is forwarded whatever its `Event`, and FreeSWITCH's in-dialog NOTIFY
+  (BroadSoft `talk`/`hold`) reaches the client even on an early dialog,
+  routed by the `fsbc=` token in its Request-URI. An out-of-dialog NOTIFY
+  (no To tag) from FreeSWITCH is forwarded when its Request-URI carries
+  the token of a binding FreeSBC holds, and answered 481 otherwise; one
+  from a client is answered 481. FreeSWITCH's message-waiting NOTIFY
+  (`Event: message-summary`) is therefore forwarded to the phone, but MWI
+  still does not work end to end, and BLF not at all, because the
+  client's SUBSCRIBE is answered 405. The event framework is not
+  implemented.
 - **SIP over UDP is sent above the RFC 3261 §18.1.1 size guidance.** A
   realistic FreeSWITCH INVITE plus the proxy's own headers clears 1300
   bytes, and the RFC's remedy — switch to TCP — is not available when both

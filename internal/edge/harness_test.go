@@ -930,6 +930,35 @@ func hostOf(addr string) string {
 // final response.
 func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string, extra ...sip.Header) *sip.Response {
 	t.Helper()
+	req := f.callRequest(ruri, dest, body, extra...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tx, err := f.cli.TransactionRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("fake switch INVITE: %v", err)
+	}
+	defer tx.Terminate()
+	for {
+		select {
+		case res, ok := <-tx.Responses():
+			if !ok {
+				t.Fatal("fake switch INVITE: no final response")
+			}
+			if res.StatusCode >= 200 {
+				return res
+			}
+		case <-tx.Done():
+			t.Fatalf("fake switch INVITE: %v", tx.Err())
+		case <-ctx.Done():
+			t.Fatal("fake switch INVITE timed out")
+		}
+	}
+}
+
+// callRequest builds the INVITE call sends, for a test that needs to drive
+// the transaction itself (to act while the call is still ringing).
+func (f *fakeSwitch) callRequest(ruri sip.Uri, dest, body string, extra ...sip.Header) *sip.Request {
 	req := sip.NewRequest(sip.INVITE, ruri)
 	from := &sip.FromHeader{Address: sip.Uri{User: "3003", Host: "example.com"}, Params: sip.NewParams()}
 	from.Params.Add("tag", sip.GenerateTagN(12))
@@ -957,29 +986,7 @@ func (f *fakeSwitch) call(t *testing.T, ruri sip.Uri, dest, body string, extra .
 	// another loopback address (startHarnessPSTN's 127.0.0.2) must source
 	// from there too — the proxy's private plane trusts exactly that IP.
 	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	tx, err := f.cli.TransactionRequest(ctx, req)
-	if err != nil {
-		t.Fatalf("fake switch INVITE: %v", err)
-	}
-	defer tx.Terminate()
-	for {
-		select {
-		case res, ok := <-tx.Responses():
-			if !ok {
-				t.Fatal("fake switch INVITE: no final response")
-			}
-			if res.StatusCode >= 200 {
-				return res
-			}
-		case <-tx.Done():
-			t.Fatalf("fake switch INVITE: %v", tx.Err())
-		case <-ctx.Done():
-			t.Fatal("fake switch INVITE timed out")
-		}
-	}
+	return req
 }
 
 // inDialog sends an in-dialog request from the fake switch, built the way

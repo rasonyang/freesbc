@@ -245,11 +245,32 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.Ad
 	s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 }
 
-// onInDialog forwards BYE and INFO. Direction is decided by the dialog the
-// request's tags name, and a BYE additionally tears the media session down
-// — but only the dialog it names, and only once its far end has agreed
-// the dialog is over.
+// onInDialog forwards BYE, INFO and NOTIFY. Direction is decided by the
+// dialog the request's tags name, and a BYE additionally tears the media
+// session down — but only the dialog it names, and only once its far end
+// has agreed the dialog is over.
+//
+// NOTIFY is forwarded whatever its Event: the proxy carries no policy, and
+// the endpoint interprets talk, hold, conference or refer itself. A NOTIFY
+// from FreeSWITCH on an EARLY dialog (Event: talk answering a ringing
+// phone) matches no confirmed dialog; directionFor routes it by the fsbc=
+// binding token its Request-URI carries, exactly as it routes the INVITE.
+//
+// Out-of-dialog NOTIFY (no To tag) is decided per plane, on purpose:
+//   - From the private plane (FreeSWITCH, trusted) it is forwarded when its
+//     Request-URI carries the token of a binding FreeSBC holds — the MWI
+//     case, Event: message-summary. Without such a binding directionFor
+//     finds no target and it is answered 481, which is what RFC 6665
+//     §4.1.3 prescribes for a NOTIFY that matches no subscription.
+//   - From the public plane it is answered 481. A client's SUBSCRIBE is
+//     answered 405, so FreeSWITCH holds no subscription a client could
+//     notify, and hashing an unsolicited NOTIFY from the internet onto a
+//     switch would only add load.
 func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
+	if req.Method == sip.NOTIFY && fsip.ToTag(req) == "" && !s.arrivedOnPrivate(req) {
+		s.reject(req, tx, 481, "Subscription Does Not Exist")
+		return
+	}
 	from, to, dest, d, ok := s.directionFor(req)
 	if !ok {
 		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")

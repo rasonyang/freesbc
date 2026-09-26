@@ -245,6 +245,7 @@ func (s *Server) Run(ctx context.Context) error {
 	srv.OnCancel(s.guard(s.onCancel))
 	srv.OnBye(s.guard(s.onInDialog))
 	srv.OnInfo(s.guard(s.onInDialog))
+	srv.OnNotify(s.guard(s.onInDialog))
 	srv.OnOptions(s.guard(s.onOptions))
 	srv.OnNoRoute(s.guard(s.onNoRoute))
 
@@ -708,7 +709,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, _ netip.A
 }
 
 // allowedMethods is what FreeSBC advertises it will proxy.
-var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "INFO", "REGISTER"}
+var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "INFO", "NOTIFY", "REGISTER"}
 
 // onNoRoute answers any method the proxy does not handle. A 405 naming the
 // methods it does handle is the honest answer; silence would leave a

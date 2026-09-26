@@ -141,7 +141,7 @@ Created once, alive for the process lifetime:
 | `trunk.Registrar` | trunk | inside `trunk.Server.Run` (`server.go:331`), published through `atomic.Pointer` | one goroutine per `register: true` peer |
 | `trunk.Resolver` | trunk | `NewServer` | SRV cache + singleflight + seeded `rand` |
 | `trunk.endpointHealth` | trunk | `NewServer` | endpoint cooldown map |
-| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:299`) | immutable snapshot afterwards |
+| `edge.topology` | edge | `edge.New`, re-pinned in `Run` (`edge.go:300`) | immutable snapshot afterwards |
 | `edge.Location` | edge | `edge.New` | registration binding table |
 | `edge.dialogTable` | edge | `edge.New` (`edge.go:152`) | grouped by Call-ID, matched on Call-ID + both tags |
 | `edge.cooldownTable` ×2 | edge | `edge.New` (`edge.go:145-146`) | `upstreamCooldown`, `pstnCooldown`; always allocated |
@@ -202,13 +202,13 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 
 | Goroutine | Started | Exits |
 |---|---|---|
-| per listener: closer, and `ln.Serve` | `Run` (`edge.go:303-313`) | `listenCtx` cancel / serve error |
-| `Location.Prune` ticker (30 s) | `Run` (`edge.go:340-355`) | `listenCtx` cancel |
+| per listener: closer, and `ln.Serve` | `Run` (`edge.go:304-314`) | `listenCtx` cancel / serve error |
+| `Location.Prune` ticker (30 s) | `Run` (`edge.go:341-356`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:745`) | session `Done` closed |
 | WebRTC establishment + fingerprint verification | `startWebRTC` (`media.go:319`), from `allocateWebRTC` or `startOfferedWebRTC` | `WebRTCSession.Start` returns |
 | `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:112-118`); `ack2xx` also from the re-INVITE relay (`indialog.go:90`) | its 5 s BYE context / after one write |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go`, `invite_leg.go`) | its 5 s CANCEL context |
-| `sendMiddleBye` ×2 (media ended a confirmed dialog) | `byeBothEnds` (`indialog.go:435-440`) | its 5 s BYE context |
+| `sendMiddleBye` ×2 (media ended a confirmed dialog) | `byeBothEnds` (`indialog.go:456-461`) | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
 **Media**
@@ -301,10 +301,10 @@ ws/wss listener on the trunk plane. TCP and TLS listeners are wrapped in
 `listen.tls_cert`/`tls_key` if present, otherwise mints a self-signed
 certificate and logs `"TLS listener using self-signed certificate"`.
 
-**Edge** (`edge.go:254-336`) binds **every socket synchronously before
+**Edge** (`edge.go:255-337`) binds **every socket synchronously before
 serving any of them**; on any failure every already-opened listener is closed
 and `Run` returns. It then starts one serving goroutine per socket and waits
-(`awaitUDPServing`, `edge.go:388-415`, bounded by 5 s) until every UDP
+(`awaitUDPServing`, `edge.go:389-416`, bounded by 5 s) until every UDP
 listener is in sipgo's connection pool: sipgo pools a UDP listener only
 inside `ServeUDP`, on that goroutine, and a request pinned to the listener's
 address before then (every forward, §7.8) misses the pool, so sipgo binds a
@@ -328,7 +328,7 @@ unsynchronised variable, which the race detector flags on every graceful
 shutdown.
 
 After binding, the edge plane replaces its topology with
-`s.topo = s.topo.pinned(opened)` (`edge.go:299`). A wildcard bind does not
+`s.topo = s.topo.pinned(opened)` (`edge.go:300`). A wildcard bind does not
 come up as the address it was written with — on a dual-stack host `0.0.0.0`
 yields a socket whose local address is `[::]:port` — and sipgo keys its
 connection pool by the socket's real local address. Without pinning, an
@@ -1424,7 +1424,7 @@ RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 ### 7.3 Method dispatch
 
 Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
-`OPTIONS`, and `OnNoRoute`.
+`NOTIFY`, `OPTIONS`, and `OnNoRoute`.
 
 | Method | Handling |
 |---|---|
@@ -1434,9 +1434,9 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | INVITE, To-tag present | `onReInvite` (§7.9) |
 | ACK | stateless forward (§7.8) |
 | CANCEL | only orphan CANCELs reach the handler (§7.8) |
-| BYE, INFO | `onInDialog` (§7.8) |
+| BYE, INFO, NOTIFY | `onInDialog` (§7.8); NOTIFY whatever its `Event`. A NOTIFY with no To-tag from a public client → **481** |
 | OPTIONS | answered locally with **200 OK** + `Allow`; never forwarded, because relaying every phone's keepalive would multiply FreeSWITCH load |
-| UPDATE, PRACK, NOTIFY, MESSAGE, SUBSCRIBE, REFER, PUBLISH | `onNoRoute` → **405** + `Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, REGISTER` |
+| UPDATE, PRACK, MESSAGE, SUBSCRIBE, REFER, PUBLISH | `onNoRoute` → **405** + `Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, NOTIFY, REGISTER` |
 
 Every locally generated response and every relayed response is sent to
 `req.Source()` — symmetric response routing (RFC 3581), so a response reaches
@@ -1748,7 +1748,7 @@ reclamation of a confirmed dialog is the media silence watchdog, surfaced
 through `sess.Done()`. When it is the media that ends the dialog (the
 watchdog, or a WebRTC peer whose certificate does not match its
 fingerprint), `end()` reports it and the watcher calls the table's
-`onMediaEnd` — `byeBothEnds` (`indialog.go:435-440`) — which sends **each
+`onMediaEnd` — `byeBothEnds` (`indialog.go:456-461`) — which sends **each
 endpoint a BYE on behalf of the other** (RFC 3261 §15): From/To and tags
 from the record, the Request-URI the endpoint's own Contact, the CSeq one
 above the highest the other endpoint used, out the same pinned socket
@@ -1780,7 +1780,7 @@ in order:
 7. Set transport, destination, and `Laddr` from the pinned side.
 
 Record-Route is added on the initial INVITE in all three call directions and
-**not** on REGISTER, ACK, BYE/INFO or re-INVITE.
+**not** on REGISTER, ACK, BYE/INFO/NOTIFY or re-INVITE.
 
 Every outbound request uses `noBuild`, a no-op `sipgo.ClientRequestOption`:
 passing *any* option suppresses sipgo's default request-building pass, which
@@ -1878,7 +1878,7 @@ nothing more: a transaction finalises once. The pump's 488 for an answer it
 cannot anchor on a **provisional** also CANCELs that branch, which would
 otherwise ring on.
 
-**BYE / INFO** (`onInDialog`): resolve direction, forward without
+**BYE / INFO / NOTIFY** (`onInDialog`): resolve direction, forward without
 Record-Route, retarget the Request-URI to the far end's own Contact, rewrite
 the Contact, and relay under a **32 s** budget. The CSeq of every in-dialog request is
 recorded per endpoint (`noteCSeq`). On a forwarding failure and
@@ -1887,11 +1887,23 @@ side and then answers **200** to the requester — answering 408 would tell the
 switch its hangup failed and sofia would keep the leg. A BYE ends a dialog
 only when its tags name that confirmed dialog **and** the far end agreed:
 a 2xx, a 481 or 408 (which end the dialog for the sender too, §12.2.1.2), or
-no answer at all (`byeEndsDialog`, `indialog.go:310-315`). A BYE with tags
+no answer at all (`byeEndsDialog`, `indialog.go:331-336`). A BYE with tags
 that match no dialog is still forwarded — the endpoint answers 481 — but
 tears nothing down, and a 401/407 challenge leaves the call up.
 
-**Direction resolution** (`directionFor`, `indialog.go:328-393`):
+NOTIFY takes the generic path whatever its `Event`: the proxy does not
+interpret BroadSoft `talk`/`hold` (or `conference`, `refer`); the endpoint
+does. FreeSWITCH's in-dialog NOTIFY on an **early** dialog (`Event: talk`
+answering a ringing phone) matches no confirmed dialog and is routed by the
+`fsbc=` token its Request-URI still carries, like the INVITE. Out-of-dialog
+NOTIFY (no To-tag) is decided per plane: from FreeSWITCH it is forwarded when
+the token names a binding FreeSBC holds (MWI, `Event: message-summary`) and
+answered **481** otherwise (no target; RFC 6665 §4.1.3); from a public client
+it is answered **481** before direction resolution, since a client's
+SUBSCRIBE is 405 and FreeSWITCH holds no subscription it could notify. MWI
+therefore reaches a phone, but does not work end to end without SUBSCRIBE.
+
+**Direction resolution** (`directionFor`, `indialog.go:349-414`):
 
 - A request whose Call-ID and tags name a confirmed dialog is routed by that
   record — `publicRemote` toward the client, `privateRemote` (the winning
@@ -1900,8 +1912,9 @@ tears nothing down, and a 401/407 challenge leaves the call up.
   A request that names the caller's tags but came in on the callee's side is
   not treated as that dialog's.
 - Otherwise, from FreeSWITCH: `bindingForRequest(req)` (an in-dialog request
-  from FreeSWITCH carries no binding token, so without a record this only
-  helps a pre-dialog request).
+  on a confirmed dialog from FreeSWITCH carries no binding token, so without
+  a record this only helps a pre-dialog request, an early-dialog NOTIFY sent
+  to the stored contact, or an out-of-dialog NOTIFY); no binding → **481**.
 - Otherwise, from a public client: hash to an upstream. **This fallback
   deliberately never 481s**; the switch answers honestly. Such a request
   carries no dialog, so nothing is torn down on its account.
@@ -3315,7 +3328,7 @@ Because the trunk read filter admits only configured peers, the trunk
 shield's `Check` only ever takes the peer-rate-limit branch
 (`shield.go:130-138`), so in a deployed system `freesbc_shield_drops_total`
 reports only `reason="rate"`. The ban and scanner branches run on the
-**edge** shield (`edge.go:652`), which `internal/app` never wires into
+**edge** shield (`edge.go:653`), which `internal/app` never wires into
 `admin.Deps` (`adminDeps` points `Deps.Shield` at the trunk shield, and
 leaves it zeroed when the trunk is off), so edge bans and drops do not reach
 `/metrics`. The ban gauges
@@ -3690,7 +3703,7 @@ read an environment variable.
 | `pstnDrain` | 300 ms | post-CANCEL drain window |
 | edge CANCEL / `ackThenBye` BYE / BYE after media end | 5 s each | one transaction |
 | edge INVITE client transaction after a 2xx | Timer M, 64·T1 (32 s; sipgo) | relaying 2xx retransmissions; a later fork's 2xx is ACKed and BYEd |
-| edge in-dialog (BYE/INFO) | 32 s | `forwardAndRelay` |
+| edge in-dialog (BYE/INFO/NOTIFY) | 32 s | `forwardAndRelay` |
 | `listen.media.rtp_timeout` | 5 min (config) | media silence, both planes |
 | `peer_cooldown` | 30 s (config) | a trunk endpoint that failed to dial |
 | `shield.auto_ban.duration` | 1 h (config); a UDP socket ban at most 1 min (`socketBanMax`) | a scanner ban |
@@ -3840,8 +3853,10 @@ Stated because the code establishes them, not as future work.
   issues one. An inbound REGISTER on the trunk plane gets 405.
 - **No registrar of its own.** The edge plane proxies registrations; the
   authoritative registrar is FreeSWITCH.
-- **No SUBSCRIBE/NOTIFY, MESSAGE, REFER or PUBLISH.** All get 405, so MWI
-  and BLF do not reach phones through the edge proxy.
+- **No SUBSCRIBE, MESSAGE, REFER or PUBLISH.** All get 405 on both planes,
+  as NOTIFY does on the trunk plane. The edge plane forwards NOTIFY (§7.8),
+  including FreeSWITCH's MWI NOTIFY to a registered phone, but MWI and BLF
+  still do not work end to end because a client's SUBSCRIBE is 405.
 - **No active peer qualification.** There is no outbound OPTIONS keepalive on
   either plane; health is entirely passive.
 - **No ws/wss on the trunk plane**, and no TCP or SIP-over-TLS on the edge
