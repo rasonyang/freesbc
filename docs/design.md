@@ -204,11 +204,11 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 |---|---|---|
 | per listener: closer, and `ln.Serve` | `Run` (`edge.go:304-314`) | `listenCtx` cancel / serve error |
 | `Location.Prune` ticker (30 s) | `Run` (`edge.go:341-356`) | `listenCtx` cancel |
-| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:745`) | session `Done` closed |
+| per confirmed dialog: media watcher (`<-sess.Done(); d.end()`) | `dialog.confirm` (`dialog.go:794`) | session `Done` closed |
 | WebRTC establishment + fingerprint verification | `startWebRTC` (`media.go:319`), from `allocateWebRTC` or `startOfferedWebRTC` | `WebRTCSession.Start` returns |
 | `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:112-118`); `ack2xx` also from the re-INVITE relay (`indialog.go:90`) | its 5 s BYE context / after one write |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go`, `invite_leg.go`) | its 5 s CANCEL context |
-| `sendMiddleBye` ×2 (media ended a confirmed dialog) | `byeBothEnds` (`indialog.go:456-461`) | its 5 s BYE context |
+| `sendMiddleBye` ×2 (media ended a confirmed dialog) | `byeBothEnds` (`indialog.go:514-519`) | its 5 s BYE context |
 | shield prune loop | `shield.NewNoKernel` | `Shield.Close` |
 
 **Media**
@@ -1434,7 +1434,7 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | INVITE, To-tag present | `onReInvite` (§7.9) |
 | ACK | stateless forward (§7.8) |
 | CANCEL | only orphan CANCELs reach the handler (§7.8) |
-| BYE, INFO, NOTIFY | `onInDialog` (§7.8); NOTIFY whatever its `Event`. A NOTIFY with no To-tag from a public client → **481** |
+| BYE, INFO, NOTIFY | `onInDialog` (§7.8); NOTIFY whatever its `Event`. A NOTIFY with no To-tag from a public client → **481**. A NOTIFY with a To-tag from FreeSWITCH that `directionFor` cannot route is forwarded by Call-ID alone to that dialog's client, tags unchecked (`relaxedNotifyDirection`, §7.8); **481** only when no dialog with a public route has the Call-ID |
 | OPTIONS | answered locally with **200 OK** + `Allow`; never forwarded, because relaying every phone's keepalive would multiply FreeSWITCH load |
 | UPDATE, PRACK, MESSAGE, SUBSCRIBE, REFER, PUBLISH | `onNoRoute` → **405** + `Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, NOTIFY, REGISTER` |
 
@@ -1639,18 +1639,19 @@ retried.
 
 A dialog is identified the RFC 3261 §12 way: **Call-ID + the caller's tag +
 the callee's tag**. `dialogTable` groups records by Call-ID
-(`byCallID map[string][]*dialog`) and every lookup then matches tags:
+(`byCallID map[string][]*dialog`) and every lookup but one then matches
+tags:
 
-- `lookup(callID, fromTag, toTag)` (`dialog.go:300-318`) finds a
+- `lookup(callID, fromTag, toTag)` (`dialog.go:306-324`) finds a
   **confirmed** record whose tags the request names in either orientation;
   From = caller's tag and To = callee's tag means the request is from the
   caller, the reverse means it is from the callee. A request missing either
   tag names no dialog.
-- `early(callID, fromTag)` (`dialog.go:285-294`) finds the **in-flight**
+- `early(callID, fromTag)` (`dialog.go:291-300`) finds the **in-flight**
   record a CANCEL applies to: same Call-ID and the INVITE's From tag
   (RFC 3261 §9.1), so a CANCEL that merely guessed a live Call-ID cannot end
   someone else's call.
-- `begin(req, callerPlane)` (`dialog.go:250-279`) refuses —
+- `begin(req, callerPlane)` (`dialog.go:256-285`) refuses —
   the handler answers **482 Loop Detected** — when an **early** record with
   the same Call-ID and caller tag exists (a merged request, §8.2.2.2), and
   refuses every INVITE once shutdown has closed the table (`beginDialog`
@@ -1658,6 +1659,13 @@ the callee's tag**. `dialogTable` groups records by Call-ID
   confirmed record with the same identifiers is left alone: the new INVITE
   opens a record beside it. An INVITE can therefore never tear down another
   call by reusing its Call-ID.
+- `newestRoutedByCallID(callID)` (`dialog.go:336-348`) is the one lookup
+  that ignores tags. It returns the most recently created record carrying
+  the Call-ID whose route has a `publicRemote` (records are appended in
+  creation order, so it walks `byCallID` from the end). Only `confirm`
+  writes a route, so an early record never qualifies and the choice is in
+  effect the newest confirmed dialog. Its only caller is the relaxed NOTIFY
+  routing of §7.8 (issue #84).
 
 `dialog` holds the Call-ID, both tags, the plane the caller's in-dialog
 requests arrive on (`callerPlane`), the state, the in-flight attempt, the
@@ -1676,7 +1684,7 @@ mutex (`media.go`).
 
 **Forks (early dialogs).** While the record is early, every response of the
 forwarded INVITE is attributed to a fork by its To tag (`fork`,
-`dialog.go:469-480`). An `earlyFork` holds that fork's own answer body, the
+`dialog.go:518-529`). An `earlyFork` holds that fork's own answer body, the
 codecs it agreed, the media address it signalled and its own `o=` identity.
 The first body a fork sends is negotiated against the **original** offer
 (`negotiateFork`, `media.go`); a later body on the same fork is answered with
@@ -1699,15 +1707,15 @@ stateDiagram-v2
     dialogEnded --> [*]
 ```
 
-Transitions: `confirm` (`dialog.go:717-755`) runs **before the 2xx is
+Transitions: `confirm` (`dialog.go:766-804`) runs **before the 2xx is
 relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:142-169,583-605`),
 so the ACK the caller sends the instant it sees the 2xx always finds the
 record. It records the callee's tag and the route, adopts the confirming
 fork's `o=` identity for the caller's leg, drops the fork table, and refuses
 when the state is not early, **no media was ever anchored**, or the call has
 been cancelled. `endUnlessUp`
-(`dialog.go:759-766`) ends only a still-early dialog and is deferred by every
-INVITE path; `end` (`dialog.go:776-805`) is the single exit for a BYE, the
+(`dialog.go:808-815`) ends only a still-early dialog and is deferred by every
+INVITE path; `end` (`dialog.go:825-854`) is the single exit for a BYE, the
 media watchdog, shutdown and a failed INVITE. `end` is idempotent — the state
 transition under the table mutex elects the one caller that does the work —
 and removes exactly this record from its Call-ID's list.
@@ -1748,7 +1756,7 @@ reclamation of a confirmed dialog is the media silence watchdog, surfaced
 through `sess.Done()`. When it is the media that ends the dialog (the
 watchdog, or a WebRTC peer whose certificate does not match its
 fingerprint), `end()` reports it and the watcher calls the table's
-`onMediaEnd` — `byeBothEnds` (`indialog.go:456-461`) — which sends **each
+`onMediaEnd` — `byeBothEnds` (`indialog.go:514-519`) — which sends **each
 endpoint a BYE on behalf of the other** (RFC 3261 §15): From/To and tags
 from the record, the Request-URI the endpoint's own Contact, the CSeq one
 above the highest the other endpoint used, out the same pinned socket
@@ -1813,7 +1821,7 @@ the **487** toward the requester itself (sipgo v1.4.3
 `sip/transaction_server_tx_fsm.go` `actCancel`). The hook
 therefore does no network I/O: it calls `cancelCall(d, cancelByCaller)`
 (`invite_leg.go:617-628`), which **synchronously** marks the record
-cancelled (`cancelSeries`, `dialog.go:613-632`) — from that instant
+cancelled (`cancelSeries`, `dialog.go:662-681`) — from that instant
 `confirm` refuses, so a 2xx racing the CANCEL is ACKed and BYEd, never
 relayed after the 487 — takes the in-flight attempt, and hands the CANCEL
 to a goroutine (`sendCancel`, `invite_leg.go:642-658`). `sendCancel` builds
@@ -1823,10 +1831,10 @@ the wire (which is what releases the media promptly instead of waiting on
 the forwarded INVITE's transaction timer).
 
 An attempt is **tracked before its INVITE is sent** (`track`,
-`dialog.go:564-572`), so no CANCEL can fall between the send and the
+`dialog.go:613-621`), so no CANCEL can fall between the send and the
 bookkeeping. A CANCEL that takes an attempt whose INVITE is not on the wire
 yet does not send its CANCEL (it would overtake the INVITE, be answered 481,
-and leave the INVITE ringing); `markSent` (`dialog.go:577-582`) tells the
+and leave the INVITE ringing); `markSent` (`dialog.go:626-631`) tells the
 sender, which CANCELs the moment the INVITE is out. `track` refuses once
 the series is cancelled, so no later attempt starts.
 
@@ -1887,7 +1895,7 @@ side and then answers **200** to the requester — answering 408 would tell the
 switch its hangup failed and sofia would keep the leg. A BYE ends a dialog
 only when its tags name that confirmed dialog **and** the far end agreed:
 a 2xx, a 481 or 408 (which end the dialog for the sender too, §12.2.1.2), or
-no answer at all (`byeEndsDialog`, `indialog.go:331-336`). A BYE with tags
+no answer at all (`byeEndsDialog`, `indialog.go:389-394`). A BYE with tags
 that match no dialog is still forwarded — the endpoint answers 481 — but
 tears nothing down, and a 401/407 challenge leaves the call up.
 
@@ -1903,7 +1911,37 @@ it is answered **481** before direction resolution, since a client's
 SUBSCRIBE is 405 and FreeSWITCH holds no subscription it could notify. MWI
 therefore reaches a phone, but does not work end to end without SUBSCRIBE.
 
-**Direction resolution** (`directionFor`, `indialog.go:349-414`):
+A NOTIFY from FreeSWITCH that **has** a To-tag but that `directionFor`
+cannot route — its tags name no dialog and its Request-URI carries no
+binding token — gets one relaxed lookup before it is refused
+(`onInDialog`, `indialog.go:283-285`; `relaxedNotifyDirection`,
+`indialog.go:363-382`; issue #84). FreeSWITCH's `uuid_phone_event` NOTIFY
+(`Event: talk` resuming a held call) copies its To header verbatim from
+the `sip_full_to` channel variable (mod_sofia's
+`SWITCH_MESSAGE_INDICATE_PHONE_EVENT`), so its To-tag can be another leg's
+— the captured resume NOTIFY had To identical to From — and the client
+accepts it when registered directly to FreeSWITCH. The rule: a NOTIFY that
+arrived on the private plane (`arrivedOnPrivate`) and whose Call-ID names a
+dialog FreeSBC holds is forwarded to that dialog's public side
+(`publicRemote`, retargeted to its `publicContact`) and is **never refused
+because of its tags**; neither the To-tag nor the From-tag is checked.
+When several records share the Call-ID, the most recently created one with
+a usable public route wins (`newestRoutedByCallID`, §7.7) — in practice the
+newest confirmed dialog, since an early record has no route. It is answered
+**481** only when no record carries the Call-ID or none has a public side
+to send to. The To header is forwarded verbatim, never rewritten to the
+dialog's tag: FreeSBC does not fabricate dialog state. The first relaxed
+routing on a dialog is logged at **WARN** (Call-ID, From-tag, stray To-tag,
+the dialog's two tags) and every later one at **Debug**, since FreeSWITCH
+retries about once a second (`noteRelaxedNotify`, `dialog.go:501-507`);
+the WARN going quiet is the signal that the upstream stopped sending the
+stray tag. There is no metric: the edge counters are per method and
+transport, and none fits a routing decision. The relaxation is NOTIFY-only
+and private-plane-only: BYE, INFO and ACK with a stray tag, and every
+NOTIFY from a public client, keep exact tag matching (a public one takes
+the public fallback below), and the no-To-tag rule above is unchanged.
+
+**Direction resolution** (`directionFor`, `indialog.go:407-472`):
 
 - A request whose Call-ID and tags name a confirmed dialog is routed by that
   record — `publicRemote` toward the client, `privateRemote` (the winning
@@ -1914,7 +1952,10 @@ therefore reaches a phone, but does not work end to end without SUBSCRIBE.
 - Otherwise, from FreeSWITCH: `bindingForRequest(req)` (an in-dialog request
   on a confirmed dialog from FreeSWITCH carries no binding token, so without
   a record this only helps a pre-dialog request, an early-dialog NOTIFY sent
-  to the stored contact, or an out-of-dialog NOTIFY); no binding → **481**.
+  to the stored contact, or an out-of-dialog NOTIFY); no binding → **481**,
+  except for a NOTIFY with a To-tag, which `onInDialog` then routes by
+  Call-ID alone (`relaxedNotifyDirection`, above). `directionFor` itself is
+  unchanged by that rule.
 - Otherwise, from a public client: hash to an upstream. **This fallback
   deliberately never 481s**; the switch answers honestly. Such a request
   carries no dialog, so nothing is torn down on its account.
@@ -2361,7 +2402,7 @@ The watchdog is the backstop for a half-dead call whose BYE was lost. On the
 trunk plane it fires `sess.Done()`, which the `onInvite` select turns into
 BYEs on both legs; on the edge plane it fires the per-dialog media watcher
 goroutine, which calls `dialog.end()` and then sends a BYE to both
-endpoints (§7.7). That watcher is launched by `confirm` (`dialog.go:745-753`),
+endpoints (§7.7). That watcher is launched by `confirm` (`dialog.go:794-802`),
 so it exists only for a **confirmed** dialog; an early one is reclaimed by
 `endUnlessUp` and the 5-minute `inviteTimeout` (which CANCELs the branch and
 answers 408) instead.

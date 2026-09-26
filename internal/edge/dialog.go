@@ -204,6 +204,12 @@ type dialog struct {
 
 	// origin is the o= identity per leg, indexed by plane.
 	origin [2]sdpOrigin
+
+	// relaxedNotify is set the first time a private-plane NOTIFY whose
+	// tags name no dialog was routed to this record by Call-ID alone
+	// (issue #84; see relaxedNotifyDirection), so the WARN is logged once
+	// per dialog rather than once per retry.
+	relaxedNotify bool
 }
 
 // dialogTable is the proxy's one store of calls.
@@ -315,6 +321,30 @@ func (t *dialogTable) lookup(callID, fromTag, toTag string) (d *dialog, fromCall
 		}
 	}
 	return nil, false, false
+}
+
+// newestRoutedByCallID returns the most recently created record carrying
+// callID that has a public route to send to (route.publicRemote set), with
+// that route. It exists for one caller: onInDialog's relaxed routing of a
+// private-plane NOTIFY whose tags name no dialog (issue #84).
+//
+// Records are appended to byCallID in creation order (begin), so the
+// newest is the last one that qualifies. Only a confirmed record has a
+// route: dialogRoute is written in confirm and nowhere else, so an early
+// record never qualifies and the choice is, in effect, the newest
+// confirmed dialog. An ended record is already out of the table.
+func (t *dialogTable) newestRoutedByCallID(callID string) (*dialog, dialogRoute, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ds := t.byCallID[callID]
+	for i := len(ds) - 1; i >= 0; i-- {
+		d := ds[i]
+		if d.state == dialogEnded || d.route.publicRemote == "" {
+			continue
+		}
+		return d, d.route, true
+	}
+	return nil, dialogRoute{}, false
 }
 
 // count is the number of calls that are up — the same number the dialog
@@ -455,6 +485,25 @@ func (d *dialog) routeSnapshot() dialogRoute {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
 	return d.route
+}
+
+// tags returns the dialog's caller and callee tags. The callee tag is
+// empty while the dialog is early.
+func (d *dialog) tags() (caller, callee string) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.callerTag, d.calleeTag
+}
+
+// noteRelaxedNotify records that a NOTIFY was routed to this dialog by
+// Call-ID alone (issue #84) and reports whether it was the first time, so
+// the proxy warns once per dialog and logs the retries at Debug.
+func (d *dialog) noteRelaxedNotify() (first bool) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	first = !d.relaxedNotify
+	d.relaxedNotify = true
+	return first
 }
 
 // nextOrigin is the o= identity and version for a body FreeSBC is about to

@@ -252,7 +252,17 @@ These are structural rather than scheduled.
   routed by the `fsbc=` token in its Request-URI. An out-of-dialog NOTIFY
   (no To tag) from FreeSWITCH is forwarded when its Request-URI carries
   the token of a binding FreeSBC holds, and answered 481 otherwise; one
-  from a client is answered 481. FreeSWITCH's message-waiting NOTIFY
+  from a client is answered 481. A NOTIFY from FreeSWITCH whose tags match
+  no dialog is not refused on that account: if its Call-ID names a dialog
+  FreeSBC holds, it is forwarded to that dialog's client with its To header
+  untouched, whatever its To and From tags (the newest such dialog when
+  several share the Call-ID), and it is answered 481 only when no dialog
+  with that Call-ID has a client side to send to. This is for FreeSWITCH's
+  `uuid_phone_event` NOTIFY, whose To is copied from the `sip_full_to`
+  channel variable and can carry another leg's tag (issue #84); the first
+  one per dialog is logged at WARN, later retries at Debug. It applies to
+  NOTIFY from FreeSWITCH only: BYE, INFO and ACK, and every NOTIFY from a
+  client, still need tags that name the dialog. FreeSWITCH's message-waiting NOTIFY
   (`Event: message-summary`) is therefore forwarded to the phone, but MWI
   still does not work end to end, and BLF not at all, because the
   client's SUBSCRIBE is answered 405. The event framework is not
