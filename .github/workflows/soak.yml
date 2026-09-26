@@ -38,8 +38,8 @@ jobs:
     env:
       FREESBC_SOAK: ${{ inputs.soak_duration || '30m' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: soak
@@ -52,8 +52,8 @@ jobs:
     env:
       COUNT: ${{ inputs.repeat_count || '3' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: repeat
@@ -84,15 +84,15 @@ jobs:
     env:
       FUZZTIME: ${{ inputs.fuzz_time || '5m' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: fuzz
         run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime "$FUZZTIME" ${{ matrix.pkg }}
       - name: upload crashing input
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-${{ matrix.target }}
           path: ${{ matrix.pkg }}/testdata/fuzz/${{ matrix.target }}
