@@ -266,12 +266,23 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ netip.Ad
 //     answered 405, so FreeSWITCH holds no subscription a client could
 //     notify, and hashing an unsolicited NOTIFY from the internet onto a
 //     switch would only add load.
+//
+// A private-plane NOTIFY that HAS a To tag but that directionFor cannot
+// route (issue #84) is forwarded by Call-ID alone, through
+// relaxedNotifyDirection: FreeSWITCH's uuid_phone_event NOTIFY copies its
+// To from a channel variable, so the tag can be another leg's. It is
+// answered 481 only when no dialog with a public route carries the
+// Call-ID. BYE, INFO and ACK, and every NOTIFY from the public plane, keep
+// exact tag matching. The no-To-tag rule above is separate and unchanged.
 func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.AddrPort) {
 	if req.Method == sip.NOTIFY && fsip.ToTag(req) == "" && !s.arrivedOnPrivate(req) {
 		s.reject(req, tx, 481, "Subscription Does Not Exist")
 		return
 	}
 	from, to, dest, d, ok := s.directionFor(req)
+	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && s.arrivedOnPrivate(req) {
+		from, to, dest, d, ok = s.relaxedNotifyDirection(req)
+	}
 	if !ok {
 		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 		return
@@ -321,6 +332,53 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, _ netip.
 		// returning to the pool immediately and minutes later.
 		d.end()
 	}
+}
+
+// relaxedNotifyDirection routes a NOTIFY from the private plane whose tags
+// name no dialog (issue #84). FreeSWITCH sends the uuid_phone_event NOTIFY
+// (Event: talk/hold, BroadSoft remote call control) with a To header
+// copied verbatim from the sip_full_to channel variable (mod_sofia.c,
+// SWITCH_MESSAGE_INDICATE_PHONE_EVENT), so its tag can belong to another
+// leg; the client accepts it when registered directly to FreeSWITCH, and a
+// proxy stricter than the endpoint would leave a held call un-resumable.
+//
+// The caller has already established that the request is a NOTIFY with a
+// To tag, that it arrived on the private plane (FreeSWITCH, trusted), and
+// that directionFor found no route. The rule is then: a NOTIFY from the
+// private plane whose Call-ID names a dialog FreeSBC holds is forwarded to
+// that dialog's public side, and is never refused because of its tags —
+// neither the To tag nor the From tag is checked. When several records
+// share the Call-ID, the most recently created one with a usable public
+// route is chosen (newestRoutedByCallID; in practice the newest confirmed
+// dialog, because only a confirmed record has a route). It is still
+// refused (ok false, answered 481) when no record carries the Call-ID or
+// none has a public side to send to — there is nowhere to deliver it.
+//
+// The To header is forwarded verbatim: rewriting it to the dialog's tag
+// would make FreeSBC fabricate dialog state. The first relaxed routing on a
+// dialog is logged at WARN and later ones (FreeSWITCH retries about once a
+// second) at Debug, so an operator can see when the upstream defect stops
+// occurring. There is no counter: the edge metrics count requests by
+// method and transport, and none of them fits a routing decision.
+func (s *Server) relaxedNotifyDirection(req *sip.Request) (from, to side, dest string, d *dialog, ok bool) {
+	callID := fsip.CallID(req)
+	dd, r, found := s.dialogs.newestRoutedByCallID(callID)
+	if !found {
+		return side{}, side{}, "", nil, false
+	}
+	to, ok = s.topo.publicSide(r.transport)
+	if !ok {
+		return side{}, side{}, "", nil, false
+	}
+	callerTag, calleeTag := dd.tags()
+	attrs := []any{"sip_call_id", callID, "from_tag", fsip.FromTag(req), "stray_to_tag", fsip.ToTag(req),
+		"dialog_caller_tag", callerTag, "dialog_callee_tag", calleeTag}
+	if dd.noteRelaxedNotify() {
+		s.log.Warn("NOTIFY tags match no dialog; routed by Call-ID", attrs...)
+	} else {
+		s.log.Debug("NOTIFY tags match no dialog; routed by Call-ID", attrs...)
+	}
+	return s.topo.private, to, r.publicRemote, dd, true
 }
 
 // byeEndsDialog reports whether the far end's answer to a tag-matched BYE
