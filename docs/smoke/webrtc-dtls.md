@@ -48,7 +48,12 @@ FreeSWITCH version in your test notes.
   SBC's hostname, or in a lab a `mkcert` certificate whose CA is installed
   in the browser's trust store.
 - **A browser client:** `web-sip-phone`, or any sip.js page, registered as
-  `1000` with server URL `wss://<sbc-hostname>:18443`.
+  `1000` with server URL `wss://<sbc-hostname>:18443`. Leave reliable
+  provisionals (100rel) unsupported or supported, never *required*:
+  FreeSBC does not relay PRACK, so an INVITE with `Require: 100rel` is
+  answered `420 Bad Extension` (sip.js: keep `sipExtension100rel` at its
+  default, not `Required`). The browser must offer `a=rtcp-mux`; every
+  current browser does by default (`rtcpMuxPolicy: "require"`).
 - **Chrome or Chromium** for `chrome://webrtc-internals`. Firefox works
   for the call tests; its equivalent page is `about:webrtc`.
 - UDP from the browser to the public RTP range (`30000-39999` below) must
@@ -131,9 +136,13 @@ trunk listener without peers fails validation.
 | `freesbc_webrtc_ice_failure_total` | browser legs that never completed ICE, including legs closed before they were established (CANCEL, tab closed) |
 | `freesbc_webrtc_dtls_failure_total` | browser legs whose DTLS handshake failed, **including a fingerprint mismatch** |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | packets relayed, folded in when a session ends |
+| `freesbc_media_ports_in_use` | RTP port pairs held across all pools: +2 per browser call |
 
-`freesbc_media_ports_in_use` / `_total` report the trunk plane's pool
-only, so on the edge plane count sockets with `ss` (below).
+`freesbc_media_ports_in_use` / `_total` count RTP port pairs across every
+pool, the edge's public and private ones included. A browser call holds
+one pair in each, so `freesbc_media_ports_in_use` rises by 2 per call and
+must return to its baseline afterwards. `ss` (below) shows the same from
+the kernel's side.
 
 **Log lines** (slog text on stderr, default level Info):
 
@@ -145,6 +154,7 @@ only, so on the edge plane count sockets with `ss` (below).
 | `level=WARN msg="webrtc leg failed" err="media: dtls peer certificate does not match the signalled fingerprint: …"` | the fingerprint check failed inside the handshake (T5) |
 | `level=WARN msg="webrtc leg failed" err="media: webrtc session closed before establishment"` (or `…leg closed before it was established`) | the call ended while ICE/DTLS was still running (T6) |
 | `level=INFO msg="call ended" sip_call_id=… stats=…` | the dialog ended and its media counters were folded in |
+| `level=WARN msg="rejecting call: media setup failed" err=…` | the browser's offer was refused with 488 before any media was set up, for example an offer without `a=rtcp-mux` |
 
 Neither fingerprint and no ICE password is ever logged. Lines starting
 `ice ERROR` come from pion's own logger. `Failed to read UDP packet: … use
@@ -157,6 +167,12 @@ and a pair in the private range:
 ss -uanp 'sport >= :30000 and sport <= :39999' | grep -c freesbc   # public WebRTC legs
 ss -uanp 'sport >= :40000 and sport <= :49999' | grep -c freesbc   # private RTP/RTCP (2 per call)
 ```
+
+**Stopping FreeSBC.** Stop it only between cases, with no call up. On
+the edge plane, shutdown (SIGINT/SIGTERM) ends every call's media but
+sends no BYE, by design (`docs/design.md` §4.5): a browser still in a
+call only sees its audio stop. That is not a regression. The trunk plane
+does BYE its calls on shutdown, but this runbook does not use it.
 
 **Goroutines.** FreeSBC does not export a goroutine count. The #16 leak
 left pion ICE goroutines behind while the port was released correctly, so
@@ -403,5 +419,6 @@ Dialling an unregistered directory user also rings until the timeout.
 
 For each case, record pass or fail, the metric deltas, the relevant log
 lines (redact the Call-IDs if needed), and a webrtc-internals dump for T1
-and T5 (the **Create Dump** button). Attach them to the PR, and note the
-versions from the table at the top.
+and T5 (the **Create Dump** button). Attach them to the PR that changed the
+media path (for the #29/#16 change, which is already merged, comment on
+issue #29), and note the versions from the table at the top.
