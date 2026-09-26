@@ -9,6 +9,63 @@
 - Maintainer decisions (2026-09-24): P2-SHD-004 → delete; P2-TRK-016 → rewrite with option (c) (per-peer selection through `tls.Config` callbacks). Each is recorded as a "Decision (2026-09-24)" line at the finding's detail entry.
 - Repro shorthand: `DKR` = `docker run --rm -v "$PWD":/src -w /src golang:1.25.7`. Tests that bind sockets or need 127.0.0.2 (edge, trunk, media) are run through `DKR`; the pure unit tests in sip, sip/sdp, config, shield and admin run locally. Phase 3 agents also mounted Go module/build caches (`-v freesbc-gomod:/go/pkg/mod -v freesbc-gocache:/root/.cache`), which only speeds the run up.
 
+# 0. Status (2026-09-26)
+
+Closed out at main `8a87217` plus [#72](https://github.com/rasonyang/freesbc/issues/72). All 133 findings were grouped into 42 fix-unit issues ([#9](https://github.com/rasonyang/freesbc/issues/9)-[#50](https://github.com/rasonyang/freesbc/issues/50); tracking issue [#51](https://github.com/rasonyang/freesbc/issues/51)). 131 findings are resolved. The two findings in [#10](https://github.com/rasonyang/freesbc/issues/10) remain open on purpose: moving edge trust classification from the source address to the local socket must be validated on real dual-NIC hardware before it ships, so until then the private plane still trusts a packet by its source address (design.md §7.1, §14.2).
+
+Tests at close-out (Linux, Go 1.25.7):
+- `go test -race -count=1 -run Audit ./...`: every package ok (116 audit test and fuzz functions).
+- `go test -race -count=3 ./... -skip Audit`: every package ok.
+
+Code defects noticed during the [#50](https://github.com/rasonyang/freesbc/issues/50) docs pass are outside this audit and filed separately: [#69](https://github.com/rasonyang/freesbc/issues/69) (trunk REGISTER lifetime with several Contacts), [#70](https://github.com/rasonyang/freesbc/issues/70) (edge Max-Forwards off by one), [#71](https://github.com/rasonyang/freesbc/issues/71) (edge re-INVITE backstop sends no final response).
+
+One row per issue; the finding IDs (with aliases and severity) are those listed in the issue and in the summary table below.
+
+| Issue | Resolved by PR | Status | Findings |
+|---|---|---|---|
+| [#9](https://github.com/rasonyang/freesbc/issues/9) | [#54](https://github.com/rasonyang/freesbc/issues/54) | resolved | P0 P2-EDG-005; P1 P2-EDG-004; P1 P2-EDG-006; P1 P2-EDG-018; P1 P2-SDP-002 |
+| [#10](https://github.com/rasonyang/freesbc/issues/10) | — | **open**, deliberately deferred | P0 P2-EDG-003; P2 P2-EDG-021 |
+| [#11](https://github.com/rasonyang/freesbc/issues/11) | [#57](https://github.com/rasonyang/freesbc/issues/57) | resolved | P1 P2-TRK-002 |
+| [#12](https://github.com/rasonyang/freesbc/issues/12) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P1 P2-TRK-006; P1 P2-TRK-007; P1 P3-TRK-N01; P1 P2-TRK-022; P2 P2-TRK-025 |
+| [#13](https://github.com/rasonyang/freesbc/issues/13) | [#66](https://github.com/rasonyang/freesbc/issues/66) | resolved | P1 P2-TRK-016 |
+| [#14](https://github.com/rasonyang/freesbc/issues/14) | [#67](https://github.com/rasonyang/freesbc/issues/67) | resolved | P0 P2-EDG-001 (aka P2-MED-006) |
+| [#15](https://github.com/rasonyang/freesbc/issues/15) | [#67](https://github.com/rasonyang/freesbc/issues/67) | resolved | P0 P2-EDG-002 |
+| [#16](https://github.com/rasonyang/freesbc/issues/16) | [#61](https://github.com/rasonyang/freesbc/issues/61) | resolved | P0 P2-MED-001; P2 P2-MED-012 |
+| [#17](https://github.com/rasonyang/freesbc/issues/17) | [#59](https://github.com/rasonyang/freesbc/issues/59) | resolved | P0 P2-SHD-001 |
+| [#18](https://github.com/rasonyang/freesbc/issues/18) | [#59](https://github.com/rasonyang/freesbc/issues/59) | resolved | P0 P2-SHD-002; P1 P2-SHD-003 |
+| [#19](https://github.com/rasonyang/freesbc/issues/19) | [#59](https://github.com/rasonyang/freesbc/issues/59) | resolved | P0 P2-TRK-001 |
+| [#20](https://github.com/rasonyang/freesbc/issues/20) | [#64](https://github.com/rasonyang/freesbc/issues/64) | resolved | P1 P2-CFG-001; P1 P3-CORE-001 |
+| [#21](https://github.com/rasonyang/freesbc/issues/21) | [#68](https://github.com/rasonyang/freesbc/issues/68) | resolved | P1 P2-CFG-002; P1 P2-TRK-004; P2 P2-CFG-007; P2 P2-APP-003; P2 P2-EDG-025 |
+| [#22](https://github.com/rasonyang/freesbc/issues/22) | [#64](https://github.com/rasonyang/freesbc/issues/64) | resolved | P1 P2-ADM-001 (aka P2-CFG-003); P2 P2-CFG-005; P2 P2-CFG-006 |
+| [#23](https://github.com/rasonyang/freesbc/issues/23) | [#65](https://github.com/rasonyang/freesbc/issues/65) | resolved | P1 P2-ADM-002; P2 P2-ADM-003 |
+| [#24](https://github.com/rasonyang/freesbc/issues/24) | [#55](https://github.com/rasonyang/freesbc/issues/55) | resolved | P1 P2-EDG-011; P1 P2-EDG-012; P1 P2-EDG-013; P2 P2-EDG-024 |
+| [#25](https://github.com/rasonyang/freesbc/issues/25) | [#55](https://github.com/rasonyang/freesbc/issues/55) | resolved | P1 P2-EDG-014; P1 P2-EDG-015 |
+| [#26](https://github.com/rasonyang/freesbc/issues/26) | [#54](https://github.com/rasonyang/freesbc/issues/54) | resolved | P1 P2-EDG-032; P1 P2-EDG-008; P1 P2-EDG-009; P2 P2-EDG-020; P2 P2-EDG-023; P2 P2-EDG-029 |
+| [#27](https://github.com/rasonyang/freesbc/issues/27) | [#61](https://github.com/rasonyang/freesbc/issues/61) | resolved | P1 P2-MED-003 (aka P2-SDP-004); P1 P2-MED-005 |
+| [#28](https://github.com/rasonyang/freesbc/issues/28) | [#61](https://github.com/rasonyang/freesbc/issues/61) | resolved | P1 P2-MED-004; P1 P3-MED-001; P2 P2-MED-007 (aka P1-011); P2 P1-012 |
+| [#29](https://github.com/rasonyang/freesbc/issues/29) | [#61](https://github.com/rasonyang/freesbc/issues/61) | resolved | P1 P2-MED-002 (aka P2-EDG-017,P1-001); P2 P1-007 |
+| [#30](https://github.com/rasonyang/freesbc/issues/30) | [#62](https://github.com/rasonyang/freesbc/issues/62) | resolved | P1 P2-SDP-001 (aka P2-EDG-016); P1 P2-SDP-003 (aka P2-EDG-030); P1 P2-SDP-005 |
+| [#31](https://github.com/rasonyang/freesbc/issues/31) | [#63](https://github.com/rasonyang/freesbc/issues/63) | resolved | P1 P2-SIP-001 (aka P2-EDG-019,PH0-007); P1 P2-EDG-028 |
+| [#32](https://github.com/rasonyang/freesbc/issues/32) | [#62](https://github.com/rasonyang/freesbc/issues/62) | resolved | P1 P2-SIP-005; P2 P2-EDG-026 |
+| [#33](https://github.com/rasonyang/freesbc/issues/33) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P1 P2-TRK-009; P1 P2-TRK-010; P1 P2-TRK-015; P2 P2-TRK-018 |
+| [#34](https://github.com/rasonyang/freesbc/issues/34) | [#67](https://github.com/rasonyang/freesbc/issues/67) | resolved | P1 P2-EDG-010 |
+| [#35](https://github.com/rasonyang/freesbc/issues/35) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P1 P2-TRK-011; P1 P2-TRK-012 |
+| [#36](https://github.com/rasonyang/freesbc/issues/36) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P1 P2-TRK-003; P1 P2-TRK-008; P1 P2-TRK-013; P2 P2-TRK-014; P2 P2-TRK-019 |
+| [#37](https://github.com/rasonyang/freesbc/issues/37) | [#68](https://github.com/rasonyang/freesbc/issues/68) | resolved | P1 P2-TRK-017 (aka P2-APP-001); P2 P2-EDG-027; P2 P2-APP-008 |
+| [#38](https://github.com/rasonyang/freesbc/issues/38) | [#68](https://github.com/rasonyang/freesbc/issues/68) | resolved | P1 P2-TRK-005; P2 P2-MED-009; P2 P2-APP-004 |
+| [#39](https://github.com/rasonyang/freesbc/issues/39) | [#65](https://github.com/rasonyang/freesbc/issues/65) | resolved | P2 P2-ADM-004; P2 P2-ADM-005; P2 P2-ADM-006 |
+| [#40](https://github.com/rasonyang/freesbc/issues/40) | [#68](https://github.com/rasonyang/freesbc/issues/68) | resolved | P2 P2-APP-002; P2 P2-APP-005 (aka P2-ADM-007,PH0-002); P2 P2-APP-007 |
+| [#41](https://github.com/rasonyang/freesbc/issues/41) | [#65](https://github.com/rasonyang/freesbc/issues/65) | resolved | P2 P2-CFG-004 (aka P2-APP-006,PH0-003); P2 P2-CFG-008; P2 P2-CFG-009; P2 P2-CFG-010; P2 P2-CFG-011; P2 P1-008 |
+| [#42](https://github.com/rasonyang/freesbc/issues/42) | [#55](https://github.com/rasonyang/freesbc/issues/55) | resolved | P2 P2-EDG-022; P2 P2-EDG-031; P2 P2-EDG-034; P2 P1-009 |
+| [#43](https://github.com/rasonyang/freesbc/issues/43) | [#61](https://github.com/rasonyang/freesbc/issues/61) | resolved | P2 P2-MED-011; P2 P2-MED-013; P2 P2-MED-010; P2 P2-MED-008 |
+| [#44](https://github.com/rasonyang/freesbc/issues/44) | [#59](https://github.com/rasonyang/freesbc/issues/59) | resolved | P2 P2-SHD-004 (aka P1-002,P2-TRK-026); P2 P2-SHD-007; P2 P2-SHD-010 |
+| [#45](https://github.com/rasonyang/freesbc/issues/45) | [#59](https://github.com/rasonyang/freesbc/issues/59) | resolved | P2 P2-SHD-005; P2 P2-SHD-006; P2 P2-SHD-008; P2 P2-SHD-009 |
+| [#46](https://github.com/rasonyang/freesbc/issues/46) | [#62](https://github.com/rasonyang/freesbc/issues/62) | resolved | P2 P2-SIP-002 (aka P2-SIP-003); P2 P2-SIP-004; P2 P2-SIP-007; P2 P2-SIP-008; P2 P2-SIP-009 |
+| [#47](https://github.com/rasonyang/freesbc/issues/47) | [#62](https://github.com/rasonyang/freesbc/issues/62) | resolved | P2 P2-SDP-006; P2 P2-SDP-009; P2 P2-SDP-012; P2 P2-SDP-011; P2 P2-SDP-010; P2 P2-SDP-007; P2 P2-SDP-008 |
+| [#48](https://github.com/rasonyang/freesbc/issues/48) | [#58](https://github.com/rasonyang/freesbc/issues/58) | resolved | P2 P2-TRK-020; P2 P2-TRK-021; P2 P2-TRK-023 |
+| [#49](https://github.com/rasonyang/freesbc/issues/49) | [#53](https://github.com/rasonyang/freesbc/issues/53) | resolved | P2 P1-003; P2 P1-004; P2 P1-005; P2 P1-006; P2 P2-APP-009; P2 P1-010 |
+| [#50](https://github.com/rasonyang/freesbc/issues/50) | [#72](https://github.com/rasonyang/freesbc/issues/72) | resolved | P2 PH0-006 (aka P2-TRK-024); P2 PH0-001; P2 PH0-004; P2 PH0-005; P2 P2-EDG-033; P2 P2-ADM-008 |
+
 # 1. Extracted invariants (from docs/)
 
 Sources: CLAUDE.md, README.md, docs/design.md (all 3013 lines), docs/edge.md, docs/trunk.md, go.mod, package tree. `D` = docs/design.md, `C` = CLAUDE.md. Every line reference was checked with `grep -n`/`sed -n`.
