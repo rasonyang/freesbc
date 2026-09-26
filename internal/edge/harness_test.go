@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -263,7 +262,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
-	assertProxyServing(t, srv, net.JoinHostPort(pubBindIP, strconv.Itoa(pubUDP)), h.privateSIP)
+	assertProxyServing(t, srv)
 	return h
 }
 
@@ -471,7 +470,7 @@ shield:
 		t.Fatal("proxy never became ready")
 	}
 	t.Cleanup(h.stop)
-	assertProxyServing(t, srv, h.publicUDP, h.privateSIP)
+	assertProxyServing(t, srv)
 	return h, switches
 }
 
@@ -597,9 +596,9 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 	return f
 }
 
-// assertProxyServing fails the test unless every proxy UDP listener at
-// udpAddrs is already in its sipgo transport's connection pool the moment
-// Ready has closed — without waiting.
+// assertProxyServing fails the test unless every proxy UDP listener is
+// already in its sipgo transport's connection pool the moment Ready has
+// closed — without waiting.
 //
 // sipgo adds a UDP listener to the pool only from the goroutine serving
 // it. A request the proxy sends from that listener's address before then
@@ -608,11 +607,24 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 // closes Ready only once every UDP listener is pooled; the harnesses check
 // that here, on every start, rather than wait the window out.
 //
+// The addresses checked are the topology's pins, which Run rewrites to
+// each socket's real local address before Ready closes — what outbound
+// requests name and what sipgo keys its pool by. A configured wildcard is
+// not that address: on a host with IPv6, 0.0.0.0 binds a dual-stack
+// socket whose local address is [::]:port.
+//
 // regression: edge startup race
-func assertProxyServing(t *testing.T, srv *Server, udpAddrs ...string) {
+func assertProxyServing(t *testing.T, srv *Server) {
 	t.Helper()
-	tl := srv.srv.TransportLayer() // written before Ready closed
-	for _, addr := range udpAddrs {
+	tl := srv.srv.TransportLayer()             // written before Ready closed
+	pins := []sip.Addr{srv.topo.private.laddr} // srv.topo is re-pinned before Ready too
+	for _, s := range srv.topo.public {
+		if s.transport == "udp" {
+			pins = append(pins, s.laddr)
+		}
+	}
+	for _, laddr := range pins {
+		addr := laddr.String()
 		if c, err := tl.GetConnection("udp", addr); err != nil || c == nil {
 			t.Errorf("Ready closed before the proxy's udp listener %s was serving (err=%v)", addr, err)
 		}
