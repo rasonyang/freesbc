@@ -50,7 +50,7 @@ func TestTeardownLeavesByPrivateListener(t *testing.T) {
 // request.
 func TestTeardownLeavesByPublicListenerOnWildcardBind(t *testing.T) {
 	carrierAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	h := startHarnessCfg(t, false, "0.0.0.0", "127.0.0.2", func(pubUDP int) string {
+	h := startHarnessCfg(t, false, "0.0.0.0", func(pubUDP int) string {
 		return fmt.Sprintf("  pstn:\n    address: %s\n    match: 127.0.0.1:%d\n", carrierAddr, pubUDP)
 	})
 	carrier := startFakeSwitch(t, carrierAddr)
