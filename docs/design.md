@@ -1,7 +1,7 @@
 # FreeSBC Design
 
 This document describes FreeSBC as it is implemented in this repository
-(module `github.com/freesbc/freesbc`, Go 1.25.7). It describes code that
+(module `github.com/freesbc/freesbc`, Go 1.27.1). It describes code that
 exists. It contains no roadmap, no tutorial, and no generic protocol
 background; where a behaviour is unusual or fragile it is stated as the
 current behaviour without a recommendation.

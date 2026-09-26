@@ -1,6 +1,6 @@
 module github.com/freesbc/freesbc
 
-go 1.25.14
+go 1.27.1
 
 require (
 	github.com/emiago/sipgo v1.4.3
