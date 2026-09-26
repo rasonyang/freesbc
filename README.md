@@ -53,7 +53,7 @@ rtp:
   private: { bind_ip: 10.77.0.2, port_min: 40000, port_max: 49999 }
 ```
 
-Then validate and run:
+Then validate and run. Both local copies, `sbc.yaml` and `edge.yaml`, are gitignored, since they may hold credentials and real addresses:
 
 ```sh
 ./freesbc check -c sbc.yaml    # validate: errors name the line and field (use edge.yaml for the edge deployment)
