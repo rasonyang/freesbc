@@ -439,8 +439,22 @@ type auditBalance struct {
 	settleFor time.Duration
 }
 
-// assert checks every resource counter and reports all violations.
+// assert checks every resource counter and the goroutine count, and
+// reports all violations.
 func (b auditBalance) assert(t *testing.T) {
+	t.Helper()
+	b.assertCounters(t)
+	within := b.settleFor
+	if within == 0 {
+		within = 40 * time.Second
+	}
+	if n, stacks := auditGoroutinesSettle(b.baseline, within); stacks != "" {
+		t.Errorf("goroutines = %d after %v, baseline %d; by top frame:\n%s", n, within, b.baseline, stacks)
+	}
+}
+
+// assertCounters is assert without the goroutine check.
+func (b auditBalance) assertCounters(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
@@ -484,13 +498,6 @@ func (b auditBalance) assert(t *testing.T) {
 		if missing > 0 {
 			t.Errorf("%d of %d callers never received a BYE from the SBC", missing, len(b.uacs))
 		}
-	}
-	within := b.settleFor
-	if within == 0 {
-		within = 40 * time.Second
-	}
-	if n, stacks := auditGoroutinesSettle(b.baseline, within); stacks != "" {
-		t.Errorf("goroutines = %d after %v, baseline %d; by top frame:\n%s", n, within, b.baseline, stacks)
 	}
 }
 

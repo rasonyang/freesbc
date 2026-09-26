@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build the only binary: `go build -o freesbc ./cmd/freesbc` (`/freesbc` is gitignored). Set the version with `-ldflags "-X main.version=<v>"` (default `dev`).
-- Vet: `go vet ./...`. There is no linter config, Makefile or CI; `gofmt -l .` is currently clean.
+- Vet: `go vet ./...`. There is no linter config or Makefile; `gofmt -l .` and `go mod tidy -diff` are clean and CI keeps them so.
+- CI (`.github/workflows/ci.yml`, on push to main and PRs): gofmt, `go mod tidy -diff`, vet, build, `check` on both example configs, `go test -race ./...`, and govulncheck (pinned v1.1.4, `GOTOOLCHAIN=local`). `soak.yml` runs nightly and on demand: the trunk soak, the suite under `-race -count=N`, and each `Fuzz*` target for `-fuzztime`. A new fuzz target must be added to its matrix.
+- Soak: `FREESBC_SOAK=10m go test -race -run '^TestSoakTrunkCalls$' -v ./internal/trunk` places calls in rounds for that long and fails on goroutine, live-heap or fd growth (`internal/trunk/soak_test.go`, SIP 13800-13801, media 13900-13999). Without `FREESBC_SOAK` it skips.
 - Tests (as the README runs them): `go test ./... -race`. One package: `go test -race ./internal/config`. One test: `go test ./internal/app -run '^TestCheckExamples$' -count=1 -v`.
 - No build tags. The trunk and edge suites are mostly integration tests over real loopback sockets (real sipgo transports and RTP sockets), not mocks.
 - CLI: `freesbc run|check [-c file]`. `-c` defaults to `sbc.yaml`; a positional argument is a usage error (exit 2), so always pass `-c`.
