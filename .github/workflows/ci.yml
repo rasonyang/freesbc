@@ -1,0 +1,87 @@
+# Fast checks on every push to main and every pull request: formatting,
+# module tidiness, vet, build, the example configs, the full test suite
+# under the race detector, and known-vulnerability scanning. The long
+# checks (soak, repeated runs, fuzzing) live in soak.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: gofmt / tidy / vet / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: go mod tidy -diff
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build -o freesbc -ldflags "-X main.version=${GITHUB_SHA::12}" ./cmd/freesbc
+
+      - name: check example configs
+        env:
+          CARRIER_A_PASS: ci-placeholder
+        run: |
+          ./freesbc check -c sbc.example.yaml
+          ./freesbc check -c edge.example.yaml
+
+  test:
+    name: go test -race
+    runs-on: ubuntu-latest
+    # The trunk package alone takes ~4 min under -race.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Linux routes all of 127/8, so the tests that bind 127.0.0.2 and
+      # 127.0.0.9 run here (they fail on a stock macOS runner).
+      - name: go test -race
+        run: go test -race -count=1 -timeout 20m ./... 2>&1 | grep -v 'UDP ref went negative on try close'; exit "${PIPESTATUS[0]}"
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Pinned to a release that builds with the go.mod toolchain, so the
+      # standard library is scanned at the version freesbc is built with.
+      - name: govulncheck
+        env:
+          GOTOOLCHAIN: local
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
