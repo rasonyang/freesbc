@@ -2,7 +2,7 @@
 
 An all-in-one open-source Session Border Controller with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.25.14-00ADD8.svg)](go.mod)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.27.1-00ADD8.svg)](go.mod)
 
 - **Pure Go, one static binary, zero external dependencies** — no database, no Redis, no kernel modules, no container orchestration, and **no external media process**.
 - **Keeps FreeSWITCH off the public internet** — the edge proxy is the only thing with a public address; FreeSWITCH stays on the private LAN and only ever talks to FreeSBC.
@@ -13,7 +13,7 @@ Deploying a traditional SBC stack (FreeSWITCH + Redis + Python + Lua + nftables 
 
 ## Install
 
-Requires Go ≥ 1.25.14.
+Requires Go ≥ 1.27.1.
 
 ```sh
 go build -o freesbc ./cmd/freesbc

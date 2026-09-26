@@ -72,7 +72,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 
   Two more bind 127.0.0.2 but skip, not fail, when it is missing: `TestAuditTCPCapExhaustedByNonPeers` (trunk) and `TestAuditMED006LooseLatchFirstPacketHijack` (media).
 
-  Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.25.14 go test -race -count=1 ./...`.
+  Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.27.1 go test -race -count=1 ./...`.
 - Test ports: each package owns a disjoint band, all below 32768 (the start of Linux's ephemeral range, so the kernel never hands a test's fixed port to a client socket; macOS's starts at 49152). Keep new test ports inside the package's band:
 
   | Band | Package | How ports are chosen |
