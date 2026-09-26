@@ -135,6 +135,7 @@ type harness struct {
 
 	publicUDP  string // where a SIP/UDP phone sends
 	publicWS   string // where a browser connects
+	publicWSS  string // where a browser connects over TLS ("" unless startHarnessWSS)
 	privateSIP string // the proxy's FreeSWITCH-facing socket
 	upstream   string // the fake FreeSWITCH
 
@@ -182,8 +183,26 @@ func startHarnessOn(t *testing.T, webrtc bool, pubBindIP string) *harness {
 // the sip.pstn section ("" disables the trunk).
 func startHarnessCfg(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, pstn func(pubUDP int) string) *harness {
 	t.Helper()
+	return startHarnessWith(t, webrtc, pubBindIP, upstreamIP, pstn, false)
+}
+
+// startHarnessWSS is startHarness with a wss listener as well, serving
+// the self-signed certificate the proxy falls back to without cert_file
+// (newWSSClient skips verification).
+func startHarnessWSS(t *testing.T, webrtc bool) *harness {
+	t.Helper()
+	return startHarnessWith(t, webrtc, "127.0.0.1", "127.0.0.1", nil, true)
+}
+
+func startHarnessWith(t *testing.T, webrtc bool, pubBindIP, upstreamIP string, pstn func(pubUDP int) string, wss bool) *harness {
+	t.Helper()
 	pubUDP := freePort(t)
 	pubWS := freeTCPPort(t)
+	wssBlock, publicWSS := "", ""
+	if wss {
+		publicWSS = fmt.Sprintf("127.0.0.1:%d", freeTCPPort(t))
+		wssBlock = fmt.Sprintf("    wss: {enabled: true, bind: \"%s\"}\n", publicWSS)
+	}
 	priv := freePort(t)
 	up := freePort(t)
 	// Media ranges are per-harness so no two tests contend for a port.
@@ -205,7 +224,7 @@ sip:
   public:
     udp: {enabled: true, bind: "%s:%d"}
     ws:  {enabled: true, bind: "127.0.0.1:%d"}
-  private:
+%s  private:
     bind: "127.0.0.1:%d"
   upstream:
     address: %s:%d
@@ -223,7 +242,7 @@ shield:
   # 20/s per_ip would throttle the harness itself rather than the code
   # under test. The rate limiter has its own tests in package shield.
   rate_limit: "5000/s per_ip"
-`, pubBindIP, pubUDP, pubWS, priv, upstreamIP, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
+`, pubBindIP, pubUDP, pubWS, wssBlock, priv, upstreamIP, up, pstnBlock, mediaBase, mediaBase+199, mediaBase+200, mediaBase+399, webrtc)
 
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -240,6 +259,7 @@ shield:
 		t: t, srv: srv, store: store,
 		publicUDP:  fmt.Sprintf("127.0.0.1:%d", pubUDP),
 		publicWS:   fmt.Sprintf("127.0.0.1:%d", pubWS),
+		publicWSS:  publicWSS,
 		privateSIP: fmt.Sprintf("127.0.0.1:%d", priv),
 		upstream:   fmt.Sprintf("%s:%d", upstreamIP, up),
 		done:       make(chan struct{}),

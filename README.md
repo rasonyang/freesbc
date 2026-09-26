@@ -134,7 +134,7 @@ Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its o
 - Session timers are negotiated, but no timer tears a call down on session expiry (on the trunk plane, a refresh the SBC itself sends that fails does end the call).
 - The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
 - The admin API lists edge-proxy dialogs alongside trunk calls, but teardown (`DELETE /api/calls/{id}`) covers trunk-plane calls only.
-- The edge proxy has further structural limits — inbound calls to browsers, offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
+- The edge proxy has further structural limits — offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
 
 ## Roadmap
 

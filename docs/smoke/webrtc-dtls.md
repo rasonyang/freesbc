@@ -248,14 +248,33 @@ late).
    `originate user/1000 &playback(local_stream://moh)`, or
    `originate user/1000 9196 XML default` for echo.
 2. **Expected:** the browser rings. FreeSWITCH's INVITE reaches it
-   through the SBC, and the offer the browser sees has `a=ice-lite`, one
-   host candidate at `203.0.113.7`, and the SBC's fingerprint.
+   through the SBC (the `proxying INVITE to client` log line shows
+   `webrtc=true`), and the offer the browser sees is the SBC's own
+   DTLS-SRTP offer: `m=audio … UDP/TLS/RTP/SAVPF`, `a=ice-lite`, exactly
+   one host candidate at `203.0.113.7`, the SBC's fingerprint,
+   `a=rtcp-mux` and `a=setup:actpass`. No `10.77.0.x` address appears in
+   it.
 3. Answer in the browser.
-   **Expected:** `webrtc media established` in the log, music (or echo)
-   plays, and webrtc-internals shows the same state as T1 step 4.
+   **Expected:** the browser's answer normally carries `a=setup:active`,
+   which makes the SBC the DTLS server. `webrtc media established` in the
+   log, music (or echo) plays, and webrtc-internals shows the same state
+   as T1 step 4. `freesbc_active_webrtc_sessions` is 1 and
+   `freesbc_media_ports_in_use` is 2 above baseline. In `fs_cli`
+   (`sofia global siptrace on`), the 200 OK FreeSWITCH receives is plain
+   `RTP/AVP` at `10.77.0.2` with no ICE, fingerprint or browser address.
 4. Hang up from the browser.
    **Expected:** everything returns to baseline and the failure counters
    are unchanged.
+5. Repeat steps 1-4 with the browser registered over the other signaling
+   transport: `wss://` straight to the SBC's `sip.public.wss` listener
+   if you used a TLS-terminating proxy in front of `sip.public.ws`, or
+   the reverse. **Expected:** identical results; only the recorded
+   transport differs.
+
+If the SBC runs with `webrtc.enabled: false`, the same `originate` fails
+with **488** from the SBC and the log line `rejecting call to WebSocket
+client: webrtc.enabled is false, so no DTLS-SRTP offer can be built`; the
+browser never rings. That is expected and is not a T2 pass.
 
 ### T3: re-INVITE and hold during the call
 

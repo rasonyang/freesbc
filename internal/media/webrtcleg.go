@@ -35,6 +35,12 @@ import (
 // Lifecycle: NewWebRTCLeg (allocates the socket and ICE credentials, so
 // the answer SDP can be built) → Start (background: ICE accept, DTLS
 // handshake, SRTP keying; publishes readiness on Ready) → Close.
+//
+// An offerer leg (WebRTCLegConfig.Offerer, for a call placed TO a browser)
+// inserts one step: NewWebRTCLeg → the offer goes out → SetRemote with
+// the browser's answer → Start → Close. Its remote credentials, DTLS role
+// and fingerprint do not exist until the answer arrives, so establishment
+// cannot begin before then.
 type WebRTCLeg struct {
 	pool *PlanePool
 	conn *net.UDPConn
@@ -47,13 +53,21 @@ type WebRTCLeg struct {
 
 	identity *DTLSIdentity
 
-	// remote credentials and DTLS role, set from the browser's offer.
+	// remote credentials and DTLS role, set from the browser's offer —
+	// or, on an offerer leg, from its answer by SetRemote. They are
+	// written under mu and only before Start, and establish reads them
+	// only after Start has claimed the leg under mu, so that lock is the
+	// happens-before edge between the two.
 	remoteUfrag string
 	remotePwd   string
 	dtlsClient  bool
 	// remoteFingerprint is the browser's signalled a=fingerprint, checked
 	// inside the DTLS handshake when set. Zero means none was given.
 	remoteFingerprint fingerprint
+	// offerer marks a leg built for FreeSBC's own offer; remoteSet says
+	// the remote half above is known (always, for an answerer leg).
+	offerer   bool
+	remoteSet bool
 
 	// verified gates media: the relay forwards nothing to or from the
 	// browser until the DTLS peer's certificate has been matched against
@@ -146,6 +160,11 @@ type WebRTCLegConfig struct {
 	// NAT'ed deployment advertises the reachable address while the socket
 	// binds the private one.
 	AdvertisedIP netip.Addr
+	// Offerer builds the leg for an SDP offer FreeSBC sends before the
+	// browser has answered: a call placed to a browser. The Remote*
+	// fields below are then ignored — they are supplied from the answer
+	// through SetRemote — and DTLSSetup reports "actpass" until they are.
+	Offerer bool
 	// RemoteUfrag/RemotePwd come from the browser's offer.
 	RemoteUfrag string
 	RemotePwd   string
@@ -188,12 +207,17 @@ var (
 
 // NewWebRTCLeg allocates the leg's socket and ICE identity. It performs no
 // network I/O beyond binding, so the caller can build and send the SDP
-// answer immediately and only then Start the handshake.
+// answer (or, for an offerer leg, the offer) immediately and only then
+// Start the handshake.
 func NewWebRTCLeg(pool *PlanePool, cfg WebRTCLegConfig) (*WebRTCLeg, error) {
 	if cfg.Identity == nil {
 		return nil, errors.New("media: webrtc leg needs a DTLS identity")
 	}
-	if cfg.RemoteUfrag == "" || cfg.RemotePwd == "" {
+	if cfg.Offerer {
+		// Nothing about the browser is known yet; SetRemote fills it in.
+		cfg.RemoteUfrag, cfg.RemotePwd, cfg.RemoteSetup = "", "", ""
+		cfg.RemoteFingerprintHash, cfg.RemoteFingerprintValue = "", ""
+	} else if cfg.RemoteUfrag == "" || cfg.RemotePwd == "" {
 		return nil, errors.New("media: webrtc leg needs the remote ICE credentials")
 	}
 	if !cfg.AdvertisedIP.IsValid() {
@@ -231,6 +255,8 @@ func NewWebRTCLeg(pool *PlanePool, cfg WebRTCLegConfig) (*WebRTCLeg, error) {
 		// from the browser makes us the client.
 		dtlsClient:        cfg.RemoteSetup == "passive",
 		remoteFingerprint: fp,
+		offerer:           cfg.Offerer,
+		remoteSet:         !cfg.Offerer,
 		ready:             make(chan struct{}),
 		closed:            make(chan struct{}),
 	}
@@ -244,12 +270,93 @@ func (l *WebRTCLeg) Port() int { return l.port }
 // LocalCredentials are the ICE ufrag/pwd for the SDP answer.
 func (l *WebRTCLeg) LocalCredentials() (ufrag, pwd string) { return l.localUfrag, l.localPwd }
 
-// DTLSSetup is the a=setup value the answer must carry.
+// DTLSSetup is the a=setup value every body toward the browser carries.
+// On an offerer leg whose answer has not arrived it is "actpass" — the
+// offer leaves the role to the answerer (RFC 5763 §5). Otherwise it is the
+// role this leg plays: "active" as the DTLS client, "passive" as the
+// server — what an answer states, and what a later re-offer restates to
+// keep the existing association (RFC 8842 §5.5).
 func (l *WebRTCLeg) DTLSSetup() string {
-	if l.dtlsClient {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch {
+	case !l.remoteSet:
+		return "actpass"
+	case l.dtlsClient:
 		return "active"
+	default:
+		return "passive"
 	}
-	return "passive"
+}
+
+// WebRTCRemote is the browser's half of an offerer leg, taken from its SDP
+// answer.
+type WebRTCRemote struct {
+	Ufrag string
+	Pwd   string
+	// Setup is the answer's a=setup: "active" (the browser is the DTLS
+	// client, FreeSBC the server — what an answerer to actpass normally
+	// picks) or "passive" (FreeSBC is the client). An absent a=setup
+	// means "active" (RFC 4145 §4). "actpass" and "holdconn" are not
+	// roles an answer may take, and are refused.
+	Setup string
+	// FingerprintHash/FingerprintValue are the answer's a=fingerprint,
+	// checked inside the DTLS handshake as on an answerer leg.
+	FingerprintHash  string
+	FingerprintValue string
+}
+
+// ErrRemoteMismatch is returned by SetRemote when the leg already has a
+// different remote: one leg carries one ICE and DTLS association.
+var ErrRemoteMismatch = errors.New("media: webrtc leg already has a different remote")
+
+// SetRemote supplies an offerer leg's remote credentials, DTLS role and
+// fingerprint from the browser's answer. It must be called before Start.
+//
+// Restating the same remote is a no-op, so a caller need not track whether
+// an answer it has seen before was already applied; a different one is
+// ErrRemoteMismatch. It fails on a leg that was not built as an offerer,
+// whose remote was fixed at allocation.
+func (l *WebRTCLeg) SetRemote(r WebRTCRemote) error {
+	if r.Ufrag == "" || r.Pwd == "" {
+		return fmt.Errorf("%w: answer carries no ICE credentials", ErrICEFailed)
+	}
+	var client bool
+	switch r.Setup {
+	case "", "active":
+		client = false
+	case "passive":
+		client = true
+	default:
+		return fmt.Errorf("%w: answer a=setup:%s is not a DTLS role", ErrDTLSHandshake, r.Setup)
+	}
+	var fp fingerprint
+	if r.FingerprintHash != "" || r.FingerprintValue != "" {
+		var err error
+		if fp, err = newFingerprint(r.FingerprintHash, r.FingerprintValue); err != nil {
+			return err
+		}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.offerer {
+		return errors.New("media: SetRemote on a webrtc leg that is not an offerer")
+	}
+	if l.remoteSet {
+		if l.remoteUfrag == r.Ufrag && l.remotePwd == r.Pwd &&
+			l.dtlsClient == client && l.remoteFingerprint == fp {
+			return nil
+		}
+		return ErrRemoteMismatch
+	}
+	if l.state != legAllocated {
+		return fmt.Errorf("%w: SetRemote after the leg left its allocated state", ErrWebRTCNotReady)
+	}
+	l.remoteUfrag, l.remotePwd = r.Ufrag, r.Pwd
+	l.dtlsClient = client
+	l.remoteFingerprint = fp
+	l.remoteSet = true
+	return nil
 }
 
 // Ready is closed once the leg is established or has failed; Err then
@@ -270,6 +377,10 @@ func (l *WebRTCLeg) Err() error {
 // legAllocated → legEstablishing transition is claimed under mu, so a
 // second Start (or a Start after Close) cannot launch a second establish
 // that would build another ICE agent over the same socket and leak it.
+//
+// An offerer leg started before SetRemote has nothing to establish
+// against: it fails at once (and is closed) rather than running ICE with
+// empty credentials until the deadline.
 func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -277,6 +388,12 @@ func (l *WebRTCLeg) Start(ctx context.Context, timeout time.Duration) {
 	l.mu.Lock()
 	if l.state != legAllocated {
 		l.mu.Unlock()
+		return
+	}
+	if !l.remoteSet {
+		l.set(legFailed, fmt.Errorf("%w: started before the remote credentials were supplied", ErrICEFailed))
+		l.mu.Unlock()
+		_ = l.Close()
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)

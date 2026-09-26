@@ -65,7 +65,7 @@ configuration, and the "Edge proxy plane" section of
 | SDP | A typed subsystem over `pion/sdp/v3` — no string manipulation. Bodies are **constructed**, never derived from the other leg, which is what makes the two address-leak guarantees structural. |
 | Codecs | PCMU, PCMA, Opus and RFC 4733 telephone-event, passed through with the offerer's payload numbers. **No transcoding**: no common codec means a clean 488. |
 | Media | Every stream anchored on an SBC port pair. Symmetric RTP: on this (edge) plane the destination is seeded from SDP so audio flows immediately, then corrected by the first authenticated packet; the trunk plane seeds only the answering side (from its answer), so media toward the caller flows once the caller sends. A destination is never an unspecified, multicast, broadcast or link-local address, nor a loopback one unless the SBC's own media plane is on loopback. The public leg latches loosely (a hard-NAT phone may signal an unroutable address), but ranks sources: the exact SDP address beats the SDP or SIP source IP, which beats anything else, and a better-ranked source takes the latch back. An off-path source that sends first therefore holds the call's audio only until the phone's first packet; when the SDP address is the phone's SIP address, audio is not redirected to another port for 3 s. The private leg latches strictly on FreeSWITCH's signalled IP. |
-| WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint` inside the DTLS handshake, so a mismatched peer never gets SRTP keys and no media is relayed for it. Manual real-browser test: [`docs/smoke/webrtc-dtls.md`](smoke/webrtc-dtls.md). |
+| WebRTC | ICE-Lite → DTLS → SRTP/SRTCP with RTCP-mux, built directly on `pion/ice`, `pion/dtls` and `pion/srtp` — no `PeerConnection`. The peer certificate is checked against the signalled `a=fingerprint` inside the DTLS handshake, so a mismatched peer never gets SRTP keys and no media is relayed for it. Both call directions: a browser's own offer is answered, and a call FreeSWITCH places to a client registered over ws or wss gets FreeSBC's own DTLS-SRTP offer (`a=setup:actpass`), whose leg starts when the browser answers. Manual real-browser test: [`docs/smoke/webrtc-dtls.md`](smoke/webrtc-dtls.md). |
 | DTMF | RFC 4733 telephone-event traverses the relay untouched; SIP INFO is proxied as signaling. |
 | re-INVITE | Hold, unhold, session-timer refresh and codec changes are renegotiated with the anchor intact: the body is rebuilt for the far side on the ports the session already holds, and a WebRTC leg keeps its ICE credentials, fingerprint and DTLS role — in answers to the browser and in re-offers FreeSWITCH makes to it — so media is never interrupted. A re-INVITE that moves either side's media address re-points the anchor to it once the 2xx completes the exchange; one whose 2xx cannot be anchored is ACKed and the call is ended on both sides. |
 | Dialogs | Identified by Call-ID and both tags (RFC 3261 §12): only a BYE that names the dialog's tags, and that its far end accepts, ends it. The dialog is on record before its 2xx is relayed, so an immediate ACK always finds it; 2xx retransmissions are relayed until Timer M. |
@@ -200,12 +200,14 @@ re-registration, not an outage.
 
 These are structural rather than scheduled.
 
-- **An inbound call to a browser is offered plain RTP**, which a browser will
-  reject: FreeSBC cannot make a DTLS-SRTP *offer*, because a WebRTC offer
-  needs the answerer's fingerprint and ICE credentials and an offer by
-  definition has not seen them. FreeSWITCH-originated calls therefore reach
-  SIP/UDP phones, not WebRTC clients. Browser-originated calls are
-  unaffected.
+- **A FreeSWITCH-originated call to a browser needs `webrtc.enabled`.** A
+  client registered over ws or wss is offered FreeSBC's own DTLS-SRTP offer
+  (`UDP/TLS/RTP/SAVPF`, `a=ice-lite`, one host candidate at the public
+  media address, FreeSBC's fingerprint, `a=rtcp-mux`, `a=setup:actpass`),
+  and ICE/DTLS start when the browser answers. With `webrtc.enabled: false`
+  no such offer can be built, so the call is refused **488** instead of
+  being offered plain RTP. A browser answer that is not a DTLS-SRTP body
+  with `a=rtcp-mux` is refused 488 as well.
 - **Offerless INVITE is refused (488)** in both directions, toward a PSTN
   gateway, and for an offerless re-INVITE.
 - **An answer that renumbers a payload type is refused (488).** RFC 3264
