@@ -134,14 +134,14 @@ Explicit non-goals: transcoding, CDR, clustering, and being a registrar in its o
 - Session timers are negotiated, but no timer tears a call down on session expiry (on the trunk plane, a refresh the SBC itself sends that fails does end the call).
 - The edge plane never offers or reads `a=crypto`: a SIP phone there gets plain RTP, and only browser legs get DTLS-SRTP.
 - The admin API lists edge-proxy dialogs alongside trunk calls, but teardown (`DELETE /api/calls/{id}`) covers trunk-plane calls only.
-- The edge proxy has further structural limits — offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE/NOTIFY, and more: see [known limitations](docs/edge.md#known-limitations).
+- The edge proxy has further structural limits — offerless INVITE, no PRACK/UPDATE/100rel, UDP-only literal upstreams, no TURN/full ICE, no SUBSCRIBE (NOTIFY is forwarded, but MWI and BLF need SUBSCRIBE), and more: see [known limitations](docs/edge.md#known-limitations).
 
 ## Roadmap
 
 Items not yet implemented. Trunk-plane items are listed in [`docs/trunk.md`](docs/trunk.md#roadmap-trunk-plane); the edge proxy's [known limitations](docs/edge.md#known-limitations) are structural rather than scheduled.
 
 - **Scanner heuristics beyond User-Agent** — method and traffic-shape fingerprinting
-- **SUBSCRIBE/NOTIFY through the edge proxy** — needed before MWI and BLF reach phones
+- **SUBSCRIBE through the edge proxy** — needed before MWI and BLF reach phones (NOTIFY is already forwarded, including FreeSWITCH's MWI NOTIFY to a registered phone)
 - **Consistent hashing for `sip.upstreams`** — the pool is modulo-hashed, so changing the node set reshuffles users between switches
 
 ## Development
