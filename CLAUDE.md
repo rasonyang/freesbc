@@ -32,7 +32,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
   - Media uses first-packet latching (strict or loose) and a silence watchdog (`listen.media.rtp_timeout`, default 5m). The watchdog is the only automatic reclaim for a confirmed call whose BYE was lost.
 
 ### Call flow
-- Trunk INVITE: the pre-parse read filter drops bytes from non-peer IPs, then `withShield`, peer identification, the call quota and routing run. `onInvite` (`b2bua.go`) allocates media once and dials targets in failover order. It then blocks in a `select` for the whole call, until either leg ends, media reports `Done`, or the admin API calls `KillCall`.
+- Trunk INVITE: the pre-parse read filter drops bytes from non-peer IPs, then `withShield`, peer identification, the call quota and routing run. `onInvite` (`b2bua.go`) allocates media once and dials targets in failover order. It then blocks in a `select` for the whole call, until either leg ends, media reports `Done`, or its kill context is cancelled: by the admin API's `KillCall`, by the shutdown drain (`drainCalls`, `shutdown.go`), or by a session refresh the SBC sent that failed (`sessiontimer.go`).
 - Edge INVITE (`onInvite` in `invite.go`) is classified in this order:
   1. A To-tag makes it a re-INVITE.
   2. An upstream source with a Request-URI equal to `sip.pstn.match` goes to a PSTN gateway.
@@ -42,7 +42,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 - SDP: the edge builds every body from scratch with `internal/sip/sdp` (`Build`) and never copies the other leg's body. That is what guarantees topology hiding. The trunk builds every body from scratch too (`internal/trunk/sdp.go`), from an allow-list, with its own tolerant line parser (not `pion/sdp`, which rejects `m=image`) and its own `o=` per leg.
 
 ### Config model
-- `config.Parse` runs in this order: strict YAML (unknown keys are errors), `${VAR}` expansion, defaults, then `validate`, which joins all errors. Expansion runs after unmarshal, so parse errors never echo a secret, and expanded values are never written back. Validation rules are in `validate.go` (trunk, shield, admin) and `validate_proxy.go` (edge).
+- `config.Parse` runs in this order: strict YAML (unknown keys are errors), `${VAR}` expansion, defaults, then `validate`, which joins all errors. Expansion runs after unmarshal, so parse errors never echo a secret, and expanded values are never written back. Validation rules are in `validate.go` (trunk, shield, admin), `validate_tls.go` (TLS peer hosts) and `validate_proxy.go` (edge, plus the cross-plane `validateSockets`).
 - `config.Store` publishes immutable `*Config` snapshots through an atomic pointer. Code reads `store.Current()` at the point of use, once per unit of work, and passes that snapshot down instead of reading again: `app.Run` makes every startup decision from the `cfg` it loaded, the trunk takes one snapshot at the top of `onInvite` and threads it through routing, dialing and `pool.AllocateWith(planeParams(cfg), …)`, and a media pool reads its params once per allocation. Never mutate a snapshot. `config.Watch` (fsnotify on the parent directory, 200 ms debounce) is the only caller of `Store.Replace`, and a bad file keeps the previous snapshot. Admin `PUT /api/config` only writes the file atomically and lets the watcher reload it.
 - Hot vs restart-only settings are tabulated in `docs/design.md` §4.4 ("What is hot vs restart-only"). Restart-only includes which planes run, the listener sets and the trunk's advertised signalling port, TLS certificates and outbound per-peer TLS material, the edge topology (upstreams, PSTN gateways/routes, `network`, `webrtc`) and the edge media planes `rtp.public`/`rtp.private`, the trunk dialog-cache Contact, `admin.listen`/`allow_remote`/`tls_cert`/`tls_key` and whether an `admin:` section exists (`admin.auth` itself hot-reloads).
 - A reload that edits a restart-only setting is still published, with a warning listing the keys (`config.RestartOnlyChanges`, `internal/config/restart.go`; keep its table in step with design.md). Each plane keeps the snapshot it was built from (`trunk.Server.boot`, `edge.Server.boot`) and reads restart-only settings only from it, never from the store.
@@ -50,7 +50,7 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 - A trunk listener (`listen.sip` or `sip.bind_ip`) with no `peers` is a validation error (`validate_proxy.go:34-36`), so edge-only configs must omit it.
 
 ### Security boundaries
-- Both planes install a sipgo transport read filter (`internal/sip/readfilter.go`) that runs before parsing. The trunk filter admits only peer IPs. The edge filter caps reads at 64 KiB and, on the private bind, admits only upstream IPs. A filter must never return an error, because sipgo treats that as fatal to the read loop; reject by returning `nil, nil`.
+- Both planes install a sipgo transport read filter (`internal/sip/readfilter.go`) that runs before parsing. The trunk filter admits only peer IPs. The edge filter caps reads at 24 KiB (`fsip.MaxReadSize`; stream transports are also bounded by sipgo's 64 KiB `ParseMaxMessageLength`), drops public reads from shield-banned sources, and, on the private bind, admits only upstream IPs. A filter must never return an error, because sipgo treats that as fatal to the read loop; reject by returning `nil, nil`.
 - Shield denials are silent drops. The trunk overrides `onNoRoute` so that non-peer sources get silence instead of a 405.
 - The edge private plane is trusted and exempt from the shield. Bans are in memory only; there is no nftables backend (removed with P2-SHD-004). The admin call list, call count, port usage and listeners cover both planes; kick and the shield drop metrics are wired to the trunk plane only. There is no unban API (`DELETE /api/bans/{ip}` was removed).
 - Admin uses bcrypt Basic Auth (cost ≥ 10) and is loopback-only unless `admin.allow_remote: true` is set. `GET /api/config/raw` is unredacted on purpose.
@@ -64,9 +64,11 @@ One process and one YAML file run two independent SIP planes, either or both. `i
 
 ## Test environment gotchas
 
-- 20 tests need loopback addresses that macOS does not configure (Linux routes all of 127/8):
+- 24 tests fail on loopback addresses that macOS does not configure (Linux routes all of 127/8):
   - trunk: `TestPreParseFilterDropsNonPeerBytes`, `TestPreParseFilterAllowsPeerBytes` (which also binds 127.0.0.9), `TestRefreshReInviteWrongTagsGet481`, and `TestBridgeNATBindAdvertisedTopology` (which fails only after a ~32 s Timer_B);
-  - edge: 16 of the 17 `TestPSTN*` tests, whose fake FreeSWITCH binds 127.0.0.2 (`TestPSTNUnconfiguredFallsBackTo404` is unaffected).
+  - edge: every test on a harness whose fake FreeSWITCH binds 127.0.0.2 (`startHarnessPSTN`, `startHarnessPSTNGateways`, or `startHarnessCfg` with upstream 127.0.0.2): 16 of the 17 `TestPSTN*` tests (`TestPSTNUnconfiguredFallsBackTo404` is unaffected), `TestAuditPSTN6xxStopsFailover`, `TestAuditPSTNProvisionalInDrainNotFinal`, `TestReloadRemovingPSTNKeepsAttemptBudget` and `TestTeardownLeavesByPublicListenerOnWildcardBind`.
+
+  Two more bind 127.0.0.2 but skip, not fail, when it is missing: `TestAuditTCPCapExhaustedByNonPeers` (trunk) and `TestAuditMED006LooseLatchFirstPacketHijack` (media).
 
   Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` and `sudo ifconfig lo0 alias 127.0.0.9 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.25.7 go test -race -count=1 ./...`.
 - Test ports: each package owns a disjoint band, all below 32768 (the start of Linux's ephemeral range, so the kernel never hands a test's fixed port to a client socket; macOS's starts at 49152). Keep new test ports inside the package's band:

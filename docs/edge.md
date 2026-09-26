@@ -169,10 +169,13 @@ the same caller causes recomputes the same answer, with no shared state.
 Once a call is up, **the dialog record beats the hash**. A call that fs-2
 placed to a phone (the phone's user may hash to fs-1) is carried by fs-2,
 and the phone's ACK and BYE return to fs-2 because that is what the dialog
-record says — a dialog never migrates between switches mid-call. A record
-that is missing (an ACK racing the 2xx commit, or an evicted dialog) falls
-back to re-hashing the caller's identity, which lands on the same node the
-INVITE went to; it never answers 481 for lack of a record.
+record says — a dialog never migrates between switches mid-call. An ACK,
+BYE or INFO from a phone whose dialog is not on record (one that already
+ended, or tags that name none) falls back to re-hashing the caller's
+identity, which lands on the same node the INVITE went to; the proxy never
+answers it 481 for lack of a record, and the switch answers honestly. A
+re-INVITE is the exception: it has to be re-anchored on the dialog's media,
+so without a record it is answered 481.
 
 What the pool requires of FreeSWITCH: a **shared registration database**
 (same `odbc-db`/`sofia` profile view on every node). Registration digests
@@ -203,7 +206,8 @@ These are structural rather than scheduled.
   definition has not seen them. FreeSWITCH-originated calls therefore reach
   SIP/UDP phones, not WebRTC clients. Browser-originated calls are
   unaffected.
-- **Offerless INVITE is refused (488)** in both directions.
+- **Offerless INVITE is refused (488)** in both directions, toward a PSTN
+  gateway, and for an offerless re-INVITE.
 - **An answer that renumbers a payload type is refused (488).** RFC 3264
   §6.1 says an answerer SHOULD reuse the offer's numbers; it does not
   require it. FreeSBC relays RTP without rewriting the payload-type byte, so

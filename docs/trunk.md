@@ -101,7 +101,8 @@ See [`docs/design.md`](design.md) §6.14 for how the selection works and its lim
   negotiation (RFC 4028), including the 422/Min-SE exchange on both legs;
   the SBC refreshes a leg whose far end names it refresher, and answers
   refreshes (retransmitting the 200 until ACKed) on the others; no timer
-  tears a call down on session expiry
+  tears a call down on session expiry, but a refresh the SBC sends that
+  gets no response, a 408 or a 481 ends the call
 
 ## Roadmap (trunk plane)
 
