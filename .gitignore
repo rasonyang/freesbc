@@ -17,3 +17,6 @@ coverage.html
 # Local tooling state
 /.superpowers/
 docs/audit/raw/
+
+# Third-party reference manuals (not redistributable)
+/docs/mediant-software-sbc-users-manual-ver-74.pdf
