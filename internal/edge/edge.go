@@ -293,22 +293,46 @@ func (s *Server) publicListeners() []bound {
 	return out
 }
 
+// localInterface returns the name of the interface that owns ip. It is the
+// one lookup behind checkLocalAddr and the private socket's ingress filter
+// (privateSocketFilter): both need the interface, and private.ip must be
+// assigned to a local interface for either to mean anything.
+func localInterface(ip netip.Addr) (string, bool, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", false, err
+	}
+	want := ip.Unmap()
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue // an interface that cannot list its addresses has none to match
+		}
+		for _, a := range addrs {
+			p, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if got, ok := netip.AddrFromSlice(p.IP); ok && got.Unmap() == want {
+				return iface.Name, true, nil
+			}
+		}
+	}
+	return "", false, nil
+}
+
 // checkLocalAddr fails unless ip is assigned to a local interface: a bind
 // to anything else fails late and obscurely, and an address that is not
 // ours would be advertised to peers that can never reach it.
 func checkLocalAddr(key string, ip netip.Addr) error {
-	addrs, err := net.InterfaceAddrs()
+	_, ok, err := localInterface(ip)
 	if err != nil {
 		return fmt.Errorf("proxy: list local addresses: %w", err)
 	}
-	for _, a := range addrs {
-		if p, ok := a.(*net.IPNet); ok {
-			if got, ok := netip.AddrFromSlice(p.IP); ok && got.Unmap() == ip.Unmap() {
-				return nil
-			}
-		}
+	if !ok {
+		return fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
 	}
-	return fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
+	return nil
 }
 
 // Run binds every listener and blocks until ctx is cancelled. It returns
@@ -569,11 +593,37 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if err != nil {
 			return l, err
 		}
-		conn, err := net.ListenUDP("udp", ua)
+		lc := net.ListenConfig{}
+		if transport == "udp-private" {
+			// Filter the trusted socket's receive path down to the
+			// interface that owns private.ip. Linux's weak host model
+			// otherwise delivers a datagram addressed to private.ip and
+			// sent into the public NIC to this socket, where a spoofed
+			// switch source is believed (issue #90). The filter drops it
+			// before FreeSBC ever sees it and leaves the send path alone;
+			// docs/edge.md states the topology requirement.
+			ifname, ok, err := localInterface(s.privAddr.Addr())
+			if err != nil {
+				return l, fmt.Errorf("private.ip: list local addresses: %w", err)
+			}
+			if !ok {
+				return l, fmt.Errorf("private.ip %s is not assigned to any local interface", s.privAddr.Addr())
+			}
+			control, err := privateSocketFilter(ifname)
+			if err != nil {
+				return l, fmt.Errorf("private socket filter on %s: %w", ifname, err)
+			}
+			lc.Control = control
+			if lc.Control == nil {
+				s.log.Warn("private socket not filtered to its interface; the weak-host fix is Linux-only",
+					"private", s.privAddr.String(), "interface", ifname)
+			}
+		}
+		pc, err := lc.ListenPacket(context.Background(), "udp", ua.String())
 		if err != nil {
 			return l, err
 		}
-		l.packet = conn
+		l.packet = pc
 		return l, nil
 	case "ws":
 		ln, err := net.Listen("tcp", addr)

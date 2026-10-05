@@ -648,7 +648,14 @@ private socket; a WS/WSS read on the same port number is a public read):
 
 - The **private socket** (`private.ip:5060`, UDP): trusted. Only a switch
   IP (`topology.fromUpstream`, any `edge.switch` node's IP) may speak on it;
-  any other source is dropped.
+  any other source is dropped. On Linux the socket also carries a BPF
+  ingress filter (`privateSocketFilter`, `privatefilter_linux.go`): only a
+  datagram that arrived on the interface owning `private.ip`, or on
+  loopback, is queued. Linux's weak host model would otherwise deliver a
+  datagram addressed to the private IP and sent into the public NIC here,
+  with a spoofed switch source (issue #90). The filter is a no-op off Linux
+  and reads `skb->dev->ifindex`, so VRF, asymmetric routing, tunnels and a
+  runtime interface change are dropped (docs/edge.md).
 - Every **public listener** (UDP, WS, WSS): accepted unless the source is
   banned (`shield.Shield.BannedFrom(addr:port, transport)`, the read-only,
   non-counting query that also matches a UDP per-socket ban; a banned stream
@@ -3055,7 +3062,7 @@ after the unmarshal, and validation errors are redacted back to the `${ENV}`
 text, so neither `freesbc check` nor the admin `PUT /api/config` response can
 be used to read an environment variable.
 
-### 14.2 Deployment assumptions (not enforced by the code)
+### 14.2 Deployment assumptions (not all enforced by the code)
 
 - **The private socket is trusted.** The switch is exempt from the shield
   entirely on `private.ip:5060`, and its requests are not rate limited. The
@@ -3065,15 +3072,19 @@ be used to read an environment variable.
   listener — spoofed or not — is a public datagram: shielded, subject to
   admission, and never trusted. What still rests on the network: a host that
   can put a datagram on the private socket from a switch IP (a compromised or
-  mis-firewalled private LAN) is the switch as far as the proxy can tell. That
-  includes a datagram that arrives on the **public** NIC addressed to the
-  private IP: Linux's weak host model delivers a packet for any local address
-  on any interface, so an attacker on the public L2 segment can reach the
-  private socket with a spoofed switch source unless strict `rp_filter` or a
-  firewall rule (for example, drop traffic to `private.ip` that did not enter
-  on the private interface) stops it. The sockets are not pinned to an
-  interface. Validation on real dual-NIC hardware, including this case, is
-  tracked in issue #90.
+  mis-firewalled private LAN) is the switch as far as the proxy can tell.
+  Linux's weak host model would otherwise deliver a datagram addressed to the
+  private IP and sent into the public NIC to the private socket, with a
+  spoofed switch source; on Linux the private socket therefore carries a BPF
+  ingress filter that accepts only datagrams received on the interface that
+  owns `private.ip`, or on loopback (`privateSocketFilter`,
+  `privatefilter_linux.go`, §7.1). The filter is a no-op off Linux, and the
+  host settings (strict `rp_filter`, or a firewall rule dropping traffic to
+  `private.ip` that did not enter on the private interface) remain the
+  mitigation there; loose `rp_filter=2` is not sufficient. Switch traffic
+  must arrive on the interface owning `private.ip`, or over loopback: VRF,
+  asymmetric routing, tunnels and a runtime interface change are dropped
+  silently (docs/edge.md, known limitations).
 - **Carrier identity is the source address, with no SIP challenge.** A public
   request from an address inside a carrier source (a resolved `edge.carriers`
   address or an `edge.carrier_sources` prefix) is delivered to the switch's

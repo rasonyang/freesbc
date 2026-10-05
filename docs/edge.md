@@ -94,6 +94,14 @@ FreeSBC enforces an allowlist and rewrites addresses; the switch must be set up 
 - Only the carrier port may skip authentication, because FreeSBC delivers nothing else there. Restrict it to `private.ip` (FreeSWITCH `external` profile `apply-inbound-acl`, or a host firewall) so no other LAN host reaches it.
 - **Line selection and failover are the switch's job**: FreeSWITCH `bridge sofia/gateway/a/N|sofia/gateway/b/N`, Asterisk sequential `Dial` on `DIALSTATUS`. FreeSBC never retries a carrier request on another carrier.
 
+### The private socket's ingress rule
+
+On Linux the private socket installs a BPF receive filter: a datagram is delivered only when it arrived on the interface that owns `private.ip` (the kernel reads `skb->dev->ifindex`), or on loopback for a switch co-located with FreeSBC. This closes the weak-host path where a datagram addressed to `private.ip` and sent into the public NIC reached the trusted socket with a spoofed switch source (issue #90). The send path is untouched, so dialing and passive failover are unchanged.
+
+- **Switch traffic must arrive on the interface that owns `private.ip`, or over loopback.** A datagram that arrives on another device — a VRF (the kernel rewrites the device to the VRF master while the address stays on the slave), asymmetric routing, or a tunnel (WireGuard/GRE, or `private.ip` on a dummy device) — is dropped silently and shows up only as upstream timeouts.
+- **The interface is resolved once at startup.** Recreating the interface that owns `private.ip` (a new VLAN/bond/bridge ifindex) drops wire traffic until FreeSBC restarts.
+- **The filter is Linux-only.** Elsewhere the private socket is unfiltered and strict `rp_filter=1` or a firewall rule dropping traffic to `private.ip` on the public interface remains the mitigation; loose `rp_filter=2` is not sufficient when the spoofed source is routable.
+
 ## Multiple switches (`edge.switch`)
 
 `edge.switch` with one entry is a single upstream. With more than one it is a pool: the proxy picks a node per user. This is the OpenSIPS dispatcher's `hash-user` algorithm (alg 10), applied at the edge.
@@ -125,6 +133,7 @@ Failover is passive and transport-driven. A node that fails to accept the datagr
 These are structural rather than scheduled.
 
 - **A public call must come from a registered transport address or a carrier source.** An out-of-dialog INVITE on a public listener is relayed only when its transport, source IP and port match a live registration, or its source IP is a carrier source; anything else is dropped with no response. A device that calls without registering through FreeSBC, or that sends its INVITE from a different socket than its REGISTER (a NAT mapping that changed since the last refresh, a new WebSocket connection), is refused until it registers again from that address. Inbound carrier calls from addresses that are neither resolved carriers nor listed in `edge.carrier_sources` are dropped the same way (look for `invite_not_admitted` in `freesbc_edge_admission_drops_total`).
+- **A datagram that misses the private socket's ingress rule is dropped silently.** On Linux, switch traffic that does not arrive on the interface owning `private.ip` (or loopback) is discarded in the kernel: no log, no metric, only upstream timeouts. VRF, asymmetric routing, tunnels and an interface recreated at runtime all hit this (see [The private socket's ingress rule](#the-private-sockets-ingress-rule)).
 - **Call-ID passes through.** FreeSBC does not rewrite it, so a carrier sees the Call-ID the switch generated.
 - **Carrier-originated in-dialog requests carry the masked public host in From and To.** On the way to the carrier the switch's host is rewritten to `public.ip`; a request the carrier sends back in the dialog therefore names that host, and the switch sees it as is.
 - **No failover across SRV targets inside FreeSBC.** A carrier name that resolves to several addresses uses the first; failover between carriers belongs to the switch. A DNS failure at startup is not fatal: FreeSBC logs it, retries, and keeps the last good answer when a refresh fails.
