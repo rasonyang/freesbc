@@ -1,0 +1,117 @@
+/*
+ * FreeSBC admin design tokens.
+ *
+ * Section 1 is the shadcn/ui "neutral" theme (Tailwind v4, OKLCH): same
+ * variable names, same values. It is the contract shared with other UIs in
+ * the stack. Sync it with upstream by value; never rename a token here.
+ *   https://ui.shadcn.com/docs/theming
+ *
+ * Each colour is written once as light-dark(<light>, <dark>). The active
+ * value follows `color-scheme`, which follows the OS unless
+ * <html data-theme="light|dark"> pins it (see theme.js). No .dark block,
+ * no duplicated dark values, no flash on load.
+ *
+ * Section 2 is FreeSBC's extension: status colours shadcn does not define,
+ * built the same way shadcn builds --destructive (Tailwind palette steps).
+ *
+ * Section 3 is the non-colour scale (Tailwind v4 defaults), so
+ * `calc(var(--spacing) * 4)` here means exactly `p-4` in a Tailwind codebase.
+ *
+ * Components consume tokens only. A literal colour outside this file is a bug.
+ */
+
+:root {
+  color-scheme: light dark;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"]  { color-scheme: dark; }
+
+/* ---- 1. shadcn/ui neutral --------------------------------------------- */
+:root {
+  --radius: 0.625rem;
+
+  --background:           light-dark(oklch(1 0 0),     oklch(0.145 0 0));
+  --foreground:           light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
+  --card:                 light-dark(oklch(1 0 0),     oklch(0.205 0 0));
+  --card-foreground:      light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
+  --popover:              light-dark(oklch(1 0 0),     oklch(0.205 0 0));
+  --popover-foreground:   light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
+  --primary:              light-dark(oklch(0.205 0 0), oklch(0.922 0 0));
+  --primary-foreground:   light-dark(oklch(0.985 0 0), oklch(0.205 0 0));
+  --secondary:            light-dark(oklch(0.97 0 0),  oklch(0.269 0 0));
+  --secondary-foreground: light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
+  --muted:                light-dark(oklch(0.97 0 0),  oklch(0.269 0 0));
+  --muted-foreground:     light-dark(oklch(0.556 0 0), oklch(0.708 0 0));
+  --accent:               light-dark(oklch(0.97 0 0),  oklch(0.269 0 0));
+  --accent-foreground:    light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
+  --destructive:          light-dark(oklch(0.577 0.245 27.325), oklch(0.704 0.191 22.216));
+  --border:               light-dark(oklch(0.922 0 0), oklch(1 0 0 / 10%));
+  --input:                light-dark(oklch(0.922 0 0), oklch(1 0 0 / 15%));
+  --ring:                 light-dark(oklch(0.708 0 0), oklch(0.556 0 0));
+
+  --chart-1: light-dark(oklch(0.646 0.222 41.116),  oklch(0.488 0.243 264.376));
+  --chart-2: light-dark(oklch(0.6 0.118 184.704),   oklch(0.696 0.17 162.48));
+  --chart-3: light-dark(oklch(0.398 0.07 227.392),  oklch(0.769 0.188 70.08));
+  --chart-4: light-dark(oklch(0.828 0.189 84.429),  oklch(0.627 0.265 303.9));
+  --chart-5: light-dark(oklch(0.769 0.188 70.08),   oklch(0.645 0.246 16.439));
+
+  --sidebar:                    light-dark(oklch(0.985 0 0), oklch(0.205 0 0));
+  --sidebar-foreground:         light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
+  --sidebar-primary:            light-dark(oklch(0.205 0 0), oklch(0.488 0.243 264.376));
+  --sidebar-primary-foreground: light-dark(oklch(0.985 0 0), oklch(0.985 0 0));
+  --sidebar-accent:             light-dark(oklch(0.97 0 0),  oklch(0.269 0 0));
+  --sidebar-accent-foreground:  light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
+  --sidebar-border:             light-dark(oklch(0.922 0 0), oklch(1 0 0 / 10%));
+  --sidebar-ring:               light-dark(oklch(0.708 0 0), oklch(0.556 0 0));
+}
+
+/* ---- 2. FreeSBC extension: status ------------------------------------- */
+/*
+ * Same recipe as shadcn --destructive (red-600 / red-400): a darker step on
+ * light, a lighter step on dark, so each reads as text on --background and
+ * --card. Used as text, icons, dots and 12% tints, never as large fills.
+ * Status colours mean state (up / degraded / down) and are never reused as
+ * chart series colours.
+ */
+:root {
+  --success: light-dark(oklch(0.527 0.154 150.069), oklch(0.792 0.209 151.711)); /* green-700 / green-400 */
+  --warning: light-dark(oklch(0.555 0.163 48.998),  oklch(0.828 0.189 84.429));  /* amber-700 / amber-400 */
+  --info:    light-dark(oklch(0.546 0.245 262.881), oklch(0.707 0.165 254.624)); /* blue-600  / blue-400  */
+
+  /* shadcn v4 dropped this pair and hard-codes text-white on destructive
+   * buttons; named here so no component carries a literal colour. */
+  --destructive-foreground: oklch(1 0 0);
+}
+
+/* ---- 3. Scale (Tailwind v4 defaults) ---------------------------------- */
+:root {
+  --spacing: 0.25rem;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+
+  --text-xs: 0.75rem;    --text-xs--line-height: 1rem;
+  --text-sm: 0.875rem;   --text-sm--line-height: 1.25rem;
+  --text-base: 1rem;     --text-base--line-height: 1.5rem;
+  --text-lg: 1.125rem;   --text-lg--line-height: 1.75rem;
+  --text-xl: 1.25rem;    --text-xl--line-height: 1.75rem;
+  --text-2xl: 1.5rem;    --text-2xl--line-height: 2rem;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+
+  --duration: 150ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+}

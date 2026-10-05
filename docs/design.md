@@ -2801,7 +2801,8 @@ response except `/healthz`.
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:382`) |
 | `/api/config` | GET, PUT (else 405 + `Allow: GET, PUT`) | Basic | GET: the **redacted** view; PUT: write-back |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml`, with an `ETag` = quoted SHA-256 hex |
-| `/` | any | Basic | the embedded single-file WebUI (catch-all; the explicit patterns win) |
+| `/assets/<file>` | any | Basic | a static WebUI asset from the embedded `webui/assets` (`tokens.css`, `ui.css`, `theme.js`, `app.js`); 404 for anything else, never a listing |
+| `/` | any | Basic | the embedded WebUI page (catch-all; the explicit patterns win) |
 
 `GET /api/config` shows the running snapshot in the config's own shape with
 JSON keys (`redactConfig`, `redact.go:9`): `public`, `private`, `rtp` (`min`,
@@ -2892,11 +2893,25 @@ admits only on a loopback address.
 
 ### 13.5 WebUI
 
-One `//go:embed`ed `index.html`, served behind the same Basic auth as
-everything else. Two tabs: a **Dashboard** polling `/api/status` and
-`/api/calls` every 5 s (a 401 shows a persistent "session expired" banner),
-and a **Config** editor that loads `/api/config/raw`, keeps its ETag, and PUTs
-to `/api/config` with `If-Match`.
+The `//go:embed`ed `webui` directory (`webui.go`): `index.html` (markup
+only) plus `assets/` — `tokens.css` (the shadcn/ui neutral theme plus FreeSBC
+status tokens), `ui.css` (components), `theme.js` (light/dark pin) and
+`app.js` (behaviour). All of it is served behind the same Basic auth as
+everything else, with `Content-Security-Policy` `default-src 'none';
+script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src
+'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer`, and the `Cache-Control: no-store` every
+admin response carries. The page loads nothing from another origin; inline
+script, style and event handlers are blocked by the CSP and rejected by
+`TestUIHasNoInlineScriptOrStyle`.
+
+Two hash-routed views: an **Overview** polling `/api/status` and
+`/api/calls` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
+poll keeps the last data and marks the header "Connection lost"; a 401 shows
+a persistent "session expired" banner), and a **Config** editor that loads
+`/api/config/raw`, keeps its ETag, and PUTs to `/api/config` with
+`If-Match`. Design rules are in `docs/admin-ui.md`.
 
 ---
 

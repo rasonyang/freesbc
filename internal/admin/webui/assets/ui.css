@@ -1,0 +1,522 @@
+/*
+ * FreeSBC admin component layer.
+ *
+ * Plain-CSS ports of the shadcn/ui primitives the admin needs. Class and
+ * variant names follow shadcn (button default/secondary/outline/ghost/
+ * destructive, card header/title/description/content, badge, table, alert)
+ * so markup reads the same as in a shadcn codebase.
+ *
+ * Rules: consume tokens from tokens.css only; spacing is calc(var(--spacing)
+ * * n); no literal colours; no inline style attributes (CSP forbids them).
+ */
+
+/* ---- derived tokens ----------------------------------------------------- */
+:root {
+  /* shadcn: dark:bg-input/30 on controls, bg-background on light */
+  --control: light-dark(var(--background), color-mix(in oklch, var(--input) 30%, transparent));
+  --control-hover: light-dark(var(--accent), color-mix(in oklch, var(--input) 50%, transparent));
+  --focus-ring: 0 0 0 3px color-mix(in oklch, var(--ring) 50%, transparent);
+  /* Text on a status tint. On light, the bare -700 step drops below 4.5:1
+   * once it sits on its own 12% tint, so pull it 15% toward the
+   * foreground. On dark the bare step already clears AA. Set on the
+   * element that defines --tone, since var() resolves where it is used. */
+  --tone: var(--muted-foreground);
+  --container: 72rem;
+  --header-h: calc(var(--spacing) * 14);
+}
+
+/* ---- base --------------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; border: 0 solid var(--border); }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm--line-height);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+h1, h2, h3, p { margin: 0; }
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; background: none; }
+code, pre, kbd, .mono { font-family: var(--font-mono); font-size: 0.8125rem; }
+[hidden] { display: none !important; }
+
+/* Focus: one ring everywhere. The transparent outline becomes visible in
+ * forced-colors mode, where box-shadow is dropped. */
+:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: var(--focus-ring);
+}
+
+.icon {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.muted { color: var(--muted-foreground); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---- app shell ---------------------------------------------------------- */
+.container {
+  width: 100%;
+  max-width: var(--container);
+  margin-inline: auto;
+  padding-inline: calc(var(--spacing) * 4);
+}
+@media (min-width: 48rem) {
+  .container { padding-inline: calc(var(--spacing) * 6); }
+}
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  border-bottom-width: 1px;
+  background: color-mix(in oklch, var(--background) 85%, transparent);
+  backdrop-filter: saturate(1.5) blur(8px);
+  -webkit-backdrop-filter: saturate(1.5) blur(8px);
+}
+.site-header .container {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 6);
+  min-height: var(--header-h);
+  flex-wrap: wrap;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  font-weight: var(--font-weight-semibold);
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: calc(var(--spacing) * 7);
+  height: calc(var(--spacing) * 7);
+  border-radius: var(--radius-md);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.header-end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+}
+
+/* Top navigation: shadcn dashboard "main-nav" style. */
+.nav { display: flex; gap: calc(var(--spacing) * 1); }
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  height: calc(var(--spacing) * 8);
+  padding-inline: calc(var(--spacing) * 3);
+  border-radius: var(--radius-md);
+  font-weight: var(--font-weight-medium);
+  color: var(--muted-foreground);
+  text-decoration: none;
+  transition: color var(--duration) var(--ease), background-color var(--duration) var(--ease);
+}
+.nav-link:hover { color: var(--foreground); }
+.nav-link[aria-current="page"] { color: var(--foreground); background: var(--accent); }
+
+/* Narrow screens: keep the header on one row. The live text stays in the
+ * accessibility tree; only the version badge is dropped (it is repeated on
+ * the Uptime tile). */
+@media (max-width: 40rem) {
+  .site-header .container { gap: calc(var(--spacing) * 3); }
+  .brand #header-version { display: none; }
+  .header-end #live-text {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+}
+
+main.container { padding-block: calc(var(--spacing) * 8); }
+.page { display: grid; gap: calc(var(--spacing) * 6); }
+
+.page-header { display: grid; gap: calc(var(--spacing) * 1); }
+.page-title {
+  font-size: var(--text-2xl);
+  line-height: var(--text-2xl--line-height);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.025em;
+}
+.page-description { color: var(--muted-foreground); }
+
+.grid-stats {
+  display: grid;
+  gap: calc(var(--spacing) * 4);
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+
+/* ---- card --------------------------------------------------------------- */
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--spacing) * 6);
+  padding-block: calc(var(--spacing) * 6);
+  border-width: 1px;
+  border-radius: var(--radius-xl);
+  background: var(--card);
+  color: var(--card-foreground);
+  box-shadow: var(--shadow-xs);
+  min-width: 0;
+}
+.card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: calc(var(--spacing) * 2);
+  padding-inline: calc(var(--spacing) * 6);
+}
+.card-heading { display: grid; gap: calc(var(--spacing) * 1.5); min-width: 0; }
+.card-action { margin-left: auto; display: flex; align-items: center; gap: calc(var(--spacing) * 2); }
+.card-title {
+  font-size: var(--text-base);
+  line-height: 1.25;
+  font-weight: var(--font-weight-semibold);
+}
+.card-description { color: var(--muted-foreground); }
+.card-content { padding-inline: calc(var(--spacing) * 6); min-width: 0; }
+.card-content.flush { padding-inline: 0; }
+
+/* ---- stat tile ---------------------------------------------------------- */
+.stat { gap: calc(var(--spacing) * 2); }
+.stat .card-header { align-items: center; }
+.stat-label { font-weight: var(--font-weight-medium); }
+.stat-header .icon { margin-left: auto; color: var(--muted-foreground); }
+.stat-value {
+  padding-inline: calc(var(--spacing) * 6);
+  font-size: var(--text-2xl);
+  line-height: var(--text-2xl--line-height);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.025em;
+  font-variant-numeric: tabular-nums;
+}
+.stat-value small {
+  font-size: var(--text-sm);
+  font-weight: var(--font-weight-normal);
+  color: var(--muted-foreground);
+  letter-spacing: 0;
+}
+.stat-foot {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
+  padding-inline: calc(var(--spacing) * 6);
+  font-size: var(--text-xs);
+  line-height: var(--text-xs--line-height);
+  color: var(--muted-foreground);
+}
+.stat-foot .icon { width: 0.875rem; height: 0.875rem; }
+
+/* ---- meter (shadcn Progress) ------------------------------------------- */
+.meter {
+  --meter-color: var(--primary);
+  position: relative;
+  height: calc(var(--spacing) * 2);
+  margin-inline: calc(var(--spacing) * 6);
+  border-radius: 9999px;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--meter-color) 20%, transparent);
+}
+.meter > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--meter-color);
+  transition: width 300ms var(--ease);
+}
+.meter[data-level="warning"]  { --meter-color: var(--warning); }
+.meter[data-level="critical"] { --meter-color: var(--destructive); }
+[data-level="warning"]  > .level-text { color: var(--warning); }
+[data-level="critical"] > .level-text { color: var(--destructive); }
+
+/* ---- button ------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--spacing) * 2);
+  height: calc(var(--spacing) * 9);
+  padding-inline: calc(var(--spacing) * 4);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  box-shadow: var(--shadow-xs);
+  transition: background-color var(--duration) var(--ease), color var(--duration) var(--ease),
+    border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
+}
+.btn:hover { background: color-mix(in oklch, var(--primary) 90%, transparent); }
+.btn:focus-visible { border-color: var(--ring); box-shadow: var(--focus-ring); }
+.btn:disabled { opacity: 0.5; pointer-events: none; }
+
+.btn[data-variant="secondary"] { background: var(--secondary); color: var(--secondary-foreground); }
+.btn[data-variant="secondary"]:hover { background: color-mix(in oklch, var(--secondary) 80%, transparent); }
+.btn[data-variant="outline"] { background: var(--control); border-color: light-dark(var(--border), var(--input)); color: var(--foreground); }
+.btn[data-variant="outline"]:hover { background: var(--control-hover); color: var(--accent-foreground); }
+.btn[data-variant="ghost"] { background: transparent; color: var(--foreground); box-shadow: none; }
+.btn[data-variant="ghost"]:hover { background: var(--control-hover); color: var(--accent-foreground); }
+/* shadcn: bg-destructive, dark:bg-destructive/60 (white on red-400 is 2.9:1). */
+.btn[data-variant="destructive"] {
+  background: light-dark(var(--destructive), color-mix(in oklch, var(--destructive) 60%, transparent));
+  color: var(--destructive-foreground);
+}
+.btn[data-variant="destructive"]:hover {
+  background: light-dark(color-mix(in oklch, var(--destructive) 90%, transparent), color-mix(in oklch, var(--destructive) 50%, transparent));
+}
+
+.btn[data-size="sm"] { height: calc(var(--spacing) * 8); padding-inline: calc(var(--spacing) * 3); gap: calc(var(--spacing) * 1.5); }
+.btn[data-size="icon"] { width: calc(var(--spacing) * 9); padding: 0; }
+
+/* ---- badge -------------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1);
+  padding: calc(var(--spacing) * 0.5) calc(var(--spacing) * 2);
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-size: var(--text-xs);
+  line-height: var(--text-xs--line-height);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.badge[data-variant="secondary"] { background: var(--secondary); color: var(--secondary-foreground); }
+.badge[data-variant="outline"]   { background: transparent; color: var(--foreground); border-color: var(--border); }
+/* Status badges: tinted, text in the status colour. Always paired with a
+ * word (and usually a dot or icon), never colour alone. */
+.badge[data-variant="success"],
+.badge[data-variant="warning"],
+.badge[data-variant="info"],
+.badge[data-variant="destructive"] {
+  background: color-mix(in oklch, var(--tone) 12%, transparent);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+}
+.badge[data-variant="success"]     { --tone: var(--success); }
+.badge[data-variant="warning"]     { --tone: var(--warning); }
+.badge[data-variant="info"]        { --tone: var(--info); }
+.badge[data-variant="destructive"] { --tone: var(--destructive); }
+
+/* ---- status dot --------------------------------------------------------- */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  font-size: var(--text-xs);
+  line-height: var(--text-xs--line-height);
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.dot {
+  --tone: var(--muted-foreground);
+  position: relative;
+  width: calc(var(--spacing) * 2);
+  height: calc(var(--spacing) * 2);
+  border-radius: 9999px;
+  background: var(--tone);
+  flex: none;
+}
+[data-state="live"] .dot     { --tone: var(--success); }
+[data-state="stale"] .dot    { --tone: var(--warning); }
+[data-state="expired"] .dot  { --tone: var(--destructive); }
+[data-state="live"] .dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--tone);
+  animation: ping 2s var(--ease) infinite;
+}
+@keyframes ping { 75%, 100% { transform: scale(2.4); opacity: 0; } }
+
+/* ---- table -------------------------------------------------------------- */
+.table-wrap { width: 100%; overflow-x: auto; }
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  caption-side: bottom;
+  white-space: nowrap;
+}
+.table th, .table td {
+  padding: calc(var(--spacing) * 2.5) calc(var(--spacing) * 2);
+  text-align: left;
+  vertical-align: middle;
+  border-bottom-width: 1px;
+}
+.table th:first-child, .table td:first-child { padding-left: calc(var(--spacing) * 6); }
+.table th:last-child,  .table td:last-child  { padding-right: calc(var(--spacing) * 6); }
+.table thead th {
+  height: calc(var(--spacing) * 10);
+  padding-block: 0;
+  font-weight: var(--font-weight-medium);
+  color: var(--muted-foreground);
+  background: color-mix(in oklch, var(--muted) 50%, transparent);
+  border-top-width: 1px;
+}
+.table tbody tr { transition: background-color var(--duration) var(--ease); }
+.table tbody tr:hover { background: color-mix(in oklch, var(--muted) 50%, transparent); }
+.table tbody tr:last-child td { border-bottom-width: 0; }
+.table .num { text-align: right; }
+.table .truncate {
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- list (key/value rows) --------------------------------------------- */
+.list { display: grid; margin: 0; padding: 0; list-style: none; }
+.list > li {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 3);
+  padding-block: calc(var(--spacing) * 2.5);
+  border-bottom-width: 1px;
+  min-width: 0;
+}
+.list > li:first-child { padding-top: 0; }
+.list > li:last-child { border-bottom-width: 0; padding-bottom: 0; }
+.list .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Short lists of peers read better as columns than as a long thin column. */
+.list[data-layout="grid"] {
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  column-gap: calc(var(--spacing) * 6);
+}
+.list[data-layout="grid"] > li { padding-block: calc(var(--spacing) * 2); border-bottom-width: 0; }
+
+/* ---- empty state -------------------------------------------------------- */
+.empty {
+  display: grid;
+  justify-items: center;
+  gap: calc(var(--spacing) * 2);
+  padding: calc(var(--spacing) * 10) calc(var(--spacing) * 6);
+  text-align: center;
+  color: var(--muted-foreground);
+}
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: calc(var(--spacing) * 10);
+  height: calc(var(--spacing) * 10);
+  margin-bottom: calc(var(--spacing) * 1);
+  border-radius: var(--radius-lg);
+  background: var(--muted);
+  color: var(--foreground);
+}
+.empty-title { font-weight: var(--font-weight-medium); color: var(--foreground); }
+
+/* ---- form controls ------------------------------------------------------ */
+.textarea {
+  display: block;
+  width: 100%;
+  min-height: 28rem;
+  padding: calc(var(--spacing) * 3);
+  border-width: 1px;
+  border-color: var(--input);
+  border-radius: var(--radius-md);
+  background: var(--control);
+  box-shadow: var(--shadow-xs);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  tab-size: 2;
+  resize: vertical;
+  transition: border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
+}
+.textarea::placeholder { color: var(--muted-foreground); }
+.textarea:focus-visible { border-color: var(--ring); box-shadow: var(--focus-ring); }
+.textarea[aria-invalid="true"] {
+  border-color: var(--destructive);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--destructive) 20%, transparent);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: calc(var(--spacing) * 2);
+}
+.toolbar-status {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
+  color: var(--muted-foreground);
+}
+.toolbar-status[data-kind="ok"]  { color: var(--success); }
+.toolbar-status[data-kind="err"] { color: var(--destructive); }
+
+/* ---- alert -------------------------------------------------------------- */
+.alert {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  column-gap: calc(var(--spacing) * 3);
+  row-gap: calc(var(--spacing) * 0.5);
+  align-items: start;
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
+  border-width: 1px;
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  color: var(--card-foreground);
+}
+.alert > .icon { margin-top: 0.125rem; }
+.alert-title { font-weight: var(--font-weight-medium); }
+.alert-body { grid-column: 2; color: var(--muted-foreground); }
+.alert pre {
+  margin: calc(var(--spacing) * 1) 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.alert[data-variant="destructive"] {
+  --tone: var(--destructive);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+  border-color: color-mix(in oklch, var(--destructive) 40%, transparent);
+  background: color-mix(in oklch, var(--destructive) 6%, var(--card));
+}
+.alert[data-variant="destructive"] .alert-body { color: color-mix(in oklch, var(--destructive) 85%, var(--foreground)); }
+
+.banner {
+  border-bottom-width: 1px;
+  border-color: color-mix(in oklch, var(--destructive) 40%, transparent);
+  background: color-mix(in oklch, var(--destructive) 10%, var(--background));
+  --tone: var(--destructive);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+  font-weight: var(--font-weight-medium);
+}
+.banner .container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--spacing) * 2);
+  min-height: calc(var(--spacing) * 10);
+}
+
+
+/* ---- motion & forced colours ------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (forced-colors: active) {
+  .btn, .badge, .card, .alert { border-color: CanvasText; }
+  .dot { forced-color-adjust: none; }
+}

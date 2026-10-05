@@ -3,482 +3,177 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
 <title>FreeSBC Admin</title>
-<style>
-  :root {
-    color-scheme: light dark;
-    --bg: #0f1115;
-    --panel: #171a21;
-    --border: #2a2e38;
-    --text: #e6e8ec;
-    --muted: #8a90a0;
-    --accent: #4f8cff;
-    --ok: #3fbf6f;
-    --warn: #e0a72c;
-    --err: #e0533f;
-    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-  header {
-    display: flex;
-    align-items: baseline;
-    gap: 0.75rem;
-    padding: 0.9rem 1.25rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-  }
-  header h1 {
-    font-size: 1.15rem;
-    margin: 0;
-    letter-spacing: 0.02em;
-  }
-  header .version {
-    color: var(--muted);
-    font-size: 0.85rem;
-  }
-  nav {
-    display: flex;
-    gap: 0.25rem;
-    padding: 0 1.25rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-  }
-  nav button {
-    background: none;
-    border: none;
-    color: var(--muted);
-    padding: 0.6rem 0.9rem;
-    font-size: 0.9rem;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-  }
-  nav button.active {
-    color: var(--text);
-    border-bottom-color: var(--accent);
-  }
-  nav button:hover { color: var(--text); }
-  main {
-    padding: 1.25rem;
-    max-width: 1100px;
-    margin: 0 auto;
-  }
-  .view { display: none; }
-  .view.active { display: block; }
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-  }
-  .status-line {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1.5rem;
-    font-size: 0.95rem;
-  }
-  .status-line .item .label {
-    color: var(--muted);
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    display: block;
-  }
-  .status-line .item .value {
-    font-size: 1.1rem;
-  }
-  h2 {
-    font-size: 0.95rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    color: var(--muted);
-    margin: 0 0 0.75rem;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.9rem;
-  }
-  th, td {
-    text-align: left;
-    padding: 0.4rem 0.6rem;
-    border-bottom: 1px solid var(--border);
-  }
-  th {
-    color: var(--muted);
-    font-weight: 600;
-    font-size: 0.8rem;
-    text-transform: uppercase;
-  }
-  tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
-  .empty-row td {
-    color: var(--muted);
-    font-style: italic;
-  }
-  .note {
-    font-size: 0.8rem;
-    color: var(--warn);
-    margin-top: 0.5rem;
-  }
-  .note.hidden { display: none; }
-  textarea {
-    width: 100%;
-    min-height: 420px;
-    background: #0b0d11;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.75rem;
-    font-family: var(--mono);
-    font-size: 0.85rem;
-    line-height: 1.4;
-    resize: vertical;
-  }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    margin-bottom: 0.75rem;
-    flex-wrap: wrap;
-  }
-  button.action {
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 0.5rem 1rem;
-    font-size: 0.9rem;
-    cursor: pointer;
-  }
-  button.action:hover { filter: brightness(1.1); }
-  button.action:disabled { opacity: 0.5; cursor: default; }
-  button.action.secondary {
-    background: transparent;
-    color: var(--text);
-    border: 1px solid var(--border);
-  }
-  .hint {
-    color: var(--muted);
-    font-size: 0.8rem;
-  }
-  .status-msg {
-    font-size: 0.85rem;
-  }
-  .status-msg.ok { color: var(--ok); }
-  .status-msg.err { color: var(--err); }
-  .error-box {
-    display: none;
-    margin-top: 0.75rem;
-    padding: 0.6rem 0.75rem;
-    background: rgba(224, 83, 63, 0.1);
-    border: 1px solid var(--err);
-    border-radius: 6px;
-    color: var(--err);
-    font-family: var(--mono);
-    font-size: 0.82rem;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .error-box.visible { display: block; }
-  .session-banner {
-    display: none;
-    background: var(--err);
-    color: #fff;
-    padding: 0.5rem 1.25rem;
-    font-size: 0.85rem;
-    text-align: center;
-  }
-  .session-banner.visible { display: block; }
-</style>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/tokens.css">
+<link rel="stylesheet" href="/assets/ui.css">
+<script src="/assets/theme.js"></script>
+<script src="/assets/app.js" defer></script>
 </head>
 <body>
 
-<div id="session-banner" class="session-banner">Session expired — reload the page to re-authenticate.</div>
+<!-- Icons: Lucide (ISC License, https://lucide.dev), inlined so the page
+     makes no third-party request. -->
+<svg xmlns="http://www.w3.org/2000/svg" hidden>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
+  <symbol id="i-theme-system" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+  <symbol id="i-theme-light" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2m-7.07-14.93 1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+  <symbol id="i-theme-dark" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+</svg>
 
-<header>
-  <h1>FreeSBC</h1>
-  <span class="version" id="header-version">version …</span>
+<div id="session-banner" class="banner" role="alert" hidden>
+  <div class="container">
+    <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+    Session expired — reload the page to re-authenticate.
+  </div>
+</div>
+
+<header class="site-header">
+  <div class="container">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#i-shield"/></svg></span>
+      <span>FreeSBC</span>
+      <span class="badge mono" data-variant="outline" id="header-version">…</span>
+    </div>
+    <nav class="nav" aria-label="Sections">
+      <a class="nav-link" href="#dashboard" data-view="dashboard" aria-current="page">Overview</a>
+      <a class="nav-link" href="#config" data-view="config">Config</a>
+    </nav>
+    <div class="header-end">
+      <span class="status" id="live" data-state="pending" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="live-text">Connecting…</span>
+      </span>
+      <button class="btn" data-variant="ghost" data-size="icon" type="button" data-theme-toggle>
+        <svg class="icon" aria-hidden="true"><use href="#i-theme-system"/></svg>
+      </button>
+    </div>
+  </div>
 </header>
 
-<nav>
-  <button id="tab-dashboard" class="active" data-view="dashboard">Dashboard</button>
-  <button id="tab-config" data-view="config">Config</button>
-</nav>
+<main class="container">
+  <section id="view-dashboard" class="page" aria-labelledby="h-dashboard">
+    <div class="page-header">
+      <h1 class="page-title" id="h-dashboard">Overview</h1>
+      <p class="page-description">Live state of this node. Refreshes every 5 seconds.</p>
+    </div>
 
-<main>
-  <section id="view-dashboard" class="view active">
-    <div class="panel">
-      <h2>Status</h2>
-      <div class="status-line" id="status-line">
-        <div class="item"><span class="label">Version</span><span class="value" id="stat-version">—</span></div>
-        <div class="item"><span class="label">Uptime</span><span class="value" id="stat-uptime">—</span></div>
-        <div class="item"><span class="label">Active calls</span><span class="value" id="stat-active-calls">—</span></div>
-        <div class="item"><span class="label">Ports</span><span class="value" id="stat-ports">—</span></div>
+    <div class="grid-stats">
+      <div class="card stat">
+        <div class="card-header stat-header">
+          <span class="stat-label">Active calls</span>
+          <svg class="icon" aria-hidden="true"><use href="#i-phone"/></svg>
+        </div>
+        <div class="stat-value" id="stat-active-calls">—</div>
+        <div class="stat-foot">In progress on this node</div>
       </div>
-      <div class="note hidden" id="dashboard-error">connection error, retrying…</div>
+
+      <div class="card stat">
+        <div class="card-header stat-header">
+          <span class="stat-label">Media ports</span>
+          <svg class="icon" aria-hidden="true"><use href="#i-activity"/></svg>
+        </div>
+        <div class="stat-value" id="stat-ports">—</div>
+        <div class="meter" id="ports-meter" role="meter" aria-label="Media port utilisation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <div class="stat-foot" id="ports-foot"><span class="level-text" id="ports-pct">—</span></div>
+      </div>
+
+      <div class="card stat">
+        <div class="card-header stat-header">
+          <span class="stat-label">Uptime</span>
+          <svg class="icon" aria-hidden="true"><use href="#i-clock"/></svg>
+        </div>
+        <div class="stat-value" id="stat-uptime">—</div>
+        <div class="stat-foot">Version <span class="mono" id="stat-version">—</span></div>
+      </div>
     </div>
 
-    <div class="panel">
-      <h2>Calls</h2>
-      <table>
-        <thead>
-          <tr><th>ID</th><th>From</th><th>To</th><th>Duration (s)</th></tr>
-        </thead>
-        <tbody id="calls-body">
-          <tr class="empty-row"><td colspan="4">no active calls</td></tr>
-        </tbody>
-      </table>
-    </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-heading">
+            <h2 class="card-title">Active calls</h2>
+            <p class="card-description">Call-ID is the A-leg's, for correlating with SIP traces.</p>
+          </div>
+          <div class="card-action"><span class="badge num" data-variant="secondary" id="calls-count">0</span></div>
+        </div>
+        <div class="card-content flush">
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr><th scope="col">Call-ID</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Started</th><th scope="col" class="num">Duration</th></tr>
+              </thead>
+              <tbody id="calls-body"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="calls-empty">
+            <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-phone"/></svg></span>
+            <span class="empty-title">No active calls</span>
+            <span>Calls appear here while they are in progress.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-heading">
+            <h2 class="card-title">Listeners</h2>
+            <p class="card-description">SIP sockets bound at startup. Changing them needs a restart.</p>
+          </div>
+        </div>
+        <div class="card-content">
+          <ul class="list" data-layout="grid" id="listeners"><li class="muted">—</li></ul>
+        </div>
+      </div>
   </section>
 
-  <section id="view-config" class="view">
-    <div class="panel">
-      <h2>Config editor</h2>
-      <div class="toolbar">
-        <button class="action" id="btn-load">Load</button>
-        <button class="action" id="btn-save" disabled>Save</button>
-        <span class="status-msg" id="config-status"></span>
+  <section id="view-config" class="page" aria-labelledby="h-config" hidden>
+    <div class="page-header">
+      <h1 class="page-title" id="h-config">Config</h1>
+      <p class="page-description">The running <span class="mono">freesbc.yaml</span>. Saving validates first; a rejected file changes nothing.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="toolbar">
+          <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-load">
+            <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Load
+          </button>
+          <button class="btn" data-size="sm" type="button" id="btn-save" disabled>
+            <svg class="icon" aria-hidden="true"><use href="#i-save"/></svg>Save
+          </button>
+          <span class="toolbar-status" id="config-status" role="status" aria-live="polite"></span>
+        </div>
       </div>
-      <textarea id="config-text" spellcheck="false" placeholder="Opening the Config tab loads the running config automatically — use Load to re-fetch."></textarea>
-      <div class="error-box" id="config-error"></div>
-      <p class="hint">Keep secrets as ${ENV} references — this file may be viewed by other operators.</p>
+      <div class="card-content page">
+        <label class="visually-hidden" for="config-text">Config YAML</label>
+        <textarea class="textarea" id="config-text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-hint" placeholder="Opening the Config tab loads the running config automatically — use Load to re-fetch."></textarea>
+
+        <div class="alert" data-variant="destructive" id="config-error" role="alert" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-error"/></svg>
+          <div class="alert-title">Not saved</div>
+          <div class="alert-body"><pre class="mono" id="config-error-text"></pre></div>
+        </div>
+
+        <div class="alert" id="config-hint">
+          <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
+          <div class="alert-title">Only <span class="mono">shield.*</span> applies live</div>
+          <div class="alert-body">Every other section is read at startup: save, then restart. Keep secrets as <span class="mono">${ENV}</span> references — other operators can read this file.</div>
+        </div>
+      </div>
     </div>
   </section>
 </main>
-
-<script>
-(function () {
-  "use strict";
-
-  var STATUS_URL = "/api/status";
-  var CALLS_URL = "/api/calls";
-  var CONFIG_RAW_URL = "/api/config/raw";
-  var CONFIG_URL = "/api/config";
-
-  var POLL_MS = 5000;
-
-  var sessionExpired = false;
-  var configEtag = null;
-
-  // ---- tabs ----
-
-  var tabs = document.querySelectorAll("nav button");
-  var views = document.querySelectorAll(".view");
-
-  tabs.forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      tabs.forEach(function (b) { b.classList.remove("active"); });
-      views.forEach(function (v) { v.classList.remove("active"); });
-      btn.classList.add("active");
-      var view = document.getElementById("view-" + btn.dataset.view);
-      view.classList.add("active");
-      // First time the Config tab is opened, fetch the running config
-      // automatically instead of showing an empty editor.
-      if (btn.dataset.view === "config") loadConfigIfEmpty();
-    });
-  });
-
-  // ---- session-expired handling ----
-
-  function showSessionExpired() {
-    if (sessionExpired) return;
-    sessionExpired = true;
-    document.getElementById("session-banner").classList.add("visible");
-  }
-
-  // fetchJSON performs a same-origin GET and parses JSON. Basic Auth
-  // credentials are already attached by the browser (same-origin reuse).
-  // On 401 it flags the session as expired; on other failures it rejects
-  // so the caller can keep last-known-good data on screen.
-  function fetchJSON(url) {
-    return fetch(url, { credentials: "same-origin" }).then(function (res) {
-      if (res.status === 401) {
-        showSessionExpired();
-        throw new Error("unauthorized");
-      }
-      if (!res.ok) {
-        throw new Error(url + ": " + res.status);
-      }
-      return res.json();
-    });
-  }
-
-  // ---- dashboard ----
-
-  var headerVersion = document.getElementById("header-version");
-  var dashboardError = document.getElementById("dashboard-error");
-
-  function fmtDuration(sec) {
-    sec = Math.max(0, sec | 0);
-    var h = Math.floor(sec / 3600);
-    var m = Math.floor((sec % 3600) / 60);
-    var s = sec % 60;
-    var parts = [];
-    if (h) parts.push(h + "h");
-    if (h || m) parts.push(m + "m");
-    parts.push(s + "s");
-    return parts.join(" ");
-  }
-
-  function renderStatus(data) {
-    headerVersion.textContent = "v" + data.version;
-    document.getElementById("stat-version").textContent = data.version;
-    document.getElementById("stat-uptime").textContent = fmtDuration(data.uptime_seconds);
-    document.getElementById("stat-active-calls").textContent = data.active_calls;
-    var ports = data.ports || {};
-    document.getElementById("stat-ports").textContent =
-      (ports.in_use != null ? ports.in_use : "—") + " / " + (ports.total != null ? ports.total : "—");
-  }
-
-  function renderCalls(calls) {
-    var body = document.getElementById("calls-body");
-    body.innerHTML = "";
-    if (!calls || calls.length === 0) {
-      body.innerHTML = '<tr class="empty-row"><td colspan="4">no active calls</td></tr>';
-      return;
-    }
-    calls.forEach(function (c) {
-      var tr = document.createElement("tr");
-      [c.id, c.from, c.to, c.duration_seconds].forEach(function (v) {
-        var td = document.createElement("td");
-        td.textContent = v == null ? "" : v;
-        tr.appendChild(td);
-      });
-      body.appendChild(tr);
-    });
-  }
-
-  function pollDashboard() {
-    Promise.all([
-      fetchJSON(STATUS_URL),
-      fetchJSON(CALLS_URL)
-    ]).then(function (results) {
-      renderStatus(results[0]);
-      renderCalls(results[1]);
-      dashboardError.classList.add("hidden");
-    }).catch(function () {
-      // keep last-known-good data on screen; just flag the problem.
-      if (!sessionExpired) {
-        dashboardError.classList.remove("hidden");
-      }
-    });
-  }
-
-  pollDashboard();
-  setInterval(pollDashboard, POLL_MS);
-
-  // ---- config editor ----
-
-  var btnLoad = document.getElementById("btn-load");
-  var btnSave = document.getElementById("btn-save");
-  var configText = document.getElementById("config-text");
-  var configStatus = document.getElementById("config-status");
-  var configError = document.getElementById("config-error");
-
-  function setConfigStatus(msg, kind) {
-    configStatus.textContent = msg;
-    configStatus.className = "status-msg" + (kind ? " " + kind : "");
-  }
-
-  function clearConfigError() {
-    configError.textContent = "";
-    configError.classList.remove("visible");
-  }
-
-  function showConfigError(text) {
-    configError.textContent = text;
-    configError.classList.add("visible");
-  }
-
-  var configLoading = false;
-
-  function loadConfig() {
-    if (configLoading) return;
-    configLoading = true;
-    setConfigStatus("Loading…");
-    clearConfigError();
-    fetch(CONFIG_RAW_URL, { credentials: "same-origin" }).then(function (res) {
-      if (res.status === 401) {
-        showSessionExpired();
-        throw new Error("unauthorized");
-      }
-      return res.text().then(function (text) {
-        if (!res.ok) {
-          throw new Error("load failed: " + res.status + " " + text);
-        }
-        configEtag = res.headers.get("ETag");
-        configText.value = text;
-        btnSave.disabled = false;
-        setConfigStatus("Loaded", "ok");
-      });
-    }).catch(function (err) {
-      setConfigStatus("Load failed", "err");
-      showConfigError(String(err.message || err));
-    }).then(function () {
-      configLoading = false;
-    });
-  }
-
-  // Auto-load on first open of the Config tab; the Load button stays as a
-  // manual refresh (e.g. after a 409 "changed on disk").
-  function loadConfigIfEmpty() {
-    if (!configText.value) loadConfig();
-  }
-
-  btnLoad.addEventListener("click", loadConfig);
-
-  btnSave.addEventListener("click", function () {
-    setConfigStatus("Saving…");
-    clearConfigError();
-    var headers = { "Content-Type": "application/x-yaml" };
-    if (configEtag) headers["If-Match"] = configEtag;
-    fetch(CONFIG_URL, {
-      method: "PUT",
-      credentials: "same-origin",
-      headers: headers,
-      body: configText.value
-    }).then(function (res) {
-      if (res.status === 401) {
-        showSessionExpired();
-        throw new Error("unauthorized");
-      }
-      return res.text().then(function (text) {
-        if (res.status === 200) {
-          configEtag = res.headers.get("ETag") || configEtag;
-          setConfigStatus("Saved ✓", "ok");
-          return;
-        }
-        if (res.status === 400) {
-          setConfigStatus("Validation error", "err");
-          showConfigError(text);
-          return;
-        }
-        if (res.status === 409) {
-          setConfigStatus("Config changed on disk — click Load to refresh", "err");
-          return;
-        }
-        if (res.status === 413) {
-          setConfigStatus("Config too large", "err");
-          return;
-        }
-        setConfigStatus("Save failed (" + res.status + ")", "err");
-        showConfigError(text);
-      });
-    }).catch(function (err) {
-      if (String(err.message || err) !== "unauthorized") {
-        setConfigStatus("Save failed", "err");
-        showConfigError(String(err.message || err));
-      }
-    });
-  });
-})();
-</script>
 
 </body>
 </html>

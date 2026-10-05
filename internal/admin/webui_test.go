@@ -1,25 +1,33 @@
 package admin
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
 
+func uiGet(t *testing.T, s *Server, path string, auth bool) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", path, nil)
+	if auth {
+		req.SetBasicAuth("admin", "secret")
+	}
+	s.handler().ServeHTTP(rr, req)
+	return rr
+}
+
 func TestUIServedBehindAuth(t *testing.T) {
 	s := testServer(t)
 	// no creds → 401
-	rr := httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/", nil))
-	if rr.Code != http.StatusUnauthorized {
+	if rr := uiGet(t, s, "/", false); rr.Code != http.StatusUnauthorized {
 		t.Fatalf("GET / no creds: %d want 401", rr.Code)
 	}
 	// with creds → 200 HTML
-	rr = httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/", nil)
-	req.SetBasicAuth("admin", "secret")
-	s.handler().ServeHTTP(rr, req)
+	rr := uiGet(t, s, "/", true)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("GET / with creds: %d want 200", rr.Code)
 	}
@@ -30,28 +38,144 @@ func TestUIServedBehindAuth(t *testing.T) {
 	if !strings.Contains(body, "FreeSBC") {
 		t.Error("UI body missing FreeSBC marker")
 	}
-	// the SPA must actually wire the API endpoints it depends on
-	for _, ep := range []string{"/api/status", "/api/config/raw", "/api/config"} {
-		if !strings.Contains(body, ep) {
-			t.Errorf("UI does not reference %q — is the SPA wired?", ep)
+	for _, a := range []string{"/assets/tokens.css", "/assets/ui.css", "/assets/theme.js", "/assets/app.js"} {
+		if !strings.Contains(body, a) {
+			t.Errorf("UI does not load %q", a)
 		}
+	}
+	// the SPA must actually wire the API endpoints it depends on
+	app := uiGet(t, s, "/assets/app.js", true).Body.String()
+	for _, ep := range []string{"/api/status", "/api/calls", "/api/config/raw", "/api/config"} {
+		if !strings.Contains(app, ep) {
+			t.Errorf("app.js does not reference %q — is the SPA wired?", ep)
+		}
+	}
+}
+
+func TestUIAssets(t *testing.T) {
+	s := testServer(t)
+	for path, ct := range map[string]string{
+		"/assets/tokens.css": "text/css",
+		"/assets/ui.css":     "text/css",
+		"/assets/theme.js":   "text/javascript",
+		"/assets/app.js":     "text/javascript",
+	} {
+		if rr := uiGet(t, s, path, false); rr.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s no creds: %d want 401", path, rr.Code)
+		}
+		rr := uiGet(t, s, path, true)
+		if rr.Code != http.StatusOK {
+			t.Errorf("GET %s: %d want 200", path, rr.Code)
+			continue
+		}
+		if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, ct) {
+			t.Errorf("GET %s Content-Type = %q, want %s", path, got, ct)
+		}
+	}
+	// Unknown assets and the directory itself are 404, not the SPA and not
+	// a listing: a typo in index.html must fail loudly.
+	for _, path := range []string{"/assets/", "/assets/missing.css"} {
+		if rr := uiGet(t, s, path, true); rr.Code != http.StatusNotFound {
+			t.Errorf("GET %s: %d want 404", path, rr.Code)
+		}
+	}
+}
+
+func TestUISecurityHeaders(t *testing.T) {
+	s := testServer(t)
+	for _, path := range []string{"/", "/assets/app.js"} {
+		h := uiGet(t, s, path, true).Header()
+		csp := h.Get("Content-Security-Policy")
+		for _, want := range []string{"default-src 'none'", "script-src 'self'", "style-src 'self'", "frame-ancestors 'none'"} {
+			if !strings.Contains(csp, want) {
+				t.Errorf("%s: CSP %q missing %q", path, csp, want)
+			}
+		}
+		if strings.Contains(csp, "unsafe-inline") || strings.Contains(csp, "unsafe-eval") {
+			t.Errorf("%s: CSP must not relax inline/eval: %q", path, csp)
+		}
+		if got := h.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q", path, got)
+		}
+	}
+}
+
+// The CSP blocks inline script and style without an error the operator would
+// see, so the page would silently lose behaviour or styling. Keep every
+// script and style in /assets/.
+func TestUIHasNoInlineScriptOrStyle(t *testing.T) {
+	inlineScript := regexp.MustCompile(`(?i)<script(\s[^>]*)?>\s*[^<\s]`)
+	scriptNoSrc := regexp.MustCompile(`(?i)<script\b[^>]*>`)
+	err := fs.WalkDir(webuiFS, "webui", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".html") {
+			return err
+		}
+		b, err := webuiFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		html := string(b)
+		if inlineScript.MatchString(html) {
+			t.Errorf("%s: inline <script> body", path)
+		}
+		for _, tag := range scriptNoSrc.FindAllString(html, -1) {
+			if !strings.Contains(tag, "src=") {
+				t.Errorf("%s: <script> without src: %s", path, tag)
+			}
+		}
+		if strings.Contains(strings.ToLower(html), "<style") {
+			t.Errorf("%s: inline <style>", path)
+		}
+		if regexp.MustCompile(`(?i)\sstyle\s*=`).MatchString(html) {
+			t.Errorf("%s: inline style attribute", path)
+		}
+		if regexp.MustCompile(`(?i)\son[a-z]+\s*=`).MatchString(html) {
+			t.Errorf("%s: inline event handler", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Components must consume tokens, not literal colours: a hex or rgb()/oklch()
+// colour outside tokens.css bypasses theming and dark mode.
+func TestUIColoursComeFromTokens(t *testing.T) {
+	literal := regexp.MustCompile(`#[0-9a-fA-F]{3,8}\b|\b(rgb|rgba|hsl|hsla|oklch|oklab|lab|lch)\(`)
+	err := fs.WalkDir(webuiFS, "webui/assets", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".css") || strings.HasSuffix(path, "/tokens.css") {
+			return err
+		}
+		b, err := webuiFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			code := line
+			if j := strings.Index(code, "/*"); j >= 0 {
+				code = code[:j]
+			}
+			if literal.MatchString(code) {
+				t.Errorf("%s:%d: literal colour, use a token: %s", path, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestUIDoesNotShadowAPI(t *testing.T) {
 	s := testServer(t)
 	// /api/status must still hit the JSON handler, not the UI catch-all.
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/status", nil)
-	req.SetBasicAuth("admin", "secret")
-	s.handler().ServeHTTP(rr, req)
+	rr := uiGet(t, s, "/api/status", true)
 	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Fatalf("/api/status Content-Type = %q, want application/json (UI shadowed it?)", ct)
 	}
 	// /healthz still open (no auth)
-	rr = httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/healthz", nil))
-	if rr.Code != http.StatusOK {
+	if rr := uiGet(t, s, "/healthz", false); rr.Code != http.StatusOK {
 		t.Fatalf("/healthz: %d want 200", rr.Code)
 	}
 }
