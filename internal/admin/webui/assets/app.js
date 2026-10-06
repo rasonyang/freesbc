@@ -239,6 +239,7 @@
 
   var btnLoad = $("btn-load");
   var btnSave = $("btn-save");
+  var btnDownload = $("btn-download");
   var configText = $("config-text");
   var configStatus = $("config-status");
   var configError = $("config-error");
@@ -358,6 +359,55 @@
       }
     });
   });
+
+  // ---- download ----
+
+  // downloadName is freesbc-<host>-<UTC timestamp>.yaml. The host is
+  // location.host, so IPv6 brackets, colons and ports must not reach the
+  // file system: anything outside [A-Za-z0-9.-] becomes "-".
+  function downloadName(host, now) {
+    var ts = now.toISOString().replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "");
+    return "freesbc-" + host.replace(/[^A-Za-z0-9.-]/g, "-") + "-" + ts + ".yaml";
+  }
+
+  var downloading = false;
+
+  // Fetches the file fresh, never the textarea (which may hold unsaved
+  // edits), and saves the exact response bytes: a Blob, not re-encoded text.
+  function downloadConfig() {
+    if (downloading) return;
+    downloading = true;
+    btnDownload.disabled = true;
+    setConfigStatus("Downloading…");
+    fetch(CONFIG_RAW_URL, { credentials: "same-origin", cache: "no-store" }).then(function (res) {
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error("unauthorized");
+      }
+      if (!res.ok) throw new Error("download failed: " + res.status);
+      clearSessionExpired();
+      return res.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(new Blob([blob], { type: "application/x-yaml" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = downloadName(location.host, new Date());
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+      setConfigStatus("Downloaded " + a.download, "ok");
+    }).catch(function (err) {
+      if (String(err.message || err) !== "unauthorized") {
+        setConfigStatus("Download failed", "err");
+      }
+    }).then(function () {
+      downloading = false;
+      btnDownload.disabled = false;
+    });
+  }
+
+  btnDownload.addEventListener("click", downloadConfig);
 
   // ---- start ----
 

@@ -179,3 +179,31 @@ func TestUIDoesNotShadowAPI(t *testing.T) {
 		t.Fatalf("/healthz: %d want 200", rr.Code)
 	}
 }
+
+// The Config tab offers a download of the on-disk file, with the warning that
+// it is unredacted. The script must fetch it fresh and save the response
+// bytes (a Blob), not the textarea or re-encoded text.
+func TestUIConfigDownload(t *testing.T) {
+	read := func(name string) string {
+		b, err := webuiFS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	html := read("webui/index.html")
+	for _, want := range []string{`id="btn-download"`, `id="download-note"`, "not redacted", "password hash"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	js := read("webui/assets/app.js")
+	for _, want := range []string{"res.blob()", "URL.createObjectURL", "URL.revokeObjectURL", ".download = downloadName(", `"freesbc-"`, "[^A-Za-z0-9.-]"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+	if i := strings.Index(js, "function downloadConfig"); i < 0 || strings.Contains(js[i:], "configText.value") {
+		t.Error("downloadConfig must not read the editor text")
+	}
+}

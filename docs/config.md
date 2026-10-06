@@ -175,6 +175,8 @@ Web security (restart-only like the rest of `admin`):
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
 
+The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the editor text, so unsaved edits are not included) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
+
 ## Reload classes
 
 `config.Watch` watches the file's parent directory (200 ms debounce, symlink-aware) and publishes each valid file as an immutable snapshot. An invalid file is logged and the previous snapshot stays. `PUT /api/config` only writes the file atomically; the watcher does the reload.

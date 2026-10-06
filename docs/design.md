@@ -2919,7 +2919,10 @@ polls are chained with `setTimeout` and each request times out after 4 s, so
 they never overlap; a 401 shows a persistent "session expired" banner that
 the next successful response clears), and a **Config** editor that loads
 `/api/config/raw`, keeps its ETag, and PUTs to `/api/config` with
-`If-Match`. Design rules are in `docs/admin-ui.md`.
+`If-Match`. A **Download config** button fetches
+`/api/config/raw` fresh (not the editor text) and saves the response bytes as
+`freesbc-<host>-<UTC timestamp>.yaml`; the file is unredacted and the page
+says so. Design rules are in `docs/admin-ui.md`.
 
 ---
 
