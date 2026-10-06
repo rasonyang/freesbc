@@ -211,6 +211,12 @@ func TestValidateErrors(t *testing.T) {
 		{"admin remote without opt-in", with("admin: { listen: 0.0.0.0:8080, password_hash: " + good + " }\n"), "allow_remote"},
 		{"admin no hash", with("admin: { listen: 127.0.0.1:8080 }\n"), "admin.password_hash"},
 		{"admin low cost", with("admin: { listen: 127.0.0.1:8080, password_hash: " + adminHash(bcrypt.MinCost) + " }\n"), "below the minimum of 10"},
+		{"allowed_hosts empty", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [\"\"] }\n"), "admin.allowed_hosts[0]"},
+		{"allowed_hosts port", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [\"a.example:8080\"] }\n"), "must not carry a port"},
+		{"allowed_hosts scheme", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [\"https://a.example\"] }\n"), "bare host"},
+		{"allowed_hosts wildcard", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [\"*.example\"] }\n"), "wildcard"},
+		{"allowed_hosts bracketed", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [\"[::1]\"] }\n"), "brackets"},
+		{"allowed_hosts dup", with("admin: { listen: 127.0.0.1:8080, password_hash: " + good + ", allowed_hosts: [A.example, a.example.] }\n"), "duplicate"},
 		{"admin vs wss", replace(t, minimalYAML, "{ udp: 5060 }", "{ wss: 8443 }") + "tls: { cert: a, key: b }\nadmin: { listen: 203.0.113.7:8443, allow_remote: true, password_hash: " + good + " }\n", "already bound by edge.listen.wss"},
 	}
 	for _, tc := range cases {
@@ -231,6 +237,7 @@ func TestValidateAcceptsEdgeCases(t *testing.T) {
 		"bare ipv6 carrier":     replace(t, minimalYAML, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: \"2001:db8::1\" }"),
 		"loopback admin":        with("admin: { listen: 127.0.0.1:8080, password_hash: " + string(good) + " }\n"),
 		"remote admin with tls": with("tls: { cert: a, key: b }\nadmin: { listen: 0.0.0.0:8080, allow_remote: true, password_hash: " + string(good) + " }\n"),
+		"allowed hosts":         with("admin: { listen: 127.0.0.1:8080, password_hash: " + string(good) + ", allowed_hosts: [sbc.example.net, 192.0.2.5, \"2001:db8::1\"] }\n"),
 		"tls without wss":       with("tls: { cert: a, key: b }\n"),
 		"carrier 4in6 source":   replace(t, minimalYAML, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [\"::ffff:10.0.0.1\"]"),
 		"distinct switches":     replace(t, minimalYAML, "[10.77.0.10:5060]", "[10.77.0.10:5060, 10.77.0.10:5061]"),

@@ -12,7 +12,7 @@ import (
 // credentials (none when user is empty) and returns the status code.
 func doAuth(h http.Handler, remote, user, pass string) int {
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	req := newReq(http.MethodGet, "/api/status", nil)
 	req.RemoteAddr = remote
 	if user != "" {
 		req.SetBasicAuth(user, pass)

@@ -12,7 +12,7 @@ import (
 func uiGet(t *testing.T, s *Server, path string, auth bool) *httptest.ResponseRecorder {
 	t.Helper()
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", path, nil)
+	req := newReq("GET", path, nil)
 	if auth {
 		req.SetBasicAuth("admin", "secret")
 	}

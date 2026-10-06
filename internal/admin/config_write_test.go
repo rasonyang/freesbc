@@ -91,7 +91,7 @@ func newTestServerWithFile(t *testing.T, yaml string) (*Server, string) {
 func authGETraw(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req := newReq(http.MethodGet, path, nil)
 	req.SetBasicAuth("admin", "secret")
 	s.handler().ServeHTTP(rr, req)
 	return rr
@@ -109,7 +109,7 @@ func authPUT(t *testing.T, s *Server, path, body, ifMatch string) *httptest.Resp
 func authREQ(t *testing.T, s *Server, method, path, body, ifMatch string) *httptest.ResponseRecorder {
 	t.Helper()
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req := newReq(method, path, strings.NewReader(body))
 	req.SetBasicAuth("admin", "secret")
 	if ifMatch != "" {
 		req.Header.Set("If-Match", ifMatch)
@@ -230,7 +230,7 @@ func TestConfigWriteTooLargeRejectedFileUnchanged(t *testing.T) {
 func TestConfigRawRequiresAuth(t *testing.T) {
 	s, _ := newTestServerWithFile(t, validCfg)
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/config/raw", nil)
+	req := newReq(http.MethodGet, "/api/config/raw", nil)
 	// no credentials set
 	s.handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {

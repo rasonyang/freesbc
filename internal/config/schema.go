@@ -119,6 +119,10 @@ type AdminConfig struct {
 	// AllowRemote permits a non-loopback listen address, served over HTTPS
 	// with the top-level tls identity.
 	AllowRemote bool `yaml:"allow_remote"`
+	// AllowedHosts are extra host names or IP literals (no port) the admin
+	// server accepts in the Host header, besides listen and, on a loopback
+	// listen, the loopback names. Optional.
+	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
 // AdminUser is the only admin user name.

@@ -63,7 +63,7 @@ func TestAuditAuthLimiterHoldsUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			<-start
 			rr := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+			req := newReq(http.MethodGet, "/api/status", nil)
 			req.SetBasicAuth("admin", "wrong")
 			h.ServeHTTP(rr, req)
 			mu.Lock()
