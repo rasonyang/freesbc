@@ -62,7 +62,7 @@ One process, one YAML file, one SIP plane: the **edge** (`internal/edge`), a sta
 - Listeners bypass `ListenAndServe*`, whose unsynchronised close is flagged by `-race` on every shutdown.
 - `edge.New` raises the process-wide `sip.UDPMTUSize` to 8192.
 
-`docs/design.md` describes the code as implemented, with file:line citations: §4 lifecycle/reload, §6 carrier path, §7 edge, §8 media, §11 concurrency, §14 security, §15.2 all timeouts, §17 package ownership. `docs/config.md` is the configuration reference; `docs/edge.md` has the switch-side requirements, non-goals and known limitations.
+`docs/design.md` describes the code as implemented, with file:line citations: §4 lifecycle/reload, §6 carrier path, §7 edge, §8 media, §11 concurrency, §14 security, §15.2 all timeouts, §17 package ownership. `docs/config.md` is the configuration reference; `docs/edge.md` has the switch-side requirements, non-goals and known limitations; `docs/admin-ui.md` has the WebUI's design tokens and rules (shadcn tokens in `internal/admin/webui/assets/tokens.css`, no inline script or style, API strings via `textContent`).
 
 ## Test environment gotchas
 
