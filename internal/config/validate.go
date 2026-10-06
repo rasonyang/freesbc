@@ -305,6 +305,18 @@ func (c *Config) validateAdmin(fail failFunc) {
 		// auth: a non-loopback bind must be an explicit opt-in.
 		fail("admin.listen: %q is not loopback; set admin.allow_remote: true (requires tls) to bind it", c.Admin.Listen)
 	}
+	seen := make(map[string]bool, len(c.Admin.AllowedHosts))
+	for i, h := range c.Admin.AllowedHosts {
+		if msg := checkAllowedHost(h); msg != "" {
+			fail("admin.allowed_hosts[%d]: %q %s", i, h, msg)
+			continue
+		}
+		k := CanonicalHost(h)
+		if seen[k] {
+			fail("admin.allowed_hosts[%d]: %q is a duplicate", i, h)
+		}
+		seen[k] = true
+	}
 	cost, cerr := bcrypt.Cost([]byte(c.Admin.PasswordHash))
 	if cerr != nil {
 		fail("admin.password_hash: must be a bcrypt hash: %v", c.envRedact.detail(c.Admin.PasswordHash, cerr))
@@ -463,4 +475,40 @@ func parsePrefixOrAddr(s string) (netip.Prefix, error) {
 		return netip.Prefix{}, fmt.Errorf("%q is neither a CIDR nor an IP", s)
 	}
 	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+// hostNameRE is a DNS-style host name: dot-separated labels of letters,
+// digits, hyphens and underscores, with an optional trailing dot.
+var hostNameRE = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?)*\.?$`)
+
+// checkAllowedHost returns why h is not a valid admin.allowed_hosts entry
+// (a bare host name or IP literal), or "" when it is.
+func checkAllowedHost(h string) string {
+	switch {
+	case h == "":
+		return "is empty"
+	case strings.Contains(h, "://") || strings.Contains(h, "/"):
+		return "must be a bare host, not a URL"
+	case strings.Contains(h, "*"):
+		return "must not contain a wildcard"
+	}
+	if _, err := netip.ParseAddr(h); err == nil {
+		return ""
+	}
+	if strings.ContainsAny(h, ":[]") {
+		return "must not carry a port or brackets (the listen port is implied)"
+	}
+	if !hostNameRE.MatchString(h) {
+		return "is not a valid host name or IP address"
+	}
+	return ""
+}
+
+// CanonicalHost normalises a host name or IP literal for comparison: IP
+// literals in their canonical form, names lower-cased without a trailing dot.
+func CanonicalHost(h string) string {
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.Unmap().String()
+	}
+	return strings.ToLower(strings.TrimSuffix(h, "."))
 }

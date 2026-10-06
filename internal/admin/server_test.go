@@ -95,7 +95,7 @@ func testServerWithSecretConfig(t *testing.T, adminHash string) *Server {
 func authGET(t *testing.T, s *Server, path string) []byte {
 	t.Helper()
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", path, nil)
+	req := newReq("GET", path, nil)
 	req.SetBasicAuth("admin", "secret")
 	s.handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
@@ -109,13 +109,13 @@ func TestAuthRequired(t *testing.T) {
 	h := s.handler()
 	// no creds → 401
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest("GET", "/api/status", nil))
+	h.ServeHTTP(rr, newReq("GET", "/api/status", nil))
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("no creds: got %d want 401", rr.Code)
 	}
 	// wrong pass → 401
 	rr = httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/status", nil)
+	req := newReq("GET", "/api/status", nil)
 	req.SetBasicAuth("admin", "wrong")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -125,7 +125,7 @@ func TestAuthRequired(t *testing.T) {
 	// inverted or missing username compare that would pass any username
 	// through as long as the password matches)
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest("GET", "/api/status", nil)
+	req = newReq("GET", "/api/status", nil)
 	req.SetBasicAuth("wronguser", "secret")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
@@ -133,7 +133,7 @@ func TestAuthRequired(t *testing.T) {
 	}
 	// correct → not 401
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest("GET", "/api/status", nil)
+	req = newReq("GET", "/api/status", nil)
 	req.SetBasicAuth("admin", "secret")
 	h.ServeHTTP(rr, req)
 	if rr.Code == http.StatusUnauthorized {
@@ -144,7 +144,7 @@ func TestAuthRequired(t *testing.T) {
 func TestHealthzNoAuth(t *testing.T) {
 	s := testServer(t)
 	rr := httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/healthz", nil))
+	s.handler().ServeHTTP(rr, newReq("GET", "/healthz", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("/healthz no-auth: got %d want 200", rr.Code)
 	}
@@ -153,7 +153,7 @@ func TestHealthzNoAuth(t *testing.T) {
 func TestMetricsBehindAuth(t *testing.T) {
 	s := testServer(t)
 	rr := httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	s.handler().ServeHTTP(rr, newReq("GET", "/metrics", nil))
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("/metrics without creds: got %d want 401", rr.Code)
 	}
@@ -186,7 +186,7 @@ func TestSensitiveResponsesNoStore(t *testing.T) {
 	s := testServer(t)
 	for _, path := range []string{"/api/config/raw", "/api/config", "/api/status", "/"} {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", path, nil)
+		req := newReq("GET", path, nil)
 		req.SetBasicAuth("admin", "secret")
 		s.handler().ServeHTTP(rr, req)
 		if got := rr.Header().Get("Cache-Control"); got != "no-store" {
@@ -194,7 +194,7 @@ func TestSensitiveResponsesNoStore(t *testing.T) {
 		}
 	}
 	rr := httptest.NewRecorder()
-	s.handler().ServeHTTP(rr, httptest.NewRequest("GET", "/healthz", nil))
+	s.handler().ServeHTTP(rr, newReq("GET", "/healthz", nil))
 	if got := rr.Header().Get("Cache-Control"); got != "" {
 		t.Errorf("/healthz: Cache-Control = %q, want none (exempt)", got)
 	}
@@ -211,7 +211,7 @@ func TestAdminLoginFailureRateLimit(t *testing.T) {
 	h := s.handler()
 	for i := 1; i <= 11; i++ {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/api/status", nil)
+		req := newReq("GET", "/api/status", nil)
 		req.SetBasicAuth("admin", "wrong")
 		h.ServeHTTP(rr, req)
 		want := http.StatusUnauthorized
@@ -223,7 +223,7 @@ func TestAdminLoginFailureRateLimit(t *testing.T) {
 		}
 	}
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/status", nil)
+	req := newReq("GET", "/api/status", nil)
 	req.SetBasicAuth("admin", "secret")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusTooManyRequests {
@@ -252,7 +252,7 @@ func TestRequireAuthSkipsKDFOnMissingHeader(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		start := time.Now()
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/api/status", nil)
+		req := newReq("GET", "/api/status", nil)
 		req.RemoteAddr = fmt.Sprintf("198.51.100.%d:1234", i+1)
 		h.ServeHTTP(rr, req)
 		latencies = append(latencies, time.Since(start))
@@ -323,7 +323,7 @@ func TestAdminIgnoresReloadedHash(t *testing.T) {
 	s.store.Replace(reloaded)
 	for pass, want := range map[string]int{"secret": http.StatusOK, "newsecret": http.StatusUnauthorized} {
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/api/status", nil)
+		req := newReq("GET", "/api/status", nil)
 		req.SetBasicAuth("admin", pass)
 		h.ServeHTTP(rr, req)
 		if rr.Code != want {
@@ -336,7 +336,7 @@ func TestAdminIgnoresReloadedHash(t *testing.T) {
 func TestAdminUserIsConstant(t *testing.T) {
 	h := testServer(t).handler()
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/api/status", nil)
+	req := newReq("GET", "/api/status", nil)
 	req.SetBasicAuth("root", "secret")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {

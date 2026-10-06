@@ -167,7 +167,7 @@ Created once, alive for the process lifetime:
    `Watch` returns and returns nil itself, `app.go:70-76`).
 2. `edge.Server.Run`: always; its error is fatal (`app.go:81-87`).
 3. `admin.Server.Run`: if `admin:` exists at startup; fatal. Its HTTP serve
-   goroutine is the only one it starts (`admin/server.go:156`).
+   goroutine is the only one it starts (`admin/server.go:159`).
 
 `cmd/freesbc`'s `withSignals` adds one more, which releases signal capture
 after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
@@ -364,7 +364,7 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.listen` |
 | | `edge.carriers` |
 | | `edge.carrier_sources` |
-| | `admin` (`listen`, `password_hash`, `allow_remote`, and whether the section exists) |
+| | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, and whether the section exists) |
 
 Which plane code runs is not a setting: the edge always runs, and the admin
 server runs when an `admin:` section existed at startup.
@@ -377,7 +377,7 @@ P2-CFG-007), diffed against the snapshot current when the watcher started.
 The edge never acts on the new values: it keeps the snapshot it was built
 from (`edge.Server.boot`) and reads every restart-only setting from it, never
 from the store; the admin server likewise holds its startup `AdminConfig` and
-`TLSConfig` (`admin.New`, `admin/server.go:128`).
+`TLSConfig` (`admin.New`, `admin/server.go:129`).
 
 ### 4.5 Shutdown
 
@@ -403,7 +403,7 @@ session timers or media timeouts. `defer sh.Close()` on the shield (and the
 sipgo client and user agent) fires after all of this.
 
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout
-(`admin/server.go:171-174`). In-flight HTTP requests are drained up to that
+(`admin/server.go:174-177`). In-flight HTTP requests are drained up to that
 budget.
 
 **Shield.Close**: cancel the prune loop and wait for it. Bans are in memory
@@ -2594,7 +2594,7 @@ spin.
 |---|---|
 | `edge.guard` (`edge.go:743`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` (`media/relay.go:115`) | every relay goroutine; closes **that session only** |
-| `admin.recoverMW` (`admin/server.go:475`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `admin.recoverMW` (`admin/server.go:489`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` (`config/loader.go:54`) | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` (`config/reload.go:158`) | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
@@ -2688,7 +2688,7 @@ own firewall in front of FreeSBC.
 | Surface | Certificate | Minimum version | Client auth |
 |---|---|---|---|
 | Edge `wss` listener | top-level `tls.cert`/`tls.key`, loaded when the listener binds (`edge.go:590-595`); `check` requires `tls` whenever `edge.listen.wss` is set | TLS 1.2 | — |
-| Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:145-166`); a loopback admin serves plain HTTP | TLS 1.2 | — |
+| Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:150-169`); a loopback admin serves plain HTTP | TLS 1.2 | — |
 | WebRTC DTLS | one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity, `media/dtlscert.go:36-87`), created when `edge.listen.ws` or `wss` is set | — | `RequireAnyClientCert` (`webrtcleg.go:539`), so there is always something to fingerprint |
 
 The DTLS certificate is never verified as a chain: the browser's identity
@@ -2789,9 +2789,14 @@ The default process log level is `Info` and there is no flag to change it.
 
 ### 13.3 Admin HTTP API
 
-All routes are on one `http.ServeMux` (`server.go:133-141`) behind `recoverMW`
-(`server.go:483`), which also sets `Cache-Control: no-store` on **every**
-response except `/healthz`.
+All routes are on one `http.ServeMux` (`server.go:136-146`) behind `recoverMW`
+(`server.go:489`) and `guardMW` (`guard.go`). `recoverMW` sets
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer` on **every** response, error responses
+included, and `Cache-Control: no-store` on every response except `/healthz`;
+the `Content-Security-Policy` is UI-only (`handleUI`). `guardMW` runs the
+Host and Origin checks (§14, Admin) before any auth work, on every route but
+`/healthz`.
 
 | Pattern | Methods | Auth | Response |
 |---|---|---|---|
@@ -2844,7 +2849,7 @@ The admin section is restart-only (`admin` in `RestartOnlyChanges`): the
 hot password rotation. The user name is always `admin` (`config.AdminUser`);
 the password is checked against `admin.password_hash`.
 
-`requireAuth` (`server.go:206`) runs per request:
+`requireAuth` (`server.go:209`) runs per request:
 
 1. A request with **no (parseable) Basic `Authorization` header** gets
    `WWW-Authenticate: Basic realm="freesbc"` and **401 — without running
@@ -2854,7 +2859,7 @@ the password is checked against `admin.password_hash`.
    (`verifiedCreds`), the request is served with no bcrypt and no limiter
    check. Entries are HMAC-SHA256 digests (per-process random key) over the
    configured hash plus the presented username and password; at most **16**
-   are kept (`verifiedCredsMax`, `server.go:394`), each for **1 h** after its
+   are kept (`verifiedCredsMax`, `server.go:397`), each for **1 h** after its
    last use. This is what keeps an operator or the Prometheus scrape working
    when a shared source address (loopback, a reverse proxy) is locked out by
    someone else's failures, and it saves a KDF per scrape. Only an exact
@@ -2872,7 +2877,7 @@ the password is checked against `admin.password_hash`.
    are remembered (step 2).
 
 Limiter constants (`authFailLimit`, `authFailWindow`, `authFailMaxIPs`,
-`server.go:263-265`): **10** failures per **1 minute** fixed window per source,
+`server.go:266-268`): **10** failures per **1 minute** fixed window per source,
 tracking at most **4096** sources. A source (`limiterKey`) is an IPv4 address
 (IPv4-mapped addresses are unmapped) or an IPv6 **/64**, so one host cannot
 mint fresh budgets from its own prefix. There is no background sweeper:
@@ -2884,11 +2889,11 @@ cannot reset an exhausted attacker's budget (audit P2-ADM-003). A refund whose
 window has since rolled over is dropped. A client whose credentials were never
 verified still gets 429 while its source is over budget.
 
-`http.Server` timeouts (`newHTTPServer`, `server.go:245`): `ReadHeaderTimeout`
+`http.Server` timeouts (`newHTTPServer`, `server.go:248`): `ReadHeaderTimeout`
 5 s, `ReadTimeout` 30 s, `WriteTimeout` 30 s, `IdleTimeout` 30 s. Shutdown
 gets a 5 s drain. With `admin.allow_remote` the listener serves HTTPS (TLS 1.2
 minimum) using the top-level `tls` identity, loaded when the admin server
-starts (`server.go:153`); otherwise it serves plain HTTP, which validation
+starts (`server.go:164`); otherwise it serves plain HTTP, which validation
 admits only on a loopback address.
 
 ### 13.5 WebUI
@@ -2908,10 +2913,16 @@ script, style and event handlers are blocked by the CSP and rejected by
 
 Two hash-routed views: an **Overview** polling `/api/status` and
 `/api/calls` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
-poll keeps the last data and marks the header "Connection lost"; a 401 shows
-a persistent "session expired" banner), and a **Config** editor that loads
+poll keeps the last data and marks the header "Connection lost"; the two
+endpoints render independently, so one failing marks only its half stale;
+polls are chained with `setTimeout` and each request times out after 4 s, so
+they never overlap; a 401 shows a persistent "session expired" banner that
+the next successful response clears), and a **Config** editor that loads
 `/api/config/raw`, keeps its ETag, and PUTs to `/api/config` with
-`If-Match`. Design rules are in `docs/admin-ui.md`.
+`If-Match`. A **Download config** button fetches
+`/api/config/raw` fresh (not the editor text) and saves the response bytes as
+`freesbc-<host>-<UTC timestamp>.yaml`; the file is unredacted and the page
+says so. Design rules are in `docs/admin-ui.md`.
 
 ---
 
@@ -3034,7 +3045,40 @@ cannot exceed it; credentials already verified keep working while their source
 is locked out (§13.4). A non-loopback `admin.listen` is a **hard validation
 error** unless `admin.allow_remote: true`, which in turn requires the
 top-level `tls` and serves HTTPS. `Cache-Control: no-store` on every response
-but `/healthz`.
+but `/healthz`; `nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer` on every response.
+
+*Auth model (decision, #120).* The admin stays on HTTP Basic Auth. There is no
+login page, no logout and no idle timeout: the session ends when the browser
+forgets the credentials (closing it, or a 401 that makes it re-prompt), and
+the server separately remembers credentials it has verified for **1 hour**
+after their last use (`verifiedCredsTTL`, `server.go:398`; §13.4), so a
+credential that is still cached by a browser keeps working for that long.
+Cookie sessions with CSRF tokens were weighed and not built: the Host and
+Origin checks below close the two web attacks Basic Auth leaves open, and
+Prometheus scrapes with Basic Auth anyway.
+
+*Host check* (`guardMW`, `hostPolicy`, `guard.go`), on every route except
+`/healthz`, before any auth work (no bcrypt, no limiter slot): a `Host` that
+is not accepted gets **421 Misdirected Request**. That closes DNS rebinding
+independent of the auth scheme: a rebound page still carries its own host
+name. Accepted, case-insensitively and ignoring a trailing dot: the
+`admin.listen` IP with the listen port; on a loopback listen also `localhost`,
+`127.0.0.1` and `[::1]` with the listen port; each `admin.allowed_hosts` entry
+with the listen port; and a bare host with no port only when the listen port
+is the scheme default (443 with TLS, 80 without). `admin.listen` may be a
+wildcard (`0.0.0.0` or `[::]`, which validation accepts with `allow_remote`);
+then there is no single listen address to match, so any **IP-literal** `Host`
+with the listen port is accepted (an IP literal cannot be DNS-rebound, since
+rebinding needs a name) and names still need `allowed_hosts`.
+
+*Origin check* (`guardMW`), on every method except GET, HEAD and OPTIONS,
+before auth: `Origin` must equal `<scheme>://<request Host>` (`https` when
+the listener serves TLS); with no `Origin`, `Sec-Fetch-Site: same-origin` is
+accepted; anything else (foreign or `null` origin, cross-site or same-site
+fetch metadata, neither header) gets **403**. Browsers always send `Origin`
+on a same-origin `PUT`, so the WebUI needs nothing; a script calling
+`PUT /api/config` must send a matching `Origin` header.
 
 **Transport security.** TLS 1.2 minimum on every TLS surface (`wss` and the
 admin listener). Both use the one top-level `tls` identity; there is no client

@@ -156,10 +156,26 @@ Optional. The section being present enables the HTTP API, `/metrics` and the Web
 | `listen` | required | Literal `IP:port`. Loopback unless `allow_remote`. |
 | `password_hash` | required | bcrypt hash, cost at least 10. The user name is always `admin`. |
 | `allow_remote` | `false` | Permits a non-loopback `listen`; requires top-level `tls` (served over HTTPS). |
+| `allowed_hosts` | none | Extra host names or IP literals, no port, scheme or wildcard, no duplicates, that the `Host` header may carry (with the `listen` port). |
+
+Web security (restart-only like the rest of `admin`):
+
+- Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` (except `/healthz`). The WebUI also carries a `Content-Security-Policy`.
+- Host check: every route except `/healthz` answers `421` unless `Host` is the `listen` IP with the listen port, on a loopback `listen` also `localhost`, `127.0.0.1` or `[::1]` with that port, or an `allowed_hosts` entry with that port (case-insensitive, trailing dot ignored). A bare host with no port is accepted only when the listen port is the scheme default (443 with TLS, 80 without). With a wildcard `listen` (`0.0.0.0`, `[::]`) any IP-literal `Host` with the listen port is accepted, since an IP literal cannot be DNS-rebound. Behind a reverse proxy or a DNS name, add the name to `allowed_hosts`. The check runs before authentication.
+- Origin check: `PUT /api/config` (any method but GET, HEAD, OPTIONS) needs an `Origin` equal to `<scheme>://<Host>`, or no `Origin` and `Sec-Fetch-Site: same-origin`; otherwise `403`. The WebUI satisfies this by itself. A script must send the header:
+
+  ```sh
+  curl -u admin:PASSWORD -X PUT -H 'Origin: http://127.0.0.1:8080' \
+       -H 'If-Match: "<etag>"' --data-binary @freesbc.yaml http://127.0.0.1:8080/api/config
+  ```
+
+- Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
 
 `admin.listen` must not collide with `edge.listen.ws` / `edge.listen.wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
+
+The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the editor text, so unsaved edits are not included) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
 
 ## Reload classes
 
@@ -170,7 +186,7 @@ Optional. The section being present enables the HTTP API, `/metrics` and the Web
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
 | `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers`, `edge.carrier_sources` | restart-only |
-| `admin` (every key, and whether the section exists) | restart-only |
+| `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
 

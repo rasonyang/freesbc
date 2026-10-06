@@ -36,6 +36,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 		{"carriers", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: 1.2.3.4 }", 1), []string{"edge.carriers"}},
 		{"carrier_sources", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [1.2.3.4]", 1), []string{"edge.carrier_sources"}},
 		{"admin", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\" }\n", []string{"admin"}},
+		{"admin allowed_hosts", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", allowed_hosts: [a.example] }\n", []string{"admin"}},
 	}
 	running := mustParse(t, base)
 	for _, tc := range cases {

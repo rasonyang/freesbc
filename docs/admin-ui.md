@@ -165,7 +165,13 @@ The data on this console is SIP state, so these rules are the core of
 - **Missing values** render as `—`, never `undefined`, `null` or `NaN`.
 - **Stale data stays on screen.** A failed poll marks the header "Connection
   lost, retrying…" and keeps the last good values. Clearing them would turn a
-  network blip into a fake outage.
+  network blip into a fake outage. `/api/status` and `/api/calls` render
+  independently: if only one fails, the other stays current, the failed half
+  gets a "Stale" badge and the header says "Partial update, retrying…".
+- **Polls never overlap.** The next poll is scheduled with `setTimeout` when
+  the previous one has settled, and each request is abandoned after 4 s
+  (below the 5 s interval). The session banner clears on the next successful
+  response.
 - **Restart-only facts say so** where they are shown (listeners, the config
   hint), so nobody expects a save to rebind a socket.
 
@@ -196,7 +202,8 @@ Also:
 - One focus style everywhere (`:focus-visible`: 3 px `--ring` at 50 %), plus
   a transparent outline that becomes visible in forced-colours mode.
 - Live regions: the header status and config status use `role="status"`;
-  validation errors and the session banner use `role="alert"`.
+  validation errors and the session banner use `role="alert"`. A failed save
+  scrolls the "Not saved" alert into view and moves focus to it.
 - Every control has a label; icon-only buttons have `aria-label`; decorative
   SVGs have `aria-hidden="true"`.
 - `prefers-reduced-motion` disables the live-dot ping and all transitions.

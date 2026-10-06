@@ -40,12 +40,10 @@ const uiCSP = "default-src 'none'; script-src 'self'; style-src 'self'; " +
 func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Content-Security-Policy", uiCSP)
-	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("X-Frame-Options", "DENY")
-	h.Set("Referrer-Policy", "no-referrer")
-	// Cache-Control: no-store is already set by recoverMW on every response
-	// but /healthz, assets included, so an upgraded binary never serves a
-	// stale UI. Do not weaken it here.
+	// nosniff, X-Frame-Options, Referrer-Policy and Cache-Control: no-store
+	// are set by recoverMW on every response (no-store: every one but
+	// /healthz), so an upgraded binary never serves a stale UI. Do not
+	// weaken them here.
 
 	if strings.HasPrefix(r.URL.Path, "/assets/") {
 		if strings.HasSuffix(r.URL.Path, "/") {

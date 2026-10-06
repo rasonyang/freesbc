@@ -111,6 +111,7 @@ type Server struct {
 	started time.Time
 	cfgPath string
 
+	hosts    *hostPolicy   // accepted Host header values
 	limiter  authLimiter   // per-source auth-failure rate limit
 	verified verifiedCreds // credentials already verified by bcrypt
 
@@ -126,10 +127,12 @@ type Server struct {
 // top-level tls identity (used only when cfg.AllowRemote). Admin is
 // restart-only, so cfg is never re-read from the store.
 func New(cfg *config.AdminConfig, tlsCfg *config.TLSConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
-	return &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
+	s := &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
+	s.hosts = newHostPolicy(cfg.Listen, cfg.AllowedHosts, s.useTLS())
+	return s
 }
 
-// handler composes the mux with the recover and (per-route) auth middleware.
+// handler composes the mux with the recover, Host/Origin guard and (per-route) auth middleware.
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz) // no auth
@@ -139,7 +142,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/", s.requireAuth(s.handleUI)) // SPA catch-all (behind auth)
-	return s.recoverMW(mux)
+	return s.recoverMW(s.guardMW(mux))
 }
 
 // useTLS reports whether the listener serves HTTPS: with allow_remote the
@@ -474,7 +477,10 @@ func remoteIP(r *http.Request) string {
 
 // recoverMW turns a handler panic into a 500 without leaking a stack trace
 // to the client; the stack is logged.
-// It also injects Cache-Control: no-store on every response:
+// It also sets the security headers (nosniff, X-Frame-Options DENY,
+// Referrer-Policy no-referrer) on every response, errors included; the
+// UI-only Content-Security-Policy stays in handleUI. And it injects
+// Cache-Control: no-store on every response:
 // the API serves live state and, on /api/config/raw, the FULL config —
 // the admin password hash — none of which belongs in a
 // browser's on-disk cache. /healthz is exempt: it is static and is what
@@ -482,8 +488,12 @@ func remoteIP(r *http.Request) string {
 // semantics are untouched.
 func (s *Server) recoverMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
 		if r.URL.Path != "/healthz" {
-			w.Header().Set("Cache-Control", "no-store")
+			h.Set("Cache-Control", "no-store")
 		}
 		defer func() {
 			if rec := recover(); rec != nil {

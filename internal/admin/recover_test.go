@@ -43,7 +43,7 @@ func TestRecoverMWLogsStack(t *testing.T) {
 		auditPanickingHandler()
 	}))
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	h.ServeHTTP(rr, newReq(http.MethodGet, "/api/status", nil))
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("status %d, want 500", rr.Code)
 	}
