@@ -1,0 +1,5 @@
+# Production defaults, written out (T6 measures that they bite).
+shield:
+  rate_limit: 20/s per_ip
+  carrier_rate_limit: 200/s per_ip
+  ban: 1h

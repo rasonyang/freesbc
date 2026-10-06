@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  Remove every binding of one user per call: Contact: * with Expires: 0
+  (RFC 3261 10.2.2). A REGISTER with a new Call-ID and the user's own
+  Contact would not do: FreeSBC mints the Contact token per (AoR, Call-ID),
+  so that Contact matches nothing the registrar holds.
+  [field0] user, [field1] the [authentication ...] keyword.
+-->
+<scenario name="client un-REGISTER">
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:[field0]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: *
+      Expires: 0
+      Max-Forwards: 70
+      User-Agent: load-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true" rtd="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:[field0]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: *
+      [field1]
+      Expires: 0
+      Max-Forwards: 70
+      User-Agent: load-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000"/>
+</scenario>

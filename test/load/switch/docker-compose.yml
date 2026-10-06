@@ -1,0 +1,31 @@
+# S3: both switches on one LAN-only host. Host networking, because a bridge
+# network would put Docker's NAT and userland proxy in the RTP path, and FreeSBC
+# addresses the switch by its LAN IP.
+#
+#   echo -n '<signalwire PAT>' > signalwire_token        # once, for the FreeSWITCH build
+#   docker compose build && docker compose up -d
+#
+# S3 has no internet: build on a host that has (S2 or a workstation), then
+#   docker save load-freeswitch load-asterisk | ssh S3 docker load
+services:
+  freeswitch:
+    image: load-freeswitch
+    build:
+      context: .
+      dockerfile: Dockerfile.freeswitch
+      secrets: [signalwire_token]
+    network_mode: host
+    tty: true
+    restart: unless-stopped
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+  asterisk:
+    image: load-asterisk
+    build:
+      context: .
+      dockerfile: Dockerfile.asterisk
+    network_mode: host
+    restart: unless-stopped
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+secrets:
+  signalwire_token:
+    file: ./signalwire_token

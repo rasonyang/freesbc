@@ -1,0 +1,29 @@
+# /etc/systemd/system/freesbc.service (the repo ships no unit; this is the
+# one the load test uses).
+[Unit]
+Description=FreeSBC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/freesbc run -c /etc/freesbc/freesbc.yaml
+Restart=on-failure
+RestartSec=2
+User=freesbc
+Group=freesbc
+# 4 sockets per call; Go raises the soft limit to this hard limit.
+LimitNOFILE=1048576
+# Only needed when edge.listen uses a port below 1024 (wss: 443).
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# FreeSBC logs ~2 Info lines per call ("proxying INVITE ...", "call ended")
+# and has no level flag. journald's default limit (10000 per 30 s) would
+# silently drop them above ~160 CPS, so lift it for this unit.
+LogRateLimitIntervalSec=0
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/etc/freesbc
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

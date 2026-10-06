@@ -1,0 +1,24 @@
+<include>
+  <!-- T1: carrier -> switch, answered and echoed -->
+  <extension name="load_echo">
+    <condition field="destination_number" expression="^80\d+$">
+      <action application="answer"/>
+      <action application="echo"/>
+    </condition>
+  </extension>
+  <!-- T2: carrier -> switch -> back out to the carrier through FreeSBC -->
+  <extension name="load_hairpin">
+    <condition field="destination_number" expression="^(81\d+)$">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="bridge" data="sofia/gateway/loadcarrier/$1"/>
+    </condition>
+  </extension>
+  <!-- T4: carrier -> switch -> registered agent 82<user> -->
+  <extension name="load_agent">
+    <condition field="destination_number" expression="^82(\d+)$">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="call_timeout=30"/>
+      <action application="bridge" data="user/$1@$${domain}"/>
+    </condition>
+  </extension>
+</include>

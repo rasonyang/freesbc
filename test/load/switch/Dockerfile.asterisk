@@ -1,0 +1,8 @@
+# Asterisk 20 LTS from Ubuntu 24.04 + the load overlay.
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends asterisk \
+ && rm -rf /var/lib/apt/lists/*
+COPY asterisk/ /opt/load/asterisk/
+COPY install-asterisk.sh /opt/load/
+RUN /opt/load/install-asterisk.sh /etc/asterisk /opt/load/asterisk
+CMD ["asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]

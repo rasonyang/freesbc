@@ -1,0 +1,6 @@
+<include>
+  <!-- Load-test variables; install-freeswitch.sh includes this from vars.xml. -->
+  <X-PRE-PROCESS cmd="set" data="load_password=${USER_PASSWORD}"/>
+  <X-PRE-PROCESS cmd="set" data="global_codec_prefs=PCMA"/>
+  <X-PRE-PROCESS cmd="set" data="outbound_codec_prefs=PCMA"/>
+</include>

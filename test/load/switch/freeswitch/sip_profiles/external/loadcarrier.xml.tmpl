@@ -1,0 +1,11 @@
+<include>
+  <!-- proxy must equal the edge.carriers entry: it becomes the Request-URI host:port. -->
+  <gateway name="loadcarrier">
+    <param name="proxy" value="${SIPP_CARRIER_IP}:${SIPP_CARRIER_UAS_PORT}"/>
+    <param name="outbound-proxy" value="${SBC_PRIVATE_IP}:5060"/>
+    <param name="register" value="false"/>
+    <param name="username" value="load"/>
+    <param name="password" value="unused"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>

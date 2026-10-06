@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  A carrier delivering a call to FreeSBC (T1, T2, T4).
+  Request-URI user = [field0] of the -inf file (the DID). No auth: FreeSBC
+  admits it by source IP (SIPP_CARRIER_IP is an edge.carriers address).
+  Media: rtp_stream of data/pcma.wav (PCMA, looped) from a per-call port.
+  Hold time: -d.
+-->
+<scenario name="carrier UAC">
+  <send retrans="500" start_txn="invite">
+    <![CDATA[
+
+      INVITE sip:[field0]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:+6560000000@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:carrier@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=carrier 1 1 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [rtpstream_audio_port] RTP/AVP 8 101
+      a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=ptime:20
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" response_txn="invite"/>
+  <recv response="180" optional="true" response_txn="invite"/>
+  <recv response="183" optional="true" response_txn="invite"/>
+  <recv response="200" rtd="true" rrs="true" response_txn="invite"/>
+
+  <send ack_txn="invite">
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      [routes]
+      From: <sip:+6560000000@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:carrier@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <nop><action><exec rtp_stream="../data/pcma.wav,-1,8"/></action></nop>
+  <pause/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      [routes]
+      From: <sip:+6560000000@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+      [last_To:]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200" crlf="true"/>
+
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000, 2000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000, 120000, 300000"/>
+</scenario>

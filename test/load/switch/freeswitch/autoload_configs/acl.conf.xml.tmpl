@@ -1,0 +1,11 @@
+<configuration name="acl.conf" description="Network Lists">
+  <network-lists>
+    <!-- the only host allowed on the external (carrier) profile -->
+    <list name="fsbc" default="deny">
+      <node type="allow" cidr="${SBC_PRIVATE_IP}/32"/>
+    </list>
+    <list name="domains" default="deny">
+      <node type="allow" domain="$${domain}"/>
+    </list>
+  </network-lists>
+</configuration>

@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+# FreeSWITCH 1.10 (SignalWire community packages, Debian 12) + the load overlay.
+# The packages need a free SignalWire personal access token, passed as a
+# build secret so it never lands in an image layer:
+#   docker compose build --secret ... (see docker-compose.yml)
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg2 lsb-release \
+ && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=secret,id=signalwire_token \
+    curl -fsSL https://freeswitch.org/fsget -o /tmp/fsget \
+ && bash /tmp/fsget "$(cat /run/secrets/signalwire_token)" release install \
+ && rm -f /etc/apt/auth.conf /tmp/fsget && rm -rf /var/lib/apt/lists/*
+COPY freeswitch/ /opt/load/freeswitch/
+COPY install-freeswitch.sh /opt/load/
+RUN /opt/load/install-freeswitch.sh /etc/freeswitch /opt/load/freeswitch
+CMD ["freeswitch", "-nonat", "-c"]

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  REGISTER one user per call through FreeSBC (T3/T4 setup, T5 storm).
+  [field0] user, [field1] the [authentication ...] keyword (see render.sh); -key expires sets the requested expiry (client_unreg.xml removes).
+  Run it from the same local port the later calls use (-p): FreeSBC admits a
+  phone's INVITE only from the transport address it registered from.
+-->
+<scenario name="client REGISTER">
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:[field0]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      Expires: [expires]
+      Max-Forwards: 70
+      User-Agent: load-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true" rtd="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:[field0]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:[field0]@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      [field1]
+      Expires: [expires]
+      Max-Forwards: 70
+      User-Agent: load-phone
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <ResponseTimeRepartition value="10, 20, 50, 100, 200, 500, 1000"/>
+</scenario>

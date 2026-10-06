@@ -1,0 +1,50 @@
+<!--
+  Clients (phones, agents) through FreeSBC: edge.switch = ${SWITCH_IP}:${FS_PORT}.
+  Every request arrives from FreeSBC's private address, so there is no inbound
+  ACL here (an ACL allowing ${SBC_PRIVATE_IP} would let every client skip digest
+  auth) and no NAT handling (FreeSBC is the NAT boundary).
+-->
+<profile name="internal">
+  <aliases></aliases>
+  <gateways></gateways>
+  <domains>
+    <domain name="all" alias="true" parse="false"/>
+  </domains>
+  <settings>
+    <param name="user-agent-string" value="load-freeswitch"/>
+    <param name="debug" value="0"/>
+    <param name="sip-trace" value="no"/>
+    <param name="log-auth-failures" value="true"/>
+    <param name="context" value="default"/>
+    <param name="dialplan" value="XML"/>
+    <param name="sip-ip" value="${SWITCH_IP}"/>
+    <param name="rtp-ip" value="${SWITCH_IP}"/>
+    <param name="sip-port" value="${FS_PORT}"/>
+    <param name="auth-calls" value="true"/>
+    <param name="auth-all-packets" value="false"/>
+    <param name="challenge-realm" value="auto_from"/>
+    <param name="force-register-domain" value="$${domain}"/>
+    <param name="force-subscription-domain" value="$${domain}"/>
+    <param name="force-register-db-domain" value="$${domain}"/>
+    <param name="multiple-registrations" value="contact"/>
+    <param name="inbound-codec-prefs" value="PCMA"/>
+    <param name="outbound-codec-prefs" value="PCMA"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="disable-transcoding" value="true"/>
+    <param name="inbound-late-negotiation" value="false"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <param name="manage-presence" value="false"/>
+    <param name="enable-100rel" value="false"/>
+    <param name="enable-timer" value="false"/>
+    <param name="nat-options-ping" value="false"/>
+    <param name="all-reg-options-ping" value="false"/>
+    <param name="aggressive-nat-detection" value="false"/>
+    <param name="NDLB-received-in-nat-reg-contact" value="false"/>
+    <param name="local-network-acl" value="localnet.auto"/>
+    <param name="tls" value="false"/>
+  </settings>
+</profile>

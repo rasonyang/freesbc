@@ -1,0 +1,40 @@
+<!--
+  Carriers through FreeSBC: edge.switch_carrier_port = ${FS_CARRIER_PORT}.
+  FreeSBC delivers only carrier-source traffic here, so calls are not
+  challenged; the ACL keeps every other LAN host off this port.
+  Outbound, the loadcarrier gateway uses FreeSBC as its outbound proxy.
+-->
+<profile name="external">
+  <gateways>
+    <X-PRE-PROCESS cmd="include" data="external/*.xml"/>
+  </gateways>
+  <aliases></aliases>
+  <domains></domains>
+  <settings>
+    <param name="user-agent-string" value="load-freeswitch"/>
+    <param name="debug" value="0"/>
+    <param name="sip-trace" value="no"/>
+    <param name="context" value="public"/>
+    <param name="dialplan" value="XML"/>
+    <param name="sip-ip" value="${SWITCH_IP}"/>
+    <param name="rtp-ip" value="${SWITCH_IP}"/>
+    <param name="sip-port" value="${FS_CARRIER_PORT}"/>
+    <param name="auth-calls" value="false"/>
+    <param name="apply-inbound-acl" value="fsbc"/>
+    <param name="inbound-codec-prefs" value="PCMA"/>
+    <param name="outbound-codec-prefs" value="PCMA"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
+    <param name="disable-transcoding" value="true"/>
+    <param name="inbound-late-negotiation" value="false"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="manage-presence" value="false"/>
+    <param name="enable-100rel" value="false"/>
+    <param name="enable-timer" value="false"/>
+    <param name="aggressive-nat-detection" value="false"/>
+    <param name="local-network-acl" value="localnet.auto"/>
+    <param name="tls" value="false"/>
+  </settings>
+</profile>

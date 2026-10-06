@@ -1,0 +1,20 @@
+<include>
+  <!-- Not 9196/9197: the stock default context already uses them (9197 is a
+       milliwatt tone that answers at once). Same numbers on Asterisk. -->
+  <!-- T3: registered phone -> echo -->
+  <extension name="load_client_echo">
+    <condition field="destination_number" expression="^7100$">
+      <action application="answer"/>
+      <action application="echo"/>
+    </condition>
+  </extension>
+  <!-- T6d: rings for 30 s before answering (holds the call early) -->
+  <extension name="load_client_ring">
+    <condition field="destination_number" expression="^7101$">
+      <action application="ring_ready"/>
+      <action application="sleep" data="30000"/>
+      <action application="answer"/>
+      <action application="echo"/>
+    </condition>
+  </extension>
+</include>

@@ -1,0 +1,5 @@
+# Load profile: one SIPp host plays many phones and carriers, so the per-IP
+# limits are raised far above any single real source. Hot-reloadable.
+shield:
+  rate_limit: 20000/s per_ip
+  carrier_rate_limit: 50000/s per_ip

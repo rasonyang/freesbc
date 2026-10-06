@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  Out-of-dialog OPTIONS (T6b/T6c). FreeSBC answers public OPTIONS itself,
+  so this measures the shield without touching the switch.
+  -key ua sets the User-Agent (T6c uses a scanner signature).
+-->
+<scenario name="OPTIONS probe">
+  <send retrans="500">
+    <![CDATA[
+
+      OPTIONS sip:probe@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch];rport
+      From: <sip:probe@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+      To: <sip:probe@[remote_ip]>
+      Call-ID: [call_id]
+      CSeq: 1 OPTIONS
+      Max-Forwards: 70
+      User-Agent: [ua]
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+</scenario>

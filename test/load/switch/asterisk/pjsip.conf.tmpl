@@ -1,0 +1,78 @@
+; Asterisk behind FreeSBC (load test). Rendered by render.sh.
+;
+; FreeSBC sends everything from ${SBC_PRIVATE_IP}:5060 to one transport here:
+; client REGISTER/INVITE (digest-authenticated as the user) and carrier
+; INVITEs (identified by the X-FreeSBC-Carrier header, which FreeSBC strips
+; from anything arriving on its public side and adds on the carrier path).
+; Never identify by IP: client calls come from the same address.
+
+[global]
+type=global
+endpoint_identifier_order=header,username
+user_agent=load-asterisk
+keep_alive_interval=0
+
+[acl-fsbc]
+type=acl
+deny=0.0.0.0/0.0.0.0
+permit=${SBC_PRIVATE_IP}/255.255.255.255
+
+[transport-load]
+type=transport
+protocol=udp
+bind=${SWITCH_IP}:${AST_PORT}
+
+; --- carrier: inbound by header, outbound through FreeSBC -------------------
+[loadcarrier]
+type=endpoint
+transport=transport-load
+context=from-carrier
+disallow=all
+allow=alaw
+dtmf_mode=rfc4733
+direct_media=no
+rtp_symmetric=no
+send_pai=no
+aors=loadcarrier
+outbound_proxy=sip:${SBC_PRIVATE_IP}:5060\;lr
+
+[loadcarrier]
+type=aor
+; must equal the edge.carriers entry: it is the Request-URI host:port
+contact=sip:${SIPP_CARRIER_IP}:${SIPP_CARRIER_UAS_PORT}
+outbound_proxy=sip:${SBC_PRIVATE_IP}:5060\;lr
+qualify_frequency=0
+
+[loadcarrier]
+type=identify
+endpoint=loadcarrier
+match_header=X-FreeSBC-Carrier: loadcarrier
+
+; --- users (phones and agents) ---------------------------------------------
+[load-user](!)
+type=endpoint
+transport=transport-load
+context=from-client
+disallow=all
+allow=alaw
+dtmf_mode=rfc4733
+direct_media=no
+rtp_symmetric=no
+send_pai=no
+; the Contact already points at FreeSBC and carries its fsbc= token
+rewrite_contact=no
+
+[load-auth](!)
+type=auth
+auth_type=userpass
+password=${USER_PASSWORD}
+
+[load-aor](!)
+type=aor
+max_contacts=1
+remove_existing=yes
+qualify_frequency=0
+default_expiration=3600
+maximum_expiration=7200
+
+#include pjsip_load_users.conf
