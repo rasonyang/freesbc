@@ -67,6 +67,7 @@
     <div class="page-header">
       <h1 class="page-title" id="h-dashboard">Overview</h1>
       <p class="page-description">Live state of this node. Refreshes every 5 seconds.</p>
+      <p><span class="badge" data-variant="warning" id="status-stale" hidden>Status stale: last refresh failed</span></p>
     </div>
 
     <div class="grid-stats">
@@ -105,7 +106,7 @@
             <h2 class="card-title">Active calls</h2>
             <p class="card-description">Call-ID is the A-leg's, for correlating with SIP traces.</p>
           </div>
-          <div class="card-action"><span class="badge num" data-variant="secondary" id="calls-count">0</span></div>
+          <div class="card-action"><span class="badge" data-variant="warning" id="calls-stale" hidden>Stale</span><span class="badge num" data-variant="secondary" id="calls-count">0</span></div>
         </div>
         <div class="card-content flush">
           <div class="table-wrap">
@@ -159,7 +160,7 @@
         <label class="visually-hidden" for="config-text">Config YAML</label>
         <textarea class="textarea" id="config-text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-hint" placeholder="Opening the Config tab loads the running config automatically — use Load to re-fetch."></textarea>
 
-        <div class="alert" data-variant="destructive" id="config-error" role="alert" hidden>
+        <div class="alert" data-variant="destructive" id="config-error" role="alert" tabindex="-1" hidden>
           <svg class="icon" aria-hidden="true"><use href="#i-error"/></svg>
           <div class="alert-title">Not saved</div>
           <div class="alert-body"><pre class="mono" id="config-error-text"></pre></div>

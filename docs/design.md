@@ -2913,8 +2913,11 @@ script, style and event handlers are blocked by the CSP and rejected by
 
 Two hash-routed views: an **Overview** polling `/api/status` and
 `/api/calls` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
-poll keeps the last data and marks the header "Connection lost"; a 401 shows
-a persistent "session expired" banner), and a **Config** editor that loads
+poll keeps the last data and marks the header "Connection lost"; the two
+endpoints render independently, so one failing marks only its half stale;
+polls are chained with `setTimeout` and each request times out after 4 s, so
+they never overlap; a 401 shows a persistent "session expired" banner that
+the next successful response clears), and a **Config** editor that loads
 `/api/config/raw`, keeps its ETag, and PUTs to `/api/config` with
 `If-Match`. Design rules are in `docs/admin-ui.md`.
 

@@ -10,6 +10,10 @@
   var CONFIG_URL = "/api/config";
 
   var POLL_MS = 5000;
+  // A dashboard request that has not answered by now is abandoned, so one
+  // hung endpoint cannot hold the next poll back or pile requests up.
+  // Keep it below POLL_MS.
+  var FETCH_TIMEOUT_MS = 4000;
   // Port-pool utilisation thresholds for the meter. A full pool fails new
   // calls (media_port_allocation_failure_total), so warn well before it.
   var PORTS_WARN = 0.8;
@@ -48,12 +52,25 @@
     setLive("expired", "Signed out");
   }
 
-  // fetchJSON performs a same-origin GET and parses JSON. Basic Auth
-  // credentials are already attached by the browser (same-origin reuse).
-  // On 401 it flags the session as expired; on other failures it rejects
-  // so the caller can keep last-known-good data on screen.
+  // Any successful response proves the browser holds working credentials
+  // again (for example after it re-prompted), so the expired state ends.
+  function clearSessionExpired() {
+    if (!sessionExpired) return;
+    sessionExpired = false;
+    $("session-banner").hidden = true;
+  }
+
+  // fetchJSON performs a same-origin GET and parses JSON, abandoning it
+  // after FETCH_TIMEOUT_MS. Basic Auth credentials are already attached by
+  // the browser (same-origin reuse). On 401 it flags the session as
+  // expired; on other failures it rejects so the caller can keep
+  // last-known-good data on screen.
   function fetchJSON(url) {
-    return fetch(url, { credentials: "same-origin" }).then(function (res) {
+    var ctl = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = ctl ? setTimeout(function () { ctl.abort(); }, FETCH_TIMEOUT_MS) : null;
+    var opts = { credentials: "same-origin" };
+    if (ctl) opts.signal = ctl.signal;
+    return fetch(url, opts).then(function (res) {
       if (res.status === 401) {
         showSessionExpired();
         throw new Error("unauthorized");
@@ -61,7 +78,14 @@
       if (!res.ok) {
         throw new Error(url + ": " + res.status);
       }
+      clearSessionExpired();
       return res.json();
+    }).then(function (data) {
+      clearTimeout(timer);
+      return data;
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
     });
   }
 
@@ -182,18 +206,33 @@
     });
   }
 
+  // pollDashboard fetches both endpoints and renders each on its own, so one
+  // failing endpoint leaves the other half current. A failed half keeps its
+  // last-good data and gets a "stale" badge. It resolves when both settle.
   function pollDashboard() {
-    Promise.all([
+    return Promise.allSettled([
       fetchJSON(STATUS_URL),
       fetchJSON(CALLS_URL)
     ]).then(function (results) {
-      renderStatus(results[0]);
-      renderCalls(results[1]);
-      setLive("live", "Live · " + fmtClock(new Date()));
-    }).catch(function () {
-      // keep last-known-good data on screen; just flag the problem.
-      if (!sessionExpired) setLive("stale", "Connection lost, retrying…");
+      var st = results[0], ca = results[1];
+      if (st.status === "fulfilled") renderStatus(st.value);
+      if (ca.status === "fulfilled") renderCalls(ca.value);
+      $("status-stale").hidden = st.status === "fulfilled";
+      $("calls-stale").hidden = ca.status === "fulfilled";
+      var failed = (st.status === "rejected") + (ca.status === "rejected");
+      if (sessionExpired) return; // showSessionExpired already set the indicator
+      if (failed === 0) setLive("live", "Live · " + fmtClock(new Date()));
+      else if (failed === 1) setLive("stale", "Partial update, retrying…");
+      else setLive("stale", "Connection lost, retrying…");
     });
+  }
+
+  // The next poll is scheduled when the previous one has finished, so polls
+  // never overlap, however slow the server is.
+  function schedulePoll() {
+    setTimeout(function () {
+      pollDashboard().then(schedulePoll, schedulePoll);
+    }, POLL_MS);
   }
 
   // ---- config editor ----
@@ -230,6 +269,10 @@
     $("config-error-text").textContent = text;
     configError.hidden = false;
     configText.setAttribute("aria-invalid", "true");
+    // The alert can sit below the fold on a short viewport: bring it into
+    // view and move focus to it so the reason is not one scroll away.
+    configError.scrollIntoView({ block: "nearest" });
+    configError.focus({ preventScroll: true });
   }
 
   var configLoading = false;
@@ -248,6 +291,7 @@
         if (!res.ok) {
           throw new Error("load failed: " + res.status + " " + text);
         }
+        clearSessionExpired();
         configEtag = res.headers.get("ETag");
         configText.value = text;
         btnSave.disabled = false;
@@ -286,6 +330,7 @@
       }
       return res.text().then(function (text) {
         if (res.status === 200) {
+          clearSessionExpired();
           configEtag = res.headers.get("ETag") || configEtag;
           setConfigStatus("Saved", "ok");
           return;
@@ -317,6 +362,5 @@
   // ---- start ----
 
   show(location.hash.slice(1));
-  pollDashboard();
-  setInterval(pollDashboard, POLL_MS);
+  pollDashboard().then(schedulePoll, schedulePoll);
 })();
