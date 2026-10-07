@@ -195,12 +195,6 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		return
 	}
 	body := req.Body()
-	if len(body) == 0 {
-		// An offerless INVITE would make FreeSBC the offerer toward the
-		// carrier and then require a second negotiation against the ACK.
-		s.reject(req, tx, 488, "Not Acceptable Here")
-		return
-	}
 	s.metrics.CarrierRequest(carrier, dirOutbound, "INVITE")
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
@@ -213,12 +207,24 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	defer d.endUnlessUp()
 	d.setCarrier(carrier)
 
-	offer, err := s.buildPublicOffer(d, body, false)
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
+	// An offerless INVITE is forwarded as it is: the offer is the
+	// carrier's first SDP, built into a private one when it arrives
+	// (offerless.go).
+	var offer *offerResult
+	var offerless func([]byte) (*offerResult, error)
+	if len(body) > 0 {
+		var err error
+		if offer, err = s.buildPublicOffer(d, body, false); err != nil {
+			s.rejectMedia(req, tx, err)
+			return
+		}
+	} else {
+		var src netip.Addr
+		if ap, err := netip.ParseAddrPort(dest); err == nil {
+			src = ap.Addr()
+		}
+		offerless = func(b []byte) (*offerResult, error) { return s.buildUpstreamOffer(ctx, d, b, src) }
 	}
-	sess := offer.sess()
 
 	out, err := s.prepareForwardHidden(req, s.topo.private, to, dest, true)
 	if err != nil {
@@ -232,14 +238,16 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		contact.User = f.Address.User
 	}
 	fsip.SetContact(out, contact)
-	fsip.SetSDPBody(out, offer.sdp)
+	if offer != nil {
+		fsip.SetSDPBody(out, offer.sdp)
+	} else {
+		stripBody(out)
+	}
 
 	s.log.Info("proxying INVITE to carrier",
 		"sip_call_id", fsip.CallID(req), "direction", "private->public",
 		"carrier", carrier, "dest", dest,
-		"rtp_public_port", sess.publicPort,
-		"rtp_private_port", sess.privatePort,
-		"codec", codecNames(sess.negotiated()))
+		"offerless", offer == nil)
 
 	// A CANCEL from the switch ends this server transaction; the INVITE
 	// sent to the carrier must be cancelled too (see inviteToClient).
@@ -266,7 +274,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		go s.sendCancel(a)
 	}
 
-	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeCarrier,
 		calleeRemote: dest, transport: "udp", fromPrivate: true, resp: respToSwitch}
 	if r := s.pumpInvite(ctx, l); !r.finalised {
@@ -296,7 +304,13 @@ func (s *Server) optionsToCarrier(req *sip.Request, tx sip.ServerTransaction, ca
 	s.metrics.CarrierRequest(carrier, dirOutbound, "OPTIONS")
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	if _, err := s.forwardAndRelay(ctx, req, tx, out, respToSwitch, nil); err != nil {
+	if _, err := s.forwardAndRelay(ctx, req, tx, out, respToSwitch, func(res *sip.Response) error {
+		// A keepalive's SDP is the carrier's own media address.
+		if isSDPBody(res) {
+			stripBody(res)
+		}
+		return nil
+	}); err != nil {
 		s.log.Debug("forward carrier OPTIONS", "err", err, "carrier", carrier)
 		if ctx.Err() != nil {
 			s.reject(req, tx, 504, "Server Time-out")

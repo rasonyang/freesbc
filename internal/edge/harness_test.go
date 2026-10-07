@@ -524,6 +524,12 @@ type fakeSwitch struct {
 	// by mu: the test goroutine installs it while handler goroutines may
 	// already be reading it.
 	inviteHook func(req *sip.Request, tx sip.ServerTransaction) bool
+	// updateHook, if set, overrides the default UPDATE behaviour (200,
+	// answering a body with the switch's own SDP). Guarded by mu.
+	updateHook func(req *sip.Request, tx sip.ServerTransaction) bool
+	// prackHook, if set, overrides the default PRACK behaviour (200).
+	// Guarded by mu.
+	prackHook func(req *sip.Request, tx sip.ServerTransaction) bool
 
 	conn   *net.UDPConn
 	cancel context.CancelFunc
@@ -557,6 +563,8 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 		f.record(req)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
+	srv.OnUpdate(f.onUpdate)
+	srv.OnPrack(f.onPrack)
 	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
 		f.record(req)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
@@ -690,6 +698,47 @@ func (f *fakeSwitch) silentHook() func(req *sip.Request, tx sip.ServerTransactio
 		}
 		return true
 	}
+}
+
+func (f *fakeSwitch) setUpdateHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
+	f.mu.Lock()
+	f.updateHook = hook
+	f.mu.Unlock()
+}
+
+func (f *fakeSwitch) setPrackHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
+	f.mu.Lock()
+	f.prackHook = hook
+	f.mu.Unlock()
+}
+
+func (f *fakeSwitch) onPrack(req *sip.Request, tx sip.ServerTransaction) {
+	f.record(req)
+	f.mu.Lock()
+	hook := f.prackHook
+	f.mu.Unlock()
+	if hook != nil && hook(req, tx) {
+		return
+	}
+	_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+}
+
+func (f *fakeSwitch) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
+	f.record(req)
+	f.mu.Lock()
+	hook := f.updateHook
+	f.mu.Unlock()
+	if hook != nil && hook(req, tx) {
+		return
+	}
+	if len(req.Body()) == 0 {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+		return
+	}
+	res := sip.NewResponseFromRequest(req, 200, "OK", []byte(f.answerSDP(req)))
+	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	_ = tx.Respond(res)
 }
 
 func (f *fakeSwitch) record(req *sip.Request) {

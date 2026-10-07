@@ -435,9 +435,15 @@ func (s *Server) forkAnswer(l *inviteLeg, res *sip.Response) ([]byte, error) {
 	if prev := d.forkAnswer(f); prev != nil {
 		// A restated answer (the 200 echoing a body-bearing 183, say): the
 		// body this fork already has — re-negotiating would re-latch media
-		// under it.
-		s.followFork(l, f)
+		// under it. An offer whose answer is still owed has no media to
+		// follow yet.
+		if !d.owedOnFork(f) {
+			s.followFork(l, f)
+		}
 		return prev, nil
+	}
+	if l.offerless != nil {
+		return s.offerlessFork(l, f, res)
 	}
 	if len(res.Body()) == 0 {
 		if res.StatusCode/100 != 2 {
@@ -467,7 +473,7 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 	if err != nil {
 		return nil, negotiateError(err)
 	}
-	sess := l.offer.sess()
+	sess := l.dialog().session()
 	// offeredWebRTC is a call FreeSBC offered to a browser as DTLS-SRTP:
 	// this answer is the browser's, and it is what starts the leg.
 	offeredWebRTC := l.callee == calleeClient && sess.webrtc != nil
@@ -538,7 +544,7 @@ func (s *Server) followFork(l *inviteLeg, f *earlyFork) {
 		return
 	}
 	remote, rtcp, codecs := d.forkMedia(f)
-	sess := l.offer.sess()
+	sess := d.session()
 	s.pointMedia(sess, l.callee.calleePlane(), remote, rtcp)
 	sess.setNegotiated(codecs)
 	d.setApplied(f)
@@ -757,7 +763,11 @@ func (s *Server) setWebRTCBlock(build *sdp.Build, leg *media.WebRTCLeg) {
 // Codec changes ARE conveyed (the offerer's list, filtered to what the
 // proxy relays, with its payload numbers), so a re-offer that drops or
 // adds a codec still works without transcoding.
-func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]byte, *sdp.Session, error) {
+//
+// f is the early fork the exchange belongs to when it happens in an early
+// dialog (an UPDATE), nil in a confirmed one; it only decides which o=
+// identity the body carries (dialog.originFor).
+func (s *Server) rebuildInDialogOffer(d *dialog, f *earlyFork, body []byte, toward plane) ([]byte, *sdp.Session, error) {
 	offer, err := s.parseSDP(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog offer: %w", err)
@@ -776,7 +786,7 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 		}
 	}
 	addr, port := s.anchorFor(sess, toward)
-	id, version := d.nextOrigin(toward)
+	id, version := d.originFor(f, toward)
 	build := sdp.Build{
 		Address: addr,
 		Port:    port,
@@ -807,7 +817,7 @@ func (s *Server) rebuildInDialogOffer(d *dialog, body []byte, toward plane) ([]b
 // side, and records the newly agreed codec list on the session. It also
 // returns the far end's answer as parsed, for the media update the 2xx
 // applies.
-func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byte, toward plane) ([]byte, *sdp.Session, error) {
+func (s *Server) rebuildInDialogAnswer(d *dialog, f *earlyFork, offer *sdp.Session, body []byte, toward plane) ([]byte, *sdp.Session, error) {
 	answer, err := s.parseSDP(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
@@ -820,7 +830,7 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, offer *sdp.Session, body []byt
 	sess.setNegotiated(agreed)
 
 	addr, port := s.anchorFor(sess, toward)
-	id, version := d.nextOrigin(toward)
+	id, version := d.originFor(f, toward)
 	build := sdp.Build{
 		Address:        addr,
 		Port:           port,

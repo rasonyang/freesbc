@@ -50,8 +50,7 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 			// Admission (issue #86; admission.go): a public out-of-dialog
 			// INVITE from a source that is neither a carrier source nor a
 			// registered transport address is dropped before anything
-			// answers it — ahead of the 100rel check below, whose 420
-			// would otherwise tell a scanner something. Returning without a
+			// answers it, so a scanner learns nothing. Returning without a
 			// response is the whole mechanism: sipgo's Server.handleRequest
 			// calls TerminateGracefully when the handler returns, which, for
 			// a transaction with no final response, is Terminate — it stops
@@ -63,9 +62,6 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 				"to", req.Recipient.User)
 			return
 		}
-	}
-	if s.rejectRequired100rel(req, tx) {
-		return // PRACK cannot pass the proxy (extensions.go)
 	}
 	if inDialog {
 		s.onReInvite(req, tx, in.private())
@@ -114,13 +110,6 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		return
 	}
 	body := req.Body()
-	if len(body) == 0 {
-		// An offerless INVITE would make FreeSBC the offerer toward
-		// FreeSWITCH and then require a second negotiation against the
-		// client's ACK. Not supported in this phase; refusing is honest.
-		s.reject(req, tx, 488, "Not Acceptable Here")
-		return
-	}
 
 	if carrier == "" {
 		release, ok := s.admitEarly(src.Addr())
@@ -153,12 +142,21 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		d.setCarrier(carrier)
 	}
 
-	offer, err := s.buildUpstreamOffer(ctx, d, body, src.Addr())
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
+	// An offerless INVITE is forwarded as it is: the offer is the
+	// switch's first SDP, built into a public one when it arrives
+	// (offerless.go).
+	var offer *offerResult
+	var offerless func([]byte) (*offerResult, error)
+	if len(body) > 0 {
+		var err error
+		if offer, err = s.buildUpstreamOffer(ctx, d, body, src.Addr()); err != nil {
+			s.rejectMedia(req, tx, err)
+			return
+		}
+	} else {
+		toBrowser := isBrowserTransport(from.transport)
+		offerless = func(b []byte) (*offerResult, error) { return s.buildPublicOffer(d, b, toBrowser) }
 	}
-	sess := offer.sess()
 
 	// The CANCEL bridge is registered ONCE, for the whole series: the server
 	// transaction the client's INVITE created is a single transaction across
@@ -244,15 +242,17 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// host), and FreeSWITCH would send in-dialog requests straight to it,
 		// bypassing the SBC entirely.
 		fsip.SetContact(out, s.topo.private.uri())
-		fsip.SetSDPBody(out, offer.sdp)
+		if offer != nil {
+			fsip.SetSDPBody(out, offer.sdp)
+		} else {
+			stripBody(out)
+		}
 
 		s.log.Info("proxying INVITE upstream",
 			"sip_call_id", fsip.CallID(req), "direction", "public->private",
 			"transport", from.transport, "public_remote", src.String(),
 			"carrier", carrier, "upstream", name, "dest", dest, "attempt", attempt+1,
-			"rtp_public_port", sess.publicPort,
-			"rtp_private_port", sess.privatePort,
-			"codec", codecNames(sess.negotiated()))
+			"offerless", offer == nil)
 
 		// The pending entry points at THIS attempt's forwarded request — its
 		// Via branch and destination are what a CANCEL must carry — BEFORE
@@ -286,7 +286,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// In-dialog traffic rides the WINNING switch: directionFor sends the
 		// client's ACKs and BYEs to this address, and the winner's Contact is
 		// what their Request-URI names.
-		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
 			near: from, far: s.topo.private, callee: calleeUpstream,
 			calleeRemote: dest, transport: from.transport, resp: resp}
 		r := s.pumpInvite(ctx, l)
@@ -401,13 +401,6 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	body := req.Body()
-	if len(body) == 0 {
-		// An offerless INVITE would make FreeSBC the offerer toward the
-		// far side and then require a second negotiation against the ACK.
-		// Not supported in this phase; refusing is honest.
-		s.reject(req, tx, 488, "Not Acceptable Here")
-		return
-	}
 	// A client registered over ws or wss is a browser: it accepts only a
 	// DTLS-SRTP offer, and without edge.listen.ws or edge.listen.wss there is no
 	// DTLS identity to build one with. Offering plain RTP would only ring the browser
@@ -430,12 +423,21 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer d.endUnlessUp()
 
-	offer, err := s.buildPublicOffer(d, body, toBrowser)
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
+	// An offerless INVITE is forwarded as it is: the offer is the
+	// client's first SDP, built into a private one when it arrives
+	// (offerless.go).
+	var offer *offerResult
+	var offerless func([]byte) (*offerResult, error)
+	if len(body) > 0 {
+		var err error
+		if offer, err = s.buildPublicOffer(d, body, toBrowser); err != nil {
+			s.rejectMedia(req, tx, err)
+			return
+		}
+	} else {
+		src := binding.Source.Addr()
+		offerless = func(b []byte) (*offerResult, error) { return s.buildUpstreamOffer(ctx, d, b, src) }
 	}
-	sess := offer.sess()
 
 	out, err := s.prepareForward(req, s.topo.private, to, dest, true)
 	if err != nil {
@@ -446,16 +448,17 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	// client must see one addressed to itself.
 	out.Recipient = clientRequestURI(binding)
 	fsip.SetContact(out, to.uri())
-	fsip.SetSDPBody(out, offer.sdp)
+	if offer != nil {
+		fsip.SetSDPBody(out, offer.sdp)
+	} else {
+		stripBody(out)
+	}
 
 	s.log.Info("proxying INVITE to client",
 		"sip_call_id", fsip.CallID(req), "direction", "private->public",
 		"transport", binding.Transport, "aor", binding.AOR,
 		"public_remote", dest,
-		"rtp_public_port", sess.publicPort,
-		"rtp_private_port", sess.privatePort,
-		"webrtc", sess.IsWebRTC(),
-		"codec", codecNames(sess.negotiated()))
+		"offerless", offer == nil)
 
 	// A CANCEL from FreeSWITCH terminates this server transaction; when it
 	// does, the INVITE we sent must be cancelled too or the far side would
@@ -485,7 +488,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		go s.sendCancel(a)
 	}
 
-	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, offer: offer,
+	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeClient,
 		calleeRemote: dest, transport: binding.Transport, fromPrivate: true}
 	if r := s.pumpInvite(ctx, l); !r.finalised {

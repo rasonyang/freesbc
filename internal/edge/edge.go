@@ -88,6 +88,11 @@ type Server struct {
 	// otherwise untestable.
 	inviteBackstop atomic.Int64
 
+	// ackWait, when non-zero, replaces ackTimeout as how long an answer
+	// owed in an ACK or PRACK may stay outstanding (nanoseconds). Only
+	// tests set it.
+	ackWait atomic.Int64
+
 	// ready is closed once every listener is bound and served, and every
 	// UDP listener is in sipgo's connection pool (see awaitUDPServing).
 	// Nothing in production waits on it; it is the happens-before edge the
@@ -229,6 +234,19 @@ func (s *Server) inviteBudget() time.Duration {
 		return time.Duration(d)
 	}
 	return inviteTimeout
+}
+
+// ackTimeout is how long FreeSBC waits for the answer it owes the callee
+// (offerless INVITE or re-INVITE, answer in the ACK): RFC 3261 Timer H,
+// the time after which the callee gives up on the ACK itself.
+const ackTimeout = 32 * time.Second
+
+// ackBudget is ackTimeout unless a test shortened it.
+func (s *Server) ackBudget() time.Duration {
+	if d := s.ackWait.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return ackTimeout
 }
 
 // Metrics exposes the proxy's counters.
@@ -391,6 +409,8 @@ func (s *Server) Run(ctx context.Context) error {
 	srv.OnCancel(s.guard(s.onCancel))
 	srv.OnBye(s.guard(s.onInDialog))
 	srv.OnInfo(s.guard(s.onInDialog))
+	srv.OnPrack(s.guard(s.onPrackUpdate))
+	srv.OnUpdate(s.guard(s.onPrackUpdate))
 	srv.OnNotify(s.guard(s.onInDialog))
 	srv.OnOptions(s.guard(s.onOptions))
 	srv.OnNoRoute(s.guard(s.onNoRoute))
@@ -918,7 +938,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inboun
 }
 
 // allowedMethods is what FreeSBC advertises it will proxy.
-var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "OPTIONS", "INFO", "NOTIFY", "REGISTER"}
+var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "PRACK", "UPDATE", "OPTIONS", "INFO", "NOTIFY", "REGISTER"}
 
 // onNoRoute answers any method the proxy does not handle. A 405 naming the
 // methods it does handle is the honest answer; silence would leave a

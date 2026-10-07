@@ -386,10 +386,10 @@ func switchRequest(t *testing.T, f *fakeSwitch, method sip.RequestMethod, ruri s
 }
 
 // What the switch originates is classified by Request-URI alone: a carrier
-// entry → carrier path (an offerless INVITE is 488, a carrier with no
-// resolved address 503; carrier_outbound_test.go has the proxying), a client
-// token → client path, FreeSBC itself → OPTIONS answered, anything else →
-// 404; a method a carrier does not accept → 405.
+// entry → carrier path (a carrier with no resolved address is 503;
+// carrier_outbound_test.go has the proxying), a client token → client path,
+// FreeSBC itself → OPTIONS answered, anything else → 404; a method a
+// carrier does not accept → 405.
 func TestCarrierPrivateClassification(t *testing.T) {
 	rig := startCarrierRig(t, "alpha: 127.0.0.1:5090, dns: Carrier.Example.com:5070, nores: nores.example.com:5071", "", func(s *Server) {
 		s.carriers.lookupSRV = (&dnsStub{}).lookupSRV
@@ -413,8 +413,8 @@ func TestCarrierPrivateClassification(t *testing.T) {
 		ruri   sip.Uri
 		want   int
 	}{
-		{"INVITE to a carrier", sip.INVITE, sip.Uri{User: "+1555", Host: "127.0.0.1", Port: 5090}, 488},
-		{"INVITE, host case and trailing dot", sip.INVITE, sip.Uri{User: "+1555", Host: "CARRIER.example.COM.", Port: 5070}, 488},
+		{"INVITE to an unresolved carrier", sip.INVITE, sip.Uri{User: "+1555", Host: "nores.example.com", Port: 5071}, 503},
+		{"INVITE, host case and trailing dot", sip.INVITE, sip.Uri{User: "+1555", Host: "NORES.example.COM.", Port: 5071}, 503},
 		{"INVITE, wrong port", sip.INVITE, sip.Uri{User: "+1555", Host: "carrier.example.com"}, 404},
 		{"INVITE to a stranger", sip.INVITE, sip.Uri{User: "+1555", Host: "203.0.113.50"}, 404},
 		{"INVITE to an expired token", sip.INVITE, sip.Uri{User: "1001", Host: "127.0.0.1", Port: 1234, UriParams: bogus}, 404},

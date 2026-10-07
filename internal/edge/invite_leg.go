@@ -45,11 +45,16 @@ func (k calleeKind) calleePlane() plane {
 // client transaction toward the callee, and what relaying its responses
 // needs.
 type inviteLeg struct {
-	req   *sip.Request // the caller's INVITE
-	tx    sip.ServerTransaction
-	out   *sip.Request // the INVITE as forwarded
-	clTx  sip.ClientTransaction
-	offer *offerResult
+	req  *sip.Request // the caller's INVITE
+	tx   sip.ServerTransaction
+	out  *sip.Request // the INVITE as forwarded
+	clTx sip.ClientTransaction
+	d    *dialog
+	// offer is what the caller's SDP was turned into; nil for an offerless
+	// INVITE, where offerless builds the near-side offer from the callee's
+	// first SDP instead (offerless.go).
+	offer     *offerResult
+	offerless func(calleeBody []byte) (*offerResult, error)
 
 	// near is the caller-facing side (the Contact the caller is given);
 	// far the callee-facing one (the side a 2xx FreeSBC will not relay is
@@ -69,7 +74,7 @@ type inviteLeg struct {
 	resp respHide
 }
 
-func (l *inviteLeg) dialog() *dialog { return l.offer.dialog }
+func (l *inviteLeg) dialog() *dialog { return l.d }
 
 // watch2xx registers the Timer M hook: once the first 2xx has moved the
 // client transaction to Accepted, sipgo passes every later 2xx —
@@ -148,6 +153,11 @@ var errDialogGone = errors.New("proxy: dialog already ended")
 func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 	is2xx := res.StatusCode/100 == 2
 	err := s.relayResponseHide(l.req, l.tx, res, l.resp, func(out *sip.Response) error {
+		if tag := fsip.ToTag(res); tag != "" && res.StatusCode < 300 {
+			// Recorded before the response goes out, so a PRACK or UPDATE
+			// the caller sends the moment it sees this 18x finds its route.
+			l.dialog().setForkRoute(tag, s.legRoute(l, res))
+		}
 		fsip.SetContact(out, l.near.uri())
 		if l.resp == respToSwitch && res.StatusCode < 300 {
 			s.addPrivateRecordRoute(out)
@@ -159,6 +169,10 @@ func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 			}
 			if body != nil {
 				fsip.SetSDPBody(out, body)
+			} else if len(out.Body()) > 0 {
+				// An SDP the caller cannot use (an unreliable 18x of an
+				// offerless call) must not reach it in the far end's words.
+				stripBody(out)
 			}
 		}
 		if !is2xx {
@@ -167,6 +181,7 @@ func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 		if !s.commit(l, res) {
 			return errDialogGone
 		}
+		s.armOwedTimer(l.dialog())
 		// What retransmissions of this 2xx are answered with.
 		l.dialog().setRelayed2xx(out.Clone())
 		return nil
@@ -383,6 +398,13 @@ func (s *Server) teardownOpts(from side) []fsip.TeardownOption {
 // dialog's, and dialog.end() is what releases it. It runs before the 2xx
 // is relayed.
 func (s *Server) commit(l *inviteLeg, final *sip.Response) bool {
+	return l.dialog().confirm(fsip.ToTag(final), s.legRoute(l, final))
+}
+
+// legRoute is the routing record for the dialog a response of the leg
+// establishes (early or confirmed): where each endpoint is reached and the
+// Contact it gave.
+func (s *Server) legRoute(l *inviteLeg, res *sip.Response) dialogRoute {
 	r := dialogRoute{transport: l.transport}
 	// The caller's signaling address is always where its INVITE came from;
 	// the callee's is the destination this call was finally connected to —
@@ -396,14 +418,14 @@ func (s *Server) commit(l *inviteLeg, final *sip.Response) bool {
 	*callerRemote, *calleeAddr = l.req.Source(), l.calleeRemote
 	// Which endpoint's Contact arrived on which message follows from the
 	// direction and nothing else: the caller's rode in on the INVITE, the
-	// callee's came back on the 200.
+	// callee's came back on the response.
 	if u, ok := fsip.ContactURI(l.req); ok {
 		*callerContact = u
 	}
-	if u, ok := fsip.ContactURI(final); ok {
+	if u, ok := fsip.ContactURI(res); ok {
 		*calleeContact = u
 	}
-	return l.dialog().confirm(fsip.ToTag(final), r)
+	return r
 }
 
 // cancelCall gives up on a call being placed and CANCELs its in-flight
