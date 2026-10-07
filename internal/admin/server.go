@@ -54,6 +54,11 @@ type Deps struct {
 	// transport://host:port. They are restart-only, so this comes from the
 	// startup snapshot, never the hot-reloaded config. Nil lists none.
 	Listeners func() []string
+	// Running returns the config snapshot the process started with, the
+	// baseline POST /api/config/validate compares a candidate against to
+	// list restart-only changes. Nil falls back to the store's current
+	// snapshot.
+	Running func() *config.Config
 	// Proxy reports the edge plane's counters; nil reports none.
 	Proxy func() ProxyStats
 }
@@ -119,10 +124,6 @@ type Server struct {
 	limiter  authLimiter   // per-source auth-failure rate limit
 	verified verifiedCreds // credentials already verified by bcrypt
 
-	// writeMu serialises PUT /api/config's If-Match check with its write,
-	// so two writers holding the same ETag cannot both succeed.
-	writeMu sync.Mutex
-
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
 }
@@ -145,6 +146,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
+	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
 	mux.HandleFunc("/", s.requireAuth(s.handleUI)) // SPA catch-all (behind auth)
 	return s.recoverMW(s.guardMW(mux))
 }
@@ -247,7 +249,7 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 // connections that would otherwise pile up fd/goroutine pairs indefinitely
 // (the unauthenticated /healthz is a favorite poll target, so idle
 // keep-alive is a real leak), and Read/WriteTimeout bound slow clients —
-// 30s leaves generous headroom for the 1MiB config PUT. Extracted so a
+// 30s leaves generous headroom for the 1MiB config validate POST. Extracted so a
 // test can pin the exact timeout set without waiting out any of them.
 func (s *Server) newHTTPServer() *http.Server {
 	return &http.Server{
@@ -488,8 +490,7 @@ func remoteIP(r *http.Request) string {
 // the API serves live state and, on /api/config/raw, the FULL config —
 // the admin password hash — none of which belongs in a
 // browser's on-disk cache. /healthz is exempt: it is static and is what
-// load balancers poll, where no-store would be noise. ETag/If-Match
-// semantics are untouched.
+// load balancers poll, where no-store would be noise.
 func (s *Server) recoverMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -523,6 +524,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStatus, handleCalls, handleConfig, and handleConfigGet
-// are implemented in api.go. handleConfigRaw and handleConfigWrite are
-// implemented in config_write.go. handleMetrics is implemented in
+// are implemented in api.go. handleConfigRaw and handleConfigValidate are
+// implemented in config_validate.go. handleMetrics is implemented in
 // metrics.go. handleUI is implemented in webui.go.

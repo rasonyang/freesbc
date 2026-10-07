@@ -9,8 +9,8 @@ to keep it consistent.
 | Decision | Reason |
 |---|---|
 | shadcn/ui **tokens**, not shadcn **components** | The token set is plain CSS variables. The components need React, Tailwind, Radix and a Node build in a Go repo with zero runtime dependencies. We take the look and leave the toolchain. |
-| No framework, no build step | The UI is two views over five endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
-| Separate files under `assets/`, nothing inline | Lets the UI run under a strict CSP (`script-src 'self'; style-src 'self'`, no `unsafe-inline`). The admin can rewrite the config file, so it is worth protecting from script injection and framing. |
+| No framework, no build step | The UI is two views over six endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
+| Separate files under `assets/`, nothing inline | Lets the UI run under a strict CSP (`script-src 'self'; style-src 'self'`, no `unsafe-inline`). The admin plane exposes the unredacted config file, so it is worth protecting from script injection and framing. |
 | `light-dark()` instead of a `.dark` block | Each colour is written once. The OS preference works with no script and no flash; `data-theme` pins a choice. |
 | Browser floor: Chrome/Edge 123, Firefox 120, Safari 17.5 | Required by `light-dark()` (2024). Older browsers lose colours; this is an operator console, not a public page. |
 
@@ -22,7 +22,7 @@ webui/
   assets/tokens.css   1. shadcn neutral  2. FreeSBC status  3. scale
   assets/ui.css       components; consumes tokens only
   assets/theme.js     pins light/dark; loaded sync in <head>
-  assets/app.js       polling, rendering, config editor; loaded defer
+  assets/app.js       polling, rendering, config view, candidate validation and diff; loaded defer
 ```
 
 Dependencies run one way: `tokens.css ← ui.css ← index.html ← app.js`.
@@ -66,7 +66,7 @@ on light and lighter on dark.
 
 | Token | Light / dark | Means |
 |---|---|---|
-| `--success` | green-700 / green-400 | up, live, saved |
+| `--success` | green-700 / green-400 | up, live, valid |
 | `--warning` | amber-700 / amber-400 | degraded, high utilisation, retrying |
 | `--info` | blue-600 / blue-400 | neutral notice |
 | `--destructive` | red-600 / red-400 (shadcn) | down, failed, rejected |
@@ -122,6 +122,7 @@ shadcn's `cva` variant names and keeps one base class per component.
 | Button | `<button class="btn" data-variant="outline" data-size="sm">` | `default` (primary, one per view), `secondary`, `outline`, `ghost`, `destructive`; sizes `sm`, `icon`. Icon first, then label. Icon-only buttons need `aria-label`. |
 | Card | `.card > .card-header > .card-heading > .card-title + .card-description`, `.card-action`, `.card-content` (`.flush` for edge-to-edge tables) | The unit of grouping. Don't nest cards. |
 | Stat tile | `.card.stat` with `.stat-value`, `.stat-foot` | One number per tile. Put the unit or total in `<small>`. |
+| Diff | `pre.diff` of `span.diff-line[data-op]` (`add`, `del`, `ctx`, `skip`, `note`) | Config candidate vs current file. Rows use the badge tint recipe; each added or removed row starts with `+ ` or `- `, so colour is never the only cue. Fill rows with `textContent`. |
 | Meter | `.meter[data-level] > span` and `role="meter"` | Width is set from script through `el.style`. Levels: `normal`, `warning` (≥ 80 %), `critical` (≥ 95 %), always with the level in words beside it. |
 | Badge | `<span class="badge" data-variant="success">` | `secondary` for counts, `outline` for labels (transports), status variants for state. |
 | Table | `.table-wrap > table.table` | Horizontal scroll inside the card, never a squeezed column. `th scope="col"`. |
@@ -173,14 +174,14 @@ The data on this console is SIP state, so these rules are the core of
   (below the 5 s interval). The session banner clears on the next successful
   response.
 - **Restart-only facts say so** where they are shown (listeners, the config
-  hint), so nobody expects a save to rebind a socket.
+  hint), so nobody expects an edit to rebind a socket.
 
 ## Copy
 
 - Sentence case everywhere. No ALL-CAPS headings or column labels.
 - Page descriptions are one line that says what the view is for.
-- Status text names the state and what to do: "Config changed on disk —
-  click Load to refresh".
+- Status text names the state and what to do: "Not valid" with the
+  reasons in an alert below.
 - Use the SIP and config terms exactly (`Call-ID`, `shield.*`, `${ENV}`);
   don't paraphrase them.
 
@@ -193,7 +194,7 @@ text/surface pair the components render, in both themes. Current minima:
 |---|---|---|
 | muted text on card / table head | 4.73 / 4.53 | 6.91 / 6.39 |
 | status text on card | ≥ 4.76 | ≥ 6.19 |
-| status ink on its 12 % badge tint | ≥ 5.12 | ≥ 5.29 |
+| status ink on its 12 % badge tint (also the config diff's added and removed rows) | ≥ 5.12 | ≥ 5.29 |
 | white on destructive button | 4.76 | 6.48 |
 | meter fill on its track (non-text, 3:1) | ≥ 3.31 | ≥ 4.63 |
 
@@ -202,8 +203,8 @@ Also:
 - One focus style everywhere (`:focus-visible`: 3 px `--ring` at 50 %), plus
   a transparent outline that becomes visible in forced-colours mode.
 - Live regions: the header status and config status use `role="status"`;
-  validation errors and the session banner use `role="alert"`. A failed save
-  scrolls the "Not saved" alert into view and moves focus to it.
+  validation errors and the session banner use `role="alert"`. A failed validation
+  scrolls the "Not valid" alert into view and moves focus to it.
 - Every control has a label; icon-only buttons have `aria-label`; decorative
   SVGs have `aria-hidden="true"`.
 - `prefers-reduced-motion` disables the live-dot ping and all transitions.
@@ -224,8 +225,8 @@ and leave the shadcn tokens alone:
 
 - **API data is hostile input.** Call-IDs, peers and listener strings
   originate on the public SIP side. Render them with `textContent` or
-  `createElement`, never `innerHTML` or string-built HTML. The admin can
-  rewrite the config, so an XSS here is a takeover.
+  `createElement`, never `innerHTML` or string-built HTML. The admin
+  plane serves the unredacted config, so an XSS here leaks every secret in it.
 - Nothing inline: no `<script>` body, `<style>`, `style=""` or `on*=`.
   `TestUIHasNoInlineScriptOrStyle` enforces this, because the CSP would
   otherwise drop it silently. Set dynamic styles with `el.style.x = …` (CSSOM

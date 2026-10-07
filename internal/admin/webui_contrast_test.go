@@ -74,6 +74,11 @@ func TestUITokenContrast(t *testing.T) {
 				pair{s + " ink on its 12% badge", ink(s), tk(s).alpha(0.12).rgb().over(card), 4.5},
 			)
 		}
+		// Config diff rows (.diff-line): the badge recipe on the card, plus
+		// muted context text on the card.
+		for _, s := range []string{"success", "destructive"} {
+			pairs = append(pairs, pair{"diff " + s + " line", ink(s), tk(s).alpha(0.12).rgb().over(card), 4.5})
+		}
 		for _, s := range []string{"primary", "warning", "destructive"} {
 			pairs = append(pairs, pair{"meter " + s + " fill on its 20% track", tk(s).rgb(), tk(s).alpha(0.2).rgb().over(card), 3})
 		}

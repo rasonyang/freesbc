@@ -38,7 +38,7 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test")
+	deps := adminDeps(edgeSrv, "test", cfg)
 
 	if inUse, total := deps.Ports(); inUse != 0 || total != 10 {
 		t.Errorf("Ports = %d/%d, want 0/10 (the public and private pools' 5 pairs each)", inUse, total)
@@ -56,6 +56,9 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.Replace(moved)
+	if deps.Running() != cfg {
+		t.Error("Running must stay the startup snapshot across a reload")
+	}
 	if got := deps.Listeners(); !slices.Equal(got, want) {
 		t.Errorf("after a reload moving the public listener, Listeners = %q, want the bound %q", got, want)
 	}

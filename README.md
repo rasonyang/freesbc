@@ -84,7 +84,7 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 - **Media anchoring**: RTP relay on FreeSBC ports with hardened first-packet latching and a silence watchdog; no transcoding.
 - **WebRTC**: ICE-Lite, DTLS-SRTP and RTCP-mux terminated for browsers (any of `edge.listen.ws`/`wss`), relayed to plain RTP.
 - **Built-in security**: per-IP rate limiting, scanner fingerprinting, in-memory bans, admission control for public INVITEs and REGISTER enumeration.
-- **Embedded WebUI + REST API**: a live dashboard and a validated, atomic editor for the same YAML file, Prometheus metrics, bcrypt Basic Auth.
+- **Embedded WebUI + REST API**: a live dashboard, a read-only config view with candidate validation and diff, Prometheus metrics, bcrypt Basic Auth.
 
 ## Documentation
 
@@ -97,11 +97,31 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 
 Enable the optional `admin` block (a bcrypt `password_hash`; generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`; the user is always `admin`), then:
 
-- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the raw-config editor. Edits are validated, written atomically and reloaded; keep secrets as `${ENV}` references,
+- browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the Config tab: the running file read-only, a candidate editor with Validate (the same checks as `freesbc check`, listing restart-only keys the candidate changes) and a line diff against the running file. The admin API never writes the config: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it, as with nginx. Keep secrets as `${ENV}` references,
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- read live state from `/api/status`, `/api/calls` and `/api/config`.
+- read live state from `/api/status`, `/api/calls` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing).
 
 Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.
+
+## Not in scope
+
+FreeSBC does only what is necessary to make one switch on a private LAN safely reachable from the public internet. Anything the switch (FreeSWITCH or Asterisk) already does well, FreeSBC does not do.
+
+A feature is in scope only if it passes one of these:
+
+1. Only the edge can see or do it: the public wire before rewrite, TLS/WSS/WebRTC termination, NAT and latching, topology hiding, media anchoring, public-side admission, or FreeSBC's own state (sockets, ports, bindings, bans, reloads).
+2. The switch cannot do it well from behind the edge.
+
+Everything else stays on the switch; FreeSBC's contribution is a documented switch-side example, not a feature. Concrete examples that stay on the switch:
+
+- Per-carrier and per-user concurrency and CPS limits: FreeSWITCH `limit`, `max-sessions`, `sessions-per-second`; Asterisk `GROUP()` / `GROUP_COUNT()`.
+- Maximum call duration: FreeSWITCH `sched_hangup`; Asterisk `Dial` `L()` and `TIMEOUT(absolute)`.
+- Toll-fraud protection: switch authentication plus dialplan rules.
+- Call history and CDR: the switch's CDR and CEL.
+- Call lifecycle events: the switch's event system.
+- RTCP reporting to HOMER: the switch receives the relayed RTCP and can report it.
+- Config version history: the operator's VCS.
+- Editing the config through the admin API: edit the file, run `freesbc check`, and the watcher reloads it. Like nginx, there is no write API.
 
 ## Status & limitations
 

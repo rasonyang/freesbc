@@ -173,8 +173,8 @@ func TestHostCheckBeforeAuth(t *testing.T) {
 
 func TestOriginCheck(t *testing.T) {
 	s := guardServer(t, "127.0.0.1:8080", nil)
-	put := func(hdr map[string]string) int {
-		req := httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader("x"))
+	post := func(hdr map[string]string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/config/validate", strings.NewReader("x"))
 		req.Host = "127.0.0.1:8080"
 		req.SetBasicAuth("admin", "secret")
 		for k, v := range hdr {
@@ -185,7 +185,7 @@ func TestOriginCheck(t *testing.T) {
 		return rr.Code
 	}
 	// A refusal is 403; an accepted request reaches the handler, which
-	// answers anything but 403 (428 or 400 here: no If-Match / bad body).
+	// answers anything but 403.
 	ok := func(code int) bool { return code != http.StatusForbidden }
 	for _, tc := range []struct {
 		name string
@@ -203,7 +203,7 @@ func TestOriginCheck(t *testing.T) {
 		{"no origin, same-site", map[string]string{"Sec-Fetch-Site": "same-site"}, false},
 		{"foreign origin beats same-origin metadata", map[string]string{"Origin": "http://evil.example.com", "Sec-Fetch-Site": "same-origin"}, false},
 	} {
-		if got := ok(put(tc.hdr)); got != tc.pass {
+		if got := ok(post(tc.hdr)); got != tc.pass {
 			t.Errorf("%s: passed=%v want %v", tc.name, got, tc.pass)
 		}
 	}
@@ -212,7 +212,7 @@ func TestOriginCheck(t *testing.T) {
 		t.Errorf("GET without Origin: %d", got)
 	}
 	// A refused Origin runs before auth: no credentials, still 403 not 401.
-	req := httptest.NewRequest(http.MethodPut, "/api/config", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/config/validate", nil)
 	req.Host = "127.0.0.1:8080"
 	req.Header.Set("Origin", "http://evil.example.com")
 	rr := httptest.NewRecorder()
@@ -223,7 +223,7 @@ func TestOriginCheck(t *testing.T) {
 }
 
 func TestOriginCheckTLSScheme(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPut, "/api/config", nil)
+	r := httptest.NewRequest(http.MethodPost, "/api/config/validate", nil)
 	r.Host = "sbc.example.net:8443"
 	r.Header.Set("Origin", "https://sbc.example.net:8443")
 	if !originAllowed(r, true) || originAllowed(r, false) {
@@ -245,7 +245,7 @@ func TestSecurityHeadersOnEveryResponse(t *testing.T) {
 		{"healthz", "GET", "/healthz", "127.0.0.1:8080", "", "", 200},
 		{"401", "GET", "/api/status", "127.0.0.1:8080", "", "", 401},
 		{"421", "GET", "/api/status", "evil.example.com", "admin", "secret", 421},
-		{"403", "PUT", "/api/config", "127.0.0.1:8080", "admin", "secret", 403},
+		{"403", "POST", "/api/config/validate", "127.0.0.1:8080", "admin", "secret", 403},
 	}
 	for _, c := range cases {
 		req := httptest.NewRequest(c.method, c.path, nil)

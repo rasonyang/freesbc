@@ -451,6 +451,39 @@ main.container { padding-block: calc(var(--spacing) * 8); }
   box-shadow: 0 0 0 3px color-mix(in oklch, var(--destructive) 20%, transparent);
 }
 
+.subhead { margin: 0; font-size: 0.875rem; font-weight: var(--font-weight-medium); }
+
+/* ---- diff --------------------------------------------------------------- */
+/* Added and removed lines reuse the badge recipe (12% tone tint, ink pulled
+ * toward the foreground in light), so TestUITokenContrast covers them. The
+ * +/- marker is text, so colour is never the only cue. */
+.diff {
+  margin: 0;
+  padding: calc(var(--spacing) * 2) 0;
+  max-height: 28rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--muted-foreground);
+  line-height: 1.6;
+}
+.diff:focus-visible { border-color: var(--ring); box-shadow: var(--focus-ring); outline: none; }
+.diff-line {
+  display: block;
+  padding: 0 calc(var(--spacing) * 3);
+  white-space: pre;
+}
+.diff-line[data-op="add"],
+.diff-line[data-op="del"] {
+  background: color-mix(in oklch, var(--tone) 12%, transparent);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+}
+.diff-line[data-op="add"] { --tone: var(--success); }
+.diff-line[data-op="del"] { --tone: var(--destructive); }
+.diff-line[data-op="skip"] { font-style: italic; }
+.diff-line[data-op="note"] { color: var(--card-foreground); }
+
 .toolbar {
   display: flex;
   align-items: center;
