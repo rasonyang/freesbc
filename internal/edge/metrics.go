@@ -40,6 +40,10 @@ type Metrics struct {
 	dtlsFailures  atomic.Uint64
 	handlerPanics atomic.Uint64
 
+	// parseFailures counts messages sipgo's parser rejected on a read, one
+	// counter per known transport plus OTHER (sipgolog.go).
+	parseFailures [len(metricTransports) + 1]atomic.Uint64
+
 	// admissionDrops counts public requests dropped silently by the
 	// admission policy, one counter per (fixed) reason (admission.go).
 	admissionDrops [numDropReasons]atomic.Uint64
@@ -156,6 +160,10 @@ func (m *Metrics) SetCarrierRegistrations(counts map[string]int) {
 // HandlerPanicked counts a SIP handler panic the guard recovered.
 func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 
+// ParseFailed counts one read sipgo's parser rejected, by transport (folded
+// into the bounded label set).
+func (m *Metrics) ParseFailed(transport string) { m.parseFailures[transportIndex(transport)].Add(1) }
+
 func (m *Metrics) DialogStarted() { m.dialogs.Add(1) }
 func (m *Metrics) DialogEnded()   { m.dialogs.Add(-1) }
 
@@ -222,6 +230,10 @@ type Snapshot struct {
 	WebRTCDTLSFailures          uint64
 	HandlerPanics               uint64
 
+	// ParseFailures is keyed by upper-case transport (or OTHER); every
+	// transport is present, zero or not.
+	ParseFailures map[string]uint64
+
 	// AdmissionDrops is keyed by drop reason (dropReasonLabels); every
 	// reason is present, zero or not.
 	AdmissionDrops map[string]uint64
@@ -253,6 +265,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		WebRTCICEFailures:           m.iceFailures.Load(),
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
 		AdmissionDrops:              map[string]uint64{},
+		ParseFailures:               map[string]uint64{},
 		CarrierRequests:             map[string]uint64{},
 		CarrierRegistrations:        map[string]int64{},
 	}
@@ -265,6 +278,13 @@ func (m *Metrics) Snapshot() Snapshot {
 		s.CarrierRequests[k.(string)] = v.(*atomic.Uint64).Load()
 		return true
 	})
+	for i := range m.parseFailures {
+		label := metricOther
+		if i < len(metricTransports) {
+			label = metricTransports[i]
+		}
+		s.ParseFailures[label] = m.parseFailures[i].Load()
+	}
 	for r := range m.admissionDrops {
 		s.AdmissionDrops[dropReasonLabels[r]] = m.admissionDrops[r].Load()
 	}

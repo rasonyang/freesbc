@@ -210,7 +210,7 @@ func startHarnessStrict(t *testing.T, webrtc, wss bool) *harness {
 
 // writeTestTLS writes a freshly generated self-signed ECDSA certificate for
 // 127.0.0.1 and its key into dir and returns the two paths.
-func writeTestTLS(t *testing.T, dir string) (certPath, keyPath string) {
+func writeTestTLS(t testing.TB, dir string) (certPath, keyPath string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -248,7 +248,7 @@ func writeTestTLS(t *testing.T, dir string) (certPath, keyPath string) {
 // WithPrivateAddr), the given switch nodes, one RTP range for both pools
 // and a shield limit high enough that the harness itself is never throttled
 // (the rate limiter has its own tests in package shield).
-func harnessYAML(t *testing.T, switches []string, pubUDP, pubWS, pubWSS, mediaBase int, carrierSources string) string {
+func harnessYAML(t testing.TB, switches []string, pubUDP, pubWS, pubWSS, mediaBase int, carrierSources string) string {
 	t.Helper()
 	var listen []string
 	listen = append(listen, fmt.Sprintf("udp: %d", pubUDP))
@@ -283,12 +283,19 @@ rtp: "%d-%d"
 // 127.0.0.1:priv and starts it; the caller attaches the fake switches.
 func newHarness(t *testing.T, yaml string, priv int) *harness {
 	t.Helper()
+	return newHarnessLog(t, yaml, priv, slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// newHarnessLog is newHarness with the proxy's log handler chosen by the
+// caller, so a test can inspect what the proxy logs.
+func newHarnessLog(t *testing.T, yaml string, priv int, handler slog.Handler) *harness {
+	t.Helper()
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatalf("harness config: %v", err)
 	}
 	store := config.NewStore(cfg)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	log := slog.New(handler)
 	srv, err := New(store, log, WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", priv))))
 	if err != nil {
 		t.Fatal(err)

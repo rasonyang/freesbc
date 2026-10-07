@@ -48,6 +48,7 @@ jobs:
       matrix:
         include:
           - { pkg: ./internal/config, target: FuzzAuditConfigParse }
+          - { pkg: ./internal/edge, target: FuzzReadFilter }
           - { pkg: ./internal/media, target: FuzzAuditClassify }
           - { pkg: ./internal/media, target: FuzzAuditDemux }
           - { pkg: ./internal/media, target: FuzzAuditSRTPUnprotect }

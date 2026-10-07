@@ -242,3 +242,29 @@ func TestCarrierSourceExemptFromScannerBanAndUsesCarrierLimit(t *testing.T) {
 		t.Errorf("non-carrier burst = %d, want about 2 (rate_limit)", n)
 	}
 }
+
+// A parsable request costs one token end to end: AllowRate is the only
+// charge, CheckScanner takes none, and CheckFrom is the two composed.
+func TestAllowRateThenCheckScannerChargesOnce(t *testing.T) {
+	s := testShield(t, shieldCfg) // rate_limit 2/s: a bucket of 2
+	src := netip.MustParseAddrPort("198.51.100.9:5060")
+	for i := 0; i < 2; i++ {
+		if !s.AllowRate(src.Addr()) {
+			t.Fatalf("token %d refused", i)
+		}
+		if s.CheckScanner(src, "Zoiper", "udp") != Allow {
+			t.Fatalf("request %d: CheckScanner must not charge a token", i)
+		}
+	}
+	if s.AllowRate(src.Addr()) {
+		t.Fatal("third read allowed: the bucket should be empty after two charges")
+	}
+	if got := s.Stats().DropsByReason["rate"]; got != 1 {
+		t.Fatalf("rate drops = %d, want 1", got)
+	}
+	other := netip.MustParseAddrPort("198.51.100.10:5060")
+	if s.CheckFrom(other, "Zoiper", "udp") != Allow || s.CheckFrom(other, "Zoiper", "udp") != Allow ||
+		s.CheckFrom(other, "Zoiper", "udp") != Drop {
+		t.Fatal("CheckFrom must charge exactly one token per call")
+	}
+}

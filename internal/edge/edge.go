@@ -344,7 +344,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := checkLocalAddr("private.ip", s.privAddr.Addr()); err != nil {
 		return err
 	}
-	sipgoLog := s.log.With("caller", "sipgo")
+	// Every sipgo record goes through sipgoHandler: a failed parse would
+	// otherwise log the raw message at Error (sipgolog.go).
+	sipgoLog := slog.New(newSipgoHandler(s.log.Handler(), s.metrics.ParseFailed)).With("caller", "sipgo")
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgentTransportLayerOptions(
 			sip.WithTransportLayerLogger(sipgoLog),
@@ -752,13 +754,24 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		// transaction — so the ban is enforced here, before parsing. There
 		// is no FreeSWITCH exemption: FreeSWITCH does not use a public
 		// listener, so a public read from its address is just a public read.
-		if sh := s.shield; sh != nil && info.RemoteAddr != nil {
-			if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil &&
-				sh.BannedFrom(ap, info.Transport) {
-				// A stream from a banned source is closed on its next
-				// read, so a ban also ends connections opened before it.
-				s.closeStream(info.Transport, info.RemoteAddr.String())
-				return false
+		s.shieldMu.RLock()
+		sh := s.shield
+		s.shieldMu.RUnlock()
+		if sh != nil && info.RemoteAddr != nil {
+			if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil {
+				if sh.BannedFrom(ap, info.Transport) {
+					// A stream from a banned source is closed on its next
+					// read, so a ban also ends connections opened before it.
+					s.closeStream(info.Transport, info.RemoteAddr.String())
+					return false
+				}
+				// The rate token is charged here, once per datagram or
+				// frame, parsable or not: a malformed flood must not reach
+				// the parser (and sipgo's failure log) for free. guard
+				// charges nothing. Over the limit is a silent drop.
+				if !sh.AllowRate(ap.Addr()) {
+					return false
+				}
 			}
 		}
 		return true
@@ -815,7 +828,9 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		// to the trusted sockets, and only to them.
 		if arr == arrPublic {
 			network := sip.NetworkToLower(req.Transport())
-			if s.shield.CheckFrom(src, fsip.UserAgent(req), network) == shield.Drop {
+			// The rate token was already charged by the read filter; a
+			// parsable request costs one token end to end.
+			if s.shield.CheckScanner(src, fsip.UserAgent(req), network) == shield.Drop {
 				if s.shield.BannedFrom(src, network) {
 					s.closeStream(network, req.Source())
 				}
