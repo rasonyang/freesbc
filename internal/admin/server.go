@@ -87,6 +87,10 @@ type ProxyStats struct {
 	DTLSFailures           uint64 `json:"webrtc_dtls_failure_total"`
 	HandlerPanics          uint64 `json:"sip_handler_panics_total"`
 
+	// ParseFailures counts reads sipgo's parser rejected, by transport
+	// (UDP, TCP, TLS, WS, WSS, OTHER).
+	ParseFailures map[string]uint64 `json:"sip_parse_failures_total"`
+
 	// AdmissionDrops counts public requests the edge admission policy
 	// dropped silently, by reason (a fixed set: invite_not_admitted,
 	// register_enumeration).

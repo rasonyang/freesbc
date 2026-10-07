@@ -139,8 +139,8 @@ A request from a `carrier_sources` address that matches no `carriers` entry gets
 
 | Key | Default | Rules |
 |---|---|---|
-| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. |
-| `carrier_rate_limit` | `200/s per_ip` | Applies to carrier sources (resolved `carriers` addresses and `carrier_sources`). |
+| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram or WS/WSS frame, charged before parsing: malformed datagrams, responses and keepalives count too. |
+| `carrier_rate_limit` | `200/s per_ip` | Applies to carrier sources (resolved `carriers` addresses and `carrier_sources`), charged the same way. |
 | `ban` | `1h` | Duration, greater than 0. How long a source fingerprinted as a scanner stays banned (in memory only). Carrier sources are never banned as scanners. |
 
 Rate limit syntax: `<n>/<s|m|h>` with an optional ` per_ip`; `n` is a positive integer. With `per_ip` each source (an IPv6 source by its /64) has its own token bucket; without it all sources share one bucket. Burst equals `n`.

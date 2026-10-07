@@ -102,6 +102,40 @@ const socketBanMax = time.Minute
 // nothing.
 func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport string) Verdict {
 	srcAP = netip.AddrPortFrom(srcAP.Addr().Unmap(), srcAP.Port())
+	if s.BannedFrom(srcAP, transport) {
+		s.dropsBanned.Add(1)
+		return Drop
+	}
+	if !s.AllowRate(srcAP.Addr()) {
+		return Drop
+	}
+	return s.CheckScanner(srcAP, userAgent, transport)
+}
+
+// AllowRate charges one token of src's rate-limit bucket (shield.rate_limit,
+// or shield.carrier_rate_limit for a carrier source) and reports whether it
+// was available. A refusal is counted as a "rate" drop. It needs no parsed
+// message, so the edge read filter calls it once per datagram or frame,
+// before the parser; a parsable request is then charged exactly once, there,
+// and its guard calls CheckScanner instead of CheckFrom.
+func (s *Shield) AllowRate(src netip.Addr) bool {
+	src = src.Unmap()
+	rl := s.rateLimit(s.store.Current(), s.isCarrier(src))
+	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
+		s.log.Debug("shield rate-limited", "source", src)
+		s.dropsRate.Add(1)
+		return false
+	}
+	return true
+}
+
+// CheckScanner is CheckFrom without the rate token: the ban re-check and the
+// scanner (User-Agent) verdict, which need a parsed message. The caller must
+// already have charged the source through AllowRate (the UA is a
+// client-controlled "ban me" signal, so it must first burn through the
+// source's rate budget like any other traffic, never skip the limiter).
+func (s *Shield) CheckScanner(srcAP netip.AddrPort, userAgent string, transport string) Verdict {
+	srcAP = netip.AddrPortFrom(srcAP.Addr().Unmap(), srcAP.Port())
 	src := srcAP.Addr()
 	cfg := s.store.Current()
 	if s.BannedFrom(srcAP, transport) {
@@ -109,12 +143,6 @@ func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport str
 		return Drop
 	}
 	carrier := s.isCarrier(src)
-	rl := s.rateLimit(cfg, carrier)
-	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
-		s.log.Debug("shield rate-limited", "source", src)
-		s.dropsRate.Add(1)
-		return Drop
-	}
 	if !carrier && isScanner(userAgent) {
 		s.dropsScanner.Add(1)
 		if !bannableTransport(transport) {
