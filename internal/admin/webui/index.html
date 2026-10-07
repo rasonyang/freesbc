@@ -29,7 +29,6 @@
   <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></symbol>
   <symbol id="i-error" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol>
-  <symbol id="i-save" viewBox="0 0 24 24"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></symbol>
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
 </svg>
@@ -142,42 +141,68 @@
   <section id="view-config" class="page" aria-labelledby="h-config" hidden>
     <div class="page-header">
       <h1 class="page-title" id="h-config">Config</h1>
-      <p class="page-description">The running <span class="mono">freesbc.yaml</span>. Saving validates first; a rejected file changes nothing.</p>
+      <p class="page-description">The running <span class="mono">freesbc.yaml</span>, read-only. Check a candidate here, then edit the file on the host: <span class="mono">freesbc check -c freesbc.yaml</span>, and the watcher reloads it.</p>
     </div>
 
     <div class="card">
       <div class="card-header">
         <div class="card-heading">
+          <h2 class="card-title">Current file</h2>
           <div class="toolbar">
             <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-load">
-              <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Load
-            </button>
-            <button class="btn" data-size="sm" type="button" id="btn-save" disabled>
-              <svg class="icon" aria-hidden="true"><use href="#i-save"/></svg>Save
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Reload
             </button>
             <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-download" aria-describedby="download-note">
               <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>Download config
             </button>
             <span class="toolbar-status" id="config-status" role="status" aria-live="polite"></span>
           </div>
-          <p class="muted" id="download-note">Download config fetches the file on disk, not the editor contents. It is <strong>not redacted</strong>: it contains the admin password hash and any literal secrets, so store it like a credential. <span class="mono">${VAR}</span> references are saved as references, not values.</p>
+          <p class="muted" id="download-note">Download config fetches the file on disk. It is <strong>not redacted</strong>: it contains the admin password hash and any literal secrets, so store it like a credential. <span class="mono">${VAR}</span> references are saved as references, not values.</p>
         </div>
       </div>
       <div class="card-content page">
-        <label class="visually-hidden" for="config-text">Config YAML</label>
-        <textarea class="textarea" id="config-text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-hint" placeholder="Opening the Config tab loads the running config automatically — use Load to re-fetch."></textarea>
-
-        <div class="alert" data-variant="destructive" id="config-error" role="alert" tabindex="-1" hidden>
-          <svg class="icon" aria-hidden="true"><use href="#i-error"/></svg>
-          <div class="alert-title">Not saved</div>
-          <div class="alert-body"><pre class="mono" id="config-error-text"></pre></div>
-        </div>
-
+        <label class="visually-hidden" for="config-text">Current config YAML (read-only)</label>
+        <textarea class="textarea" id="config-text" readonly spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Opening the Config tab loads the file on disk automatically — use Reload to re-fetch."></textarea>
         <div class="alert" id="config-hint">
           <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
           <div class="alert-title">Only <span class="mono">shield.*</span> applies live</div>
-          <div class="alert-body">Every other section is read at startup: save, then restart. Keep secrets as <span class="mono">${ENV}</span> references — other operators can read this file.</div>
+          <div class="alert-body">Every other section is read at startup: edit the file, then restart. Keep secrets as <span class="mono">${ENV}</span> references — other operators can read this file.</div>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Candidate</h2>
+          <p class="card-description">Paste or edit a candidate file. Validate runs the same checks as <span class="mono">freesbc check</span> and writes nothing.</p>
+          <div class="toolbar">
+            <button class="btn" data-size="sm" type="button" id="btn-validate">
+              <svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>Validate
+            </button>
+            <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-copy-current">Copy current file</button>
+            <span class="toolbar-status" id="validate-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+      </div>
+      <div class="card-content page">
+        <label class="visually-hidden" for="config-candidate">Candidate config YAML</label>
+        <textarea class="textarea" id="config-candidate" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="Paste a candidate freesbc.yaml here."></textarea>
+
+        <div class="alert" data-variant="destructive" id="validate-errors" role="alert" tabindex="-1" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-error"/></svg>
+          <div class="alert-title">Not valid</div>
+          <div class="alert-body"><pre class="mono" id="validate-errors-text"></pre></div>
+        </div>
+
+        <div class="alert" id="validate-restart" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>
+          <div class="alert-title">Restart required</div>
+          <div class="alert-body">Changes to these keys take effect only after a restart: <span class="mono" id="validate-restart-keys"></span></div>
+        </div>
+
+        <h3 class="subhead" id="h-diff">Diff, current file to candidate</h3>
+        <pre class="diff mono" id="config-diff" role="region" aria-labelledby="h-diff" tabindex="0"></pre>
       </div>
     </div>
   </section>

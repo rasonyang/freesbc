@@ -162,11 +162,11 @@ Web security (restart-only like the rest of `admin`):
 
 - Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` (except `/healthz`). The WebUI also carries a `Content-Security-Policy`.
 - Host check: every route except `/healthz` answers `421` unless `Host` is the `listen` IP with the listen port, on a loopback `listen` also `localhost`, `127.0.0.1` or `[::1]` with that port, or an `allowed_hosts` entry with that port (case-insensitive, trailing dot ignored). A bare host with no port is accepted only when the listen port is the scheme default (443 with TLS, 80 without). With a wildcard `listen` (`0.0.0.0`, `[::]`) any IP-literal `Host` with the listen port is accepted, since an IP literal cannot be DNS-rebound. Behind a reverse proxy or a DNS name, add the name to `allowed_hosts`. The check runs before authentication.
-- Origin check: `PUT /api/config` (any method but GET, HEAD, OPTIONS) needs an `Origin` equal to `<scheme>://<Host>`, or no `Origin` and `Sec-Fetch-Site: same-origin`; otherwise `403`. The WebUI satisfies this by itself. A script must send the header:
+- Origin check: `POST /api/config/validate` (any method but GET, HEAD, OPTIONS) needs an `Origin` equal to `<scheme>://<Host>`, or no `Origin` and `Sec-Fetch-Site: same-origin`; otherwise `403`. The WebUI satisfies this by itself. A script must send the header:
 
   ```sh
-  curl -u admin:PASSWORD -X PUT -H 'Origin: http://127.0.0.1:8080' \
-       -H 'If-Match: "<etag>"' --data-binary @freesbc.yaml http://127.0.0.1:8080/api/config
+  curl -u admin:PASSWORD -X POST -H 'Origin: http://127.0.0.1:8080' \
+       --data-binary @freesbc.yaml http://127.0.0.1:8080/api/config/validate
   ```
 
 - Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
@@ -175,11 +175,21 @@ Web security (restart-only like the rest of `admin`):
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
 
-The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the editor text, so unsaved edits are not included) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
+The config API is read-only. There is no write endpoint: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it (see Reload classes). Any method other than GET on `/api/config` or `/api/config/raw` is `405` with an `Allow` header.
+
+`POST /api/config/validate` checks a candidate without writing anything. The body is the candidate YAML file (at most 1 MiB, else `413`); it runs the same `config.Parse` as `freesbc check`, so an expanded `${VAR}` value never appears in an error. The response is always `200` JSON:
+
+```json
+{"valid": true, "errors": [], "restart_required": ["edge.listen"]}
+```
+
+`errors` lists the problems (`[]` when valid). `restart_required` lists the restart-only keys the candidate changes compared with the config the process started with (`[]` for none, and for an invalid candidate); see Reload classes. Any method other than POST is `405` with `Allow: POST`.
+
+The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the candidate text) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
 
 ## Reload classes
 
-`config.Watch` watches the file's parent directory (200 ms debounce, symlink-aware) and publishes each valid file as an immutable snapshot. An invalid file is logged and the previous snapshot stays. `PUT /api/config` only writes the file atomically; the watcher does the reload.
+`config.Watch` watches the file's parent directory (200 ms debounce, symlink-aware) and publishes each valid file as an immutable snapshot. An invalid file is logged and the previous snapshot stays. FreeSBC never writes the file: the operator edits it (run `freesbc check` first) and the watcher does the reload.
 
 | Setting | Class |
 |---|---|

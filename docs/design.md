@@ -30,7 +30,21 @@ If the config has no `edge` section that validates, `config.Parse` fails
 before anything starts; there is no mode in which the process runs without the
 edge (`internal/config/validate.go`).
 
-### 1.1 Boundaries
+### 1.1 Scope and boundaries
+
+**The scope rule.** FreeSBC does only what is necessary to make one switch on
+a private LAN safely reachable from the public internet. Anything the switch
+(FreeSWITCH or Asterisk) already does well, FreeSBC does not do. A feature is
+in scope only if it passes one of these:
+
+1. Only the edge can see or do it: the public wire before rewrite, TLS/WSS/WebRTC termination, NAT and latching, topology hiding, media anchoring, public-side admission, or FreeSBC's own state (sockets, ports, bindings, bans, reloads).
+2. The switch cannot do it well from behind the edge.
+
+Everything else stays on the switch; FreeSBC's contribution is a documented
+switch-side example, not a feature. Per-carrier concurrency and CPS limits,
+maximum call duration, toll-fraud protection, CDR, call events, RTCP
+reporting, config history and a config write API are all on the far side of
+this line (README, "Not in scope"). The boundaries below follow from it.
 
 **Toward public endpoints.** FreeSBC terminates SIP over UDP, WS and WSS, and
 terminates the media path: RTP, SRTP-over-DTLS, and ICE-Lite. A public
@@ -312,7 +326,7 @@ the process's life.
 Reload is driven only by `config.Watch` (`internal/config/reload.go`, `Watch` and `linkTracker`):
 
 - `fsnotify` watches **the parent directory**, not the file, so atomic-rename
-  saves are seen.
+  edits that replace the file are seen.
 - Events are filtered by `Op & (Write|Create|Rename) != 0` (`Chmod` and
   `Remove` are ignored) and by `linkTracker.affects`: an event on the config
   path itself, or on the file it resolves to, reloads; any other entry in the
@@ -438,9 +452,9 @@ class. This section is the mechanism.
 
 `config.Store` (`store.go`) publishes immutable `*Config` snapshots through an
 atomic pointer. Code reads `store.Current()` at the point of use, once per
-unit of work. `config.Watch` is the only caller of `Store.Replace`; the admin
-`PUT /api/config` writes the file atomically and lets the watcher reload it
-(§4.4). The edge reads restart-only values from its `boot` snapshot and the
+unit of work. `config.Watch` is the only caller of `Store.Replace`; the
+admin API never writes the file: the operator edits it and the watcher
+reloads it (§4.4). The edge reads restart-only values from its `boot` snapshot and the
 shield reads its hot values per check. Custom scalar types (`Duration`,
 `PortRange`, `RateLimit`) are in `internal/config/types.go`.
 
@@ -2559,7 +2573,6 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | `shield.banList.mu` ×2, `shield.rateLimiter.mu`, `Shield.rlMu` | the IP and UDP-socket ban tables, the limiter's buckets and global bucket, and the cached rate-limit parses |
 | `admin.authLimiter.mu` | the per-source auth-failure window, including reservations |
 | `admin.verifiedCreds.mu` | the verified-credential digests |
-| `admin.Server.writeMu` | `PUT /api/config`'s If-Match check plus atomic write |
 | `config.Store.mu` | the subscriber slice only |
 
 ### 11.3 Atomics, channels, CAS
@@ -2741,7 +2754,7 @@ self-signed certificate.
 | The switch addresses each carrier exactly as the `edge.carriers` entry reads, through FreeSBC as outbound proxy | **Enforced for requests that reach the private socket**: a request whose Request-URI is neither a live client token nor an `edge.carriers` entry gets 404, so FreeSBC is not an open relay |
 | `admin.listen` binds loopback | **Enforced**, opt out with `admin.allow_remote: true` (which requires `tls`) |
 | The process runs non-root with CAP_NET_BIND_SERVICE if a listen port is below 1024 | **Not enforced, no unit file shipped** |
-| Config file mode 0600 | **Not enforced**; the admin write-back preserves the existing file's mode |
+| Config file mode 0600 | **Not enforced**; FreeSBC only reads the file |
 | A single routable media address (no TURN) | **Assumed** |
 | Public and private media pools do not collide | **Enforced by construction**: different bind IPs |
 | Switch nodes are UDP at literal IPs | **Enforced** by validation (`check` and `run`) and at topology build |
@@ -2836,8 +2849,9 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:382`) |
-| `/api/config` | GET, PUT (else 405 + `Allow: GET, PUT`) | Basic | GET: the **redacted** view; PUT: write-back |
-| `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml`, with an `ETag` = quoted SHA-256 hex |
+| `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
+| `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
+| `/api/config/validate` | POST (else 405 + `Allow: POST`) | Basic | check a candidate file, write nothing: `{"valid","errors","restart_required"}` |
 | `/assets/<file>` | any | Basic | a static WebUI asset from the embedded `webui/assets` (`tokens.css`, `ui.css`, `theme.js`, `app.js`); 404 for anything else, never a listing |
 | `/` | any | Basic | the embedded WebUI page (catch-all; the explicit patterns win) |
 
@@ -2848,31 +2862,26 @@ JSON keys (`redactConfig`, `redact.go:9`): `public`, `private`, `rtp` (`min`,
 `tls` (`cert`, `key` paths) and `admin` (`listen`, `allow_remote`, and
 `password_hash: "***"` only when the hash is non-empty). The one secret,
 `admin.password_hash`, is masked; no other config value is secret.
-`GET /api/config/raw` is deliberately unredacted because it is the round-trip
-source for the editor; redaction would break the write-back.
+`GET /api/config/raw` is deliberately unredacted: it is the operator's view of
+the exact file on disk (and the Download button's source).
 
-`PUT /api/config` (`handleConfigWrite`, `config_write.go:123`), in order: read
-at most **1 MiB** + 1 (413 above that); `config.Parse(body)` on a throwaway
-config (400 on failure, with the validation text, in which expanded `${ENV}`
-values are redacted — docs/config.md); then, under `Server.writeMu`, the
-optional `If-Match` check (re-read the file, **409** on a mismatch) and
-`writeFileAtomic` (`config_write.go:33`). The check and the write are one
-critical section, so of several writers holding the same ETag exactly one
-succeeds and the rest get 409 (audit P2-ADM-004); a PUT without `If-Match` is
-last-writer-wins. `writeFileAtomic` first resolves the path with
-`filepath.EvalSymlinks`, so a symlinked config is written at its target and
-the link survives (a dangling link is refused), then: `CreateTemp` in the
-**target's directory**, write, `Sync`, `Close`, `Chmod` (0600, or the existing
-file's mode when it exists), `Rename`, and an `fsync` of the directory so the
-rename is durable (audit P2-ADM-005). A failed directory sync is logged as a
-warning; the new file is already in place. Every other failure path removes
-the temp file and leaves the original untouched. The submitted bytes are
-written **verbatim**, which is why comments and `${ENV}` references survive;
-there is no AST patching. A 200 carries the new body's ETag.
-
-The write-back does **not** call `Store.Replace`. Reload happens only because
-`config.Watch` sees the rename in the parent directory, debounces 200 ms, and
-re-`Load`s (§4.4).
+`POST /api/config/validate` (`handleConfigValidate`, `config_validate.go:48`),
+in order: read at most **1 MiB** + 1 (413 above that); `config.Parse(body)`,
+the same function `freesbc check` runs. The response is always 200 JSON
+`{"valid": bool, "errors": [string], "restart_required": [string]}`; both
+lists encode as `[]`, never `null`. `errors` has one entry per validation
+problem (`splitErrors`, `config_validate.go:84`; a YAML syntax error stays one
+multi-line entry), and `${ENV}` values the validator would echo are redacted
+(docs/config.md), so the response cannot be used to read an environment
+variable. For a valid candidate, `restart_required` is
+`config.RestartOnlyChanges(running, candidate)`, where `running` is
+`Deps.Running()`: the snapshot the process started with, supplied by `app`
+(`adminDeps`), not `store.Current()`, which a hot reload may have advanced
+past what the planes actually run. It is `[]` for an invalid candidate.
+Nothing is written and `Store.Replace` is never called. The admin API has no
+write path: the operator edits the file, runs `freesbc check`, and
+`config.Watch` sees the change in the parent directory, debounces 200 ms and
+re-`Load`s (§4.4). Every other method on `/api/config` is 405.
 
 ### 13.4 Authentication and its limiter
 
@@ -2949,10 +2958,13 @@ poll keeps the last data and marks the header "Connection lost"; the two
 endpoints render independently, so one failing marks only its half stale;
 polls are chained with `setTimeout` and each request times out after 4 s, so
 they never overlap; a 401 shows a persistent "session expired" banner that
-the next successful response clears), and a **Config** editor that loads
-`/api/config/raw`, keeps its ETag, and PUTs to `/api/config` with
-`If-Match`. A **Download config** button fetches
-`/api/config/raw` fresh (not the editor text) and saves the response bytes as
+the next successful response clears), and a **Config** tab that is
+read-only: it shows `/api/config/raw` in a readonly textarea, and a candidate
+textarea whose **Validate** button POSTs to `/api/config/validate` and shows
+the errors or the restart-only keys, next to a client-side line diff (an LCS
+over the common-trimmed middle, three lines of context) of the current file
+against the candidate. A **Download config** button fetches
+`/api/config/raw` fresh (not the candidate text) and saves the response bytes as
 `freesbc-<host>-<UTC timestamp>.yaml`; the file is unredacted and the page
 says so. Design rules are in `docs/admin-ui.md`.
 
@@ -3114,8 +3126,8 @@ before auth: `Origin` must equal `<scheme>://<request Host>` (`https` when
 the listener serves TLS); with no `Origin`, `Sec-Fetch-Site: same-origin` is
 accepted; anything else (foreign or `null` origin, cross-site or same-site
 fetch metadata, neither header) gets **403**. Browsers always send `Origin`
-on a same-origin `PUT`, so the WebUI needs nothing; a script calling
-`PUT /api/config` must send a matching `Origin` header.
+on a same-origin `POST`, so the WebUI needs nothing; a script calling
+`POST /api/config/validate` must send a matching `Origin` header.
 
 **Transport security.** TLS 1.2 minimum on every TLS surface (`wss` and the
 admin listener). Both use the one top-level `tls` identity; there is no client
@@ -3155,7 +3167,7 @@ verbatim — for clients and for carrier registrations alike — and never holds
 credential; the edge never logs an Authorization header, a nonce or a password. `${ENV}` references in the config are expanded only in memory and
 never written back. Parse errors cannot echo a secret because expansion runs
 after the unmarshal, and validation errors are redacted back to the `${ENV}`
-text, so neither `freesbc check` nor the admin `PUT /api/config` response can
+text, so neither `freesbc check` nor the admin `POST /api/config/validate` response can
 be used to read an environment variable.
 
 ### 14.2 Deployment assumptions (not all enforced by the code)
@@ -3210,7 +3222,7 @@ be used to read an environment variable.
   authentication, and a private bind (or admin TLS).
 - **The config file is the single source of truth**: a local user who can
   write it controls the SBC. Its permissions are not checked, and the admin
-  write-back inherits the existing file's mode.
+  API only reads it.
 - The media plane has **no application-layer rate limiting**; its security is
   latch semantics plus SRTP authentication.
 - The edge's ws/wss listeners have **no connection cap and no idle timeout**.

@@ -28,7 +28,7 @@ func (c *Config) validate() error {
 	// Messages may name a value, and validation runs after ${VAR}
 	// expansion, so every argument is redacted: an error must never echo
 	// an environment value (it reaches `freesbc check` output and the
-	// admin PUT response).
+	// admin validate response).
 	fail := func(format string, args ...any) {
 		errs = append(errs, fmt.Sprintf(format, c.envRedact.args(args)...))
 	}

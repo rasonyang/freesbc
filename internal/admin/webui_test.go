@@ -207,3 +207,47 @@ func TestUIConfigDownload(t *testing.T) {
 		t.Error("downloadConfig must not read the editor text")
 	}
 }
+
+// The Config tab is read-only: the file is shown in a readonly textarea and
+// the only write-shaped call is the side-effect-free candidate validation.
+// Nothing in the UI may save, send If-Match, or PUT.
+func TestUIConfigIsReadOnly(t *testing.T) {
+	read := func(name string) string {
+		b, err := webuiFS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	html := read("webui/index.html")
+	for _, want := range []string{
+		`id="config-text" readonly`, `id="config-candidate"`, `id="btn-validate"`,
+		`id="config-diff"`, `id="validate-errors"`, `id="validate-restart"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	for _, bad := range []string{`id="btn-save"`, "#i-save", "Not saved"} {
+		if strings.Contains(html, bad) {
+			t.Errorf("index.html still has save UI %q", bad)
+		}
+	}
+	js := read("webui/assets/app.js")
+	for _, want := range []string{`"/api/config/validate"`, `method: "POST"`, "function diffLines", "res.json()"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+	for _, bad := range []string{`"PUT"`, "If-Match", "ETag", "btnSave", "configEtag", "innerHTML"} {
+		if strings.Contains(js, bad) {
+			t.Errorf("app.js still has %q", bad)
+		}
+	}
+	// API strings reach the DOM through textContent only.
+	for _, id := range []string{"validate-errors-text", "validate-restart-keys"} {
+		if !strings.Contains(js, `$("`+id+`").textContent =`) {
+			t.Errorf("%s must be filled via textContent", id)
+		}
+	}
+}

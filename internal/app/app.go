@@ -87,7 +87,7 @@ func Run(ctx context.Context, opts Options) error {
 	})
 
 	if adminCfg := cfg.Admin; adminCfg != nil {
-		deps := adminDeps(edgeSrv, opts.Version)
+		deps := adminDeps(edgeSrv, opts.Version, cfg)
 		adminSrv := admin.New(adminCfg, cfg.TLS, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
 			if err := adminSrv.Run(gctx); err != nil && gctx.Err() == nil {
@@ -106,9 +106,11 @@ func Run(ctx context.Context, opts Options) error {
 }
 
 // adminDeps assembles the admin API's view of the running edge plane.
-func adminDeps(edgeSrv *edge.Server, version string) admin.Deps {
+func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) admin.Deps {
 	return admin.Deps{
 		Version: version,
+		// The startup snapshot: the baseline for restart-only comparison.
+		Running: func() *config.Config { return running },
 		Ports:   edgeSrv.PortStats,
 		Calls: func() []admin.Call {
 			out := []admin.Call{}

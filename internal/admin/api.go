@@ -56,18 +56,15 @@ func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, redactConfig(s.store.Current()))
 }
 
-// handleConfig dispatches /api/config by method: GET returns the redacted
-// running config (handleConfigGet); PUT validates and atomically writes a
-// new config file (handleConfigWrite, in config_write.go); any other method
-// is rejected.
+// handleConfig serves /api/config: GET returns the redacted running config
+// (handleConfigGet). The API is read-only; every other method is rejected.
+// Editing means changing the file, running `freesbc check` and letting the
+// watcher reload it; POST /api/config/validate checks a candidate.
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.handleConfigGet(w, r)
-	case http.MethodPut:
-		s.handleConfigWrite(w, r)
-	default:
-		w.Header().Set("Allow", "GET, PUT")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+	s.handleConfigGet(w, r)
 }
