@@ -149,13 +149,13 @@ func TestMediaPoolExhaustionRejectsCleanly(t *testing.T) {
 	}
 }
 
-// A hostile or malformed offer must be refused, never panic the process.
+// A hostile or malformed offer must be refused, never panic the process. An
+// empty body is not malformed: it is an offerless INVITE (offerless_test.go).
 func TestMalformedOffersRejected(t *testing.T) {
 	h := startHarness(t, false) // no ws/wss listener: WebRTC is off
 	phone := newUDPClient(t)
 
 	bodies := map[string]string{
-		"empty":           "",
 		"garbage":         "not sdp at all\r\n",
 		"no audio":        "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 5000 RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\n",
 		"no connection":   "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\n",

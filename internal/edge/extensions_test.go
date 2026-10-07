@@ -23,25 +23,26 @@ func headerTokens(m interface{ GetHeaders(string) []sip.Header }, name string) m
 	return toks
 }
 
-// assertExtensionsSanitized checks that m advertises neither PRACK/UPDATE
-// nor 100rel, and still carries what the proxy can do (INVITE, timer).
-func assertExtensionsSanitized(t *testing.T, what string, m interface{ GetHeaders(string) []sip.Header }) {
+// assertExtensionsAdvertised checks that m advertises what the proxy
+// carries (PRACK and UPDATE included) and still has 100rel and timer in
+// Supported, and that a method it does not carry (REFER) was dropped from
+// Allow.
+func assertExtensionsAdvertised(t *testing.T, what string, m interface{ GetHeaders(string) []sip.Header }) {
 	t.Helper()
 	allow := headerTokens(m, "Allow")
-	for _, method := range []string{"PRACK", "UPDATE", "REFER"} {
-		if allow[method] {
-			t.Errorf("%s: Allow still advertises %s: %v", what, method, allow)
+	if allow["REFER"] {
+		t.Errorf("%s: Allow still advertises REFER: %v", what, allow)
+	}
+	for _, method := range []string{"INVITE", "BYE", "PRACK", "UPDATE"} {
+		if !allow[method] {
+			t.Errorf("%s: Allow lost %s: %v", what, method, allow)
 		}
 	}
-	if !allow["INVITE"] || !allow["BYE"] {
-		t.Errorf("%s: Allow lost methods the proxy carries: %v", what, allow)
-	}
 	supported := headerTokens(m, "Supported")
-	if supported["100REL"] {
-		t.Errorf("%s: Supported still advertises 100rel: %v", what, supported)
-	}
-	if !supported["TIMER"] {
-		t.Errorf("%s: Supported lost timer, which re-INVITE refreshes still serve: %v", what, supported)
+	for _, tok := range []string{"100REL", "TIMER"} {
+		if !supported[tok] {
+			t.Errorf("%s: Supported lost %s: %v", what, tok, supported)
+		}
 	}
 }
 
@@ -54,13 +55,11 @@ func extensionHeaders() []sip.Header {
 
 // audit: P2-EDG-010
 //
-// The proxy answers PRACK and UPDATE with 405, so neither end may be told
-// the other supports them: a callee that saw 100rel could send a reliable
-// 18x whose PRACK never arrives (RFC 3262 §3), and a refresher that saw
-// UPDATE could refresh with it and lose the call (RFC 4028 §9). A call
-// from a phone: the INVITE FreeSWITCH receives and the 200 the phone
-// receives both advertise only what the proxy carries.
-func TestAuditPRACKUpdateNotAdvertisedPhoneToFS(t *testing.T) {
+// The proxy carries PRACK and UPDATE, so Supported: 100rel and Allow:
+// PRACK/UPDATE pass between the ends and only methods it cannot carry are
+// dropped. A call from a phone: the INVITE FreeSWITCH receives and the 200
+// the phone receives both advertise them.
+func TestAuditPRACKUpdateAdvertisedPhoneToFS(t *testing.T) {
 	h := startHarness(t, false)
 	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
 		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(h.fs.answerSDP(req)))
@@ -87,16 +86,15 @@ func TestAuditPRACKUpdateNotAdvertisedPhoneToFS(t *testing.T) {
 	if len(up) != 1 {
 		t.Fatalf("FreeSWITCH saw %d INVITEs", len(up))
 	}
-	assertExtensionsSanitized(t, "INVITE toward FreeSWITCH", up[0])
-	assertExtensionsSanitized(t, "200 toward the phone", res)
+	assertExtensionsAdvertised(t, "INVITE toward FreeSWITCH", up[0])
+	assertExtensionsAdvertised(t, "200 toward the phone", res)
 }
 
 // audit: P2-EDG-010
 //
 // The other direction: FreeSWITCH calls a registered phone. The INVITE the
-// phone receives and the 200 FreeSWITCH receives are sanitised the same
-// way.
-func TestAuditPRACKUpdateNotAdvertisedFSToPhone(t *testing.T) {
+// phone receives and the 200 FreeSWITCH receives are treated the same way.
+func TestAuditPRACKUpdateAdvertisedFSToPhone(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
 	ruri := auditRegisterPhone(t, h, phone, "1001")
@@ -131,36 +129,33 @@ func TestAuditPRACKUpdateNotAdvertisedFSToPhone(t *testing.T) {
 	if got == nil {
 		t.Fatal("the phone never saw the INVITE")
 	}
-	assertExtensionsSanitized(t, "INVITE toward the phone", got)
-	assertExtensionsSanitized(t, "200 toward FreeSWITCH", res)
+	assertExtensionsAdvertised(t, "INVITE toward the phone", got)
+	assertExtensionsAdvertised(t, "200 toward FreeSWITCH", res)
 }
 
-// audit: P2-EDG-010
-//
-// An INVITE that REQUIRES 100rel cannot be honoured through a proxy that
-// refuses PRACK: it is answered 420 naming the extension (RFC 3261
-// §8.2.2.3), so the caller can retry without it, and it never reaches
-// FreeSWITCH.
-func TestAuditRequire100relGets420(t *testing.T) {
+// An INVITE that REQUIRES 100rel is no longer refused: Require passes to
+// FreeSWITCH unchanged.
+func TestRequire100relPassesThrough(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
 	invite := phone.buildInvite("1001", "2002", "example.com", phoneOfferSDP(40004))
 	invite.AppendHeader(sip.NewHeader("Require", "100rel"))
 	res := phone.do(t, invite, h.publicUDP)
-	if res.StatusCode != 420 {
-		t.Fatalf("INVITE with Require: 100rel: got %d, want 420", res.StatusCode)
+	if res.StatusCode != 200 {
+		t.Fatalf("INVITE with Require: 100rel: got %d, want 200", res.StatusCode)
 	}
-	if u := headerTokens(res, "Unsupported"); !u["100REL"] {
-		t.Errorf("420 must name 100rel in Unsupported, got %v", u)
+	up := h.fs.waitFor(sip.INVITE, 1, 3*time.Second)
+	if len(up) != 1 {
+		t.Fatalf("FreeSWITCH saw %d INVITEs, want 1", len(up))
 	}
-	if n := len(h.fs.received(sip.INVITE)); n != 0 {
-		t.Errorf("FreeSWITCH saw %d INVITEs, want 0", n)
+	if req := headerTokens(up[0], "Require"); !req["100REL"] {
+		t.Errorf("Require: 100rel did not reach FreeSWITCH: %v", up[0].GetHeaders("Require"))
 	}
 }
 
-// PRACK and UPDATE themselves are still refused, with an Allow that does
-// not list them.
-func TestPRACKAndUpdateStill405(t *testing.T) {
+// PRACK and UPDATE outside any dialog are answered 481: there is nothing to
+// acknowledge or refresh, and the proxy never guesses a switch for them.
+func TestPRACKAndUpdateWithoutDialog481(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
 	for _, m := range []sip.RequestMethod{sip.PRACK, sip.UPDATE} {
@@ -168,12 +163,12 @@ func TestPRACKAndUpdateStill405(t *testing.T) {
 		req.Method = m
 		req.CSeq().MethodName = m
 		res := phone.do(t, req, h.publicUDP)
-		if res.StatusCode != 405 {
-			t.Errorf("%s: got %d, want 405", m, res.StatusCode)
+		if res.StatusCode != 481 {
+			t.Errorf("%s: got %d, want 481", m, res.StatusCode)
 		}
-		if allow := headerTokens(res, "Allow"); allow[string(m)] {
-			t.Errorf("%s: the 405's Allow lists it: %v", m, allow)
-		}
+	}
+	if n := len(h.fs.received(sip.PRACK)) + len(h.fs.received(sip.UPDATE)); n != 0 {
+		t.Errorf("%d dialog-less PRACK/UPDATE reached the switch", n)
 	}
 }
 
@@ -181,35 +176,37 @@ func TestFilterTokenHeader(t *testing.T) {
 	req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
 	req.AppendHeader(sip.NewHeader("k", "100rel"))
 	req.AppendHeader(sip.NewHeader("Supported", "timer, 100REL, replaces"))
-	req.AppendHeader(sip.NewHeader("allow", "INVITE, update"))
-	req.AppendHeader(sip.NewHeader("Allow", "Prack"))
+	req.AppendHeader(sip.NewHeader("allow", "INVITE, refer"))
+	req.AppendHeader(sip.NewHeader("Allow", "Prack, Update"))
 	sanitizeExtensions(req)
-	if hs := req.GetHeaders("k"); len(hs) != 0 {
-		t.Errorf("compact Supported left behind: %v", hs)
+	// Supported is end to end and is never touched.
+	if hs := req.GetHeaders("k"); len(hs) != 1 || hs[0].Value() != "100rel" {
+		t.Errorf("compact Supported = %v, want it untouched", hs)
 	}
 	sup := req.GetHeaders("Supported")
-	if len(sup) != 1 || sup[0].Value() != "timer, replaces" {
-		t.Errorf("Supported = %v, want one header \"timer, replaces\"", sup)
+	if len(sup) != 1 || sup[0].Value() != "timer, 100REL, replaces" {
+		t.Errorf("Supported = %v, want it untouched", sup)
 	}
 	allow := req.GetHeaders("Allow")
-	if len(allow) != 1 || allow[0].Value() != "INVITE" {
-		t.Errorf("Allow = %v, want one header \"INVITE\"", allow)
+	if len(allow) != 1 || allow[0].Value() != "INVITE, Prack, Update" {
+		t.Errorf("Allow = %v, want one header \"INVITE, Prack, Update\"", allow)
 	}
 
-	// Only 100rel: the header goes away rather than being left empty.
+	// Only methods the proxy cannot carry: the header goes away rather
+	// than being left empty.
 	req = sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
-	req.AppendHeader(sip.NewHeader("Supported", "100rel"))
+	req.AppendHeader(sip.NewHeader("Allow", "REFER"))
 	sanitizeExtensions(req)
-	if hs := req.GetHeaders("Supported"); len(hs) != 0 {
-		t.Errorf("empty Supported left behind: %v", hs)
+	if hs := req.GetHeaders("Allow"); len(hs) != 0 {
+		t.Errorf("empty Allow left behind: %v", hs)
 	}
 
 	// Nothing to drop: the headers are left exactly as they were.
 	req = sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
-	orig := sip.NewHeader("Supported", "timer,replaces")
+	orig := sip.NewHeader("Allow", "INVITE,PRACK")
 	req.AppendHeader(orig)
 	sanitizeExtensions(req)
-	if hs := req.GetHeaders("Supported"); len(hs) != 1 || hs[0] != orig {
+	if hs := req.GetHeaders("Allow"); len(hs) != 1 || hs[0] != orig {
 		t.Errorf("an unchanged header was rewritten: %v", hs)
 	}
 }

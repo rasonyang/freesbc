@@ -264,6 +264,19 @@ func auditSwapFakeSwitch(t *testing.T, h *harness, bye func(f *fakeSwitch, req *
 func auditInDialogWithBody(t *testing.T, f *fakeSwitch, method sip.RequestMethod, invite *sip.Request,
 	toTag string, cseq uint32, body string) *sip.Response {
 	t.Helper()
+	req, res := auditInDialogRaw(t, f, method, invite, toTag, cseq, body)
+	if method == sip.INVITE && res.StatusCode/100 == 2 {
+		auditAckInDialog(t, f, req, res)
+	}
+	return res
+}
+
+// auditInDialogRaw is auditInDialogWithBody without the ACK of a 2xx to an
+// INVITE: the test sends it, with or without an answer body. It returns the
+// request as sent and the final response.
+func auditInDialogRaw(t *testing.T, f *fakeSwitch, method sip.RequestMethod, invite *sip.Request,
+	toTag string, cseq uint32, body string) (*sip.Request, *sip.Response) {
+	t.Helper()
 	target, ok := fsip.ContactURI(invite)
 	if !ok {
 		t.Fatal("the INVITE the switch received carried no Contact")
@@ -310,10 +323,7 @@ func auditInDialogWithBody(t *testing.T, f *fakeSwitch, method sip.RequestMethod
 		select {
 		case res := <-tx.Responses():
 			if res != nil && res.StatusCode >= 200 {
-				if method == sip.INVITE && res.StatusCode/100 == 2 {
-					auditAckInDialog(t, f, req, res)
-				}
-				return res
+				return req, res
 			}
 		case <-tx.Done():
 			t.Fatalf("fake switch %s: %v", method, tx.Err())
@@ -325,6 +335,13 @@ func auditInDialogWithBody(t *testing.T, f *fakeSwitch, method sip.RequestMethod
 
 // auditAckInDialog ACKs a 2xx to a re-INVITE the switch sent.
 func auditAckInDialog(t *testing.T, f *fakeSwitch, inv *sip.Request, res *sip.Response) {
+	t.Helper()
+	auditAckInDialogBody(t, f, inv, res, "")
+}
+
+// auditAckInDialogBody is auditAckInDialog carrying an SDP answer body, the
+// ACK of a delayed-offer re-INVITE.
+func auditAckInDialogBody(t *testing.T, f *fakeSwitch, inv *sip.Request, res *sip.Response, body string) {
 	t.Helper()
 	ack := sip.NewRequest(sip.ACK, inv.Recipient)
 	sip.CopyHeaders("From", inv, ack)
@@ -340,6 +357,10 @@ func auditAckInDialog(t *testing.T, f *fakeSwitch, inv *sip.Request, res *sip.Re
 		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	ack.PrependHeader(via)
+	if body != "" {
+		ack.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		ack.SetBody([]byte(body))
+	}
 	ack.SetTransport("UDP")
 	ack.SetDestination(f.topRouteDest(t, ack))
 	ack.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}

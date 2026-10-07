@@ -55,7 +55,7 @@ import (
 // removed, and a Contact, if present, is FreeSBC's public one, so no
 // private address leaves in a response either.
 //
-// ACK, CANCEL, BYE, re-INVITE, UPDATE, INFO and NOTIFY in a carrier dialog
+// ACK, CANCEL, BYE, re-INVITE, PRACK, UPDATE, INFO and NOTIFY in a carrier dialog
 // all take the same rules because they all leave through
 // prepareForwardHidden / relayResponseHide. SDP is rebuilt from scratch on
 // every leg already, so no body carries a foreign address.

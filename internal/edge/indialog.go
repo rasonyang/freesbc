@@ -36,18 +36,32 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 	}
 	d.noteCSeq(req)
 	body := req.Body()
-	if len(body) == 0 {
-		// An offerless re-INVITE would make FreeSBC the offerer and
-		// require answering against the ACK. Not supported; refusing is
-		// honest and leaves the existing session untouched.
-		s.reject(req, tx, 488, "Not Acceptable Here")
+	// An offerless re-INVITE is forwarded as it is. The offer is the far
+	// end's, in its 2xx, and the answer comes in the requester's ACK
+	// (offerless.go).
+	offerless := len(body) == 0
+	if !d.beginReInviteOffer() {
+		// An UPDATE offer, or an answer owed in an ACK, is pending in this
+		// dialog (RFC 3311 §5.2).
+		s.reject(req, tx, 491, "Request Pending")
 		return
 	}
-
-	reOffer, parsed, err := s.rebuildInDialogOffer(d, body, to.plane)
-	if err != nil {
-		s.rejectMedia(req, tx, err)
-		return
+	// The offer slot is held until the ACK when this re-INVITE's 2xx
+	// carries an offer, then released with it (owedAnswer.release).
+	keepSlot := false
+	defer func() {
+		if !keepSlot {
+			d.endReInviteOffer()
+		}
+	}()
+	var reOffer []byte
+	var parsed *sdp.Session
+	if !offerless {
+		var err error
+		if reOffer, parsed, err = s.rebuildInDialogOffer(d, nil, body, to.plane); err != nil {
+			s.rejectMedia(req, tx, err)
+			return
+		}
 	}
 	hide, resp := s.carrierLeg(req, d, from, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
@@ -58,7 +72,11 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 	s.noteOutbound(req, d, hide)
 	s.retargetInDialog(req, out, to, d)
 	fsip.SetContact(out, to.uri())
-	fsip.SetSDPBody(out, reOffer)
+	if offerless {
+		stripBody(out)
+	} else {
+		fsip.SetSDPBody(out, reOffer)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
@@ -126,8 +144,38 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			is2xx := res.StatusCode/100 == 2
 			err := s.relayResponseHide(req, tx, res, resp, func(relayed *sip.Response) error {
 				fsip.SetContact(relayed, from.uri())
+				if offerless {
+					// The far end's offer in the 2xx is rebuilt for the
+					// requester; any other body (an unreliable 18x) is not
+					// an offer it can answer and is dropped. The answer is
+					// owed from here, and nothing moves until the ACK.
+					if !is2xx || len(res.Body()) == 0 {
+						stripBody(relayed)
+						if is2xx {
+							mu.Lock()
+							okOut = relayed.Clone()
+							mu.Unlock()
+						}
+						return nil
+					}
+					if answer == nil {
+						offerBody, offerParsed, err := s.rebuildInDialogOffer(d, nil, res.Body(), from.plane)
+						if err != nil {
+							return err
+						}
+						answer = offerBody
+						d.setOwed(&owedAnswer{offer: offerParsed, offerer: to.plane, answerer: from.plane,
+							cseq: fsip.CSeqNumber(req), release: d.endReInviteOffer})
+						keepSlot = true
+					}
+					fsip.SetSDPBody(relayed, answer)
+					mu.Lock()
+					okOut = relayed.Clone()
+					mu.Unlock()
+					return nil
+				}
 				if len(res.Body()) > 0 && answer == nil {
-					reAnswer, parsedAnswer, err := s.rebuildInDialogAnswer(d, parsed, res.Body(), from.plane)
+					reAnswer, parsedAnswer, err := s.rebuildInDialogAnswer(d, nil, parsed, res.Body(), from.plane)
 					if err != nil {
 						return err
 					}
@@ -174,6 +222,9 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			}
 			if res.StatusCode >= 200 {
 				finalised = is2xx
+				if is2xx {
+					s.armOwedTimer(d)
+				}
 				return
 			}
 		case <-clTx.Done():
@@ -277,8 +328,49 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if !in.private() {
 		s.stampCarrier(out, req, d)
 	}
+	// The ACK carries a body only as the answer to an offer FreeSBC owes
+	// the far end (offerless.go); that body is rebuilt, never passed on.
+	// Any other body is dropped. An ACK cannot be refused, so when the owed
+	// answer is missing or unusable it is forwarded without one and the
+	// call is ended on both sides.
+	answerFailed := false
+	var owed *owedAnswer
+	if d != nil {
+		d.ackMu.Lock()
+		defer d.ackMu.Unlock()
+		owed = d.takeOwed(from.plane, fsip.CSeqNumber(req))
+	}
+	if owed != nil {
+		body, err := s.answerFromACK(d, owed, req.Body())
+		if err != nil {
+			s.log.Warn("answer to a delayed offer unusable; ending the call", "err", err, "sip_call_id", fsip.CallID(req))
+			stripBody(out)
+			answerFailed = true
+		} else {
+			fsip.SetSDPBody(out, body)
+			d.setAckAnswer(from.plane, owed.cseq, body)
+		}
+		owed.finish()
+	} else {
+		var again []byte
+		if d != nil {
+			again = d.ackAnswerFor(from.plane, fsip.CSeqNumber(req))
+		}
+		switch {
+		case again != nil:
+			// A retransmitted ACK: the first may not have reached the
+			// callee, which then retransmits its 2xx. The answer is
+			// restated as it was built, and the media is not touched again.
+			fsip.SetSDPBody(out, again)
+		case len(out.Body()) > 0:
+			stripBody(out)
+		}
+	}
 	if err := s.client.WriteRequest(out, noBuild); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
+	}
+	if answerFailed && d.end() {
+		s.byeBothEnds(d)
 	}
 }
 
@@ -297,10 +389,10 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ inbound)
 	s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 }
 
-// onInDialog forwards BYE, INFO and NOTIFY. Direction is decided by the
-// dialog the request's tags name, and a BYE additionally tears the media
-// session down — but only the dialog it names, and only once its far end
-// has agreed the dialog is over.
+// onInDialog forwards BYE, INFO, NOTIFY, PRACK and UPDATE. Direction is
+// decided by the dialog the request's tags name, and a BYE additionally
+// tears the media session down — but only the dialog it names, and only
+// once its far end has agreed the dialog is over.
 //
 // NOTIFY is forwarded whatever its Event: the proxy carries no policy, and
 // the endpoint interprets talk, hold, conference or refer itself. A NOTIFY
@@ -357,6 +449,39 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	if d != nil {
 		d.noteCSeq(req)
 	}
+	// An UPDATE with SDP is an offer: its body is rebuilt like a
+	// re-INVITE's and the answer in its 2xx the same way (update.go).
+	// onPrackUpdate has established that d is a dialog it belongs to.
+	var ux *updateExchange
+	if req.Method == sip.UPDATE && len(req.Body()) > 0 {
+		var err error
+		if ux, err = s.beginUpdate(req, d, from, to); err != nil {
+			if errors.Is(err, errOfferPending) {
+				s.reject(req, tx, 491, "Request Pending")
+			} else {
+				s.rejectMedia(req, tx, err)
+			}
+			return
+		}
+		defer ux.end()
+	}
+	// A PRACK with SDP is the answer to an offer in a reliable 18x of an
+	// offerless INVITE: it is rebuilt for the callee and applied when the
+	// callee accepts it. onPrackUpdate has checked that one is owed.
+	var pk *owedAnswer
+	var pkBody []byte
+	var pkAnswer *sdp.Session
+	if req.Method == sip.PRACK && len(req.Body()) > 0 {
+		if pk = d.owedForPrack(req, from.plane); pk == nil {
+			s.reject(req, tx, 488, "Not Acceptable Here")
+			return
+		}
+		var err error
+		if pkBody, pkAnswer, err = s.prepareOwed(d, pk, req.Body()); err != nil {
+			s.rejectMedia(req, tx, err)
+			return
+		}
+	}
 	hide, resp := s.carrierLeg(req, d, from, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
@@ -368,14 +493,70 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	if d == nil && !in.private() {
 		s.restoreCarrierRURI(req, out)
 	}
-	fsip.SetContact(out, to.uri())
+	if pk != nil {
+		fsip.SetSDPBody(out, pkBody)
+	}
+	if req.Method != sip.PRACK { // a PRACK carries no Contact
+		fsip.SetContact(out, to.uri())
+	}
 	if !in.private() {
 		s.stampCarrier(out, req, d)
+	}
+	var adapt func(*sip.Response) error
+	var answerErr error
+	rebuilt := false // the response body in hand is one FreeSBC built
+	if pk != nil {
+		adapt = func(res *sip.Response) error {
+			if res.StatusCode/100 == 2 && d.dropOwed(pk) {
+				pk.finish()
+				answerErr = s.applyOwed(d, pk, pkAnswer)
+			}
+			return answerErr
+		}
+	}
+	if req.Method == sip.UPDATE {
+		if ux != nil {
+			fsip.SetSDPBody(out, ux.offerBody)
+		}
+		adapt = func(res *sip.Response) error {
+			// The 2xx's Contact refreshes the requester's remote target
+			// (RFC 3311 §5.2): it must name FreeSBC, not the far endpoint.
+			if len(res.GetHeaders("Contact")) > 0 {
+				fsip.SetContact(res, from.uri())
+			}
+			if ux != nil && res.StatusCode/100 == 2 {
+				had := len(res.Body()) > 0
+				if answerErr = ux.answered(res); answerErr != nil {
+					return answerErr
+				}
+				rebuilt = had
+			}
+			return nil
+		}
+	}
+
+	// A response body FreeSBC did not rebuild never crosses: a PRACK or
+	// UPDATE response carries SDP only as the answer rebuilt above, and any
+	// SDP in another in-dialog response (INFO, NOTIFY, BYE) is the far
+	// end's own addresses. Non-SDP bodies of INFO and the like pass.
+	inner := adapt
+	adapt = func(res *sip.Response) error {
+		rebuilt = false
+		if inner != nil {
+			if err := inner(res); err != nil {
+				return err
+			}
+		}
+		if len(res.Body()) > 0 && !rebuilt &&
+			(req.Method == sip.PRACK || req.Method == sip.UPDATE || isSDPBody(res)) {
+			stripBody(res)
+		}
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, nil)
+	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt)
 	if err != nil {
 		s.log.Warn("forward in-dialog request failed", "err", err,
 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
@@ -400,6 +581,22 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 			}
 			s.respond(req, tx, sip.NewResponseFromRequest(req, 200, "OK", nil))
 		}
+	}
+	if answerErr != nil {
+		// The far end accepted an offer whose answer FreeSBC cannot anchor
+		// (nothing was relayed or applied): the requester is refused, and
+		// since the two ends now disagree about the session the call is
+		// ended on both, as for a re-INVITE.
+		s.log.Warn("UPDATE media negotiation failed", "err", answerErr, "sip_call_id", fsip.CallID(req))
+		s.reject(req, tx, 488, "Not Acceptable Here")
+		if ux != nil && ux.fork == nil {
+			if d.end() {
+				s.byeBothEnds(d)
+			}
+		} else {
+			s.cancelCall(d, cancelBackstop)
+		}
+		return
 	}
 	if req.Method == sip.BYE && d != nil && byeEndsDialog(final) {
 		// The media ends as soon as the dialog does, rather than waiting
@@ -481,7 +678,18 @@ func byeEndsDialog(final *sip.Response) bool {
 // the endpoint itself answers 481 honestly — but d is nil, so nothing is
 // torn down on its account.
 func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, dest string, d *dialog, ok bool) {
-	if dd, fromCaller, found := s.dialogs.lookup(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req)); found {
+	dd, fromCaller, found := s.dialogs.lookup(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req))
+	var r dialogRoute
+	switch {
+	case found:
+		r = dd.routeSnapshot()
+	case req.Method == sip.PRACK || req.Method == sip.UPDATE:
+		// These two are valid in an early dialog. Everything else keeps
+		// requiring a confirmed one (a re-INVITE needs a committed
+		// session; a NOTIFY on an early dialog is routed by its token).
+		dd, r, fromCaller, found = s.dialogs.lookupEarly(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req))
+	}
+	if found {
 		sender := dd.callerPlane
 		if !fromCaller {
 			sender = otherPlane(sender)
@@ -491,7 +699,6 @@ func (s *Server) directionFor(req *sip.Request, onPrivate bool) (from, to side, 
 			arrived = planePrivate
 		}
 		if arrived == sender {
-			r := dd.routeSnapshot()
 			if onPrivate {
 				if to, ok = s.topo.publicSide(r.transport); ok && r.publicRemote != "" {
 					return s.topo.private, to, r.publicRemote, dd, true
@@ -572,7 +779,7 @@ func otherPlane(p plane) plane {
 // dialog we track), and leaves the URI alone when neither is known.
 func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
 	if d != nil {
-		r := d.routeSnapshot()
+		r := d.routeFor(req)
 		u := r.privateContact
 		if to.plane == planePublic {
 			u = r.publicContact

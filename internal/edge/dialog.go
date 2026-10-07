@@ -125,6 +125,16 @@ type earlyFork struct {
 	remote netip.AddrPort
 	rtcp   netip.AddrPort // explicit a=rtcp, when the answer carried one
 	origin sdpOrigin
+
+	// route is where an in-dialog request that names this fork goes while
+	// the dialog is still early (PRACK, UPDATE); routed says it was
+	// recorded. It is the route a 2xx on this fork would confirm.
+	//
+	// Per-dialog offer/answer state for early-dialog SDP exchanges (an
+	// UPDATE offer, a PRACK answer) belongs here too, next to the answer
+	// the fork already holds.
+	route  dialogRoute
+	routed bool
 }
 
 // dialog is one proxied call, from the first forwarded INVITE to the
@@ -209,6 +219,30 @@ type dialog struct {
 
 	// origin is the o= identity per leg, indexed by plane.
 	origin [2]sdpOrigin
+
+	// updateOffers and reInviteOffers count the offers of UPDATE and
+	// re-INVITE requests FreeSBC has forwarded and not yet seen answered.
+	// An UPDATE offer is only forwarded when neither is pending, and a
+	// re-INVITE offer only when no UPDATE offer is (RFC 3311 §5.2: an offer
+	// while one is outstanding is answered 491); crossing re-INVITEs stay
+	// as they were, each answered from its own transaction.
+	updateOffers, reInviteOffers int
+
+	// owed is the answer FreeSBC still owes the callee in an offerless
+	// exchange (offerless.go): the callee's offer was relayed to the
+	// caller, and the caller's answer arrives in the ACK (or, for an offer
+	// in a reliable 18x, the PRACK). At most one is outstanding, and while
+	// it is no other offer is forwarded in the dialog.
+	owed *owedAnswer
+	// lastAck is the answer the last owed answer was rebuilt into, kept so
+	// that a retransmitted ACK (the first never reached the callee, which
+	// retransmits its 2xx) is restated rather than stripped. It is cleared
+	// when the next offer exchange starts and with the dialog.
+	lastAck *ackAnswer
+	// ackMu serialises the handling of ACKs that may carry an owed answer,
+	// so a duplicate ACK arriving at once waits for the first to finish and
+	// finds its answer to restate (it is not guarded by the table mutex).
+	ackMu sync.Mutex
 
 	// relaxedNotify is set the first time a private-plane NOTIFY whose
 	// tags name no dialog was routed to this record by Call-ID alone
@@ -326,6 +360,37 @@ func (t *dialogTable) lookup(callID, fromTag, toTag string) (d *dialog, fromCall
 		}
 	}
 	return nil, false, false
+}
+
+// lookupEarly finds the early dialog a PRACK or UPDATE belongs to, and the
+// route recorded for its fork (setForkRoute). The tags work as in lookup,
+// with the callee's being the To tag of a response the fork sent. Unlike
+// lookup it only matches a dialog that is still early: once confirmed, the
+// record's own route applies.
+func (t *dialogTable) lookupEarly(callID, fromTag, toTag string) (d *dialog, r dialogRoute, fromCaller, ok bool) {
+	if fromTag == "" || toTag == "" {
+		return nil, dialogRoute{}, false, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, d := range t.byCallID[callID] {
+		if d.state != dialogEarly {
+			continue
+		}
+		var tag string
+		switch {
+		case fromTag == d.callerTag:
+			tag, fromCaller = toTag, true
+		case toTag == d.callerTag:
+			tag, fromCaller = fromTag, false
+		default:
+			continue
+		}
+		if f := d.forks[tag]; f != nil && f.routed {
+			return d, f.route, fromCaller, true
+		}
+	}
+	return nil, dialogRoute{}, false, false
 }
 
 // newestRoutedByCallID returns the most recently created record carrying
@@ -500,6 +565,22 @@ func (d *dialog) routeSnapshot() dialogRoute {
 	return d.route
 }
 
+// routeFor is the routing record an in-dialog request is sent by: the
+// confirmed dialog's, or, while it is still early, that of the fork the
+// request's tags name (zero when none, which retargetInDialog treats as
+// unknown).
+func (d *dialog) routeFor(req *sip.Request) dialogRoute {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.state != dialogEarly {
+		return d.route
+	}
+	if f := d.forkOfLocked(req); f != nil && f.routed {
+		return f.route
+	}
+	return dialogRoute{}
+}
+
 // setCarrier records the carrier a call came from.
 func (d *dialog) setCarrier(name string) {
 	d.tab.mu.Lock()
@@ -541,6 +622,99 @@ func (d *dialog) nextOrigin(toward plane) (id, version uint64) {
 	return d.origin[toward].next()
 }
 
+// beginUpdateOffer claims the dialog's offer slot for an UPDATE with SDP,
+// and reports false when another offer is pending. Every true is paired
+// with endUpdateOffer.
+func (d *dialog) beginUpdateOffer() bool {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.updateOffers > 0 || d.reInviteOffers > 0 || d.owed != nil {
+		return false
+	}
+	d.lastAck = nil
+	d.updateOffers++
+	return true
+}
+
+func (d *dialog) endUpdateOffer() {
+	d.tab.mu.Lock()
+	d.updateOffers--
+	d.tab.mu.Unlock()
+}
+
+// beginReInviteOffer registers a re-INVITE offer, and reports false while
+// an UPDATE offer is pending. Every true is paired with endReInviteOffer.
+func (d *dialog) beginReInviteOffer() bool {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.updateOffers > 0 || d.owed != nil {
+		return false
+	}
+	d.lastAck = nil
+	d.reInviteOffers++
+	return true
+}
+
+func (d *dialog) endReInviteOffer() {
+	d.tab.mu.Lock()
+	d.reInviteOffers--
+	d.tab.mu.Unlock()
+}
+
+// forkOf is the early fork the tags of an in-dialog request name, or nil
+// once the dialog is confirmed or when none matches.
+func (d *dialog) forkOf(req *sip.Request) *earlyFork {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.forkOfLocked(req)
+}
+
+func (d *dialog) forkOfLocked(req *sip.Request) *earlyFork {
+	if d.state != dialogEarly {
+		return nil
+	}
+	tag := fsip.ToTag(req)
+	if tag == d.callerTag {
+		tag = fsip.FromTag(req)
+	}
+	return d.forks[tag]
+}
+
+// originFor is nextOrigin for a body of an exchange that may be early: in an
+// early dialog the bodies toward the caller carry the fork's identity (the
+// one its 18x already used, and the one confirm hands to the caller leg).
+func (d *dialog) originFor(f *earlyFork, toward plane) (id, version uint64) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if f != nil && d.state == dialogEarly && toward == d.callerPlane {
+		return f.origin.next()
+	}
+	return d.origin[toward].next()
+}
+
+// noteForkUpdate records what an UPDATE answered in an early dialog changed
+// on its fork: callerBody is the last body the caller was shown, so a
+// later 2xx or a retransmitted 18x restates it rather than an older
+// answer; remote and rtcp are where the callee's media now goes (left as
+// they were when invalid); codecs the list agreed. The media follows this
+// fork from here on. It does nothing once the dialog is confirmed: the
+// record's own state is used then.
+func (d *dialog) noteForkUpdate(f *earlyFork, callerBody []byte, remote, rtcp netip.AddrPort, codecs []sdp.Codec) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.state != dialogEarly || f == nil {
+		return
+	}
+	f.answer = callerBody
+	if remote.IsValid() {
+		f.remote, f.rtcp = remote, rtcp
+	}
+	if len(codecs) > 0 {
+		f.codecs = codecs
+	}
+	d.applied = f
+}
+
 // fork returns the early dialog for a To tag, creating it on first sight.
 func (d *dialog) fork(tag string) *earlyFork {
 	d.tab.mu.Lock()
@@ -553,6 +727,23 @@ func (d *dialog) fork(tag string) *earlyFork {
 		d.forks[tag] = f
 	}
 	return f
+}
+
+// setForkRoute records where in-dialog requests on an early fork go. It is
+// a no-op once the dialog is confirmed or ended: the forks are gone by then
+// and the record's own route applies.
+func (d *dialog) setForkRoute(tag string, r dialogRoute) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.state != dialogEarly || d.forks == nil {
+		return
+	}
+	f, ok := d.forks[tag]
+	if !ok {
+		f = &earlyFork{origin: newSDPOrigin()}
+		d.forks[tag] = f
+	}
+	f.route, f.routed = r, true
 }
 
 // forkAnswer is the answer already built for a fork, or nil.
@@ -860,6 +1051,11 @@ func (d *dialog) end() bool {
 	wasUp := d.state == dialogConfirmed
 	d.state = dialogEnded
 	d.inFlight = nil
+	if d.owed != nil && d.owed.timer != nil {
+		d.owed.timer.Stop()
+	}
+	d.owed = nil
+	d.lastAck = nil
 	sess := d.media
 	t.removeLocked(d)
 	t.mu.Unlock()
