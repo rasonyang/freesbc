@@ -452,8 +452,8 @@ class. This section is the mechanism.
 
 `config.Store` (`store.go`) publishes immutable `*Config` snapshots through an
 atomic pointer. Code reads `store.Current()` at the point of use, once per
-unit of work. `config.Watch` is the only caller of `Store.Replace`; the admin
-the admin API never writes the file: the operator edits it and the watcher
+unit of work. `config.Watch` is the only caller of `Store.Replace`; the
+admin API never writes the file: the operator edits it and the watcher
 reloads it (§4.4). The edge reads restart-only values from its `boot` snapshot and the
 shield reads its hot values per check. Custom scalar types (`Duration`,
 `PortRange`, `RateLimit`) are in `internal/config/types.go`.
