@@ -23,6 +23,8 @@ func redactConfig(cfg *config.Config) any {
 			"rate_limit":         cfg.Shield.RateLimit,
 			"carrier_rate_limit": cfg.Shield.CarrierRateLimit,
 			"ban":                cfg.Shield.Ban.Std().String(),
+			"max_sessions":       cfg.Shield.MaxSessions,
+			"invite_rate_limit":  cfg.Shield.InviteRateLimit,
 		},
 	}
 	if cfg.TLS != nil {

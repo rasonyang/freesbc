@@ -32,6 +32,7 @@ type Metrics struct {
 	registrationFailure atomic.Uint64
 
 	dialogs        atomic.Int64 // gauge
+	sessions       atomic.Int64 // gauge: calls holding a session slot
 	mediaSessions  atomic.Int64 // gauge
 	webrtcSessions atomic.Int64 // gauge
 
@@ -178,6 +179,9 @@ func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 // into the bounded label set).
 func (m *Metrics) ParseFailed(transport string) { m.parseFailures[transportIndex(transport)].Add(1) }
 
+// SetSessions publishes the dialog table's session count.
+func (m *Metrics) SetSessions(n int) { m.sessions.Store(int64(n)) }
+
 func (m *Metrics) DialogStarted() { m.dialogs.Add(1) }
 func (m *Metrics) DialogEnded()   { m.dialogs.Add(-1) }
 
@@ -225,6 +229,7 @@ func (m *Metrics) WebRTCFailure(err error) {
 type Snapshot struct {
 	ActiveRegistrations  int64
 	ActiveDialogs        int64
+	ActiveSessions       int64
 	ActiveMediaSessions  int64
 	ActiveWebRTCSessions int64
 
@@ -269,6 +274,7 @@ func (m *Metrics) Snapshot() Snapshot {
 	s := Snapshot{
 		ActiveRegistrations:  m.registrations.Load(),
 		ActiveDialogs:        m.dialogs.Load(),
+		ActiveSessions:       m.sessions.Load(),
 		ActiveMediaSessions:  m.mediaSessions.Load(),
 		ActiveWebRTCSessions: m.webrtcSessions.Load(),
 		RegistrationTotal:    m.registrationTotal.Load(),

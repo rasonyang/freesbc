@@ -90,12 +90,12 @@ func auditWaitBalanced(t *testing.T, h *harness, label string, d time.Duration) 
 		pub, _ := h.srv.pubPool.Stats()
 		priv, _ := h.srv.privPool.Stats()
 		entries := auditDialogEntries(h)
-		if pub == 0 && priv == 0 && entries == 0 {
+		if pub == 0 && priv == 0 && entries == 0 && h.srv.dialogs.sessionCount() == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("%s: not balanced after %v: public ports in use=%d private=%d dialog records=%d confirmed=%d",
-				label, d, pub, priv, entries, h.srv.ActiveCalls())
+			t.Errorf("%s: not balanced after %v: public ports in use=%d private=%d dialog records=%d confirmed=%d sessions=%d",
+				label, d, pub, priv, entries, h.srv.ActiveCalls(), h.srv.dialogs.sessionCount())
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

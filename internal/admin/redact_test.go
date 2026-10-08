@@ -18,7 +18,10 @@ func cfgWithAdminHash(t *testing.T) *config.Config {
 }
 
 func TestRedactConfig(t *testing.T) {
-	b, _ := json.Marshal(redactConfig(cfgWithAdminHash(t)))
+	cfg := cfgWithAdminHash(t)
+	cfg.Shield.MaxSessions = 123
+	cfg.Shield.InviteRateLimit = "9/s"
+	b, _ := json.Marshal(redactConfig(cfg))
 	s := string(b)
 	if strings.Contains(s, "adminhash") {
 		t.Error("admin password_hash not redacted")
@@ -27,7 +30,8 @@ func TestRedactConfig(t *testing.T) {
 		t.Errorf("password_hash not masked: %s", s)
 	}
 	// non-secret fields preserved
-	for _, want := range []string{"203.0.113.7", "10.77.0.10:5060", "127.0.0.1:8080"} {
+	for _, want := range []string{"203.0.113.7", "10.77.0.10:5060", "127.0.0.1:8080",
+		`"max_sessions":123`, `"invite_rate_limit":"9/s"`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("non-secret value %q lost: %s", want, s)
 		}

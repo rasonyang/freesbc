@@ -66,6 +66,9 @@ func TestParseMinimalDefaults(t *testing.T) {
 	if c.Shield.RateLimit != "20/s per_ip" || c.Shield.CarrierRateLimit != "200/s per_ip" || c.Shield.Ban.Std() != time.Hour {
 		t.Errorf("shield defaults = %+v", c.Shield)
 	}
+	if c.Shield.MaxSessions != 5000 || c.Shield.InviteRateLimit != "" {
+		t.Errorf("session defaults = %d / %q, want 5000 (the default rtp pairs) and off", c.Shield.MaxSessions, c.Shield.InviteRateLimit)
+	}
 	if got := c.Switches(); len(got) != 1 || got[0] != netip.MustParseAddrPort("10.77.0.10:5060") {
 		t.Errorf("switches = %v", got)
 	}
@@ -207,6 +210,11 @@ func TestValidateErrors(t *testing.T) {
 		{"shield rate", with("shield: { rate_limit: nope }\n"), "shield.rate_limit"},
 		{"shield carrier rate", with("shield: { carrier_rate_limit: 0/s }\n"), "shield.carrier_rate_limit"},
 		{"shield ban", with("shield: { ban: -1s }\n"), "shield.ban"},
+		{"max sessions negative", with("shield: { max_sessions: -1 }\n"), "shield.max_sessions"},
+		{"max sessions over rtp", with("rtp: \"30000-30099\"\nshield: { max_sessions: 51 }\n"), "exceeds the 50 calls rtp 30000-30099 can anchor"},
+		{"invite rate junk", with("shield: { invite_rate_limit: nope }\n"), "shield.invite_rate_limit"},
+		{"invite rate zero", with("shield: { invite_rate_limit: 0/s }\n"), "shield.invite_rate_limit"},
+		{"invite rate per_ip", with("shield: { invite_rate_limit: 5/s per_ip }\n"), "per_ip is not allowed"},
 		{"admin listen", with("admin: { listen: nope, password_hash: " + good + " }\n"), "admin.listen"},
 		{"admin remote without opt-in", with("admin: { listen: 0.0.0.0:8080, password_hash: " + good + " }\n"), "allow_remote"},
 		{"admin no hash", with("admin: { listen: 127.0.0.1:8080 }\n"), "admin.password_hash"},
@@ -333,6 +341,7 @@ func TestValidationErrorDoesNotEchoEnv(t *testing.T) {
 		"carrier":      replace(t, minimalYAML, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: \"${SECRET_X}:99999\" }"),
 		"carrier src":  replace(t, minimalYAML, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [\"${SECRET_X}\"]"),
 		"shield":       with("shield: { rate_limit: \"${SECRET_X}\" }\n"),
+		"invite rate":  with("shield: { invite_rate_limit: \"${SECRET_X}\" }\n"),
 		"admin hash":   with("admin: { listen: 127.0.0.1:8080, password_hash: \"${SECRET_X}\" }\n"),
 		"admin listen": with("admin: { listen: \"${SECRET_X}\", password_hash: x }\n"),
 	} {
@@ -402,4 +411,40 @@ func TestValidateOpensNoFilesAndChecksNoLocality(t *testing.T) {
 	// Non-existent cert paths and a public.ip that is not local both pass:
 	// check binds nothing and opens nothing.
 	mustParse(t, with("tls: { cert: /nonexistent/c.pem, key: /nonexistent/k.pem }\n"))
+}
+
+// max_sessions defaults to what the rtp range can anchor, and an explicit
+// value up to that is accepted.
+func TestShieldSessionLimits(t *testing.T) {
+	c := mustParse(t, with("rtp: \"30000-30099\"\n"))
+	if c.Shield.MaxSessions != 50 {
+		t.Errorf("max_sessions default for rtp 30000-30099 = %d, want 50", c.Shield.MaxSessions)
+	}
+	// An odd start gives up its first port: 30001-30100 holds 30002..30099.
+	if c := mustParse(t, with("rtp: \"30001-30100\"\n")); c.Shield.MaxSessions != 49 {
+		t.Errorf("max_sessions default for rtp 30001-30100 = %d, want 49", c.Shield.MaxSessions)
+	}
+	c = mustParse(t, with("rtp: \"30000-30099\"\nshield: { max_sessions: 50, invite_rate_limit: 10/s }\n"))
+	if c.Shield.MaxSessions != 50 || c.Shield.InviteRateLimit != "10/s" {
+		t.Errorf("explicit session limits = %d / %q", c.Shield.MaxSessions, c.Shield.InviteRateLimit)
+	}
+	if c := mustParse(t, with("shield: { max_sessions: 3 }\n")); c.Shield.MaxSessions != 3 {
+		t.Errorf("max_sessions = %d, want 3", c.Shield.MaxSessions)
+	}
+}
+
+func TestPortRangePairs(t *testing.T) {
+	for _, tc := range []struct {
+		r    PortRange
+		want int
+	}{
+		{PortRange{Min: 20000, Max: 29999}, 5000},
+		{PortRange{Min: 30000, Max: 30001}, 1},
+		{PortRange{Min: 30001, Max: 30002}, 0},
+		{PortRange{Min: 30001, Max: 30100}, 49},
+	} {
+		if got := tc.r.Pairs(); got != tc.want {
+			t.Errorf("%d-%d Pairs() = %d, want %d", tc.r.Min, tc.r.Max, got, tc.want)
+		}
+	}
 }

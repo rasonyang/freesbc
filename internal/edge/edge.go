@@ -104,6 +104,12 @@ type Server struct {
 	earlyMu sync.Mutex
 	early   map[netip.Addr]int
 
+	// inviteLimiter is the global new-INVITE bucket behind
+	// shield.invite_rate_limit; capWarn rate-limits the WARN of each
+	// admission-control reject (invite.go beginDialog).
+	inviteLimiter *shield.Limiter
+	capWarn       capWarner
+
 	// dropWarned limits admission-drop WARNs to one per source IP and
 	// reason; enumLimit is the REGISTER enumeration limit (admission.go).
 	dropWarned *warnOnce
@@ -205,6 +211,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		early:            map[netip.Addr]int{},
 		dropWarned:       newWarnOnce(maxWarnedSources),
 		enumLimit:        newEnumLimiter(),
+		inviteLimiter:    shield.NewLimiter(),
 		webrtcEnabled:    cfg.WebRTC(),
 	}
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
@@ -471,6 +478,8 @@ func (s *Server) Run(ctx context.Context) error {
 		// and literal-IP edge.carriers. Empty means only registered clients
 		// may place calls on a public listener.
 		"carrier_sources", s.carriers.snapshot().sourcesString(),
+		"max_sessions", s.sessionLimit(s.store.Current()),
+		"invite_rate_limit", s.store.Current().Shield.InviteRateLimit,
 		"webrtc", s.webrtcEnabled)
 
 	close(s.ready)

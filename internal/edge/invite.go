@@ -3,11 +3,15 @@ package edge
 import (
 	"context"
 	"errors"
+	"math"
 	"net/netip"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
@@ -106,6 +110,12 @@ const (
 	rejectUpstreamFailed
 	// rejectTimeout: the INVITE's own budget ran out (408).
 	rejectTimeout
+	// rejectSessionCap: shield.max_sessions calls already hold a session
+	// slot (503 + Retry-After).
+	rejectSessionCap
+	// rejectInviteRate: shield.invite_rate_limit is exhausted (503 +
+	// Retry-After).
+	rejectInviteRate
 	numInviteRejects
 )
 
@@ -122,6 +132,8 @@ var inviteRejectLabels = [numInviteRejects]string{
 	rejectPortExhausted:  "port_exhausted",
 	rejectUpstreamFailed: "upstream_failed",
 	rejectTimeout:        "timeout",
+	rejectSessionCap:     "session_cap",
+	rejectInviteRate:     "invite_rate",
 }
 
 func (r inviteReject) String() string { return inviteRejectLabels[r] }
@@ -135,18 +147,111 @@ func (s *Server) rejectInvite(req *sip.Request, tx sip.ServerTransaction, code i
 	s.reject(req, tx, code, reason)
 }
 
-// beginDialog opens the call's record, or answers 482 when the INVITE
-// merges with one still in progress (RFC 3261 §8.2.2.2: same Call-ID and
-// From tag as a transaction the proxy is already working on).
+// sessionCapRetryAfter is the Retry-After (seconds) of a 503 for a full
+// session cap: a call has to end to free a slot, so the hint is a constant.
+const sessionCapRetryAfter = 5
+
+// capWarnEvery is the least time between two WARN lines for the same
+// admission-control reason; the rest are logged at DEBUG.
+const capWarnEvery = 10 * time.Second
+
+// capWarner rate-limits the WARN for each admission-control reject reason,
+// so a flood against a full cap cannot flood the log.
+type capWarner struct {
+	mu   sync.Mutex
+	last [numInviteRejects]time.Time
+}
+
+// allow reports whether a WARN for why may be logged now, and if so
+// remembers it.
+func (w *capWarner) allow(why inviteReject) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if now := time.Now(); now.Sub(w.last[why]) >= capWarnEvery {
+		w.last[why] = now
+		return true
+	}
+	return false
+}
+
+// rejectBusy refuses an out-of-dialog INVITE from an admitted peer with a
+// 503 and a Retry-After, through the same counting path as rejectInvite.
+func (s *Server) rejectBusy(req *sip.Request, tx sip.ServerTransaction, retryAfter int, why inviteReject, msg string, args ...any) {
+	args = append(args, "reason", why.String(), "retry_after", retryAfter, "sip_call_id", fsip.CallID(req))
+	if s.capWarn.allow(why) {
+		s.log.Warn(msg, args...)
+	} else {
+		s.log.Debug(msg, args...)
+	}
+	s.metrics.InviteRejected(why)
+	res := sip.NewResponseFromRequest(req, 503, "Service Unavailable", nil)
+	res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(retryAfter)))
+	s.respond(req, tx, res)
+}
+
+// sessionLimit is the effective session cap of cfg: shield.max_sessions,
+// never above what the boot rtp range can anchor (rtp is restart-only, so
+// a hot value cannot exceed it after validation, but the clamp keeps the
+// cap honest if a snapshot ever disagrees).
+func (s *Server) sessionLimit(cfg *config.Config) int {
+	limit, pairs := cfg.Shield.MaxSessions, s.boot.RTP.Pairs()
+	if limit <= 0 || limit > pairs {
+		return pairs
+	}
+	return limit
+}
+
+// inviteRetryAfter is the whole seconds (at least 1) until a token of rl
+// is free again: ceil(interval / rate).
+func inviteRetryAfter(rl config.RateLimit) int {
+	if rl.Rate <= 0 {
+		return 1
+	}
+	secs := int(math.Ceil(rl.Interval.Seconds() / float64(rl.Rate)))
+	return max(1, secs)
+}
+
+// beginDialog opens the call's record, or refuses the INVITE. It is where
+// the global admission control applies, once per out-of-dialog INVITE and
+// before any media is allocated:
+//
+//   - 482 when the INVITE merges with one still in progress (RFC 3261
+//     §8.2.2.2: same Call-ID and From tag as a transaction the proxy is
+//     already working on);
+//   - 503 + Retry-After when shield.max_sessions calls already hold a
+//     slot (the slot is taken inside dialogTable.begin);
+//   - 503 + Retry-After when shield.invite_rate_limit is exhausted. A
+//     refused INVITE is ended here, before the response, so its slot is
+//     free again by the time the peer sees the 503; an early dialog that
+//     never connected is never counted as a call ended.
+//
+// All four directions reach it after their cheap validation, and
+// re-INVITEs never do (they go through onReInvite).
 func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane) (*dialog, bool) {
-	d, ok := s.dialogs.begin(req, callerPlane)
-	if !ok {
-		if s.dialogs.isClosed() { // closed never reopens, so this is exact
-			s.rejectInvite(req, tx, 503, "Service Unavailable", rejectShuttingDown)
-			return nil, false
-		}
+	cfg := s.store.Current()
+	limit := s.sessionLimit(cfg)
+	d, res := s.dialogs.begin(req, callerPlane, limit)
+	switch res {
+	case beginClosed:
+		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectShuttingDown)
+		return nil, false
+	case beginMerged:
 		s.rejectInvite(req, tx, 482, "Loop Detected", rejectLoopDetected)
 		return nil, false
+	case beginFull:
+		s.rejectBusy(req, tx, sessionCapRetryAfter, rejectSessionCap,
+			"rejecting call: session cap reached", "limit", limit)
+		return nil, false
+	}
+	if cfg.Shield.InviteRateLimit != "" {
+		// Validated at load; a parse failure here would mean a snapshot
+		// that skipped validation, and then no limit applies.
+		if rl, err := config.ParseRateLimit(cfg.Shield.InviteRateLimit); err == nil && !s.inviteLimiter.Allow(rl) {
+			d.end(endShutdown) // never confirmed: frees the slot, counts nothing
+			s.rejectBusy(req, tx, inviteRetryAfter(rl), rejectInviteRate,
+				"rejecting call: new-INVITE rate limit reached", "limit", cfg.Shield.InviteRateLimit)
+			return nil, false
+		}
 	}
 	return d, true
 }

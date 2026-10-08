@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 // bucketCap is the hard ceiling on per-source buckets, the same bound as
@@ -110,4 +112,20 @@ func (r *rateLimiter) prune() {
 		}
 		e = prev
 	}
+}
+
+// Limiter is a single global token bucket: Allow consumes one token from a
+// bucket of capacity rl.Rate that refills rl.Rate tokens per rl.Interval.
+// The limit is passed per call, so a hot-reloaded value applies at once;
+// rl.PerIP is ignored (the bucket is always global). Safe for concurrent
+// use. The zero value is not usable; call NewLimiter.
+type Limiter struct{ rl *rateLimiter }
+
+// NewLimiter returns an empty (full) global limiter.
+func NewLimiter() *Limiter { return &Limiter{rl: newRateLimiter()} }
+
+// Allow reports whether a token was available and consumes it. A limit with
+// no rate or interval never refuses.
+func (l *Limiter) Allow(rl config.RateLimit) bool {
+	return l.rl.allow(netip.Addr{}, rl.Rate, rl.Interval, false)
 }

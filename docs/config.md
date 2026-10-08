@@ -63,6 +63,8 @@ At startup `run` fails if `public.bind` or `private.ip` is not assigned to a loc
 - `min` must be at least 1024.
 - The range must hold at least one RTP/RTCP pair: RTP on an even port, RTCP on RTP+1.
 
+Capacity: each call anchors one RTP/RTCP pair on each plane, and the planes bind different IPs, so the range holds `(max - min + 1) / 2` calls (with `min` rounded up to even). `shield.max_sessions` defaults to that number and may not exceed it.
+
 There is one range and two independent allocators over it, one bound to `public.bind` and one to `private.ip`, so a port number can be in use on both sides at once.
 
 ### `tls`
@@ -142,8 +144,12 @@ A request from a `carrier_sources` address that matches no `carriers` entry gets
 | `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram or WS/WSS frame, charged before parsing: malformed datagrams, responses and keepalives count too. |
 | `carrier_rate_limit` | `200/s per_ip` | Applies to carrier sources (resolved `carriers` addresses and `carrier_sources`), charged the same way. |
 | `ban` | `1h` | Duration, greater than 0. How long a source fingerprinted as a scanner stays banned (in memory only). Carrier sources are never banned as scanners. |
+| `max_sessions` | the calls `rtp` can anchor | Integer, 0 or more. Global cap on calls holding a session slot: from the first out-of-dialog INVITE (ringing calls hold one) until the call is torn down by any path. 0 means the default, the `rtp` capacity (see `rtp`); an explicit value above that capacity is an error (`exceeds the N calls rtp a-b can anchor`). Counted across all four directions (client, carrier, switch to client, switch to carrier). Hot: applies to the next INVITE, running calls are never torn down, and lowering it below the running count refuses new calls until it drains. |
+| `invite_rate_limit` | off | `<n>/<s|m|h>`, no `per_ip`: one global token bucket (burst `n`) charged once per new out-of-dialog INVITE that passed the session cap. Re-INVITEs and retransmissions are not charged. Empty is off. Hot. |
 
 Rate limit syntax: `<n>/<s|m|h>` with an optional ` per_ip`; `n` is a positive integer. With `per_ip` each source (an IPv6 source by its /64) has its own token bucket; without it all sources share one bucket. Burst equals `n`.
+
+An admitted peer (a registered client, a carrier or the switch) whose new INVITE is over `max_sessions` or `invite_rate_limit` gets `503 Service Unavailable` with `Retry-After` and costs no media port: `5` seconds for the session cap, `max(1, ceil(interval / n))` for the rate limit. They are counted in `freesbc_edge_invite_rejects_total{reason="session_cap"|"invite_rate"}`, and `freesbc_edge_sessions` is the current count. The reject is logged at WARN at most once per 10 s per reason. An unknown public source keeps the silent drop of INVITE admission. Per-carrier, per-user and per-source concurrency or rate, and a maximum call duration, stay on the switch (FreeSWITCH `limit` and `sched_hangup`, Asterisk `GROUP_COUNT()` and `TIMEOUT(absolute)`).
 
 A UDP scanner verdict bans only the exact source socket for at most one minute, because a datagram source address can be forged; stream transports get the IP ban for `ban`.
 
@@ -193,7 +199,7 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 
 | Setting | Class |
 |---|---|
-| `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban` | hot |
+| `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`, `shield.max_sessions`, `shield.invite_rate_limit` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
 | `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers`, `edge.carrier_sources` | restart-only |
 | `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
@@ -208,6 +214,8 @@ Not configurable. They live in code until there is a concrete need to tune one.
 |---|---|---|
 | Private SIP port | 5060 | `config.PrivateSIPPort` |
 | Default carrier port | 5060 | `config.DefaultCarrierPort` |
+| Retry-After of a session-cap 503 | 5 s | `sessionCapRetryAfter`, `internal/edge/invite.go` |
+| Session-cap and invite-rate WARN spacing | 10 s per reason | `capWarnEvery`, `internal/edge/invite.go` |
 | RTP silence teardown | 5 min | `rtpSilenceTimeout`, `internal/edge/edge.go` |
 | Switch node cooldown | 30 s | `switchCooldown`, `internal/edge/edge.go` |
 | Carrier DNS cache | 300 s (10 s for a failed or empty lookup) | `carrierDNSTTL`, `carrierDNSNegTTL`, `internal/edge/carrierdns.go` |

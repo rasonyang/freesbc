@@ -25,13 +25,13 @@ func TestInFlightInviteCannotAllocateAfterShutdown(t *testing.T) {
 
 	// A handler that opened its dialog before shutdown, and allocates
 	// after it began.
-	early, ok := h.srv.dialogs.begin(phone.buildInvite("1001", "2002", "example.com", body), planePublic)
-	if !ok {
+	early, res := h.srv.dialogs.begin(phone.buildInvite("1001", "2002", "example.com", body), planePublic, 0)
+	if res != beginOK {
 		t.Fatal("begin before shutdown refused")
 	}
 	// A handler that allocated before shutdown, and attaches after it.
-	late, ok := h.srv.dialogs.begin(phone.buildInvite("1003", "2002", "example.com", body), planePublic)
-	if !ok {
+	late, res := h.srv.dialogs.begin(phone.buildInvite("1003", "2002", "example.com", body), planePublic, 0)
+	if res != beginOK {
 		t.Fatal("begin before shutdown refused")
 	}
 	offer, err := h.srv.parseSDP([]byte(body))
@@ -54,7 +54,7 @@ func TestInFlightInviteCannotAllocateAfterShutdown(t *testing.T) {
 	if n := inUse(); n != 0 {
 		t.Errorf("media pairs in use after shutdown began = %d, want 0 (nothing allocated, nothing leaked)", n)
 	}
-	if _, ok := h.srv.dialogs.begin(phone.buildInvite("1005", "2002", "example.com", body), planePublic); ok {
+	if _, res := h.srv.dialogs.begin(phone.buildInvite("1005", "2002", "example.com", body), planePublic, 0); res == beginOK {
 		t.Error("begin after shutdown began opened a dialog")
 	}
 	h.srv.dialogs.closeAll()

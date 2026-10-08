@@ -71,8 +71,11 @@ type Deps struct {
 // response class): a Call-ID here would create a permanent time series per
 // call.
 type ProxyStats struct {
-	ActiveRegistrations  int64 `json:"active_registrations"`
-	ActiveDialogs        int64 `json:"active_dialogs"`
+	ActiveRegistrations int64 `json:"active_registrations"`
+	ActiveDialogs       int64 `json:"active_dialogs"`
+	// ActiveSessions is the calls holding a session slot (ringing or up),
+	// the number shield.max_sessions caps.
+	ActiveSessions       int64 `json:"active_sessions"`
 	ActiveMediaSessions  int64 `json:"active_media_sessions"`
 	ActiveWebRTCSessions int64 `json:"active_webrtc_sessions"`
 

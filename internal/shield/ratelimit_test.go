@@ -4,6 +4,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 func TestRateLimiterBurstThenThrottle(t *testing.T) {
@@ -132,5 +134,36 @@ func TestRateLimiterPruneHonoursInterval(t *testing.T) {
 	r.prune()
 	if len(r.buckets) != 0 || r.lru.Len() != 0 {
 		t.Fatal("a bucket idle for its whole interval must be pruned")
+	}
+}
+
+func TestLimiterIsGlobalAndHot(t *testing.T) {
+	l := NewLimiter()
+	now := time.Unix(1000, 0)
+	l.rl.now = func() time.Time { return now }
+	rl := config.RateLimit{Rate: 2, Interval: time.Minute}
+	if !l.Allow(rl) || !l.Allow(rl) {
+		t.Fatal("the first two tokens must be allowed")
+	}
+	if l.Allow(rl) {
+		t.Fatal("the third token in the same instant must be denied")
+	}
+	// 30 s refills one token of a 2/m bucket.
+	now = now.Add(30 * time.Second)
+	if !l.Allow(rl) {
+		t.Fatal("a refilled token must be allowed")
+	}
+	if l.Allow(rl) {
+		t.Fatal("bucket should be empty again")
+	}
+	// A hot change of the parameters applies at once: a larger rate refills
+	// faster against the same bucket.
+	now = now.Add(30 * time.Second)
+	if !l.Allow(config.RateLimit{Rate: 600, Interval: time.Minute}) {
+		t.Fatal("a raised rate must apply immediately")
+	}
+	// A limit with no rate never refuses.
+	if !l.Allow(config.RateLimit{}) {
+		t.Fatal("an unset limit must not throttle")
 	}
 }

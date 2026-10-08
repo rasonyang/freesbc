@@ -46,6 +46,19 @@ type PortRange struct {
 	Min, Max uint16
 }
 
+// Pairs is how many RTP/RTCP pairs fit in the range: RTP on an even port,
+// RTCP on RTP+1 (media.PlanePool.sweep).
+func (p PortRange) Pairs() int {
+	lo, hi := int(p.Min), int(p.Max)
+	if lo%2 != 0 {
+		lo++
+	}
+	if hi < lo {
+		return 0
+	}
+	return (hi - lo + 1) / 2
+}
+
 func (p *PortRange) UnmarshalYAML(b []byte) error {
 	s, err := yamlScalarString(b)
 	if err != nil {

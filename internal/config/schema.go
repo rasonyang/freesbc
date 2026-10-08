@@ -110,6 +110,13 @@ type ShieldConfig struct {
 	// Ban is how long a source fingerprinted as a scanner stays banned
 	// (in memory only).
 	Ban Duration `yaml:"ban"`
+	// MaxSessions caps concurrent calls holding a session slot (ringing or
+	// up), counted from the first out-of-dialog INVITE. 0 = the number of
+	// calls the rtp range can anchor. Hot.
+	MaxSessions int `yaml:"max_sessions"`
+	// InviteRateLimit is a global limit on new out-of-dialog INVITEs from
+	// admitted peers ("<n>/<s|m|h>", no per_ip). Empty = off. Hot.
+	InviteRateLimit string `yaml:"invite_rate_limit"`
 }
 
 type AdminConfig struct {
@@ -138,6 +145,9 @@ func withDefaults(c *Config) {
 	}
 	if c.RTP == (PortRange{}) {
 		c.RTP = DefaultRTP
+	}
+	if c.Shield.MaxSessions == 0 {
+		c.Shield.MaxSessions = c.RTP.Pairs()
 	}
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
