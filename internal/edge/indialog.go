@@ -389,7 +389,8 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ inbound)
 	s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
 }
 
-// onInDialog forwards BYE, INFO, NOTIFY, PRACK and UPDATE. Direction is
+// onInDialog forwards BYE, INFO, NOTIFY, REFER, MESSAGE, PRACK and UPDATE
+// (MESSAGE also out of dialog from the switch, see below). Direction is
 // decided by the dialog the request's tags name, and a BYE additionally
 // tears the media session down — but only the dialog it names, and only
 // once its far end has agreed the dialog is over.
@@ -400,16 +401,21 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ inbound)
 // phone) matches no confirmed dialog; directionFor routes it by the fsbc=
 // binding token its Request-URI carries, exactly as it routes the INVITE.
 //
+// A NOTIFY is first matched against the SUBSCRIBE dialogs FreeSBC carried
+// (subTable, subscribe.go) by Call-ID and both tags, from either plane, and
+// forwarded along the subscription; a terminated Subscription-State or a
+// 481 ends the record. Only a NOTIFY that matches no subscription goes on
+// to the rules below.
+//
 // Out-of-dialog NOTIFY (no To tag) is decided per plane, on purpose:
 //   - From the private plane (FreeSWITCH, trusted) it is forwarded when its
 //     Request-URI carries the token of a binding FreeSBC holds — the MWI
 //     case, Event: message-summary. Without such a binding directionFor
 //     finds no target and it is answered 481, which is what RFC 6665
 //     §4.1.3 prescribes for a NOTIFY that matches no subscription.
-//   - From the public plane it is answered 481. A client's SUBSCRIBE is
-//     answered 405, so FreeSWITCH holds no subscription a client could
-//     notify, and hashing an unsolicited NOTIFY from the internet onto a
-//     switch would only add load.
+//   - From the public plane it is answered 481: a NOTIFY needs a
+//     subscription, and an unsolicited one from the internet would only add
+//     load on a switch.
 //
 // A private-plane NOTIFY that HAS a To tag but that directionFor cannot
 // route (issue #84) is forwarded by Call-ID alone, through
@@ -417,7 +423,25 @@ func (s *Server) onCancel(req *sip.Request, tx sip.ServerTransaction, _ inbound)
 // To from a channel variable, so the tag can be another leg's. It is
 // answered 481 only when no dialog with a public route carries the
 // Call-ID. BYE, INFO and ACK, and every NOTIFY from the public plane, keep
-// exact tag matching. The no-To-tag rule above is separate and unchanged.
+// exact tag matching.
+//
+// A public NOTIFY that matches neither a subscription nor an INVITE dialog
+// (the refer sipfrag NOTIFY of a transfer rides the call's dialog) is
+// answered 481, not hashed upstream. The no-To-tag rule above is separate
+// and unchanged.
+//
+// REFER (RFC 3515) is in-dialog only and forwarded unchanged, so Refer-To,
+// Referred-By and Replaces reach the other end as written; the transfer
+// target's call is that endpoint's own INVITE, admitted like any other. It
+// is answered 481 with no To tag or no matching dialog, and 603 on a
+// carrier dialog (never forwarded).
+//
+// A MESSAGE from the public plane that names no dialog is likewise 481: the
+// generic fallback that hashes an unmatched public in-dialog request
+// upstream would let a made-up To tag carry it past admission. A MESSAGE
+// from the switch with no To tag is classified by Request-URI above and
+// delivered to the client its token names, or answered 404 when the token
+// names no live binding (onMessage sends everything else here).
 func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if req.Method == sip.NOTIFY && fsip.ToTag(req) == "" && !in.private() {
 		s.reject(req, tx, 481, "Subscription Does Not Exist")
@@ -438,12 +462,56 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 			return
 		}
 	}
+	if req.Method == sip.REFER && fsip.ToTag(req) == "" {
+		// A REFER is only ever in-dialog (RFC 3515): there is no
+		// out-of-dialog form to route, from either plane.
+		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+	if req.Method == sip.NOTIFY && fsip.ToTag(req) != "" {
+		// A NOTIFY on a subscription FreeSBC carried (subscribe.go) goes
+		// back along it, whatever INVITE dialogs share the Call-ID.
+		arrived := planePublic
+		if in.private() {
+			arrived = planePrivate
+		}
+		if sub, v, fromSub, ok := s.subs.lookup(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req), arrived, req.Method); ok {
+			s.forwardInSubscription(req, tx, sub, v, fromSub)
+			return
+		}
+	}
 	from, to, dest, d, ok := s.directionFor(req, in.private())
 	if !ok && req.Method == sip.NOTIFY && fsip.ToTag(req) != "" && in.private() {
 		from, to, dest, d, ok = s.relaxedNotifyDirection(req)
 	}
 	if !ok {
+		if req.Method == sip.MESSAGE && in.private() && fsip.ToTag(req) == "" {
+			// An out-of-dialog switch MESSAGE whose token names no live
+			// binding is nobody's: 404, as for any unknown token.
+			s.reject(req, tx, 404, "Not Found")
+			return
+		}
 		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+	// directionFor forwards a public in-dialog request that names no
+	// dialog to the hashed switch (FreeSWITCH answers 481 itself). That is
+	// right for a BYE or INFO, but a REFER, MESSAGE or NOTIFY would then
+	// reach the switch past admission with nothing but a made-up To tag,
+	// so these are answered 481 here. A switch REFER is refused the same way: it
+	// has no dialog to refer. A private MESSAGE with no dialog is the
+	// out-of-dialog case, routed by its client token.
+	if d == nil && (req.Method == sip.REFER || ((req.Method == sip.MESSAGE || req.Method == sip.NOTIFY) && !in.private())) {
+		s.reject(req, tx, 481, "Call/Transaction Does Not Exist")
+		return
+	}
+	// Call transfer is the switch's business, and a carrier leg's Refer-To
+	// would name an address on the far side of the topology hiding. A
+	// REFER on a carrier dialog is declined, never forwarded.
+	if req.Method == sip.REFER && d.carrierName() != "" {
+		s.log.Info("REFER on a carrier dialog declined", "sip_call_id", fsip.CallID(req),
+			"carrier", d.carrierName())
+		s.reject(req, tx, 603, "Decline")
 		return
 	}
 	if d != nil {
@@ -496,7 +564,9 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 	if pk != nil {
 		fsip.SetSDPBody(out, pkBody)
 	}
-	if req.Method != sip.PRACK { // a PRACK carries no Contact
+	// A PRACK carries no Contact, and a MESSAGE only when the sender
+	// supplied one.
+	if req.Method != sip.PRACK && (req.Method != sip.MESSAGE || len(req.GetHeaders("Contact")) > 0) {
 		fsip.SetContact(out, to.uri())
 	}
 	if !in.private() {
@@ -512,6 +582,17 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 				answerErr = s.applyOwed(d, pk, pkAnswer)
 			}
 			return answerErr
+		}
+	}
+	if req.Method == sip.REFER || req.Method == sip.MESSAGE {
+		adapt = func(res *sip.Response) error {
+			// A 2xx to a REFER may carry a Contact (a target refresh,
+			// RFC 3515), and a 3xx to a MESSAGE one (RFC 3428): it must
+			// name FreeSBC, not the far endpoint.
+			if len(res.GetHeaders("Contact")) > 0 {
+				fsip.SetContact(res, from.uri())
+			}
+			return nil
 		}
 	}
 	if req.Method == sip.UPDATE {

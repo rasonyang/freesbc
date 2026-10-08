@@ -28,6 +28,7 @@ type Metrics struct {
 	responsesOut sync.Map // status class ("2xx") → *atomic.Uint64
 
 	registrations       atomic.Int64 // gauge
+	subscriptions       atomic.Int64 // gauge
 	registrationTotal   atomic.Uint64
 	registrationFailure atomic.Uint64
 
@@ -140,7 +141,11 @@ func (m *Metrics) ResponseOut(code int) {
 func (m *Metrics) Registered()            { m.registrationTotal.Add(1) }
 func (m *Metrics) RegistrationFailed()    { m.registrationFailure.Add(1) }
 func (m *Metrics) SetRegistrations(n int) { m.registrations.Store(int64(n)) }
-func (m *Metrics) PortAllocationFailed()  { m.portFailures.Add(1) }
+
+// SetSubscriptions publishes the live subscription record count.
+func (m *Metrics) SetSubscriptions(n int) { m.subscriptions.Store(int64(n)) }
+
+func (m *Metrics) PortAllocationFailed() { m.portFailures.Add(1) }
 
 // AdmissionDropped counts one public request dropped by admission.
 func (m *Metrics) AdmissionDropped(r dropReason) { m.admissionDrops[r].Add(1) }
@@ -228,6 +233,7 @@ func (m *Metrics) WebRTCFailure(err error) {
 // render.
 type Snapshot struct {
 	ActiveRegistrations  int64
+	ActiveSubscriptions  int64
 	ActiveDialogs        int64
 	ActiveSessions       int64
 	ActiveMediaSessions  int64
@@ -273,6 +279,7 @@ type Snapshot struct {
 func (m *Metrics) Snapshot() Snapshot {
 	s := Snapshot{
 		ActiveRegistrations:  m.registrations.Load(),
+		ActiveSubscriptions:  m.subscriptions.Load(),
 		ActiveDialogs:        m.dialogs.Load(),
 		ActiveSessions:       m.sessions.Load(),
 		ActiveMediaSessions:  m.mediaSessions.Load(),

@@ -69,6 +69,13 @@ type Location struct {
 	// maxPerAOR caps how many devices one user may have registered at
 	// once, so a single compromised account cannot consume the table.
 	maxPerAOR int
+
+	// onRemove, when set, is told the tokens of bindings that left the
+	// table (SetOnRemove). removed collects them under mu; the mutating
+	// methods hand them over only after mu is released, so the hook may
+	// take its own locks without an ordering constraint.
+	onRemove func(tokens []string)
+	removed  []string
 }
 
 // Default table bounds. A single node targets a few thousand
@@ -105,6 +112,7 @@ func NewLocation() *Location {
 // It returns the stored binding, whose Token is the one to advertise
 // upstream.
 func (l *Location) Put(b Binding) (*Binding, error) {
+	defer l.flushRemoved()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	// Only THIS AoR is swept, not the whole table: a REGISTER is the
@@ -148,6 +156,7 @@ func (l *Location) Put(b Binding) (*Binding, error) {
 // Remove drops the binding for an (AoR, Call-ID) pair — an explicit
 // un-REGISTER (Expires: 0). It returns the removed binding, if any.
 func (l *Location) Remove(aor, callID string) *Binding {
+	defer l.flushRemoved()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	list := l.byAOR[aor]
@@ -166,6 +175,7 @@ func (l *Location) Remove(aor, callID string) *Binding {
 // leak table entries until their expiry and, worse, make FreeSBC accept
 // inbound calls it cannot deliver.
 func (l *Location) RemoveBySource(src netip.AddrPort) int {
+	defer l.flushRemoved()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	// Copy: deleteLocked edits the index slice being walked.
@@ -197,6 +207,32 @@ func (l *Location) HasSource(transport string, src netip.AddrPort) bool {
 	return false
 }
 
+// SourceBinding returns a live binding registered over transport from
+// exactly src: the one whose User equals user (case-insensitively), else
+// the first live one. ok is false when the source holds none. It is
+// HasSource that also says which registration the source is.
+func (l *Location) SourceBinding(transport string, src netip.AddrPort, user string) (Binding, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	now := time.Now()
+	var first *Binding
+	for _, b := range l.bySource[src] {
+		if !strings.EqualFold(b.Transport, transport) || b.Expired(now) {
+			continue
+		}
+		if user != "" && strings.EqualFold(b.User, user) {
+			return *b, true
+		}
+		if first == nil {
+			first = b
+		}
+	}
+	if first == nil {
+		return Binding{}, false
+	}
+	return *first, true
+}
+
 // indexSourceLocked adds b to the source index. Caller holds the lock.
 func (l *Location) indexSourceLocked(b *Binding) {
 	l.bySource[b.Source] = append(l.bySource[b.Source], b)
@@ -224,6 +260,9 @@ func (l *Location) unindexSourceLocked(b *Binding) {
 func (l *Location) deleteLocked(aor string, i int) {
 	list := l.byAOR[aor]
 	delete(l.byToken, list[i].Token)
+	if l.onRemove != nil {
+		l.removed = append(l.removed, list[i].Token)
+	}
 	l.unindexSourceLocked(list[i])
 	list = append(list[:i], list[i+1:]...)
 	if len(list) == 0 {
@@ -231,6 +270,31 @@ func (l *Location) deleteLocked(aor string, i int) {
 		return
 	}
 	l.byAOR[aor] = list
+}
+
+// SetOnRemove registers f to be told the tokens of bindings that are
+// removed (un-REGISTER, WebSocket close, expiry, the per-AoR sweep in Put).
+// f runs after the table's lock is released, on the goroutine that made the
+// change, so it may take locks of its own. A binding that is refreshed in
+// place keeps its token and is not reported. Call it before the table is
+// shared.
+func (l *Location) SetOnRemove(f func(tokens []string)) {
+	l.mu.Lock()
+	l.onRemove = f
+	l.mu.Unlock()
+}
+
+// flushRemoved hands the tokens collected by deleteLocked to the hook. It
+// must run with mu NOT held (the mutating methods defer it before taking
+// the lock, so it runs after their unlock).
+func (l *Location) flushRemoved() {
+	l.mu.Lock()
+	f, tokens := l.onRemove, l.removed
+	l.removed = nil
+	l.mu.Unlock()
+	if f != nil && len(tokens) > 0 {
+		f(tokens)
+	}
 }
 
 // ByToken looks up the binding FreeSWITCH addressed. Expired bindings are
@@ -272,6 +336,7 @@ func (l *Location) Count() int {
 // client that vanishes without un-registering does not hold an entry past
 // its registrar-granted lifetime.
 func (l *Location) Prune() int {
+	defer l.flushRemoved()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.pruneLocked(time.Now())

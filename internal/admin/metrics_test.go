@@ -42,7 +42,7 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		return ProxyStats{
 			CallsEnded:     map[string]uint64{"bye_caller": 2, "rtp_silence": 0},
 			InviteRejects:  map[string]uint64{"early_cap": 1, "port_exhausted": 0, "session_cap": 3, "invite_rate": 0},
-			ActiveSessions: 4,
+			ActiveSessions: 4, ActiveSubscriptions: 7,
 		}
 	}
 	body := string(authGET(t, newTestServer(t, deps), "/metrics"))
@@ -54,6 +54,7 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		`freesbc_edge_invite_rejects_total{reason="session_cap"} 3`,
 		`freesbc_edge_invite_rejects_total{reason="invite_rate"} 0`,
 		"freesbc_edge_sessions 4",
+		"freesbc_edge_subscriptions 7",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\n---\n%s", want, body)

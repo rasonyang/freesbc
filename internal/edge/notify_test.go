@@ -508,7 +508,7 @@ func TestOutOfDialogNotify(t *testing.T) {
 }
 
 // TestAllowListsNotify: the Allow FreeSBC emits — on its own OPTIONS answer
-// and on a 405 — lists NOTIFY, and SUBSCRIBE is still refused.
+// and on a 405 — lists NOTIFY and SUBSCRIBE, and PUBLISH is still refused.
 func TestAllowListsNotify(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
@@ -538,17 +538,20 @@ func TestAllowListsNotify(t *testing.T) {
 		t.Errorf("OPTIONS Allow does not list NOTIFY: %v", headerTokens(opt, "Allow"))
 	}
 
-	sub := build(sip.SUBSCRIBE, "allow-notify-subscribe")
-	sub.AppendHeader(sip.NewHeader("Event", "message-summary"))
-	res := phone.do(t, sub, h.publicUDP)
+	pub := build(sip.PUBLISH, "allow-notify-publish")
+	pub.AppendHeader(sip.NewHeader("Event", "presence"))
+	res := phone.do(t, pub, h.publicUDP)
 	if res.StatusCode != 405 {
-		t.Fatalf("SUBSCRIBE: got %d, want 405", res.StatusCode)
+		t.Fatalf("PUBLISH: got %d, want 405", res.StatusCode)
 	}
 	allow := headerTokens(res, "Allow")
 	if !allow["NOTIFY"] {
 		t.Errorf("405 Allow does not list NOTIFY: %v", allow)
 	}
-	if allow["SUBSCRIBE"] {
-		t.Errorf("405 Allow lists SUBSCRIBE: %v", allow)
+	if !allow["SUBSCRIBE"] {
+		t.Errorf("405 Allow does not list SUBSCRIBE: %v", allow)
+	}
+	if allow["PUBLISH"] {
+		t.Errorf("405 Allow lists PUBLISH: %v", allow)
 	}
 }

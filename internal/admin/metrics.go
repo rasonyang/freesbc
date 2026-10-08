@@ -22,6 +22,7 @@ type collector struct {
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
 	// source is wired, and Collect skips the whole block then).
 	proxyRegs       *prometheus.Desc
+	proxySubs       *prometheus.Desc
 	proxyDialogs    *prometheus.Desc
 	proxyMedia      *prometheus.Desc
 	proxyWebRTC     *prometheus.Desc
@@ -56,6 +57,7 @@ func newCollector(deps Deps) *collector {
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
 		proxyRegs:       prometheus.NewDesc("freesbc_active_registrations", "Registration bindings the edge proxy currently holds.", nil, nil),
+		proxySubs:       prometheus.NewDesc("freesbc_edge_subscriptions", "SUBSCRIBE dialogs the edge routes NOTIFYs for, pending or active.", nil, nil),
 		proxyDialogs:    prometheus.NewDesc("freesbc_active_sip_dialogs", "Dialogs the edge proxy is currently on the path of.", nil, nil),
 		proxySessions:   prometheus.NewDesc("freesbc_edge_sessions", "Calls holding a session slot, ringing or up; the number shield.max_sessions caps.", nil, nil),
 		proxyMedia:      prometheus.NewDesc("freesbc_active_media_sessions", "Media sessions the edge proxy is anchoring.", nil, nil),
@@ -92,7 +94,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
-		c.proxyRegs, c.proxyDialogs, c.proxySessions, c.proxyMedia, c.proxyWebRTC,
+		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
@@ -124,6 +126,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, v, lv...)
 	}
 	g(c.proxyRegs, float64(p.ActiveRegistrations))
+	g(c.proxySubs, float64(p.ActiveSubscriptions))
 	g(c.proxyDialogs, float64(p.ActiveDialogs))
 	g(c.proxySessions, float64(p.ActiveSessions))
 	g(c.proxyMedia, float64(p.ActiveMediaSessions))

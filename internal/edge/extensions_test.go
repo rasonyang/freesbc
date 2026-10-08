@@ -25,13 +25,13 @@ func headerTokens(m interface{ GetHeaders(string) []sip.Header }, name string) m
 
 // assertExtensionsAdvertised checks that m advertises what the proxy
 // carries (PRACK and UPDATE included) and still has 100rel and timer in
-// Supported, and that a method it does not carry (REFER) was dropped from
+// Supported, and that a method it does not carry (PUBLISH) was dropped from
 // Allow.
 func assertExtensionsAdvertised(t *testing.T, what string, m interface{ GetHeaders(string) []sip.Header }) {
 	t.Helper()
 	allow := headerTokens(m, "Allow")
-	if allow["REFER"] {
-		t.Errorf("%s: Allow still advertises REFER: %v", what, allow)
+	if allow["PUBLISH"] {
+		t.Errorf("%s: Allow still advertises PUBLISH: %v", what, allow)
 	}
 	for _, method := range []string{"INVITE", "BYE", "PRACK", "UPDATE"} {
 		if !allow[method] {
@@ -48,7 +48,7 @@ func assertExtensionsAdvertised(t *testing.T, what string, m interface{ GetHeade
 
 func extensionHeaders() []sip.Header {
 	return []sip.Header{
-		sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, REFER"),
+		sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, PUBLISH"),
 		sip.NewHeader("Supported", "100rel, timer"),
 	}
 }
@@ -176,7 +176,7 @@ func TestFilterTokenHeader(t *testing.T) {
 	req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
 	req.AppendHeader(sip.NewHeader("k", "100rel"))
 	req.AppendHeader(sip.NewHeader("Supported", "timer, 100REL, replaces"))
-	req.AppendHeader(sip.NewHeader("allow", "INVITE, refer"))
+	req.AppendHeader(sip.NewHeader("allow", "INVITE, publish"))
 	req.AppendHeader(sip.NewHeader("Allow", "Prack, Update"))
 	sanitizeExtensions(req)
 	// Supported is end to end and is never touched.
@@ -195,7 +195,7 @@ func TestFilterTokenHeader(t *testing.T) {
 	// Only methods the proxy cannot carry: the header goes away rather
 	// than being left empty.
 	req = sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
-	req.AppendHeader(sip.NewHeader("Allow", "REFER"))
+	req.AppendHeader(sip.NewHeader("Allow", "PUBLISH"))
 	sanitizeExtensions(req)
 	if hs := req.GetHeaders("Allow"); len(hs) != 0 {
 		t.Errorf("empty Allow left behind: %v", hs)
