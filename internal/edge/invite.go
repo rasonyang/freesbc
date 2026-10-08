@@ -430,7 +430,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// Started on ctx, the series context: the client transaction must
 		// outlive the attempt so its CANCEL and its retransmissions are
 		// still matched.
-		clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+		clTx, err := s.clientTx(ctx, out)
 		if err != nil {
 			s.log.Warn("forward INVITE upstream", "err", err, "sip_call_id", fsip.CallID(req),
 				"upstream", name, "attempt", attempt+1)
@@ -644,7 +644,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer d.untrack()
 
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)
 		s.giveUp(ctx, d, req, tx, 480, "Temporarily Unavailable")

@@ -22,9 +22,9 @@ private:
 
 rtp: 20000-29999             # one range, allocated independently per bind IP
 
-# tls:                       # identity for wss:// and a remote admin;
-#   cert: /etc/freesbc/cert.pem  # required only by edge.listen.wss or
-#   key:  /etc/freesbc/key.pem   # admin.allow_remote
+# tls:                       # identity for sips:// and wss:// and a remote admin;
+#   cert: /etc/freesbc/cert.pem  # required only by edge.listen.tls, edge.listen.wss
+#   key:  /etc/freesbc/key.pem   # or admin.allow_remote
 
 # --- Edge -------------------------------------------------------------------
 #
@@ -41,6 +41,8 @@ edge:
                              #   default = the switch port above
   listen:                    # ports on public.bind; present = enabled
     udp: 5060
+    tcp: 5060                # SIP/TCP; shares the number with udp, they are separate sockets
+    # tls: 5061              # SIP/TLS (sips); needs tls
     # wss: 443               # enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux); needs tls
     # ws: 8080               # plaintext WebSocket, development only
 

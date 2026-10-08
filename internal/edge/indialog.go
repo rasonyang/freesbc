@@ -81,7 +81,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Debug("forward re-INVITE", "err", err, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 503, "Service Unavailable")
@@ -366,7 +366,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 			stripBody(out)
 		}
 	}
-	if err := s.client.WriteRequest(out, noBuild); err != nil {
+	if err := s.writeRequest(out); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
 	if answerFailed && d.end(endAnswerUnusable) {
@@ -656,7 +656,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 			// A clone: the failed client transaction may still hold the
 			// original request (a retransmission timer winding down), so
 			// handing the same object to WriteRequest would race it.
-			if werr := s.client.WriteRequest(out.Clone(), noBuild); werr != nil {
+			if werr := s.writeRequest(out.Clone()); werr != nil {
 				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
 					"sip_call_id", fsip.CallID(req))
 			}
@@ -952,7 +952,7 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.client.TransactionRequest(ctx, req, noBuild)
+	clTx, err := s.clientTx(ctx, req)
 	if err != nil {
 		s.log.Debug("bye after media end", "err", err, "sip_call_id", b.callID)
 		return

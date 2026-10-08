@@ -264,7 +264,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.untrack()
 
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)
 		s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")

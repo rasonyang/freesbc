@@ -51,7 +51,8 @@ type PrivateConfig struct {
 	IP string `yaml:"ip"`
 }
 
-// TLSConfig is the PEM identity used by edge.listen.wss and a remote admin.
+// TLSConfig is the PEM identity used by edge.listen.tls, edge.listen.wss and a
+// remote admin.
 type TLSConfig struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
@@ -60,6 +61,8 @@ type TLSConfig struct {
 // ListenPorts are the edge's public ports on public.bind; 0 = not enabled.
 type ListenPorts struct {
 	UDP int `yaml:"udp"`
+	TCP int `yaml:"tcp"`
+	TLS int `yaml:"tls"`
 	WS  int `yaml:"ws"`
 	WSS int `yaml:"wss"`
 }

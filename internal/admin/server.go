@@ -102,6 +102,15 @@ type ProxyStats struct {
 	// (UDP, TCP, TLS, WS, WSS, OTHER).
 	ParseFailures map[string]uint64 `json:"sip_parse_failures_total"`
 
+	// StreamConnections is the open stream connections by transport (tcp,
+	// tls, ws, wss); StreamRefused counts connections refused at accept by
+	// reason (global_cap, ip_cap, banned, rate) and StreamClosed connections
+	// closed by policy by reason (idle, slow, oversize, malformed,
+	// handshake, rate).
+	StreamConnections map[string]int64  `json:"stream_connections"`
+	StreamRefused     map[string]uint64 `json:"stream_refused_total"`
+	StreamClosed      map[string]uint64 `json:"stream_closed_total"`
+
 	// AdmissionDrops counts public requests the edge admission policy
 	// dropped silently, by reason (a fixed set: invite_not_admitted,
 	// register_enumeration, subscribe_not_admitted, message_not_admitted).

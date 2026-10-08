@@ -58,6 +58,14 @@ type Metrics struct {
 	// out-of-dialog INVITE, one counter per (fixed) reason (invite.go).
 	inviteRejects [numInviteRejects]atomic.Uint64
 
+	// streamConns is the gauge of open stream connections per transport
+	// (streamTransports); streamRefused counts connections refused at
+	// accept, streamClosed connections closed by policy, both by (fixed)
+	// reason (stream.go).
+	streamConns   [len(streamTransports)]atomic.Int64
+	streamRefused [numStreamRefusals]atomic.Uint64
+	streamClosed  [numStreamCloses]atomic.Uint64
+
 	// carrierReqs counts requests of the carrier path by (carrier,
 	// direction, method) — key "carrier/direction/method". The carrier is a
 	// configured name or "unknown", the direction one of two, the method
@@ -155,6 +163,26 @@ func (m *Metrics) CallEnded(r endReason) { m.callsEnded[r].Add(1) }
 
 // InviteRejected counts one out-of-dialog INVITE the edge refused itself.
 func (m *Metrics) InviteRejected(r inviteReject) { m.inviteRejects[r].Add(1) }
+
+// StreamConnOpened and StreamConnClosed move the open-connection gauge of
+// one stream transport.
+func (m *Metrics) StreamConnOpened(transport string) {
+	if i := streamIndex(transport); i >= 0 {
+		m.streamConns[i].Add(1)
+	}
+}
+
+func (m *Metrics) StreamConnClosed(transport string) {
+	if i := streamIndex(transport); i >= 0 {
+		m.streamConns[i].Add(-1)
+	}
+}
+
+// StreamRefused counts one connection refused at accept.
+func (m *Metrics) StreamRefused(r streamRefusal) { m.streamRefused[r].Add(1) }
+
+// StreamClosed counts one connection closed by policy.
+func (m *Metrics) StreamClosed(r streamClose) { m.streamClosed[r].Add(1) }
 
 // CarrierRequest counts one request of the carrier path.
 func (m *Metrics) CarrierRequest(carrier, direction, method string) {
@@ -269,6 +297,14 @@ type Snapshot struct {
 	CallsEnded    map[string]uint64
 	InviteRejects map[string]uint64
 
+	// StreamConnections is the open stream connections by lower-case
+	// transport (tcp, tls, ws, wss), every one present. StreamRefused is
+	// keyed by refusal reason and StreamClosed by policy-close reason, every
+	// reason present.
+	StreamConnections map[string]int64
+	StreamRefused     map[string]uint64
+	StreamClosed      map[string]uint64
+
 	// CarrierRequests is keyed "carrier/direction/method".
 	CarrierRequests map[string]uint64
 
@@ -303,6 +339,18 @@ func (m *Metrics) Snapshot() Snapshot {
 		ParseFailures:               map[string]uint64{},
 		CarrierRequests:             map[string]uint64{},
 		CarrierRegistrations:        map[string]int64{},
+		StreamConnections:           map[string]int64{},
+		StreamRefused:               map[string]uint64{},
+		StreamClosed:                map[string]uint64{},
+	}
+	for i, t := range streamTransports {
+		s.StreamConnections[t] = m.streamConns[i].Load()
+	}
+	for r := range m.streamRefused {
+		s.StreamRefused[streamRefusalLabels[r]] = m.streamRefused[r].Load()
+	}
+	for r := 1; r < len(m.streamClosed); r++ {
+		s.StreamClosed[streamCloseLabels[r]] = m.streamClosed[r].Load()
 	}
 	m.carrierRegsMu.Lock()
 	for k, v := range m.carrierRegs {

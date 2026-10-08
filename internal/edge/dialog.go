@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -512,6 +513,22 @@ func (t *dialogTable) newestRoutedByCallID(callID string) (*dialog, dialogRoute,
 		return d, d.route, true
 	}
 	return nil, dialogRoute{}, false
+}
+
+// usesRemote reports whether a live dialog is routed to the public remote
+// (an "IP:port") over transport: the stream connection to it carries a call
+// and must not be closed for being quiet.
+func (t *dialogTable) usesRemote(transport, remote string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, ds := range t.byCallID {
+		for _, d := range ds {
+			if d.state != dialogEnded && d.route.publicRemote == remote && strings.EqualFold(d.route.transport, transport) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // count is the number of calls that are up — the same number the dialog

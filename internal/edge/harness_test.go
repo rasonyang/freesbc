@@ -145,6 +145,8 @@ type harness struct {
 	publicUDP  string // where a SIP/UDP phone sends
 	publicWS   string // where a browser connects
 	publicWSS  string // where a browser connects over TLS ("" unless startHarnessWSS)
+	publicTCP  string // where a SIP/TCP phone connects ("" unless the harness has tcp)
+	publicTLS  string // where a SIP/TLS phone connects ("" unless the harness has tls)
 	privateSIP string // the proxy's FreeSWITCH-facing socket
 	upstream   string // the fake FreeSWITCH
 
@@ -248,16 +250,26 @@ func writeTestTLS(t testing.TB, dir string) (certPath, keyPath string) {
 // WithPrivateAddr), the given switch nodes, one RTP range for both pools
 // and a shield limit high enough that the harness itself is never throttled
 // (the rate limiter has its own tests in package shield).
-func harnessYAML(t testing.TB, switches []string, pubUDP, pubWS, pubWSS, mediaBase int, carrierSources string) string {
+//
+// extra are further edge.listen entries ("tcp: 5060", "tls: 5061"); a "tls:"
+// one adds the top-level tls identity as wss does.
+func harnessYAML(t testing.TB, switches []string, pubUDP, pubWS, pubWSS, mediaBase int, carrierSources string, extra ...string) string {
 	t.Helper()
 	var listen []string
 	listen = append(listen, fmt.Sprintf("udp: %d", pubUDP))
 	if pubWS != 0 {
 		listen = append(listen, fmt.Sprintf("ws: %d", pubWS))
 	}
-	tlsBlock := ""
+	needTLS := pubWSS != 0
 	if pubWSS != 0 {
 		listen = append(listen, fmt.Sprintf("wss: %d", pubWSS))
+	}
+	for _, e := range extra {
+		listen = append(listen, e)
+		needTLS = needTLS || strings.HasPrefix(e, "tls:")
+	}
+	tlsBlock := ""
+	if needTLS {
 		cert, key := writeTestTLS(t, t.TempDir())
 		tlsBlock = fmt.Sprintf("tls: {cert: %q, key: %q}\n", cert, key)
 	}
@@ -313,6 +325,12 @@ func newHarnessLog(t *testing.T, yaml string, priv int, handler slog.Handler) *h
 	}
 	if l.WSS != 0 {
 		h.publicWSS = fmt.Sprintf("127.0.0.1:%d", l.WSS)
+	}
+	if l.TCP != 0 {
+		h.publicTCP = fmt.Sprintf("127.0.0.1:%d", l.TCP)
+	}
+	if l.TLS != 0 {
+		h.publicTLS = fmt.Sprintf("127.0.0.1:%d", l.TLS)
 	}
 	return h
 }

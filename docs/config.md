@@ -29,7 +29,7 @@ Principles of the schema:
 | `public` | yes | restart |
 | `private` | yes | restart |
 | `rtp` | no (default `20000-29999`) | restart |
-| `tls` | when `edge.listen.wss` is set or `admin.allow_remote` is true | restart |
+| `tls` | when `edge.listen.tls` or `edge.listen.wss` is set, or `admin.allow_remote` is true | restart |
 | `edge` | yes | restart (every key) |
 | `shield` | no | hot |
 | `admin` | no | restart |
@@ -74,7 +74,7 @@ There is one range and two independent allocators over it, one bound to `public.
 | `cert` | PEM certificate file path. |
 | `key` | PEM private key file path. |
 
-Both must be set when `tls` is present. The section is required when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by `check`.
+Both must be set when `tls` is present. The section is required when `edge.listen.tls` is set, when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by `check`.
 
 The DTLS identity for WebRTC media is a per-process self-signed certificate generated at startup. It is independent of `tls`.
 
@@ -84,7 +84,7 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 |---|---|---|
 | `switch` | required | List of literal `IP:port` (UDP), at least one. |
 | `switch_carrier_port` | `0` (the node's own `switch` port) | `0` or 1-65535. |
-| `listen` | required | At least one of `udp`, `ws`, `wss`. |
+| `listen` | required | At least one of `udp`, `tcp`, `tls`, `ws`, `wss`. |
 | `carriers` | none | Map of name to `host[:port]`. |
 | `carrier_sources` | none | List of IPs or CIDRs. |
 
@@ -107,10 +107,16 @@ Ports on `public.bind`; `0` or absent means not enabled; each present value is 1
 | Key | Transport |
 |---|---|
 | `udp` | SIP over UDP. Required by `carriers`. |
+| `tcp` | SIP over TCP, for registered clients. |
+| `tls` | SIP over TLS, for registered clients; needs `tls`. Min TLS 1.2. |
 | `ws` | Plaintext WebSocket, development only. |
 | `wss` | WebSocket over TLS; needs `tls`. |
 
-`ws` and `wss` must differ. Setting either enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux) for WebSocket clients. The public UDP and TCP ports are separate namespaces.
+`tcp`, `tls`, `ws` and `wss` are all TCP sockets on `public.bind`, so no two may share a port. `udp` is a separate port space and may share a number with `tcp` (the usual `5060` for both). Setting `ws` or `wss` enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux) for WebSocket clients; `tcp` and `tls` clients get plain RTP like UDP phones.
+
+A client on a stream transport is reachable only through the connection it opened: FreeSBC never dials a client (RFC 5626 flow semantics), and the binding goes when the connection does. FreeSBC answers the RFC 5626 double-CRLF keep-alive ping with a single CRLF. Carriers are still UDP only.
+
+Every stream transport (`tcp`, `tls`, `ws`, `wss`) is bounded by constants, not keys (design.md §15.2): at most 256 open connections per source IP (an IPv6 source by its /64) and 10000 in all, a 10 s TLS handshake and WebSocket upgrade, a 15 s bound on one message once its first byte has arrived, a 60 s idle timeout, and 24 KiB per SIP message. The idle timeout does not apply to a connection with a live registration binding, a dialog or a carrier source. Each new connection costs the source one `shield.rate_limit` token. Open connections and refusals are in `freesbc_edge_stream_connections{transport}`, `freesbc_edge_stream_refused_total{reason}` and `freesbc_edge_stream_closed_total{reason}`. Each connection takes a file descriptor, so raise the process limit (`LimitNOFILE`) above the 10000 cap plus the media ports.
 
 #### `edge.carriers`
 
@@ -141,7 +147,7 @@ A request from a `carrier_sources` address that matches no `carriers` entry gets
 
 | Key | Default | Rules |
 |---|---|---|
-| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram or WS/WSS frame, charged before parsing: malformed datagrams, responses and keepalives count too. |
+| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram, WS/WSS frame, TCP/TLS message started, and new stream connection, charged before parsing: malformed datagrams, responses and keepalives count too. |
 | `carrier_rate_limit` | `200/s per_ip` | Applies to carrier sources (resolved `carriers` addresses and `carrier_sources`), charged the same way. |
 | `ban` | `1h` | Duration, greater than 0. How long a source fingerprinted as a scanner stays banned (in memory only). Carrier sources are never banned as scanners. |
 | `max_sessions` | the calls `rtp` can anchor | Integer, 0 or more. Global cap on calls holding a session slot: from the first out-of-dialog INVITE (ringing calls hold one) until the call is torn down by any path. 0 means the default, the `rtp` capacity (see `rtp`); an explicit value above that capacity is an error (`exceeds the N calls rtp a-b can anchor`). Counted across all four directions (client, carrier, switch to client, switch to carrier). Hot: applies to the next INVITE, running calls are never torn down, and lowering it below the running count refuses new calls until it drains. |
@@ -177,7 +183,7 @@ Web security (restart-only like the rest of `admin`):
 
 - Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
 
-`admin.listen` must not collide with `edge.listen.ws` / `edge.listen.wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
+`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
 

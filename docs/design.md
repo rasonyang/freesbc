@@ -22,7 +22,7 @@ It is a **stateful SIP proxy**, not a B2BUA, implemented in one package
 
 | Far end | Reaches FreeSBC on | Notes |
 |---|---|---|
-| Registered clients: SIP/UDP phones, WS/WSS (WebRTC) browsers | the public sockets (`edge.listen`, bound on `public.bind`) | REGISTER is proxied to the switch; a public INVITE is admitted only from a live registration |
+| Registered clients: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS (WebRTC) browsers | the public sockets (`edge.listen`, bound on `public.bind`) | REGISTER is proxied to the switch; a public INVITE is admitted only from a live registration |
 | Carriers | the same public UDP socket | named in `edge.carriers` (directory resolved by `carrierdns.go`) or listed in `edge.carrier_sources`; the switch holds the carrier accounts and uses FreeSBC as its outbound proxy |
 | The switch (FreeSWITCH or Asterisk) | the fixed private socket `private.ip:5060` | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
 
@@ -46,7 +46,7 @@ maximum call duration, toll-fraud protection, CDR, call events, RTCP
 reporting, config history and a config write API are all on the far side of
 this line (README, "Not in scope"). The boundaries below follow from it.
 
-**Toward public endpoints.** FreeSBC terminates SIP over UDP, WS and WSS, and
+**Toward public endpoints.** FreeSBC terminates SIP over UDP, TCP, TLS, WS and WSS, and
 terminates the media path: RTP, SRTP-over-DTLS, and ICE-Lite. A public
 endpoint never learns the switch's address, because every SDP body the edge
 emits is *constructed* by `internal/sip/sdp.Build` and is never derived from
@@ -282,6 +282,8 @@ snapshot:
 | Socket | Address | Present when |
 |---|---|---|
 | `udp` | `public.bind:edge.listen.udp` | `edge.listen.udp` set |
+| `tcp` | `public.bind:edge.listen.tcp` (a TCP socket; may share its number with `udp`) | `edge.listen.tcp` set |
+| `tls` | `public.bind:edge.listen.tls`, certificate from the top-level `tls` | `edge.listen.tls` set |
 | `ws` | `public.bind:edge.listen.ws` | `edge.listen.ws` set |
 | `wss` | `public.bind:edge.listen.wss`, certificate from the top-level `tls` | `edge.listen.wss` set |
 | `udp-private` | `private.ip:5060` (`config.PrivateSIPPort`; not configurable) | always |
@@ -301,7 +303,7 @@ sipgo pools a UDP listener only inside `ServeUDP`, on that goroutine, and a
 request pinned to the listener's address before then (every forward, §7.8)
 misses the pool, so sipgo binds a second socket on the same address and fails
 with "address already in use", a 503 to the first callers after a restart.
-WS/WSS listeners need no wait, since nothing is sent pinned to them. A serve
+Stream listeners (tcp, tls, ws, wss) need no wait, since nothing is sent pinned to them. A serve
 error or the timeout during that wait makes `Run` return it. Only then does
 the unexported `ready` channel close (`edge.go:485`), so `ready` means every
 socket can both receive and send. Nothing in production waits on it; it is
@@ -374,7 +376,7 @@ Every top-level section is restart-only except `shield`. The table is
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`shield.go:123`), re-parsing a rate-limit string only when it changes (`shield.go:228`) | `public` (`ip`, `bind`) |
 | | `private` (`ip`) |
 | | `rtp` (the media pools read the range from `boot`, `mediapool.go:19`) |
-| | `tls` (certificates are loaded at bind: WSS in `openListener`, `edge.go:671-675`; the admin in `admin.Server.Run`) |
+| | `tls` (certificates are loaded at bind: TLS and WSS in `openListener`; the admin in `admin.Server.Run`) |
 | | `edge.switch` |
 | | `edge.switch_carrier_port` |
 | | `edge.listen` |
@@ -644,25 +646,41 @@ a carrier (§6).
 
 | Side | Transports | Trust |
 |---|---|---|
-| Public | `udp`, `ws`, `wss` (no TCP, no SIP-over-TLS), each on `public.bind` and the port set by `edge.listen` | untrusted; full shield treatment |
+| Public | `udp`, `tcp`, `tls`, `ws`, `wss`, each on `public.bind` and the port set by `edge.listen` | untrusted; full shield treatment |
 | Private | `udp` only, the one fixed socket `private.ip:5060` (`config.PrivateSIPPort`) | trusted; exempt from the shield |
 
 `side` carries `plane`, `transport`, advertised IP and port, and `laddr` —
 the pinned local socket address, set for UDP sides only
-(`internal/edge/topology.go:45`). A WebSocket is inbound-only, so its
-outbound path is the client's own pooled connection and `laddr` stays zero.
+(`internal/edge/topology.go:45`). A tcp, tls, ws or wss client is
+inbound-only, so its outbound path is the client's own pooled connection and
+`laddr` stays zero. FreeSBC never dials a client: `requireFlow`
+(`forward.go`) fails a request toward a stream client whose connection is not
+in sipgo's pool, because sipgo would otherwise dial the destination (RFC 5626
+§5.3: a NAT'd client has no dialable address). `side.uri()` and
+`side.recordRoute()` carry `;transport=tcp|tls|ws|wss`, and `side.via()`
+names the transport (`SIP/2.0/TLS`), so a leg's Via, Record-Route and Contact
+describe the transport it uses; the double Record-Route covers a transport
+change between legs. The Request-URI toward a TLS client is `sip:` with
+`;transport=tls`, not `sips:`, since `sips:` would require TLS on the
+switch leg as well.
 `side.via(branch)` adds an empty `rport` parameter on **UDP only** (RFC
 3581). `side.recordRoute()` always carries `lr`.
 
 **Read filter** (`fsip.ReadFilter(fsip.MaxReadSize, accept)`, wrapped by
-`Server.readFilter`, `internal/edge/edge.go:757`): a read larger than
-**24 KiB** is dropped before the parser. The cap sits below sipgo's 32 KiB
+`Server.readFilter`, `internal/edge/edge.go:757`): a UDP datagram or
+WebSocket frame larger than **24 KiB** is dropped before the parser. The cap
+does not apply to a tcp or tls read (`fsip.IsByteStream`): there a read is an
+arbitrary chunk of the byte stream, so a message may arrive split over several
+reads or several to one, and dropping a chunk would desynchronise sipgo's
+stream parser. The stream connection bounds the message instead (§7.1a). The cap sits below sipgo's 32 KiB
 read buffer (`TransportBufferReadSize`), which bounds every read, so it can
 fire: an oversized datagram or WebSocket frame arrives truncated to 32 KiB
 and is dropped here rather than parsed as a partial message
 (`internal/sip/readfilter.go:5-20`). The edge has two kinds of socket, told
 apart by the **local** address of the read (`fsip.SameListener` against the
-private socket; a WS/WSS read on the same port number is a public read):
+private socket; a TCP, TLS or WS/WSS read on the same port number is a
+public read, which is what lets `edge.listen.tcp` sit on 5060 beside the
+private UDP socket):
 
 - The **private socket** (`private.ip:5060`, UDP): trusted. Only a switch
   IP (`topology.fromUpstream`, any `edge.switch` node's IP) may speak on it;
@@ -674,12 +692,12 @@ private socket; a WS/WSS read on the same port number is a public read):
   with a spoofed switch source (issue #90). The filter is a no-op off Linux
   and reads `skb->dev->ifindex`, so VRF, asymmetric routing, tunnels and a
   runtime interface change are dropped (docs/edge.md).
-- Every **public listener** (UDP, WS, WSS): accepted unless the source is
+- Every **public listener** (UDP, TCP, TLS, WS, WSS): accepted unless the source is
   banned (`shield.Shield.BannedFrom(addr:port, transport)`, the read-only,
   non-counting query that also matches a UDP per-socket ban; a banned stream
   source has its connection closed on that read) or its rate-limit bucket is
-  empty (`shield.Shield.AllowRate`, one token per datagram or WS/WSS frame,
-  see below). The public plane has no
+  empty (`shield.Shield.AllowRate`, one token per datagram or WS/WSS frame; a
+  tcp/tls connection is charged per message it starts, §7.1a, see below). The public plane has no
   source allowlist — phones, browsers and carriers have no single fixed
   address, and the filter cannot tell a request from a response. There is
   **no switch exemption**: the switch does not use a public listener, so a
@@ -765,7 +783,9 @@ The same filter charges the **rate limit**, before parsing:
 for every public read, and an empty bucket drops the read silently and counts
 it as `freesbc_shield_drops_total{reason="rate"}`. sipgo calls the filter once
 per UDP datagram and once per WS/WSS frame (`Read` returns one frame per call,
-`transport_ws.go`), so a read costs the same as a message. The charge sits
+`transport_ws.go`), so a read costs the same as a message. A tcp or tls read
+is a chunk, and an empty bucket cannot drop one without desynchronising the
+stream, so those are charged by the connection instead (§7.1a). The charge sits
 here, not in `guard`, so a malformed flood cannot reach the parser for free
 (issue #133); `guard` charges nothing, so a parsable request costs exactly one
 token end to end. A response read (a carrier's or a client's reply) and a
@@ -819,6 +839,68 @@ refused **503** before anything is allocated. Carrier sources are exempt
 (`shield.carrier_rate_limit` bounds them instead). The count is per IP so a flood spread over many source ports is
 bounded too, and the slot is released when the INVITE handler returns
 (answered or not).
+
+### 7.1a Stream connections
+
+`internal/edge/stream.go`. sipgo's tcp, tls, ws and wss transports accept
+every connection and read it for ever: no cap, no deadline, and for ws/wss the
+TLS handshake and the HTTP upgrade run inline in the serial accept loop, where
+one stalled client blocks every later one. The edge therefore hands sipgo its
+own listener (`streamListener`) and bounds every stream transport the same way.
+
+- **Accept.** A goroutine accepts raw connections and prepares each on its own
+  goroutine; only a ready connection reaches sipgo's `Accept`. Preparation
+  refuses (silently, by closing; counted in
+  `freesbc_edge_stream_refused_total{reason}`) a banned source (`banned`), a
+  connection over `streamMaxConnsPerIP` (256, an IPv6 source by its /64,
+  `ip_cap`) or `streamMaxConns` (10000, `global_cap`), and a source out of
+  rate tokens (`rate`: a connection costs the source one `shield.rate_limit`
+  or `carrier_rate_limit` token, so a flood of connections or TLS handshakes
+  meets the same budget as a flood of requests). It then completes the TLS
+  handshake (tls, wss) and, for ws/wss, receives the whole HTTP upgrade
+  request, each within `streamHandshakeTimeout` (10 s); a failure is
+  `closed{handshake}`.
+- **Message bounds.** `streamConn.Read` feeds the bytes to a framer that only
+  follows message boundaries: for SIP (`sipFramer`) the header block up to the
+  empty line and `Content-Length` (or `l:`) bytes of body, with CRLFs between
+  messages as RFC 5626 keep-alives; for WebSocket (`wsFramer`) the upgrade
+  request and then the frame lengths. A message over `fsip.MaxReadSize`
+  (24 KiB; a header block with no end, a larger `Content-Length`, a frame
+  payload over it) closes the connection (`closed{oversize}`), as do a
+  `Content-Length` that is not a number or two that disagree (`malformed`).
+  Each message that starts costs a rate token, as does each keep-alive read;
+  an empty bucket closes the connection (`closed{rate}`) rather than dropping
+  a chunk. The framer never parses SIP: sipgo's parser still parses.
+- **Deadlines.** The read deadline is set before each read. While a message is
+  arriving it is `streamMessageTimeout` (15 s) from the message's first byte,
+  not reset by later bytes, so a client trickling a header cannot hold the
+  connection (`closed{slow}`). Between messages it is `streamIdleTimeout`
+  (60 s); when it expires the connection is closed (`closed{idle}`) unless it
+  is in use (`streamBusy`): a live registration binding made over it
+  (`Location.HasSource`), a dialog routed to it (`dialogTable.usesRemote`), or
+  a carrier source. An in-use connection is re-armed and lives as long as the
+  binding or dialog, so a phone refreshing its registration every few minutes
+  keeps its connection and a registered flow is never reaped for being quiet.
+  Every write has a `streamWriteTimeout` (10 s) deadline, so a client that
+  stops reading cannot pin a transaction goroutine. A policy close returns
+  `io.EOF` to sipgo, which logs it at Debug.
+- **Close.** `streamConn.Close` runs once: it frees the connection's slot and
+  calls `Location.RemoveBySource(remote)`, which drops the bindings made over
+  it (and their subscriptions, through the `Location` removal hook). A
+  REGISTER over a new connection from the same device (same AoR and Call-ID)
+  re-indexes the existing binding under the new source, so the old
+  connection closing afterwards removes nothing.
+- **Keep-alive.** sipgo answers a double CRLF with a single CRLF on tcp and tls
+  (`transport_tcp.go`, after the read filter) and ignores a single CRLF. The
+  framer sees these as keep-alives, not messages, and a CRLF-only read is
+  never a parse failure.
+- **Metrics.** `freesbc_edge_stream_connections{transport}` (gauge),
+  `freesbc_edge_stream_refused_total{reason}` and
+  `freesbc_edge_stream_closed_total{reason}`; every label is always exported.
+
+Known sipgo behaviour: the pool also keys an accepted connection by the
+listener's own address, and a policy close followed by sipgo's own close logs
+sipgo's `TCP ref went negative` at Warn (harmless, as for UDP).
 
 ### 7.2 Topology snapshot
 
@@ -1013,13 +1095,15 @@ table refuses a new binding (`ErrTooManyBindings`).
 
 `Binding.Source` is the **transport source of the REGISTER**, never the
 Contact host: the far side of the client's NAT pinhole for UDP, and the
-pooled connection key for WS/WSS. A browser's own Contact typically names a
-`.invalid` host, which is exactly why it is replaced.
+pooled connection key for TCP/TLS/WS/WSS. A browser's own Contact typically
+names a `.invalid` host, which is exactly why it is replaced; a TCP or TLS
+phone's Contact is likewise never dialed.
 
-On WebSocket close, `watchConnections` calls `Location.RemoveBySource(ap)`
-and updates the registration gauge: a WebSocket registration is reachable
-only through its own connection, so keeping the binding would make FreeSBC
-accept calls it cannot deliver.
+On the close of a stream connection, `streamConn.Close` calls
+`Location.RemoveBySource(ap)` and updates the registration gauge: a stream
+registration is reachable only through its own connection (RFC 5626 flow
+semantics), so keeping the binding would make FreeSBC accept calls it cannot
+deliver.
 
 ### 7.5 INVITE classification
 
@@ -2660,12 +2744,15 @@ sequenceDiagram
 The switch cooldown is cleared on **any** final response; the series ends on
 any final. `logRegister` records the outcome without any credential.
 
-### 9.2 WebSocket REGISTER
+### 9.2 WebSocket REGISTER (and TCP/TLS)
+
+The same sequence holds for a SIP/TCP or SIP/TLS phone, with `Binding.Transport`
+`tcp` or `tls` and no upgrade step.
 
 ```mermaid
 sequenceDiagram
     participant B as Browser (WSS)
-    participant L as edge wss listener (closeNotifyListener)
+    participant L as edge wss listener (streamListener)
     participant G as onRegister
     participant FS as Switch
 
@@ -2676,11 +2763,11 @@ sequenceDiagram
     G-->>B: 200 OK (the .invalid Contact restored, expires=granted)
     Note over G: Binding.Source = the WebSocket's remote addr and port, Binding.Transport = "wss"
     B--xL: WebSocket closes
-    L->>G: closeNotifyConn -> Location.RemoveBySource(addr:port)
+    L->>G: streamConn.Close -> Location.RemoveBySource(addr:port)
     Note over G: metrics.SetRegistrations(loc.Count())
 ```
 
-`side.laddr` is zero for ws/wss, so outbound requests toward this client ride
+`side.laddr` is zero for tcp/tls/ws/wss, so outbound requests toward this client ride
 the client's own pooled inbound connection; no `rport` is added on a WS Via.
 
 ### 9.3 WebRTC browser → switch, through the edge plane
@@ -3010,7 +3097,7 @@ The topology is two addresses, each written once (`docs/config.md`).
 
 - **Public side.** Every public socket binds `public.bind` (default
   `public.ip`; it differs only behind 1:1 NAT, where `public.ip` is not a
-  local address). Listeners are `udp`, `ws` and `wss` on the ports of
+  local address). Listeners are `udp`, `tcp`, `tls`, `ws` and `wss` on the ports of
   `edge.listen` (`edge.go:307-318`). Everything advertised to phones,
   browsers and carriers (Via, Contact, Record-Route, SDP `c=`) names
   `public.ip` and the port the listener bound: there is deliberately no
@@ -3089,7 +3176,7 @@ own firewall in front of FreeSBC.
 
 | Surface | Certificate | Minimum version | Client auth |
 |---|---|---|---|
-| Edge `wss` listener | top-level `tls.cert`/`tls.key`, loaded when the listener binds (`edge.go:619-624`); `check` requires `tls` whenever `edge.listen.wss` is set | TLS 1.2 | — |
+| Edge `tls` and `wss` listeners | top-level `tls.cert`/`tls.key`, loaded when the listener binds (`openListener`); `check` requires `tls` whenever `edge.listen.tls` or `edge.listen.wss` is set | TLS 1.2 | — |
 | Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:162-181`); a loopback admin serves plain HTTP | TLS 1.2 | — |
 | WebRTC DTLS | one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity, `media/dtlscert.go:36-87`), created when `edge.listen.ws` or `wss` is set | — | `RequireAnyClientCert` (`webrtcleg.go:539`), so there is always something to fingerprint |
 
@@ -3122,7 +3209,7 @@ self-signed certificate.
 | Switch pool members share one registration database, and a carrier registration and its calls stay on the registering node | **Assumed** for client registrations: after a failover the new node re-challenges and the phone's answer is valid there too (one extra round trip), and the pool is hashed, so changing the node set reshuffles users. **Enforced** for carrier registrations: a request with a live token goes to the registering node only |
 | RTP/RTCP ranges reachable end to end | **Assumed** |
 | IP fragmentation survives the path | **Assumed** |
-| Edge ws/wss listeners are resource-capped | **Not enforced** — there is no connection cap or idle timeout |
+| Edge stream listeners (tcp, tls, ws, wss) are resource-capped | **Enforced** by constants: connection caps per source and in all, handshake, message and idle timeouts (§7.1a). The process file-descriptor limit is **assumed** to exceed the 10000-connection cap plus the RTP ports |
 | Changing a restart-only setting needs a restart | **Warned**: a reload that changes any restart-only key is still published, with a warning listing the keys (`config.RestartOnlyChanges`); the running planes keep their startup values |
 
 ---
@@ -3165,6 +3252,9 @@ permanent series per call."
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
 | `freesbc_sip_handler_panics_total` | Counter | — | edge `guard`, one per recovered handler panic |
 | `freesbc_sip_parse_failures_total` | Counter | `transport` ∈ {`UDP`, `TCP`, `TLS`, `WS`, `WSS`, `OTHER`} | edge `sipgoHandler` (`sipgolog.go`), one per read sipgo's parser rejected; every transport is always exported |
+| `freesbc_edge_stream_connections` | Gauge | `transport` ∈ {`tcp`, `tls`, `ws`, `wss`} | open public stream connections, moved by `streamConn` open and close (§7.1a); every transport is always exported |
+| `freesbc_edge_stream_refused_total` | Counter | `reason` ∈ {`global_cap`, `ip_cap`, `banned`, `rate`} | connections refused at accept (§7.1a); every reason is always exported |
+| `freesbc_edge_stream_closed_total` | Counter | `reason` ∈ {`idle`, `slow`, `oversize`, `malformed`, `handshake`, `rate`} | connections closed by stream policy (§7.1a); every reason is always exported |
 | `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`} | edge `dropSilently` (`admission.go:141`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a); every reason is always exported |
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`} | edge `dialog.end` (`dialog.go:1144`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`} | edge `rejectInvite` / `rejectBusy` (`invite.go:145`, `invite.go:179`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
@@ -3212,7 +3302,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 |---|---|---|---|
 | `/healthz` | any | **none** | `{"status":"ok"}` |
 | `/metrics` | any | Basic | Prometheus text |
-| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
+| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
@@ -3504,7 +3594,7 @@ fetch metadata, neither header) gets **403**. Browsers always send `Origin`
 on a same-origin `POST`, so the WebUI needs nothing; a script calling
 `POST /api/config/validate` must send a matching `Origin` header.
 
-**Transport security.** TLS 1.2 minimum on every TLS surface (`wss` and the
+**Transport security.** TLS 1.2 minimum on every TLS surface (`tls`, `wss` and the
 admin listener). Both use the one top-level `tls` identity; there is no client
 certificate verification.
 
@@ -3600,7 +3690,11 @@ be used to read an environment variable.
   API only reads it.
 - The media plane has **no application-layer rate limiting**; its security is
   latch semantics plus SRTP authentication.
-- The edge's ws/wss listeners have **no connection cap and no idle timeout**.
+- A stream connection with a live registration binding, a routed dialog or a
+  carrier source is never closed for being idle (§7.1a); a registered client
+  that goes silent keeps its connection, a descriptor and a goroutine until its
+  binding expires or the connection fails. The per-source cap (256) is shared
+  by everything behind one NAT address.
 - There is **no operator unban**: a ban lapses only on expiry (`shield.ban`, or
   1 min for a UDP socket ban) or with a restart.
 - Strict-mode latch arming compares the **source IP only**; there is no SSRC
@@ -3636,6 +3730,11 @@ code constant.
 | `rtpSilenceTimeout` | 5 min (`edge.go:122`) | media silence; the only automatic reclaim for a confirmed call whose BYE was lost |
 | `switchCooldown` | 30 s (`edge.go:126`) | a switch node that answered nothing is skipped while alternatives exist |
 | `udpServingTimeout` | 5 s (`edge.go:542`) | startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
+| `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, and a ws/wss connection's HTTP upgrade request (§7.1a) |
+| `streamIdleTimeout` | 60 s | a stream connection silent this long and in no use (no binding, dialog or carrier source) is closed; an in-use one is re-armed |
+| `streamMessageTimeout` | 15 s from the message's first byte | one SIP message or WebSocket frame must arrive complete (slow-loris guard) |
+| `streamWriteTimeout` | 10 s | one write to a stream client |
+| `streamMaxConnsPerIP` / `streamMaxConns` | 256 / 10000 | open stream connections per source (an IPv6 /64) and in all |
 | `registerTimeout` | 32 s (`register.go:17`) | one whole REGISTER series, client or carrier |
 | `ackTimeout` | 32 s (`edge.go:249`; Timer H) | an answer owed in an ACK that never arrived: the call is ended with a BYE to both sides (§7.9a) |
 | `sessionCapRetryAfter` | 5 s (`invite.go:152`) | `Retry-After` of a 503 for a full session cap |
@@ -3795,7 +3894,8 @@ Stated because the code establishes them, not as future work.
   switch-node health is entirely passive, and an OPTIONS from the public side
   is answered locally.
 - **No TCP or SIP-over-TLS toward the switch or a carrier.** The private socket
-  and carrier legs are UDP only. Public ws/wss exist for browsers.
+  and carrier legs are UDP only. Public tcp/tls serve registered phones and
+  ws/wss serve browsers.
 - **No DNS toward the switch.** `edge.switch` entries are literal `IP:port`.
   DNS (SRV, then A/AAAA) exists only for `edge.carriers`, on the public side.
 - **No Via-based loop detection** (RFC 3261 §16.3); the only loop protection

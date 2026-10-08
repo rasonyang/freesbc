@@ -362,7 +362,7 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1, s.teardownOpts(from)...)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.client.TransactionRequest(ctx, bye, noBuild)
+	clTx, err := s.clientTx(ctx, bye)
 	if err != nil {
 		s.log.Debug("bye unanchorable dialog", "err", err)
 		return
@@ -378,7 +378,7 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 // ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself.
 func (s *Server) ack2xx(res *sip.Response, from side) bool {
 	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res), s.teardownOpts(from)...)
-	if err := s.client.WriteRequest(ack, noBuild); err != nil {
+	if err := s.writeRequest(ack); err != nil {
 		s.log.Debug("ack unanchorable answer", "err", err)
 		return false
 	}
@@ -467,7 +467,7 @@ func (s *Server) sendCancel(a *inviteAttempt) {
 	cancelReq := fsip.BuildCancel(a.req)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.client.TransactionRequest(ctx, cancelReq, noBuild)
+	clTx, err := s.clientTx(ctx, cancelReq)
 	a.cancel()
 	if err != nil {
 		s.log.Debug("forward CANCEL", "err", err, "sip_call_id", fsip.CallID(a.req))

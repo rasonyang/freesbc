@@ -255,7 +255,7 @@ func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, 
 // respPlain and nil.
 func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
 	mode respHide, adapt func(out *sip.Response) error) (*sip.Response, error) {
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: forward %s: %w", out.Method, err)
 	}
@@ -286,4 +286,52 @@ func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.S
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// errNoFlow reports a request for a client reachable only over a stream
+// connection (tcp, tls, ws, wss) that is no longer there.
+var errNoFlow = errors.New("proxy: no connection to the client")
+
+// requireFlow refuses to send a request over a stream transport when the
+// connection to its destination is not in sipgo's pool.
+//
+// A client on a stream transport is reachable only through the connection
+// it opened: it is usually behind NAT, its Contact is no address to dial,
+// and RFC 5626 §5.3 says a request for it uses its flow. sipgo, when the
+// pool has no connection, dials the destination instead. That must never
+// happen toward a client, so the request fails here and the caller answers
+// as for any transport failure (480 or 408 to an INVITE, nothing sent for
+// the rest).
+//
+// FreeSBC dials no stream connection today. Carrier TCP and TLS, which will,
+// are sent by their own path and need no flow.
+func (s *Server) requireFlow(req *sip.Request) error {
+	network := sip.NetworkToLower(req.Transport())
+	if streamIndex(network) < 0 {
+		return nil
+	}
+	c, err := s.srv.TransportLayer().GetConnection(network, req.Destination())
+	if err != nil || c == nil {
+		return errNoFlow
+	}
+	_, _ = c.TryClose() // GetConnection took a reference; hand it back
+	return nil
+}
+
+// clientTx starts a client transaction for a request FreeSBC built itself
+// (noBuild), after requireFlow.
+func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+	if err := s.requireFlow(req); err != nil {
+		return nil, err
+	}
+	return s.client.TransactionRequest(ctx, req, noBuild)
+}
+
+// writeRequest sends a request outside any transaction (an ACK), after
+// requireFlow.
+func (s *Server) writeRequest(req *sip.Request) error {
+	if err := s.requireFlow(req); err != nil {
+		return err
+	}
+	return s.client.WriteRequest(req, noBuild)
 }

@@ -98,6 +98,9 @@ func (c *Config) validateTLS(fail failFunc) {
 		}
 		return
 	}
+	if c.Edge.Listen.TLS != 0 {
+		fail("tls: required by edge.listen.tls")
+	}
 	if c.Edge.Listen.WSS != 0 {
 		fail("tls: required by edge.listen.wss (browsers refuse an untrusted WSS certificate)")
 	}
@@ -138,14 +141,28 @@ func (c *Config) validateEdge(fail failFunc) {
 	}
 
 	l := e.Listen
-	if l.UDP == 0 && l.WS == 0 && l.WSS == 0 {
-		fail("edge.listen: at least one of udp, ws, wss required")
+	if l.UDP == 0 && l.TCP == 0 && l.TLS == 0 && l.WS == 0 && l.WSS == 0 {
+		fail("edge.listen: at least one of udp, tcp, tls, ws, wss required")
 	}
 	checkPort(fail, "edge.listen.udp", l.UDP)
+	checkPort(fail, "edge.listen.tcp", l.TCP)
+	checkPort(fail, "edge.listen.tls", l.TLS)
 	checkPort(fail, "edge.listen.ws", l.WS)
 	checkPort(fail, "edge.listen.wss", l.WSS)
-	if l.WS != 0 && l.WS == l.WSS {
-		fail("edge.listen.wss: port %d already used by edge.listen.ws", l.WSS)
+	// tcp, tls, ws and wss are all TCP sockets on public.bind, so no two may
+	// share a port. udp is its own port space and may share one with tcp
+	// (SIP's usual 5060).
+	streams := [...]struct {
+		key  string
+		port int
+	}{{"edge.listen.tcp", l.TCP}, {"edge.listen.tls", l.TLS}, {"edge.listen.ws", l.WS}, {"edge.listen.wss", l.WSS}}
+	for i := range streams {
+		for j := 0; j < i; j++ {
+			if streams[i].port != 0 && streams[i].port == streams[j].port {
+				fail("%s: port %d already used by %s", streams[i].key, streams[i].port, streams[j].key)
+				break
+			}
+		}
 	}
 
 	e.carrierNets = nil
@@ -343,7 +360,7 @@ func (c *Config) validateAdmin(fail failFunc) {
 // validateSockets rejects two listeners that would bind the same socket:
 // `run` would fail with "address already in use", so `check` must too. The
 // public UDP and TCP ports are separate namespaces; the admin API shares
-// the TCP one with ws/wss when it binds the same address.
+// the TCP one with tcp/tls/ws/wss when it binds the same address.
 func (c *Config) validateSockets(fail failFunc) {
 	if c.Admin == nil {
 		return
@@ -356,7 +373,8 @@ func (c *Config) validateSockets(fail failFunc) {
 	for _, l := range []struct {
 		key  string
 		port int
-	}{{"edge.listen.ws", c.Edge.Listen.WS}, {"edge.listen.wss", c.Edge.Listen.WSS}} {
+	}{{"edge.listen.tcp", c.Edge.Listen.TCP}, {"edge.listen.tls", c.Edge.Listen.TLS},
+		{"edge.listen.ws", c.Edge.Listen.WS}, {"edge.listen.wss", c.Edge.Listen.WSS}} {
 		if l.port != 0 && l.port == int(ap.Port()) && hostsCollide(bind, ap.Addr().String()) {
 			fail("admin.listen: tcp/%s already bound by %s", c.Admin.Listen, l.key)
 		}

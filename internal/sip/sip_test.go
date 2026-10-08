@@ -289,6 +289,34 @@ func TestReadFilter(t *testing.T) {
 	}
 }
 
+// A stream read is a chunk of a byte stream, not a message: dropping an
+// "oversized" one would desynchronise every message after it, so the size cap
+// does not apply to tcp and tls. The accept policy still does, and the cap
+// still applies to datagrams and WebSocket frames.
+func TestReadFilterDoesNotCapByteStreams(t *testing.T) {
+	data := make([]byte, 100)
+	f := ReadFilter(50, nil)
+	for _, tr := range []string{"TCP", "tls", "Tcp"} {
+		if got, err := f(sip.TransportReadProps{Transport: tr}, data); err != nil || len(got) != len(data) {
+			t.Errorf("%s read over the cap: len %d, %v; want it passed whole", tr, len(got), err)
+		}
+	}
+	for _, tr := range []string{"UDP", "WS", "WSS", ""} {
+		if got, err := f(sip.TransportReadProps{Transport: tr}, data); err != nil || got != nil {
+			t.Errorf("%q read over the cap: len %d, %v; want dropped", tr, len(got), err)
+		}
+	}
+	deny := ReadFilter(50, func(sip.TransportReadProps) bool { return false })
+	if got, _ := deny(sip.TransportReadProps{Transport: "TCP"}, data); got != nil {
+		t.Error("the accept policy must still apply to a stream read")
+	}
+	for tr, want := range map[string]bool{"tcp": true, "TLS": true, "ws": false, "wss": false, "udp": false} {
+		if IsByteStream(tr) != want {
+			t.Errorf("IsByteStream(%q) = %v", tr, !want)
+		}
+	}
+}
+
 // audit: P2-SIP-002
 // The cap planes use must be reachable: sipgo reads into a buffer of
 // TransportBufferReadSize bytes, so a cap at or above it never fires. A

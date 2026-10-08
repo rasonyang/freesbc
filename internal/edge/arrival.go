@@ -17,7 +17,7 @@ import (
 type arrival uint8
 
 const (
-	// arrPublic is every read on a public listener (UDP, WS, WSS), and any
+	// arrPublic is every read on a public listener (UDP, TCP, TLS, WS, WSS), and any
 	// request that carries no valid arrival marker. Nothing about the source
 	// address can promote it: a spoofed or forged request is public.
 	arrPublic arrival = iota

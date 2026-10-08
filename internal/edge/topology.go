@@ -1,5 +1,6 @@
 // Package edge implements FreeSBC's edge plane: a stateful SIP proxy
-// between public clients (SIP/UDP phones and sip.js browsers over WS/WSS)
+// between public clients (SIP/UDP, SIP/TCP and SIP/TLS phones and sip.js
+// browsers over WS/WSS)
 // and one upstream FreeSWITCH, with every media stream anchored through
 // the SBC — plain RTP for phones, DTLS-SRTP for browsers.
 //
@@ -44,14 +45,15 @@ const (
 // the far side does not recognise.
 type side struct {
 	plane     plane
-	transport string // "udp", "ws" or "wss"
+	transport string // "udp", "tcp", "tls", "ws" or "wss"
 	advIP     netip.Addr
 	advPort   int
 	// laddr pins the outbound socket (see sipgo
 	// TransportLayer.ClientRequestConnection: a request whose Laddr names
 	// a bound listener reuses that listener's connection). It is left zero
-	// for ws/wss, where the connection is found by the client's remote
-	// address instead — a WebSocket is inbound-only, so there is exactly
+	// for tcp/tls/ws/wss, where the connection is found by the client's
+	// remote address instead — a stream connection is inbound-only (FreeSBC
+	// never dials a client, RFC 5626 flow semantics), so there is exactly
 	// one connection per client and it is already in the pool.
 	laddr sip.Addr
 }
@@ -181,7 +183,8 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 	for _, l := range []struct {
 		transport string
 		port      int
-	}{{"udp", cfg.Edge.Listen.UDP}, {"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
+	}{{"udp", cfg.Edge.Listen.UDP}, {"tcp", cfg.Edge.Listen.TCP}, {"tls", cfg.Edge.Listen.TLS},
+		{"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
 		if l.port == 0 {
 			continue
 		}
