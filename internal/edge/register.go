@@ -139,7 +139,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 		// this Request-URI), so changing it would break every authenticated
 		// REGISTER.
 
-		clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+		clTx, err := s.clientTx(ctx, out)
 		if err != nil {
 			s.log.Warn("forward REGISTER upstream", "err", err, "aor", aor,
 				"upstream", name, "attempt", attempt+1)

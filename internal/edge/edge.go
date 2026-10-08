@@ -3,7 +3,7 @@ package edge
 import (
 	"context"
 	"crypto/tls"
-	"errors"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
@@ -48,6 +48,11 @@ type Server struct {
 	// Both are written once in New.
 	carriers    *carrierDirectory
 	carrierURIs map[string]string
+	// carrierByName holds each edge.carriers entry; carrierConns dials and
+	// pools the tcp and tls connections to them (carrierconn.go). Both are
+	// written once in New.
+	carrierByName map[string]config.Carrier
+	carrierConns  *carrierConns
 
 	// carrierRegs holds the switch's live registrations at carriers
 	// (carrierreg.go), by token. Separate from loc, the client table.
@@ -121,6 +126,12 @@ type Server struct {
 	// reason; enumLimit is the REGISTER enumeration limit (admission.go).
 	dropWarned *warnOnce
 	enumLimit  *enumLimiter
+
+	// streams counts open tcp/tls/ws/wss connections for the caps; streamLim
+	// is the bounds they live under (stream.go). Tests shorten streamLim
+	// before Run.
+	streams   *streamTable
+	streamLim streamLimits
 }
 
 const (
@@ -205,7 +216,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		store:            store,
 		boot:             cfg,
 		privAddr:         priv,
-		log:              log.With("component", "proxy"),
+		log:              slog.New(newRedactHandler(log.Handler())).With("component", "proxy"),
 		topo:             topo,
 		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
 		carrierURIs:      carrierURIsOf(cfg),
@@ -220,6 +231,15 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		enumLimit:        newEnumLimiter(),
 		inviteLimiter:    shield.NewLimiter(),
 		webrtcEnabled:    cfg.WebRTC(),
+		streams:          newStreamTable(),
+		streamLim:        defaultStreamLimits(),
+	}
+	s.carrierByName = map[string]config.Carrier{}
+	for _, c := range cfg.CarrierList() {
+		s.carrierByName[c.Name] = c
+	}
+	if s.carrierConns, err = newCarrierConns(s, cfg); err != nil {
+		return nil, err
 	}
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
 	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
@@ -313,7 +333,7 @@ type bound struct {
 	addr      string
 }
 
-// publicListeners is the public socket set, udp then ws then wss, on
+// publicListeners is the public socket set, udp, tcp, tls, ws then wss, on
 // public.bind.
 func (s *Server) publicListeners() []bound {
 	bind := s.boot.PublicBind()
@@ -321,7 +341,8 @@ func (s *Server) publicListeners() []bound {
 	for _, l := range []struct {
 		transport string
 		port      int
-	}{{"udp", s.boot.Edge.Listen.UDP}, {"ws", s.boot.Edge.Listen.WS}, {"wss", s.boot.Edge.Listen.WSS}} {
+	}{{"udp", s.boot.Edge.Listen.UDP}, {"tcp", s.boot.Edge.Listen.TCP}, {"tls", s.boot.Edge.Listen.TLS},
+		{"ws", s.boot.Edge.Listen.WS}, {"wss", s.boot.Edge.Listen.WSS}} {
 		if l.port != 0 {
 			out = append(out, bound{l.transport, netip.AddrPortFrom(bind, uint16(l.port)).String()})
 		}
@@ -397,6 +418,11 @@ func (s *Server) Run(ctx context.Context) error {
 			sip.WithTransportLayerReadFilter(s.readFilter()),
 		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
+		// sipgo never dials a TLS connection to a carrier (carrierconn.go
+		// does, with the carrier's own settings). Should it ever try, in a
+		// race with a connection that just closed, an empty root set makes
+		// the handshake fail closed.
+		sipgo.WithUserAgenTLSConfig(&tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}),
 	)
 	if err != nil {
 		return fmt.Errorf("proxy: sipgo ua: %w", err)
@@ -457,6 +483,9 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		opened = append(opened, ln)
 	}
+	// The connections FreeSBC dials to tcp and tls carriers enter sipgo
+	// through listeners of their own (carrierconn.go).
+	opened = append(opened, s.carrierConns.listeners()...)
 
 	errs := make(chan error, len(opened))
 	var wg sync.WaitGroup
@@ -485,7 +514,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.log.Info("edge proxy listening",
-		"public_listeners", len(s.topo.public),
+		"public_listeners", len(s.publicListeners()),
 		"private", s.privAddr.String(),
 		"switches", len(s.topo.upstreamNames),
 		"switch_nodes", strings.Join(s.topo.upstreamNames, ","),
@@ -601,7 +630,7 @@ type listener struct {
 	transport string
 	addr      string
 	packet    net.PacketConn // udp
-	stream    net.Listener   // ws / wss
+	stream    net.Listener   // tcp / tls / ws / wss (a *streamListener)
 }
 
 func (l listener) Describe() string { return l.transport + "://" + l.addr }
@@ -627,6 +656,10 @@ func (l listener) Serve(tl *sip.TransportLayer) error {
 	switch l.transport {
 	case "udp", "udp-private":
 		return tl.ServeUDP(l.packet)
+	case "tcp":
+		return tl.ServeTCP(l.stream)
+	case "tls":
+		return tl.ServeTLS(l.stream)
 	case "ws":
 		return tl.ServeWS(l.stream)
 	case "wss":
@@ -676,89 +709,41 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		}
 		l.packet = pc
 		return l, nil
-	case "ws":
+	case "tcp", "ws":
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return l, err
 		}
-		l.stream = s.watchConnections(ln)
+		l.stream = s.newStreamListener(ln, transport, nil)
 		return l, nil
-	case "wss":
-		// validate guarantees tls is set whenever wss is.
+	case "tls", "wss":
+		// validate guarantees tls is set whenever tls or wss is.
 		if s.boot.TLS == nil {
-			return l, errors.New("wss needs the top-level tls cert and key")
+			return l, fmt.Errorf("%s needs the top-level tls cert and key", transport)
 		}
 		cert, err := tls.LoadX509KeyPair(s.boot.TLS.Cert, s.boot.TLS.Key)
 		if err != nil {
-			return l, fmt.Errorf("wss certificate: %w", err)
+			return l, fmt.Errorf("%s certificate: %w", transport, err)
 		}
 		tlsConf := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-		ln, err := tls.Listen("tcp", addr, tlsConf)
+		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return l, err
 		}
-		l.stream = s.watchConnections(ln)
+		l.stream = s.newStreamListener(ln, transport, tlsConf)
 		return l, nil
 	default:
 		return l, fmt.Errorf("unsupported transport %q", transport)
 	}
 }
 
-// watchConnections wraps a WebSocket listener so that when a client's
-// connection closes, the registration bindings made over it are dropped.
-//
-// A WebSocket registration is only reachable through its own connection —
-// there is no address to re-dial. Keeping the binding after the socket is
-// gone would make FreeSBC accept inbound calls it cannot deliver and leak
-// a table entry until the registrar-granted expiry, so spec §3's
-// "connection close" case needs an actual hook. FreeSBC owns these
-// listeners (sipgo is handed the wrapper), which is what makes the hook
-// possible at all.
-func (s *Server) watchConnections(ln net.Listener) net.Listener {
-	return &closeNotifyListener{Listener: ln, onClose: func(remote string) {
-		ap, err := netip.ParseAddrPort(remote)
-		if err != nil {
-			return
-		}
-		if n := s.loc.RemoveBySource(ap); n > 0 {
-			s.metrics.SetRegistrations(s.loc.Count())
-			s.log.Debug("websocket closed; dropped its registration bindings",
-				"public_remote", remote, "count", n)
-		}
-	}}
-}
-
-type closeNotifyListener struct {
-	net.Listener
-	onClose func(remote string)
-}
-
-func (l *closeNotifyListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	return &closeNotifyConn{Conn: c, onClose: l.onClose}, nil
-}
-
-type closeNotifyConn struct {
-	net.Conn
-	onClose func(remote string)
-	once    sync.Once
-}
-
-func (c *closeNotifyConn) Close() error {
-	err := c.Conn.Close()
-	// Once: sipgo's pool may close a connection more than once, and the
-	// hook must not run again after the address has been reused.
-	c.once.Do(func() { c.onClose(c.Conn.RemoteAddr().String()) })
-	return err
-}
-
 // maxMessageSize caps an inbound read before the parser sees it (spec
 // §16): one UDP datagram or one WebSocket frame. It is fsip.MaxReadSize,
 // which sits below sipgo's read buffer so the cap can actually fire; see
-// its comment for why that matters.
+// its comment for why that matters. A tcp or tls read is a chunk of a byte
+// stream, not a message, so it is not capped here: dropping a chunk would
+// corrupt the framing. The stream connection (stream.go) bounds the message
+// instead and closes the connection.
 const maxMessageSize = fsip.MaxReadSize
 
 // readFilter is the transport-layer trust boundary. It runs before the SIP
@@ -818,7 +803,12 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 				// frame, parsable or not: a malformed flood must not reach
 				// the parser (and sipgo's failure log) for free. guard
 				// charges nothing. Over the limit is a silent drop.
-				if !sh.AllowRate(ap.Addr()) {
+				//
+				// A tcp or tls read is a chunk, and dropping one would
+				// desynchronise the stream, so the connection charges
+				// those per message it sees start instead and closes
+				// when the budget is gone (streamConn.observe).
+				if !fsip.IsByteStream(info.Transport) && !sh.AllowRate(ap.Addr()) {
 					return false
 				}
 			}

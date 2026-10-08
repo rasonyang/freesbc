@@ -129,12 +129,29 @@ func (c *client) setAnswer(f func(req *sip.Request, tx sip.ServerTransaction)) {
 	c.answerMu.Unlock()
 }
 
+// newTCPClient and newTLSClient are phones speaking SIP over one outbound
+// TCP or TLS connection, never listening themselves: a phone behind NAT. Its
+// Contact is unreachable (contactURI), so any request to it can only travel
+// over the connection it opened.
+func newTCPClient(t *testing.T) *client {
+	t.Helper()
+	return newClientBase(t, "tcp")
+}
+
+func newTLSClient(t *testing.T) *client {
+	t.Helper()
+	return newClientBase(t, "tls", sipgo.WithUserAgenTLSConfig(&tls.Config{
+		InsecureSkipVerify: true, // test client against a self-signed listener
+		MinVersion:         tls.VersionTLS12,
+	}))
+}
+
 // contactURI is what this client puts in its Contact header. A WebSocket
-// client writes an unreachable ".invalid" host, exactly as sip.js does —
-// which is the whole reason the proxy must rewrite it before FreeSWITCH
-// ever sees it.
+// (or TCP/TLS) client writes an unreachable ".invalid" host, exactly as
+// sip.js does — which is the whole reason the proxy must rewrite it before
+// FreeSWITCH ever sees it.
 func (c *client) contactURI(user string) sip.Uri {
-	if c.transport == "ws" || c.transport == "wss" {
+	if c.transport == "ws" || c.transport == "wss" || c.transport == "tcp" || c.transport == "tls" {
 		params := sip.NewParams()
 		params.Add("transport", c.transport)
 		return sip.Uri{User: user, Host: "abcd1234.invalid", UriParams: params}

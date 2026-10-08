@@ -36,6 +36,18 @@ const (
 	dirOutbound = "outbound" // switch → carrier
 )
 
+// carrierSide is the public side a request to this carrier leaves from and
+// names in its Via, Record-Route and Contact: the side of the carrier's own
+// transport. A udp carrier needs the udp listener (validated); a tcp or tls
+// one has a side even with no listener (buildTopology).
+func (s *Server) carrierSide(name string) (side, bool) {
+	c, ok := s.carrierByName[name]
+	if !ok {
+		return side{}, false
+	}
+	return s.topo.publicSide(c.Transport)
+}
+
 // carrierKey is the canonical "host:port" an edge.carriers entry is
 // matched by: host lower-cased without a trailing dot (a literal IP in
 // canonical form), port defaulting to 5060.
@@ -142,7 +154,7 @@ func (s *Server) carrierFallback(req *sip.Request) (name string, ok bool) {
 	if !ok || s.loc.HasSource(sip.NetworkToLower(req.Transport()), src) {
 		return "", false
 	}
-	return s.carriers.snapshot().carrierFor(src)
+	return s.carriers.snapshot().carrierFor(src, sip.NetworkToLower(req.Transport()))
 }
 
 // stampCarrier adds X-FreeSBC-Carrier to a request forwarded from the
@@ -189,7 +201,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoTarget)
 		return
 	}
-	to, ok := s.topo.publicSide("udp")
+	to, ok := s.carrierSide(carrier)
 	if !ok {
 		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoPublicSide)
 		return
@@ -206,6 +218,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.endUnlessUp()
 	d.setCarrier(carrier)
+	d.setSRTP(s.legSRTPPolicy(carrier, ""))
 
 	// An offerless INVITE is forwarded as it is: the offer is the
 	// carrier's first SDP, built into a private one when it arrives
@@ -264,7 +277,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.untrack()
 
-	clTx, err := s.client.TransactionRequest(ctx, out, noBuild)
+	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)
 		s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
@@ -276,7 +289,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 
 	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeCarrier,
-		calleeRemote: dest, transport: "udp", fromPrivate: true, resp: respToSwitch}
+		calleeRemote: dest, transport: to.transport, fromPrivate: true, resp: respToSwitch}
 	if r := s.pumpInvite(ctx, l); !r.finalised {
 		code, reason := 503, "Service Unavailable"
 		if errors.Is(clTx.Err(), sip.ErrTransactionTimeout) {
@@ -291,7 +304,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 // with the signaling hidden, and the carrier's answer relayed back.
 func (s *Server) optionsToCarrier(req *sip.Request, tx sip.ServerTransaction, carrier string) {
 	dest, ok := s.carrierDest(carrier)
-	pub, pubOK := s.topo.publicSide("udp")
+	pub, pubOK := s.carrierSide(carrier)
 	if !ok || !pubOK {
 		s.reject(req, tx, 503, "Service Unavailable")
 		return

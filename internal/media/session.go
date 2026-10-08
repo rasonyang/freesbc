@@ -250,6 +250,19 @@ func (l *latch) accept(src *net.UDPAddr) bool {
 	return true
 }
 
+// permits reports whether accept would take a packet from src, without
+// latching to it. The SDES path checks it before spending a decrypt on a
+// source the latch refuses anyway, and calls accept only once the packet
+// has authenticated, so a forged packet never moves the latch.
+func (l *latch) permits(src *net.UDPAddr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.rank != rankNone && l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port {
+		return true
+	}
+	return l.rankOf(src) > l.rank
+}
+
 // learningDelayed reports whether a below-exact latch waits LearnDelay
 // before it becomes the destination: the SDP address was installed and is
 // the address the side's SIP came from, so it is plausibly where the
@@ -315,6 +328,9 @@ type Session struct {
 	rtp     [2]*latch
 	rtcp    [2]*latch
 	timeout time.Duration
+
+	// sdes[side] is non-nil once the side is an SDES-SRTP side (sdes.go).
+	sdes [2]atomic.Pointer[sdesLeg]
 
 	lastRx   [2]atomic.Int64 // per sending side: unix nanos of its last genuine packet
 	counters counters

@@ -49,6 +49,7 @@ jobs:
         include:
           - { pkg: ./internal/config, target: FuzzAuditConfigParse }
           - { pkg: ./internal/edge, target: FuzzReadFilter }
+          - { pkg: ./internal/edge, target: FuzzStreamFramer }
           - { pkg: ./internal/media, target: FuzzAuditClassify }
           - { pkg: ./internal/media, target: FuzzAuditDemux }
           - { pkg: ./internal/media, target: FuzzAuditSRTPUnprotect }
@@ -58,6 +59,7 @@ jobs:
           - { pkg: ./internal/sip, target: FuzzAuditSIPMessageHelpers }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditParseBuild }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditBuildNoSentinelLeak }
+          - { pkg: ./internal/sip/sdp, target: FuzzParseCrypto }
     env:
       FUZZTIME: ${{ inputs.fuzz_time || '5m' }}
     steps:

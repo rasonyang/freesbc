@@ -337,7 +337,7 @@ func TestCarrierDNSResolvedSourceAdmitted(t *testing.T) {
 	})
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if name, ok := rig.srv.carriers.snapshot().carrierFor(ap(phone.local)); ok && name == "dns" {
+		if name, ok := rig.srv.carriers.snapshot().carrierFor(ap(phone.local), "udp"); ok && name == "dns" {
 			break
 		}
 		if time.Now().After(deadline) {

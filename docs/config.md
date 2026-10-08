@@ -29,7 +29,7 @@ Principles of the schema:
 | `public` | yes | restart |
 | `private` | yes | restart |
 | `rtp` | no (default `20000-29999`) | restart |
-| `tls` | when `edge.listen.wss` is set or `admin.allow_remote` is true | restart |
+| `tls` | when `edge.listen.tls` or `edge.listen.wss` is set, or `admin.allow_remote` is true | restart |
 | `edge` | yes | restart (every key) |
 | `shield` | no | hot |
 | `admin` | no | restart |
@@ -74,7 +74,7 @@ There is one range and two independent allocators over it, one bound to `public.
 | `cert` | PEM certificate file path. |
 | `key` | PEM private key file path. |
 
-Both must be set when `tls` is present. The section is required when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by `check`.
+Both must be set when `tls` is present. The section is required when `edge.listen.tls` is set, when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by `check`.
 
 The DTLS identity for WebRTC media is a per-process self-signed certificate generated at startup. It is independent of `tls`.
 
@@ -84,8 +84,10 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 |---|---|---|
 | `switch` | required | List of literal `IP:port` (UDP), at least one. |
 | `switch_carrier_port` | `0` (the node's own `switch` port) | `0` or 1-65535. |
-| `listen` | required | At least one of `udp`, `ws`, `wss`. |
-| `carriers` | none | Map of name to `host[:port]`. |
+| `listen` | required | At least one of `udp`, `tcp`, `tls`, `ws`, `wss`. |
+| `carriers` | none | Map of name to `host[:port]`, or to a mapping `{host, transport, ca_file, client_cert, client_key, srtp}`. |
+| `srtp` | `off` | SDES-SRTP policy for registered clients: `off`, `optional` or `required`. |
+| `allow_insecure_sdes` | `false` | Allow SDES on a leg whose signaling is not TLS or WSS. |
 | `carrier_sources` | none | List of IPs or CIDRs. |
 
 #### `edge.switch`
@@ -106,29 +108,59 @@ Ports on `public.bind`; `0` or absent means not enabled; each present value is 1
 
 | Key | Transport |
 |---|---|
-| `udp` | SIP over UDP. Required by `carriers`. |
+| `udp` | SIP over UDP. Required by a `udp` carrier. |
+| `tcp` | SIP over TCP, for registered clients and `tcp` carriers. |
+| `tls` | SIP over TLS, for registered clients and `tls` carriers; needs `tls`. Min TLS 1.2. |
 | `ws` | Plaintext WebSocket, development only. |
 | `wss` | WebSocket over TLS; needs `tls`. |
 
-`ws` and `wss` must differ. Setting either enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux) for WebSocket clients. The public UDP and TCP ports are separate namespaces.
+`tcp`, `tls`, `ws` and `wss` are all TCP sockets on `public.bind`, so no two may share a port. `udp` is a separate port space and may share a number with `tcp` (the usual `5060` for both). Setting `ws` or `wss` enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux) for WebSocket clients; `tcp` and `tls` clients get plain RTP like UDP phones.
+
+A client on a stream transport is reachable only through the connection it opened: FreeSBC never dials a client (RFC 5626 flow semantics), and the binding goes when the connection does. FreeSBC answers the RFC 5626 double-CRLF keep-alive ping with a single CRLF. A carrier on `tcp` or `tls` is the one exception: FreeSBC opens (and reopens) the connection to it, because its address is configured.
+
+Every stream transport (`tcp`, `tls`, `ws`, `wss`) is bounded by constants, not keys (design.md §15.2): at most 256 open connections per source IP (an IPv6 source by its /64) and 10000 in all (connections to and from carriers have their own 1024 pool), a 10 s TLS handshake and WebSocket upgrade, a 15 s bound on one message once its first byte has arrived, a 60 s idle timeout (CRLF keep-alives and WebSocket ping/pong frames do not defer it), and 24 KiB per SIP message. The idle timeout does not apply to a connection with a live registration binding, a dialog or a carrier source. Each new connection costs the source one `shield.rate_limit` token. Open connections and refusals are in `freesbc_edge_stream_connections{transport}`, `freesbc_edge_stream_refused_total{reason}` and `freesbc_edge_stream_closed_total{reason}`. Each connection takes a file descriptor, so raise the process limit (`LimitNOFILE`) above the 10000 cap plus the media ports.
 
 #### `edge.carriers`
 
-An allowlist of the destinations the switch may send carrier traffic to. Each key is a name; each value is `host[:port]`:
+An allowlist of the destinations the switch may send carrier traffic to. Each key is a name; each value is `host[:port]` (a UDP carrier) or a mapping:
+
+```yaml
+carriers:
+  plain: sip.carrier-a.com:5060          # string form: UDP
+  secure:
+    host: sip.carrier-b.com              # same grammar as the string form
+    transport: tls                       # udp (default) | tcp | tls
+    ca_file: /etc/freesbc/carrier-b-ca.pem   # tls only, optional
+    client_cert: /etc/freesbc/client.pem     # tls only; both or neither
+    client_key: /etc/freesbc/client.key
+    srtp: required                       # off (default) | optional | required; needs tls
+```
+
+An unknown key in the mapping is an error. `host` is required. Rules for the mapping and the keys it adds:
 
 - The name matches `[A-Za-z0-9._-]+`. It appears in logs and metrics and is stamped on inbound requests as `X-FreeSBC-Carrier`.
 - `host` is a literal IP or a DNS name (labels of letters, digits and interior hyphens; at most 253 characters). A trailing dot is ignored and the host is lower-cased. An unspecified address is rejected.
-- The port defaults to 5060 (UDP). An IPv6 literal with a port needs brackets: `[2001:db8::1]:5060`.
-- A DNS name without a port is resolved through SRV (`_sip._udp`), then A/AAAA. A DNS name with a port is resolved through A/AAAA only (RFC 3263 §4.2). Resolution happens on the public side only and is cached for 300 s.
+- The port written in `host` is the port the switch's Request-URI must carry and the port FreeSBC dials. Without one, the Request-URI port is taken as 5060 and the dial port is 5060 (5061 for `tls`) unless SRV says otherwise. An IPv6 literal with a port needs brackets: `[2001:db8::1]:5060`.
+- A DNS name without a port is resolved through SRV (`_sip._udp`, `_sip._tcp` or `_sips._tcp` for `transport` udp, tcp, tls), then A/AAAA. A DNS name with a port is resolved through A/AAAA only (RFC 3263 §4.2). Resolution happens on the public side only and is cached for 300 s.
 - No two entries may share the same `host:port` (default port applied).
-- A literal-IP entry must not be FreeSBC's own public UDP socket (`public.bind` or `public.ip` with `edge.listen.udp`), nor an `edge.switch` node.
-- A non-empty `carriers` requires `edge.listen.udp`.
+- A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` or `public.ip` with that `edge.listen` port), nor an `edge.switch` node.
+- `transport` is `udp` (default), `tcp` or `tls`. A `udp` carrier requires `edge.listen.udp`. A `tcp` or `tls` carrier needs no listener to be called, because FreeSBC opens the connection; its own requests to FreeSBC (inbound calls, in-dialog requests) need the matching `edge.listen.tcp` or `edge.listen.tls`, or they can only use the connection FreeSBC opened. A `tls` carrier does not need the top-level `tls`, which is FreeSBC's server identity.
+- `srtp` is `off` (default), `optional` or `required`, the SDES-SRTP policy toward that carrier. The string form means `off`. A non-`off` value needs `transport: tls`, unless `edge.allow_insecure_sdes` is `true`; `check` fails otherwise. Unlike a client, a carrier's transport is fixed, so the rule is checked at load. Restart-only, with the rest of `edge.carriers`.
+- `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. `check` does not open these files; startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
 
 An entry must equal the `host[:port]` the switch puts in the Request-URI (FreeSWITCH gateway `proxy`, Asterisk aor `contact`). That equality is what makes a request a carrier request.
 
+#### `edge.srtp`
+
+The SDES-SRTP policy (RFC 4568) for the public leg of a call with a registered client: `off` (default), `optional` or `required`. `off` ignores `a=crypto` and keeps the leg plain RTP. The switch leg is always plain RTP. SDES is used on a client leg only when the client's signaling is TLS or WSS, decided per call by the transport the client registered over, unless `edge.allow_insecure_sdes` is set. A WebRTC leg (a client registered over `ws` or `wss`) is always DTLS-SRTP and ignores this key. Any other value is a validation error. Restart-only. Semantics: [SDES-SRTP on public legs](edge.md#sdes-srtp-on-public-legs).
+
+#### `edge.allow_insecure_sdes`
+
+Default `false`. SDES keys travel in the SDP, so with this off a leg whose signaling is not encrypted never uses SDES: `srtp: optional` then behaves as `off`, and `srtp: required` refuses every offer and answer with 488. Set it `true` only on a network where the signaling path is already protected (a VPN, a private link). It also lets a carrier with `transport: udp` or `tcp` have a non-`off` `srtp`. Restart-only.
+
 #### `edge.carrier_sources`
 
-Extra inbound carrier IPs or CIDRs, on top of the resolved addresses of `carriers`, which are sources implicitly. A bare IP is a single-host prefix. Rules:
+Extra inbound carrier IPs or CIDRs, on top of the resolved addresses of `carriers`, which are sources implicitly. A `carriers` address is a source only on its carrier's transport (a `tls` carrier over UDP is not); a `carrier_sources` address matches on any public transport. A bare IP is a single-host prefix. Rules:
 
 - Valid CIDR or IP.
 - No wider than /8 (IPv4) or /32 (IPv6).
@@ -141,7 +173,7 @@ A request from a `carrier_sources` address that matches no `carriers` entry gets
 
 | Key | Default | Rules |
 |---|---|---|
-| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram or WS/WSS frame, charged before parsing: malformed datagrams, responses and keepalives count too. |
+| `rate_limit` | `20/s per_ip` | Applies to every public source that is not a carrier. One token per UDP datagram, WS/WSS frame, TCP/TLS message started, and new stream connection, charged before parsing: malformed datagrams, responses and keepalives count too. |
 | `carrier_rate_limit` | `200/s per_ip` | Applies to carrier sources (resolved `carriers` addresses and `carrier_sources`), charged the same way. |
 | `ban` | `1h` | Duration, greater than 0. How long a source fingerprinted as a scanner stays banned (in memory only). Carrier sources are never banned as scanners. |
 | `max_sessions` | the calls `rtp` can anchor | Integer, 0 or more. Global cap on calls holding a session slot: from the first out-of-dialog INVITE (ringing calls hold one) until the call is torn down by any path. 0 means the default, the `rtp` capacity (see `rtp`); an explicit value above that capacity is an error (`exceeds the N calls rtp a-b can anchor`). Counted across all four directions (client, carrier, switch to client, switch to carrier). Hot: applies to the next INVITE, running calls are never torn down, and lowering it below the running count refuses new calls until it drains. |
@@ -177,7 +209,7 @@ Web security (restart-only like the rest of `admin`):
 
 - Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
 
-`admin.listen` must not collide with `edge.listen.ws` / `edge.listen.wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
+`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
 
@@ -201,7 +233,7 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 |---|---|
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`, `shield.max_sessions`, `shield.invite_rate_limit` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
-| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers`, `edge.carrier_sources` | restart-only |
+| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
 | `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
@@ -213,7 +245,7 @@ Not configurable. They live in code until there is a concrete need to tune one.
 | Value | Constant | Where |
 |---|---|---|
 | Private SIP port | 5060 | `config.PrivateSIPPort` |
-| Default carrier port | 5060 | `config.DefaultCarrierPort` |
+| Default carrier port | 5060 (5061 for a `tls` carrier) | `config.DefaultCarrierPort`, `config.DefaultCarrierTLSPort` |
 | Retry-After of a session-cap 503 | 5 s | `sessionCapRetryAfter`, `internal/edge/invite.go` |
 | Session-cap and invite-rate WARN spacing | 10 s per reason | `capWarnEvery`, `internal/edge/invite.go` |
 | RTP silence teardown | 5 min | `rtpSilenceTimeout`, `internal/edge/edge.go` |

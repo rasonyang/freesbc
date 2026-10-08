@@ -1,5 +1,6 @@
 // Package edge implements FreeSBC's edge plane: a stateful SIP proxy
-// between public clients (SIP/UDP phones and sip.js browsers over WS/WSS)
+// between public clients (SIP/UDP, SIP/TCP and SIP/TLS phones and sip.js
+// browsers over WS/WSS)
 // and one upstream FreeSWITCH, with every media stream anchored through
 // the SBC — plain RTP for phones, DTLS-SRTP for browsers.
 //
@@ -44,16 +45,22 @@ const (
 // the far side does not recognise.
 type side struct {
 	plane     plane
-	transport string // "udp", "ws" or "wss"
+	transport string // "udp", "tcp", "tls", "ws" or "wss"
 	advIP     netip.Addr
 	advPort   int
 	// laddr pins the outbound socket (see sipgo
 	// TransportLayer.ClientRequestConnection: a request whose Laddr names
 	// a bound listener reuses that listener's connection). It is left zero
-	// for ws/wss, where the connection is found by the client's remote
-	// address instead — a WebSocket is inbound-only, so there is exactly
+	// for tcp/tls/ws/wss, where the connection is found by the client's
+	// remote address instead — a stream connection is inbound-only (FreeSBC
+	// never dials a client, RFC 5626 flow semantics), so there is exactly
 	// one connection per client and it is already in the pool.
 	laddr sip.Addr
+	// outbound marks the side of a tcp or tls carrier with no matching
+	// public listener: nothing listens at advPort, so the carrier can reach
+	// FreeSBC only over the connection FreeSBC opened. Its Via carries the
+	// RFC 5923 alias parameter to say so.
+	outbound bool
 }
 
 // uri is the SBC's own URI on this side, as it appears in Record-Route,
@@ -98,6 +105,9 @@ func (s side) via(branch string) *sip.ViaHeader {
 	v.Params.Add("branch", branch)
 	if s.transport == "udp" {
 		v.Params.Add("rport", "")
+	}
+	if s.outbound {
+		v.Params.Add("alias", "")
 	}
 	return v
 }
@@ -181,7 +191,8 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 	for _, l := range []struct {
 		transport string
 		port      int
-	}{{"udp", cfg.Edge.Listen.UDP}, {"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
+	}{{"udp", cfg.Edge.Listen.UDP}, {"tcp", cfg.Edge.Listen.TCP}, {"tls", cfg.Edge.Listen.TLS},
+		{"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
 		if l.port == 0 {
 			continue
 		}
@@ -193,6 +204,19 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 			s.laddr = sipAddr(bind, l.port)
 		}
 		t.public[l.transport] = s
+	}
+	// A tcp or tls carrier is dialed by FreeSBC, so it needs no listener. It
+	// still needs a side to name in Via, Record-Route and Contact; one
+	// without a listener advertises the transport's default port.
+	for _, c := range cfg.CarrierList() {
+		if _, ok := t.public[c.Transport]; ok || c.Transport == config.CarrierUDP {
+			continue
+		}
+		port := 5060
+		if c.Transport == config.CarrierTLS {
+			port = config.DefaultCarrierTLSPort
+		}
+		t.public[c.Transport] = side{plane: planePublic, transport: c.Transport, advIP: pubIP, advPort: port, outbound: true}
 	}
 	return t
 }

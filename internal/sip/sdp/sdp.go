@@ -171,6 +171,22 @@ type Audio struct {
 	ICEPwd      string
 	Fingerprint *Fingerprint
 	Setup       string // actpass | active | passive | holdconn
+
+	// Crypto is the section's usable SDES a=crypto lines in offer order
+	// (see ParseCrypto for what usable means). Lines that are malformed,
+	// of an unknown suite or that need MKI or session parameters are
+	// dropped, so an SRTP offer with no usable line has an empty Crypto.
+	Crypto []Crypto
+}
+
+// SDES reports whether the section's transport is plain-UDP SRTP (RTP/SAVP
+// or RTP/SAVPF), keyed by a=crypto, not DTLS.
+func (a *Audio) SDES() bool {
+	if len(a.Proto) != 2 || !strings.EqualFold(a.Proto[0], "RTP") {
+		return false
+	}
+	p := strings.ToUpper(a.Proto[1])
+	return p == "SAVP" || p == "SAVPF"
 }
 
 // WebRTC reports whether the section is a DTLS-SRTP (browser) offer: a
@@ -293,6 +309,13 @@ func ParseWithOptions(body []byte, opts ParseOptions) (*Session, error) {
 		return nil, err
 	}
 	parseAttributes(&sd, md, a)
+	var cryptoVals []string
+	for _, at := range md.Attributes {
+		if at.Key == "crypto" {
+			cryptoVals = append(cryptoVals, at.Value)
+		}
+	}
+	a.Crypto = parseCryptoAttrs(cryptoVals)
 	var err error
 	if a.Codecs, err = parseCodecs(md); err != nil {
 		return nil, err

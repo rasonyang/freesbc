@@ -175,11 +175,27 @@ func (l *Location) Remove(aor, callID string) *Binding {
 // leak table entries until their expiry and, worse, make FreeSBC accept
 // inbound calls it cannot deliver.
 func (l *Location) RemoveBySource(src netip.AddrPort) int {
+	return l.removeBySource("", src)
+}
+
+// RemoveBySourceOn is RemoveBySource limited to bindings registered over
+// transport, compared case-insensitively. A stream connection closing must
+// not take a UDP binding that has the same IP:port.
+func (l *Location) RemoveBySourceOn(transport string, src netip.AddrPort) int {
+	return l.removeBySource(transport, src)
+}
+
+func (l *Location) removeBySource(transport string, src netip.AddrPort) int {
 	defer l.flushRemoved()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	// Copy: deleteLocked edits the index slice being walked.
-	victims := append([]*Binding(nil), l.bySource[src]...)
+	var victims []*Binding
+	for _, b := range l.bySource[src] {
+		if transport == "" || strings.EqualFold(b.Transport, transport) {
+			victims = append(victims, b)
+		}
+	}
 	for _, b := range victims {
 		for i, e := range l.byAOR[b.AOR] {
 			if e == b {

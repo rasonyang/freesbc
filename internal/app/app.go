@@ -151,6 +151,9 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 				CallsEnded:             s.CallsEnded,
 				InviteRejects:          s.InviteRejects,
 				ParseFailures:          s.ParseFailures,
+				StreamConnections:      s.StreamConnections,
+				StreamRefused:          s.StreamRefused,
+				StreamClosed:           s.StreamClosed,
 				CarrierRequests:        s.CarrierRequests,
 				CarrierRegistrations:   s.CarrierRegistrations,
 			}

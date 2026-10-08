@@ -34,6 +34,32 @@ func TestMetricsExposition(t *testing.T) {
 	}
 }
 
+// The stream connection gauge and its refusal and close counters render one
+// series per transport and reason, zeros included.
+func TestMetricsStreamConnections(t *testing.T) {
+	deps := emptyDeps()
+	deps.Proxy = func() ProxyStats {
+		return ProxyStats{
+			StreamConnections: map[string]int64{"tcp": 3, "tls": 0},
+			StreamRefused:     map[string]uint64{"ip_cap": 5, "global_cap": 0},
+			StreamClosed:      map[string]uint64{"idle": 2, "slow": 0},
+		}
+	}
+	body := string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{
+		`freesbc_edge_stream_connections{transport="tcp"} 3`,
+		`freesbc_edge_stream_connections{transport="tls"} 0`,
+		`freesbc_edge_stream_refused_total{reason="ip_cap"} 5`,
+		`freesbc_edge_stream_refused_total{reason="global_cap"} 0`,
+		`freesbc_edge_stream_closed_total{reason="idle"} 2`,
+		`freesbc_edge_stream_closed_total{reason="slow"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q\n---\n%s", want, body)
+		}
+	}
+}
+
 // The end-reason and reject counters render one series per reason, zeros
 // included, so a rate() has a baseline from the first scrape.
 func TestMetricsCallEndAndRejectCounters(t *testing.T) {

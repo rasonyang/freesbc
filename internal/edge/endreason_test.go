@@ -518,7 +518,7 @@ func TestInviteRejectPortExhausted(t *testing.T) {
 	_, total := h.srv.pubPool.Stats()
 	var held []interface{ Close() error }
 	for i := 0; i < total; i++ {
-		sess, err := h.srv.allocateRTP(&sdp.Session{Audio: &sdp.Audio{Address: mustAddr("127.0.0.1"), Port: 40000}}, netip.MustParseAddr("127.0.0.1"))
+		sess, err := h.srv.allocateRTP(&sdp.Session{Audio: &sdp.Audio{Address: mustAddr("127.0.0.1"), Port: 40000}}, netip.MustParseAddr("127.0.0.1"), srtpOff)
 		if err != nil {
 			break
 		}

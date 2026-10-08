@@ -1,6 +1,10 @@
 package sip
 
-import "github.com/emiago/sipgo/sip"
+import (
+	"strings"
+
+	"github.com/emiago/sipgo/sip"
+)
 
 // MaxReadSize is the read-filter size cap a plane passes to ReadFilter.
 //
@@ -24,7 +28,11 @@ const MaxReadSize = 24 << 10
 //
 // The first is the size cap: maxSize bounds a read BEFORE the parser sees
 // it, so one oversized datagram or WebSocket frame is dropped rather than
-// parsed. A maxSize of 0 disables the cap; a maxSize at or above sipgo's
+// parsed. The cap does not apply to tcp and tls (IsByteStream): there a read
+// is an arbitrary chunk of the byte stream, a message may arrive split over
+// several reads or several to one, and dropping a chunk would corrupt every
+// message after it. A byte-stream plane bounds the message size another way.
+// A maxSize of 0 disables the cap; a maxSize at or above sipgo's
 // read buffer disables it too, in effect (see MaxReadSize).
 //
 // The second, and the reason this wrapper exists at all, is that the
@@ -38,7 +46,7 @@ const MaxReadSize = 24 << 10
 // accept lets everything through.
 func ReadFilter(maxSize int, accept func(info sip.TransportReadProps) bool) sip.TransportReadFilter {
 	return func(info sip.TransportReadProps, data []byte) ([]byte, error) {
-		if maxSize > 0 && len(data) > maxSize {
+		if maxSize > 0 && len(data) > maxSize && !IsByteStream(info.Transport) {
 			return nil, nil
 		}
 		if accept != nil && !accept(info) {
@@ -46,4 +54,11 @@ func ReadFilter(maxSize int, accept func(info sip.TransportReadProps) bool) sip.
 		}
 		return data, nil
 	}
+}
+
+// IsByteStream reports whether a transport name ("TCP", "tls", ...) is a raw
+// byte stream whose reads are not message boundaries. ws and wss are not:
+// each read is one WebSocket message.
+func IsByteStream(transport string) bool {
+	return strings.EqualFold(transport, "tcp") || strings.EqualFold(transport, "tls")
 }

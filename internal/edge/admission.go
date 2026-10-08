@@ -79,7 +79,9 @@ const (
 //     carrier's address is never sent down the unauthenticated carrier
 //     path: srcClient, delivered to the switch's client port;
 //   - inside a carrier source (carrierDirectory): srcCarrier, with the
-//     carrier's name, delivered to the switch's carrier port;
+//     carrier's name, delivered to the switch's carrier port. A carrier's
+//     own address counts only on that carrier's transport (a tls carrier's
+//     IP over UDP is nobody); edge.carrier_sources match on any;
 //   - anything else: srcDrop.
 //
 // The check keys on the transport source only, never on From or any
@@ -88,7 +90,7 @@ func (s *Server) admitPublicInvite(req *sip.Request, src netip.AddrPort) (invite
 	if s.loc.HasSource(sip.NetworkToLower(req.Transport()), src) {
 		return srcClient, ""
 	}
-	if name, ok := s.carriers.snapshot().carrierFor(src); ok {
+	if name, ok := s.carriers.snapshot().carrierFor(src, sip.NetworkToLower(req.Transport())); ok {
 		return srcCarrier, name
 	}
 	return srcDrop, ""
@@ -125,7 +127,7 @@ func (s *Server) admitPublicOutOfDialog(req *sip.Request, src netip.AddrPort, re
 	if b, ok := s.loc.SourceBinding(sip.NetworkToLower(req.Transport()), src, user); ok {
 		return b, oodAdmitted
 	}
-	if _, ok := s.carriers.snapshot().carrierFor(src); ok {
+	if _, ok := s.carriers.snapshot().carrierFor(src, sip.NetworkToLower(req.Transport())); ok {
 		return Binding{}, oodCarrier
 	}
 	s.dropSilently(reason, req, src)

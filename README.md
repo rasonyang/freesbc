@@ -6,7 +6,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 
 - **Pure Go, one static binary, zero external dependencies**: no database, no Redis, no kernel modules, and **no external media process**.
 - **Keeps your switch off the public internet**: FreeSBC is the only element with a public address. FreeSWITCH or Asterisk stays on a private LAN and only ever talks to FreeSBC.
-- **Phones, browsers and carriers through one public address**: SIP/UDP phones, WS/WSS WebRTC browsers, and carriers (the switch uses FreeSBC as its outbound proxy).
+- **Phones, browsers and carriers through one public address**: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS WebRTC browsers, and carriers (the switch uses FreeSBC as its outbound proxy).
 - **Embedded WebUI, REST API and Prometheus metrics** behind bcrypt Basic Auth.
 
 ## Install
@@ -60,7 +60,7 @@ On SIGINT/SIGTERM FreeSBC drops its calls with their media released; no BYE is s
 ## How it fits together
 
 ```text
-  Internet ──> FreeSBC  203.0.113.7   public: SIP/UDP, WS/WSS, RTP, WebRTC
+  Internet ──> FreeSBC  203.0.113.7   public: SIP/UDP/TCP/TLS, WS/WSS, RTP, WebRTC
                   │
                   │ private LAN/VPN: plain SIP/UDP + RTP
                   │ one fixed socket, 10.77.0.2:5060
@@ -79,7 +79,7 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 
 ## Features
 
-- **Edge proxy**: SIP/UDP, WS and WSS interworking in front of a private switch; REGISTER proxying; a multi-switch pool with per-user hashing.
+- **Edge proxy**: SIP/UDP, TCP, TLS, WS and WSS interworking in front of a private switch; REGISTER proxying; a multi-switch pool with per-user hashing.
 - **Carrier path**: carrier directory by literal IP or DNS (SRV/A/AAAA, cached), switch-to-carrier proxying with topology hiding, inbound carrier delivery to the switch's carrier port, and deterministic carrier registration tokens.
 - **Media anchoring**: RTP relay on FreeSBC ports with hardened first-packet latching and a silence watchdog; no transcoding.
 - **WebRTC**: ICE-Lite, DTLS-SRTP and RTCP-mux terminated for browsers (any of `edge.listen.ws`/`wss`), relayed to plain RTP.
@@ -131,8 +131,8 @@ Non-goals: transcoding, CDR, clustering, and being a registrar in its own right.
 
 - No transcoding; left to the switch.
 - All state is in memory; a restart drops every call, dialog and binding.
-- The edge never offers or reads `a=crypto`: a SIP phone gets plain RTP, and only browser legs get DTLS-SRTP.
-- Switches and carrier gateways are UDP only; switches are literal `IP:port`, with no DNS.
+- SDES-SRTP (`a=crypto`) is off unless `edge.srtp` or a carrier's `srtp` enables it, and then only over TLS/WSS signaling (or `edge.allow_insecure_sdes`); browser legs get DTLS-SRTP.
+- Switches are UDP only (carriers may be udp, tcp or tls); switches are literal `IP:port`, with no DNS.
 - Call-ID passes through the proxy unchanged.
 - No PUBLISH, and no TURN or full ICE.
 

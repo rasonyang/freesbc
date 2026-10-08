@@ -23,9 +23,11 @@ import (
 //
 // A literal-IP entry is static. A DNS-name entry resolves on the PUBLIC
 // side only (the switch is never asked, and the private leg does no DNS):
-// without a port through SRV _sip._udp.<host> ordered by priority and
-// weight (RFC 2782) and then A/AAAA per target; with an explicit port
-// through A/AAAA only (RFC 3263 §4.2). Go exposes no record TTL, so a good
+// without a port through SRV (_sip._udp, _sip._tcp or _sips._tcp.<host>
+// by the carrier's transport) ordered by priority and weight (RFC 2782) and
+// then A/AAAA per target; with an explicit port through A/AAAA only (RFC
+// 3263 §4.2). With no SRV record the port is the transport's default (5060,
+// 5061 for tls). There is no NAPTR and no failover across SRV targets. Go exposes no record TTL, so a good
 // answer is cached for the carrierDNSTTL constant and a failed one for the
 // much shorter carrierDNSNegTTL. A failed refresh keeps the last good set:
 // a resolver outage must never turn a carrier's source address into
@@ -55,6 +57,13 @@ type carrierSnapshot struct {
 	names []string                    // edge.carriers names, sorted
 	addrs map[string][]netip.AddrPort // name → resolved destinations, in preference order
 	nets  []netip.Prefix              // carrier source prefixes, sorted and deduplicated
+	// extra is edge.carrier_sources alone: prefixes that match on any
+	// public transport. nets also holds the carriers' own addresses, which
+	// match by IP for the shield but are admitted only on their carrier's
+	// transport (carrierFor).
+	extra []netip.Prefix
+	// transports is each carrier's transport by name.
+	transports map[string]string
 }
 
 // isSource reports whether ip is inside a carrier-source prefix.
@@ -68,16 +77,22 @@ func (c *carrierSnapshot) isSource(ip netip.Addr) bool {
 	return false
 }
 
-// carrierFor names the carrier a public source belongs to. An exact
-// IP:port match wins; failing that the first entry (by sorted name) with
-// that IP; a source inside carrier_sources that matches no entry is
+// carrierFor names the carrier a public source belongs to, for a request
+// that arrived over network (udp, tcp, tls...). A carrier's resolved
+// address counts only on that carrier's own transport: a tls carrier's IP
+// over UDP is no carrier. An exact IP:port match wins; failing that the
+// first entry (by sorted name) with that IP; a source inside
+// edge.carrier_sources (any transport) that matches no entry is
 // carrierUnknown. ok is false for a source that is no carrier source at
 // all.
-func (c *carrierSnapshot) carrierFor(src netip.AddrPort) (name string, ok bool) {
+func (c *carrierSnapshot) carrierFor(src netip.AddrPort, network string) (name string, ok bool) {
 	ip := src.Addr().Unmap().WithZone("")
 	src = netip.AddrPortFrom(ip, src.Port())
 	byIP := ""
 	for _, n := range c.names {
+		if c.transports[n] != network {
+			continue
+		}
 		for _, a := range c.addrs[n] {
 			if a == src {
 				return n, true
@@ -90,8 +105,10 @@ func (c *carrierSnapshot) carrierFor(src netip.AddrPort) (name string, ok bool) 
 	if byIP != "" {
 		return byIP, true
 	}
-	if c.isSource(ip) {
-		return carrierUnknown, true
+	for _, p := range c.extra {
+		if p.Contains(ip) {
+			return carrierUnknown, true
+		}
 	}
 	return "", false
 }
@@ -117,6 +134,7 @@ type carrierDirectory struct {
 	log      *slog.Logger
 	carriers []config.Carrier // sorted by name
 	static   []netip.Prefix   // carrier_sources plus literal-IP carriers
+	extra    []netip.Prefix   // carrier_sources alone
 
 	// lookupSRV and lookupIP are the DNS seams; tests replace them.
 	lookupSRV func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
@@ -135,6 +153,7 @@ func newCarrierDirectory(cfg *config.Config, log *slog.Logger) *carrierDirectory
 		log:      log,
 		carriers: cfg.CarrierList(),
 		static:   cfg.CarrierNets(),
+		extra:    cfg.CarrierSourceNets(),
 		lookupSRV: func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error) {
 			return net.DefaultResolver.LookupSRV(ctx, service, proto, name)
 		},
@@ -156,7 +175,7 @@ func (d *carrierDirectory) snapshot() *carrierSnapshot { return d.snap.Load() }
 // static prefixes and the cached resolutions. The caller holds mu, or is
 // the constructor.
 func (d *carrierDirectory) publish() {
-	snap := &carrierSnapshot{addrs: map[string][]netip.AddrPort{}}
+	snap := &carrierSnapshot{addrs: map[string][]netip.AddrPort{}, transports: map[string]string{}, extra: d.extra}
 	seen := map[netip.Prefix]bool{}
 	add := func(p netip.Prefix) {
 		if !seen[p] {
@@ -169,9 +188,13 @@ func (d *carrierDirectory) publish() {
 	}
 	for _, c := range d.carriers {
 		snap.names = append(snap.names, c.Name)
+		snap.transports[c.Name] = config.CarrierUDP
+		if c.Transport != "" {
+			snap.transports[c.Name] = c.Transport
+		}
 		if c.Literal() {
 			add(netip.PrefixFrom(c.Addr, c.Addr.BitLen()))
-			snap.addrs[c.Name] = []netip.AddrPort{netip.AddrPortFrom(c.Addr, uint16(c.Port))}
+			snap.addrs[c.Name] = []netip.AddrPort{netip.AddrPortFrom(c.Addr, uint16(c.DialPort()))}
 			continue
 		}
 		if e := d.entries[c.Name]; e != nil {
@@ -259,8 +282,9 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 	if c.ExplicitPort {
 		return d.hostAddrs(ctx, c.Host, uint16(c.Port))
 	}
+	service, proto := srvName(c.Transport)
 	sctx, cancel := context.WithTimeout(ctx, carrierLookupTimeout)
-	_, recs, err := d.lookupSRV(sctx, "sip", "udp", c.Host)
+	_, recs, err := d.lookupSRV(sctx, service, proto, c.Host)
 	cancel()
 	if err != nil {
 		var dnsErr *net.DNSError
@@ -285,7 +309,19 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 	if len(recs) > 0 && lastErr != nil {
 		return nil, lastErr // SRV exists but none of its targets resolved
 	}
-	return d.hostAddrs(ctx, c.Host, uint16(config.DefaultCarrierPort))
+	return d.hostAddrs(ctx, c.Host, uint16(c.DialPort()))
+}
+
+// srvName is the SRV service and protocol of a carrier transport (RFC 3263
+// §4.2): _sip._udp, _sip._tcp, and _sips._tcp for tls.
+func srvName(transport string) (service, proto string) {
+	switch transport {
+	case config.CarrierTLS:
+		return "sips", "tcp"
+	case config.CarrierTCP:
+		return "sip", "tcp"
+	}
+	return "sip", "udp"
 }
 
 // hostAddrs resolves host to A/AAAA addresses on port.

@@ -98,6 +98,9 @@ func (c *Config) validateTLS(fail failFunc) {
 		}
 		return
 	}
+	if c.Edge.Listen.TLS != 0 {
+		fail("tls: required by edge.listen.tls")
+	}
 	if c.Edge.Listen.WSS != 0 {
 		fail("tls: required by edge.listen.wss (browsers refuse an untrusted WSS certificate)")
 	}
@@ -133,19 +136,38 @@ func (c *Config) validateEdge(fail failFunc) {
 		}
 		e.switches = append(e.switches, ap)
 	}
+	switch e.SRTP {
+	case SRTPOff, SRTPOptional, SRTPRequired:
+	default:
+		fail("edge.srtp: must be off, optional or required, got %q", e.SRTP)
+	}
 	if p := e.SwitchCarrierPort; p < 0 || p > 65535 {
 		fail("edge.switch_carrier_port: must be 1-65535 (0 = the node's switch port), got %d", p)
 	}
 
 	l := e.Listen
-	if l.UDP == 0 && l.WS == 0 && l.WSS == 0 {
-		fail("edge.listen: at least one of udp, ws, wss required")
+	if l.UDP == 0 && l.TCP == 0 && l.TLS == 0 && l.WS == 0 && l.WSS == 0 {
+		fail("edge.listen: at least one of udp, tcp, tls, ws, wss required")
 	}
 	checkPort(fail, "edge.listen.udp", l.UDP)
+	checkPort(fail, "edge.listen.tcp", l.TCP)
+	checkPort(fail, "edge.listen.tls", l.TLS)
 	checkPort(fail, "edge.listen.ws", l.WS)
 	checkPort(fail, "edge.listen.wss", l.WSS)
-	if l.WS != 0 && l.WS == l.WSS {
-		fail("edge.listen.wss: port %d already used by edge.listen.ws", l.WSS)
+	// tcp, tls, ws and wss are all TCP sockets on public.bind, so no two may
+	// share a port. udp is its own port space and may share one with tcp
+	// (SIP's usual 5060).
+	streams := [...]struct {
+		key  string
+		port int
+	}{{"edge.listen.tcp", l.TCP}, {"edge.listen.tls", l.TLS}, {"edge.listen.ws", l.WS}, {"edge.listen.wss", l.WSS}}
+	for i := range streams {
+		for j := 0; j < i; j++ {
+			if streams[i].port != 0 && streams[i].port == streams[j].port {
+				fail("%s: port %d already used by %s", streams[i].key, streams[i].port, streams[j].key)
+				break
+			}
+		}
 	}
 
 	e.carrierNets = nil
@@ -225,24 +247,16 @@ func finishCarrierHost(h string, port int) (string, int, netip.Addr, error) {
 	return h, port, netip.Addr{}, nil
 }
 
-// validateCarriers checks edge.carriers and compiles the carrier list.
+// validateCarriers checks edge.carriers and compiles the carrier list. It
+// opens no file: ca_file, client_cert and client_key are loaded when the
+// edge starts.
 func (c *Config) validateCarriers(fail failFunc) {
 	e := &c.Edge
 	e.carriers = nil
 	if len(e.Carriers) == 0 {
 		return
 	}
-	if e.Listen.UDP == 0 {
-		fail("edge.carriers: requires edge.listen.udp (carrier traffic is SIP over UDP on the public side)")
-	}
-	own := netip.AddrPort{}
-	if e.Listen.UDP != 0 {
-		own = netip.AddrPortFrom(c.PublicBind(), uint16(e.Listen.UDP))
-	}
-	pubAdv := netip.AddrPort{}
-	if e.Listen.UDP != 0 {
-		pubAdv = netip.AddrPortFrom(c.PublicIP(), uint16(e.Listen.UDP))
-	}
+	listen := map[string]int{CarrierUDP: e.Listen.UDP, CarrierTCP: e.Listen.TCP, CarrierTLS: e.Listen.TLS}
 	taken := map[string]string{}
 	for _, name := range sortedKeys(e.Carriers) {
 		label := "edge.carriers." + name
@@ -250,9 +264,44 @@ func (c *Config) validateCarriers(fail failFunc) {
 			fail("edge.carriers: name %q must match [A-Za-z0-9._-]+", name)
 			continue
 		}
-		host, port, addr, err := ParseCarrierHost(e.Carriers[name])
+		cc := e.Carriers[name]
+		tr := cc.Transport
+		if tr == "" {
+			tr = CarrierUDP
+		}
+		if tr != CarrierUDP && tr != CarrierTCP && tr != CarrierTLS {
+			fail("%s.transport: must be udp, tcp or tls, got %q", label, tr)
+			continue
+		}
+		if tr == CarrierUDP && e.Listen.UDP == 0 {
+			fail("%s: a udp carrier requires edge.listen.udp (its traffic is SIP over UDP on the public side)", label)
+		}
+		if tr != CarrierTLS {
+			for _, f := range [...]struct{ key, val string }{{"ca_file", cc.CAFile}, {"client_cert", cc.ClientCert}, {"client_key", cc.ClientKey}} {
+				if f.val != "" {
+					fail("%s.%s: only valid with transport: tls", label, f.key)
+				}
+			}
+		}
+		srtp := cc.SRTP
+		if srtp == "" {
+			srtp = SRTPOff
+		}
+		switch srtp {
+		case SRTPOff:
+		case SRTPOptional, SRTPRequired:
+			if tr != CarrierTLS && !e.AllowInsecureSDES {
+				fail("%s.srtp: %s needs transport: tls (SDES keys travel in the SDP), or edge.allow_insecure_sdes: true", label, srtp)
+			}
+		default:
+			fail("%s.srtp: must be off, optional or required, got %q", label, srtp)
+		}
+		if (cc.ClientCert == "") != (cc.ClientKey == "") {
+			fail("%s: client_cert and client_key must be set together", label)
+		}
+		host, port, addr, err := ParseCarrierHost(cc.Host)
 		if err != nil {
-			fail("%s: %v", label, c.envRedact.detail(e.Carriers[name], err))
+			fail("%s: %v", label, c.envRedact.detail(cc.Host, err))
 			continue
 		}
 		key := net.JoinHostPort(host, strconv.Itoa(port))
@@ -263,8 +312,9 @@ func (c *Config) validateCarriers(fail failFunc) {
 		taken[key] = name
 		if addr.IsValid() {
 			ap := netip.AddrPortFrom(addr, uint16(port))
-			if ap == own || ap == pubAdv {
-				fail("%s: %s is FreeSBC's own public UDP socket", label, key)
+			if lp := listen[tr]; lp != 0 && (ap == netip.AddrPortFrom(c.PublicBind(), uint16(lp)) ||
+				ap == netip.AddrPortFrom(c.PublicIP(), uint16(lp))) {
+				fail("%s: %s is FreeSBC's own public %s socket", label, key, strings.ToUpper(tr))
 				continue
 			}
 			for _, sw := range e.switches {
@@ -275,7 +325,8 @@ func (c *Config) validateCarriers(fail failFunc) {
 			}
 		}
 		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr,
-			ExplicitPort: carrierHasPort(e.Carriers[name])})
+			ExplicitPort: carrierHasPort(cc.Host), Transport: tr, SRTP: srtp,
+			CAFile: cc.CAFile, ClientCert: cc.ClientCert, ClientKey: cc.ClientKey})
 	}
 }
 
@@ -343,7 +394,7 @@ func (c *Config) validateAdmin(fail failFunc) {
 // validateSockets rejects two listeners that would bind the same socket:
 // `run` would fail with "address already in use", so `check` must too. The
 // public UDP and TCP ports are separate namespaces; the admin API shares
-// the TCP one with ws/wss when it binds the same address.
+// the TCP one with tcp/tls/ws/wss when it binds the same address.
 func (c *Config) validateSockets(fail failFunc) {
 	if c.Admin == nil {
 		return
@@ -356,7 +407,8 @@ func (c *Config) validateSockets(fail failFunc) {
 	for _, l := range []struct {
 		key  string
 		port int
-	}{{"edge.listen.ws", c.Edge.Listen.WS}, {"edge.listen.wss", c.Edge.Listen.WSS}} {
+	}{{"edge.listen.tcp", c.Edge.Listen.TCP}, {"edge.listen.tls", c.Edge.Listen.TLS},
+		{"edge.listen.ws", c.Edge.Listen.WS}, {"edge.listen.wss", c.Edge.Listen.WSS}} {
 		if l.port != 0 && l.port == int(ap.Port()) && hostsCollide(bind, ap.Addr().String()) {
 			fail("admin.listen: tcp/%s already bound by %s", c.Admin.Listen, l.key)
 		}
