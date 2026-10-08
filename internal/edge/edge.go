@@ -216,7 +216,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		store:            store,
 		boot:             cfg,
 		privAddr:         priv,
-		log:              log.With("component", "proxy"),
+		log:              slog.New(newRedactHandler(log.Handler())).With("component", "proxy"),
 		topo:             topo,
 		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
 		carrierURIs:      carrierURIsOf(cfg),

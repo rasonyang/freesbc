@@ -109,3 +109,46 @@ func TestCarrierRestartOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestSRTPConfig(t *testing.T) {
+	c := mustParse(t, minimalYAML)
+	if c.Edge.SRTP != SRTPOff || c.Edge.AllowInsecureSDES {
+		t.Errorf("defaults: srtp %q allow_insecure_sdes %v, want off false", c.Edge.SRTP, c.Edge.AllowInsecureSDES)
+	}
+
+	c = mustParse(t, carrierYAML(t, "udp: 5060, tls: 5061", `    sec: {host: sip.sec.example, transport: tls, srtp: required}
+    opt: {host: sip.opt.example, transport: tls, srtp: optional}
+    none: {host: sip.none.example, transport: tls}
+    plain: sip.plain.example
+`)+"tls: { cert: a, key: b }\n")
+	got := map[string]string{}
+	for _, k := range c.CarrierList() {
+		got[k.Name] = k.SRTP
+	}
+	want := map[string]string{"sec": "required", "opt": "optional", "none": "off", "plain": "off"}
+	for n, w := range want {
+		if got[n] != w {
+			t.Errorf("carrier %s srtp = %q, want %q", n, got[n], w)
+		}
+	}
+	if c.Edge.Carriers["sec"].Plain() || !c.Edge.Carriers["plain"].Plain() {
+		t.Error("Plain must be false for a carrier with srtp and true without")
+	}
+
+	// A non-TLS carrier cannot use SDES unless the operator opts in.
+	y := carrierYAML(t, "udp: 5060", "    udpc: {host: sip.u.example, srtp: optional}\n")
+	if _, err := Parse([]byte(y)); err == nil || !strings.Contains(err.Error(), "edge.carriers.udpc.srtp") {
+		t.Errorf("udp carrier with srtp: err = %v, want an srtp error", err)
+	}
+	mustParse(t, strings.Replace(y, "  carriers:", "  allow_insecure_sdes: true\n  carriers:", 1))
+
+	for _, bad := range []string{
+		carrierYAML(t, "udp: 5060", "    x: {host: sip.u.example, srtp: maybe}\n"),
+		strings.Replace(minimalYAML, "edge:\n", "edge:\n  srtp: always\n", 1),
+	} {
+		if _, err := Parse([]byte(bad)); err == nil || !strings.Contains(err.Error(), "must be off, optional or required") {
+			t.Errorf("bad srtp value: err = %v", err)
+		}
+	}
+	mustParse(t, strings.Replace(minimalYAML, "edge:\n", "edge:\n  srtp: required\n", 1))
+}

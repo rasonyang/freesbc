@@ -307,6 +307,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	if carrier != "" {
 		d.setCarrier(carrier)
 	}
+	d.setSRTP(s.legSRTPPolicy(carrier, from.transport))
 
 	// An offerless INVITE is forwarded as it is: the offer is the
 	// switch's first SDP, built into a public one when it arrives
@@ -588,6 +589,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 	defer d.endUnlessUp()
+	d.setSRTP(s.legSRTPPolicy("", binding.Transport))
 
 	// An offerless INVITE is forwarded as it is: the offer is the
 	// client's first SDP, built into a private one when it arrives
@@ -730,7 +732,7 @@ func clientRequestURI(b Binding) sip.Uri {
 // is 503 (temporary capacity), anything else 500.
 func (s *Server) rejectMedia(req *sip.Request, tx sip.ServerTransaction, err error) {
 	switch {
-	case errors.Is(err, errNoUsableCodec), errors.Is(err, errRenumbered):
+	case errors.Is(err, errNoUsableCodec), errors.Is(err, errRenumbered), errors.Is(err, errSDES):
 		s.log.Info("rejecting call: media not negotiable", "err", err, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 488, "Not Acceptable Here")
 	case errors.Is(err, errShuttingDown):

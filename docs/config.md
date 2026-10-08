@@ -85,7 +85,9 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 | `switch` | required | List of literal `IP:port` (UDP), at least one. |
 | `switch_carrier_port` | `0` (the node's own `switch` port) | `0` or 1-65535. |
 | `listen` | required | At least one of `udp`, `tcp`, `tls`, `ws`, `wss`. |
-| `carriers` | none | Map of name to `host[:port]`, or to a mapping `{host, transport, ca_file, client_cert, client_key}`. |
+| `carriers` | none | Map of name to `host[:port]`, or to a mapping `{host, transport, ca_file, client_cert, client_key, srtp}`. |
+| `srtp` | `off` | SDES-SRTP policy for registered clients: `off`, `optional` or `required`. |
+| `allow_insecure_sdes` | `false` | Allow SDES on a leg whose signaling is not TLS or WSS. |
 | `carrier_sources` | none | List of IPs or CIDRs. |
 
 #### `edge.switch`
@@ -131,6 +133,7 @@ carriers:
     ca_file: /etc/freesbc/carrier-b-ca.pem   # tls only, optional
     client_cert: /etc/freesbc/client.pem     # tls only; both or neither
     client_key: /etc/freesbc/client.key
+    srtp: required                       # off (default) | optional | required; needs tls
 ```
 
 An unknown key in the mapping is an error. `host` is required. Rules for the mapping and the keys it adds:
@@ -142,9 +145,18 @@ An unknown key in the mapping is an error. `host` is required. Rules for the map
 - No two entries may share the same `host:port` (default port applied).
 - A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` or `public.ip` with that `edge.listen` port), nor an `edge.switch` node.
 - `transport` is `udp` (default), `tcp` or `tls`. A `udp` carrier requires `edge.listen.udp`. A `tcp` or `tls` carrier needs no listener to be called, because FreeSBC opens the connection; its own requests to FreeSBC (inbound calls, in-dialog requests) need the matching `edge.listen.tcp` or `edge.listen.tls`, or they can only use the connection FreeSBC opened. A `tls` carrier does not need the top-level `tls`, which is FreeSBC's server identity.
+- `srtp` is `off` (default), `optional` or `required`, the SDES-SRTP policy toward that carrier. The string form means `off`. A non-`off` value needs `transport: tls`, unless `edge.allow_insecure_sdes` is `true`; `check` fails otherwise. Unlike a client, a carrier's transport is fixed, so the rule is checked at load. Restart-only, with the rest of `edge.carriers`.
 - `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. `check` does not open these files; startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
 
 An entry must equal the `host[:port]` the switch puts in the Request-URI (FreeSWITCH gateway `proxy`, Asterisk aor `contact`). That equality is what makes a request a carrier request.
+
+#### `edge.srtp`
+
+The SDES-SRTP policy (RFC 4568) for the public leg of a call with a registered client: `off` (default), `optional` or `required`. `off` ignores `a=crypto` and keeps the leg plain RTP. The switch leg is always plain RTP. SDES is used on a client leg only when the client's signaling is TLS or WSS, decided per call by the transport the client registered over, unless `edge.allow_insecure_sdes` is set. A WebRTC leg (a client registered over `ws` or `wss`) is always DTLS-SRTP and ignores this key. Any other value is a validation error. Restart-only. Semantics: [SDES-SRTP on public legs](edge.md#sdes-srtp-on-public-legs).
+
+#### `edge.allow_insecure_sdes`
+
+Default `false`. SDES keys travel in the SDP, so with this off a leg whose signaling is not encrypted never uses SDES: `srtp: optional` then behaves as `off`, and `srtp: required` refuses every offer and answer with 488. Set it `true` only on a network where the signaling path is already protected (a VPN, a private link). It also lets a carrier with `transport: udp` or `tcp` have a non-`off` `srtp`. Restart-only.
 
 #### `edge.carrier_sources`
 
@@ -221,7 +233,7 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 |---|---|
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`, `shield.max_sessions`, `shield.invite_rate_limit` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
-| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers`, `edge.carrier_sources` | restart-only |
+| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
 | `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.

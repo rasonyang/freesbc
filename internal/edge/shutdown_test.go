@@ -38,7 +38,7 @@ func TestInFlightInviteCannotAllocateAfterShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess, err := h.srv.allocateRTP(offer, src)
+	sess, err := h.srv.allocateRTP(offer, src, srtpOff)
 	if err != nil {
 		t.Fatal(err)
 	}

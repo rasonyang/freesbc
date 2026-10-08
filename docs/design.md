@@ -380,7 +380,9 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.switch` |
 | | `edge.switch_carrier_port` |
 | | `edge.listen` |
-| | `edge.carriers` |
+| | `edge.carriers` (including each carrier's `srtp`) |
+| | `edge.srtp` |
+| | `edge.allow_insecure_sdes` |
 | | `edge.carrier_sources` |
 | | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, and whether the section exists) |
 
@@ -1831,6 +1833,11 @@ covers both over UDP and WS.
 
 ### 7.9 re-INVITE
 
+On an SDES leg (§8.9) the same offer/answer rules apply to `a=crypto`: the
+same line keeps the keys, a new key re-keys in place, FreeSBC repeats its own
+key in its offers, and an offer that would drop SRTP is 488 with the keys left
+as they were. The same holds for UPDATE, PRACK and delayed offers (§7.9a).
+
 Reached whenever an INVITE carries a To tag (`onReInvite`, `indialog.go:28`).
 
 1. `directionFor` must name a confirmed dialog with a media session, else
@@ -2073,8 +2080,8 @@ neither a client token nor a carrier is **404** (§6).
 | Operation | Where | Notes |
 |---|---|---|
 | **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path (phones, carriers and the switch) | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer (`relay.go:40-76`) |
-| **Termination** — a protocol endpoint FreeSBC itself terminates | the DTLS handshake, SRTP/SRTCP and the ICE-Lite agent of a browser leg | the browser's cryptographic association ends at FreeSBC; there is no SRTP anywhere else |
-| **Transformation** — re-keying and rewriting | SRTP↔RTP interworking on a browser call (decrypt what the browser sends, encrypt what the switch sends; `webrtcsession.go:209-298`); SDP construction — every body on every leg is built from scratch with `sdp.Build` (§8.8) | the SRTP contexts exist only on the browser leg; SRTCP is unprotected and re-protected like SRTP, only its **contents** are never inspected |
+| **Termination** — a protocol endpoint FreeSBC itself terminates | the DTLS handshake, SRTP/SRTCP and the ICE-Lite agent of a browser leg | the browser's cryptographic association ends at FreeSBC; SDES-SRTP legs (§8.6) are the only other SRTP |
+| **Transformation** — re-keying and rewriting | SRTP↔RTP interworking on a browser call (decrypt what the browser sends, encrypt what the switch sends; `webrtcsession.go:209-298`); SDP construction — every body on every leg is built from scratch with `sdp.Build` (§8.8) | the SRTP contexts exist only on a browser leg and an SDES leg (§8.6); SRTCP is unprotected and re-protected like SRTP, only its **contents** are never inspected |
 | **Transcoding** | **none, anywhere** | there is no codec conversion in `internal/media`; payload-type numbers must survive end to end, which is why `sdp.ErrRenumbered` rejects a renumbering answer |
 
 **Where data passes through without interpretation:**
@@ -2341,9 +2348,22 @@ CANCELs the branch and answers 408) instead.
 
 ### 8.6 SRTP
 
-SRTP exists only on the browser leg, keyed by DTLS (RFC 5764); the plain
-`Session` carries RTP and RTCP in the clear and FreeSBC never reads, offers
-or answers `a=crypto`.
+SRTP exists on two kinds of public leg. A browser leg is keyed by DTLS
+(RFC 5764). A plain-`Session` leg can instead be an **SDES leg** (RFC 4568),
+keyed by `a=crypto` lines in the SDP when `edge.srtp` or the carrier's `srtp`
+allows it (§7.9, §8.9); with the policy `off` the plain `Session` carries RTP
+and RTCP in the clear and the `a=crypto` lines are ignored. The switch side is
+always plain.
+
+An SDES leg keeps the ordinary UDP port pair and latch. `media.Session.SetSDESRemote`
+sets the key the peer protects with (the relay unprotects what arrives from
+that side) and `SetSDESLocal` the key FreeSBC protects with; the same key
+again is a no-op and a new key replaces the context in place. As soon as
+either key is set the side is an SDES side and a direction without its key
+drops (counted in the leg stats), so it fails closed. There is no rtcp-mux:
+RTCP stays on RTP+1, and a packet that fails authentication neither latches the
+leg nor counts as activity for the silence watchdog (§8.5). The media package
+never parses SDP.
 
 `SRTPContext` wraps pion's lockless `*srtp.Context` behind a mutex, because
 the RTP and RTCP goroutines of one direction share it. Replay protection is
@@ -2554,9 +2574,10 @@ Only these attributes are understood: direction (`sendrecv`/`sendonly`/
 `recvonly`/`inactive`), `ice-ufrag`, `ice-pwd`, `setup`, `fingerprint`,
 `rtcp` (the port only; the optional address is discarded as topology),
 `rtcp-mux` (`Audio.RTCPMux`). Everything else — including `candidate`, `ssrc`, `extmap`,
-`ptime`, `crypto` — is dropped. **SDES is not parsed by this package at
-all**: `a=crypto` is dropped on parse and never built, so a plain leg is
-always `RTP/AVP`.
+`ptime` — is dropped. `a=crypto` is parsed into `Audio.Crypto` and built from
+`Build.Crypto` (`internal/sip/sdp/crypto.go`); an audio section with crypto lines
+is `RTP/SAVP` and one without is `RTP/AVP`. `sdp.RedactCrypto` rewrites
+`inline:<key>` to `inline:[redacted]`.
 
 ICE tokens are sanitised to alphanumerics plus `+`, `/`, `-` and `_`
 (`sanitizeICEToken`, `internal/sip/sdp/sdp.go:557-570`) — the RFC 5245 ice-char set widened to base64url, which is
@@ -2628,6 +2649,22 @@ The single host candidate's priority is `iceLitePriority = 126<<24 |
 65535<<8 | 255`.
 
 ### 8.9 Media anchoring
+
+**SDES state.** On a plain-RTP session whose public leg has an SRTP policy,
+`mediaSession.sdes` (`*sdesLeg`, `internal/edge/sdes.go`) holds the policy,
+the lines FreeSBC offers, and the negotiated local and peer keys; it is nil
+when the policy is `off`. The policy comes from `legSRTPPolicy`: `edge.srtp`
+for a client with the registration transport as the secure test (TLS or WSS),
+the carrier's `srtp` with `transport: tls` for a carrier, both overridden by
+`edge.allow_insecure_sdes`; `required` on an insecure leg becomes
+`srtpImpossible`, which refuses every offer and answer. A body from the public
+side is parsed into an `sdesPlan` (`planAnswer` for an offer, `checkAnswer`
+for an answer) that is applied by `commit` only when the exchange takes
+effect: for the initial call in `negotiateFork` (plan) and `followFork`
+(commit), for a re-INVITE, UPDATE, PRACK or delayed-offer answer in
+`rebuildInDialogAnswer`. A re-offer is validated in `rebuildInDialogOffer`
+before it is forwarded, so a refusal leaves the keys in force. An SDES refusal
+(`errSDES`) is mapped to 488.
 
 Media is **always** anchored; there is no SDP pass-through path. A missing
 body is rejected 488 rather than forwarded. Every call, whichever far end it
@@ -3635,7 +3672,7 @@ relay additionally refuses to carry media for any leg whose fingerprint has not
 been verified. The session is torn down on mismatch, logging neither
 fingerprint. The RFC 7983 demultiplexer drops everything that is not DTLS or
 SRTP, so a single hostile datagram cannot tear down a live media path. Keys
-are never copied across legs. The edge never reads or offers `a=crypto`.
+are never copied across legs. SDES keys are generated by FreeSBC with `crypto/rand`, never copied across legs, and never logged: the edge log handler (`internal/edge/redact.go`) and the sipgo logger rewrite `inline:<key>` to `inline:[redacted]`, and `media.SDESKey` prints only its suite under every fmt verb.
 
 **Topology hiding.** Toward clients it is structural: every SDP body is
 constructed, never derived, so the switch is never given a public endpoint's
@@ -3868,8 +3905,11 @@ Stated because the code establishes them, not as future work.
 - **No transcoding.** No codec conversion, no repacketization, no `a=ptime`
   emission, no payload-type rewriting. An answer that renumbers a codec is
   rejected rather than bridged.
-- **No SDES.** The edge never reads or offers `a=crypto`. A public SRTP-SDES
-  offer is not negotiated; SRTP exists only as DTLS-SRTP on WebRTC legs.
+- **SDES is opt-in and TLS-only by default.** `edge.srtp` and a carrier's `srtp`
+  default to `off`, where `a=crypto` is ignored. A leg whose signaling is not
+  TLS/WSS never uses SDES unless `edge.allow_insecure_sdes`. There is no
+  automatic retry after a 488 to our `RTP/SAVP` offer, and no rtcp-mux on an
+  SDES leg.
 - **No video.** The SDP subsystem is audio-only; every non-audio section is
   declined at port 0.
 - **No TURN, no full ICE.** ICE-lite with exactly one host candidate.
@@ -3950,7 +3990,7 @@ Stated because the code establishes them, not as future work.
 | `internal/app` | construction order, the errgroup, the `admin.Deps` wiring | protocol logic; it never touches a SIP message or an SDP body |
 | `internal/config` | the schema, custom scalar types, `${ENV}` expansion, defaults, every validation rule, the atomic snapshot store, the fsnotify watcher, the restart-only diff (`RestartOnlyChanges`) | any knowledge of how the edge uses a value; it imports nothing from this module |
 | `internal/sip` | reusable SIP primitives only: safe header accessors, transport-source parsing with `Unmap`, default ports, listener matching, branch/token generation, REGISTER expiry parsing (`DeltaSeconds`, `GrantedExpires`), `BuildCancel`/`TeardownRequest`, the read-filter wrapper | policy, workflow, or state: "a transcription of RFC 3261/3264 with no policy of its own" |
-| `internal/sip/sdp` | the bounded typed parse, codec intersection, and body construction from scratch | copying anything from another leg's body; SDES (`a=crypto` is not parsed here); DNS |
+| `internal/sip/sdp` | the bounded typed parse, codec intersection, and body construction from scratch | copying anything from another leg's body; deciding SDES policy (the package parses and builds `a=crypto`, the edge decides); DNS |
 | `internal/media` | port pools, latching, the payload-agnostic relay, the silence watchdog, the ICE-lite/DTLS-SRTP browser leg, the per-process DTLS identity, packet/byte counters | SIP, SDP, or any protocol above UDP. Its doc: "It knows nothing about SIP" |
 | `internal/shield` | the in-memory ban table, per-source token buckets, scanner signatures, the carrier-source predicate hook | kernel firewall state; being a hard dependency of anything |
 | `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the client binding table, the carrier directory (DNS) and carrier registration table, switch-node routing with cooldown, switch-request classification, topology hiding on carrier legs, admission, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | carrier accounts, routing or credentials; any B2BUA call state |

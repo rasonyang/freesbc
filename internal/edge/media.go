@@ -27,6 +27,9 @@ import (
 type mediaSession struct {
 	rtp    *media.Session
 	webrtc *media.WebRTCSession
+	// sdes is the SDES-SRTP state of the public leg of a plain-RTP session
+	// (sdes.go); nil when the leg's policy is off.
+	sdes *sdesLeg
 
 	// publicPort and privatePort are what the two SDP bodies advertise.
 	publicPort  int
@@ -192,7 +195,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		}
 		sess, err = s.allocateWebRTC(ctx, offer)
 	} else {
-		sess, err = s.allocateRTP(offer, src)
+		sess, err = s.allocateRTP(offer, src, d.publicSRTP())
 	}
 	if err != nil {
 		return nil, err
@@ -202,6 +205,14 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 	// leaves it to the dialog's own end(), which is the single teardown.
 	if err := d.attach(sess); err != nil {
 		return nil, err
+	}
+	// The public side's offer must fit the leg's SRTP policy (a plain offer
+	// under "required", an SAVP offer with no usable key) before anything
+	// is sent upstream; the keys themselves are committed with the answer.
+	if sess.sdes != nil {
+		if _, err := sess.planAnswer(offer.Audio); err != nil {
+			return nil, err
+		}
 	}
 
 	// A fresh session identity: the upstream body is FreeSBC's own offer,
@@ -226,7 +237,10 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 // allocateRTP builds the RTP↔RTP session for a plain SIP phone: side A in
 // the public plane, side B in the private one. src is the IP the phone's
 // SIP came from.
-func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr) (*mediaSession, error) {
+func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy) (*mediaSession, error) {
+	if pol == srtpImpossible {
+		return nil, errSDESInsecure
+	}
 	sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
 		// Loose latching on the PUBLIC leg (media.LatchLoose, the config
 		// name for "symmetric RTP"): a phone behind a hard NAT cannot be
@@ -257,6 +271,7 @@ func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr) (*mediaSession,
 		rtp:         sess,
 		publicPort:  sess.RTPPort(media.SideA),
 		privatePort: sess.RTPPort(media.SideB),
+		sdes:        newSDESLeg(pol),
 	}
 	ms.seedApplied(planePublic, remote)
 	return ms, nil
@@ -505,6 +520,34 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		rtcp = netip.AddrPortFrom(answer.Audio.Address, uint16(answer.Audio.RTCPPort))
 	}
 
+	// The public leg's SRTP. A public callee answered FreeSBC's offer: its
+	// answer must select a line that was offered, and the plan is applied
+	// when the media follows this fork. A public caller's offer was checked
+	// on arrival; its keys are committed now, before the relay can start,
+	// and the answer carries FreeSBC's line.
+	var cryptoLines []sdp.Crypto
+	var forkSDES sdesPlan
+	if sess.sdes != nil {
+		if l.callee == calleeUpstream {
+			plan, err := sess.planAnswer(l.offer.offer.Audio)
+			if err != nil {
+				return nil, err
+			}
+			if err := sess.commit(plan); err != nil {
+				return nil, err
+			}
+			cryptoLines = plan.answerLines()
+		} else {
+			offered, err := sess.answerSet(true)
+			if err != nil {
+				return nil, err
+			}
+			if forkSDES, err = sess.checkAnswer(answer.Audio, offered); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	d := l.dialog()
 	callerPlane := planePublic
 	if l.callee.calleePlane() == planePublic {
@@ -519,6 +562,7 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		Direction:      answer.Audio.Direction,
 		SessionID:      id,
 		SessionVersion: version,
+		Crypto:         cryptoLines,
 	}
 	if callerPlane == planePublic && sess.webrtc != nil {
 		s.setWebRTCBlock(&build, sess.webrtc.Leg())
@@ -533,6 +577,7 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 		}
 	}
 	d.setForkAnswer(f, body, agreed, remote, rtcp)
+	d.setForkSDES(f, forkSDES)
 	if l.callee.calleePlane() == planePublic && sess.rtp != nil {
 		// The answering phone or gateway: rank its media by the address
 		// FreeSBC sent the INVITE to, as allocateRTP does for a caller.
@@ -553,6 +598,11 @@ func (s *Server) followFork(l *inviteLeg, f *earlyFork) {
 	}
 	remote, rtcp, codecs := d.forkMedia(f)
 	sess := d.session()
+	if l.callee.calleePlane() == planePublic && sess.sdes != nil {
+		if err := sess.commit(d.forkSDES(f)); err != nil {
+			s.log.Warn("SDES keys not applied; the public leg carries no media", "err", err, "sip_call_id", d.callID)
+		}
+	}
 	s.pointMedia(sess, l.callee.calleePlane(), remote, rtcp)
 	sess.setNegotiated(codecs)
 	d.setApplied(f)
@@ -650,6 +700,9 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 			codecs:      codecs,
 		}
 	} else {
+		if d.publicSRTP() == srtpImpossible {
+			return nil, errSDESInsecure
+		}
 		sess, err := media.AllocateAcross(s.pubPool, s.privPool, media.SessionConfig{
 			// Same policy as allocateRTP: the public leg (the answering
 			// phone) latches loosely so a hard-NAT phone's real RTP
@@ -671,6 +724,7 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 			publicPort:  sess.RTPPort(media.SideA),
 			privatePort: sess.RTPPort(media.SideB),
 			codecs:      codecs,
+			sdes:        newSDESLeg(d.publicSRTP()),
 		}
 	}
 	ms.seedApplied(planePrivate, remote)
@@ -691,6 +745,9 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 	if ms.webrtc != nil {
 		// The leg has no remote yet, so its DTLSSetup is actpass.
 		s.setWebRTCBlock(&build, ms.webrtc.Leg())
+	}
+	if build.Crypto, err = ms.sdesOffer(); err != nil {
+		return nil, err
 	}
 	body, err := build.Marshal()
 	if err != nil {
@@ -793,6 +850,15 @@ func (s *Server) rebuildInDialogOffer(d *dialog, f *earlyFork, body []byte, towa
 			return nil, nil, err
 		}
 	}
+	if toward == planePrivate && sess.sdes != nil {
+		// The public side's re-offer is checked against the leg's SRTP
+		// state now, before anything is forwarded or changed: one that
+		// drops SRTP, or offers none the policy allows, is refused (488)
+		// and the keys in force stay.
+		if _, err := sess.planAnswer(offer.Audio); err != nil {
+			return nil, nil, err
+		}
+	}
 	addr, port := s.anchorFor(sess, toward)
 	id, version := d.originFor(f, toward)
 	build := sdp.Build{
@@ -813,6 +879,13 @@ func (s *Server) rebuildInDialogOffer(d *dialog, f *earlyFork, body []byte, towa
 		// re-offer would be refused, or taken as a request to drop the
 		// secure transport.
 		s.setWebRTCBlock(&build, sess.webrtc.Leg())
+	}
+	if toward == planePublic {
+		// A re-offer toward an SRTP leg repeats the key in force; toward
+		// one still undecided it repeats the initial offer's lines.
+		if build.Crypto, err = sess.sdesOffer(); err != nil {
+			return nil, nil, err
+		}
 	}
 	out, err := build.Marshal()
 	if err != nil {
@@ -835,6 +908,32 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, f *earlyFork, offer *sdp.Sessi
 		return nil, nil, negotiateError(err)
 	}
 	sess := d.session()
+	// The public leg's SRTP: toward the public side FreeSBC answers its
+	// offer (its key stays, or is replaced when the offer changes suite);
+	// toward the private side the public side answered FreeSBC's offer,
+	// and its key is the peer's. Committed before the negotiated codecs
+	// are recorded so a refusal changes nothing.
+	var cryptoLines []sdp.Crypto
+	if sess.sdes != nil {
+		var plan sdesPlan
+		if toward == planePublic {
+			plan, err = sess.planAnswer(offer.Audio)
+		} else {
+			var offered []sdp.Crypto
+			if offered, err = sess.answerSet(false); err == nil {
+				plan, err = sess.checkAnswer(answer.Audio, offered)
+			}
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := sess.commit(plan); err != nil {
+			return nil, nil, err
+		}
+		if toward == planePublic {
+			cryptoLines = plan.answerLines()
+		}
+	}
 	sess.setNegotiated(agreed)
 
 	addr, port := s.anchorFor(sess, toward)
@@ -846,6 +945,7 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, f *earlyFork, offer *sdp.Sessi
 		Direction:      answer.Audio.Direction,
 		SessionID:      id,
 		SessionVersion: version,
+		Crypto:         cryptoLines,
 	}
 	if toward == planePublic && sess.webrtc != nil {
 		s.setWebRTCBlock(&build, sess.webrtc.Leg())

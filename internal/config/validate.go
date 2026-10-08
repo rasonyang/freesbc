@@ -136,6 +136,11 @@ func (c *Config) validateEdge(fail failFunc) {
 		}
 		e.switches = append(e.switches, ap)
 	}
+	switch e.SRTP {
+	case SRTPOff, SRTPOptional, SRTPRequired:
+	default:
+		fail("edge.srtp: must be off, optional or required, got %q", e.SRTP)
+	}
 	if p := e.SwitchCarrierPort; p < 0 || p > 65535 {
 		fail("edge.switch_carrier_port: must be 1-65535 (0 = the node's switch port), got %d", p)
 	}
@@ -278,6 +283,19 @@ func (c *Config) validateCarriers(fail failFunc) {
 				}
 			}
 		}
+		srtp := cc.SRTP
+		if srtp == "" {
+			srtp = SRTPOff
+		}
+		switch srtp {
+		case SRTPOff:
+		case SRTPOptional, SRTPRequired:
+			if tr != CarrierTLS && !e.AllowInsecureSDES {
+				fail("%s.srtp: %s needs transport: tls (SDES keys travel in the SDP), or edge.allow_insecure_sdes: true", label, srtp)
+			}
+		default:
+			fail("%s.srtp: must be off, optional or required, got %q", label, srtp)
+		}
 		if (cc.ClientCert == "") != (cc.ClientKey == "") {
 			fail("%s: client_cert and client_key must be set together", label)
 		}
@@ -307,7 +325,7 @@ func (c *Config) validateCarriers(fail failFunc) {
 			}
 		}
 		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr,
-			ExplicitPort: carrierHasPort(cc.Host), Transport: tr,
+			ExplicitPort: carrierHasPort(cc.Host), Transport: tr, SRTP: srtp,
 			CAFile: cc.CAFile, ClientCert: cc.ClientCert, ClientKey: cc.ClientKey})
 	}
 }

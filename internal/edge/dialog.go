@@ -196,6 +196,11 @@ type earlyFork struct {
 	// the fork already holds.
 	route  dialogRoute
 	routed bool
+
+	// sdes is what this fork's answer decided for the public leg, applied
+	// when the media follows the fork (followFork); the zero plan changes
+	// nothing.
+	sdes sdesPlan
 }
 
 // dialog is one proxied call, from the first forwarded INVITE to the
@@ -234,6 +239,8 @@ type dialog struct {
 	// (edge.carriers name, or "unknown"); empty for every other call. Set
 	// once right after the record is created (setCarrier).
 	carrier string
+	// srtp is the SDES policy of the call's public leg (sdes.go).
+	srtp srtpPolicy
 
 	// cancelled is set, synchronously, the moment the caller's CANCEL (or
 	// the INVITE backstop) gives up on the call. From then on no 2xx may
@@ -894,6 +901,34 @@ func (d *dialog) lastApplied() *earlyFork {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
 	return d.applied
+}
+
+// setForkSDES records the SDES plan of a fork's answer.
+func (d *dialog) setForkSDES(f *earlyFork, p sdesPlan) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	f.sdes = p
+}
+
+// forkSDES is the SDES plan recorded for a fork.
+func (d *dialog) forkSDES(f *earlyFork) sdesPlan {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return f.sdes
+}
+
+// setSRTP records the SDES policy of the call's public leg.
+func (d *dialog) setSRTP(p srtpPolicy) {
+	d.tab.mu.Lock()
+	d.srtp = p
+	d.tab.mu.Unlock()
+}
+
+// publicSRTP is the SDES policy of the call's public leg.
+func (d *dialog) publicSRTP() srtpPolicy {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	return d.srtp
 }
 
 // setApplied records the fork whose answer the media now follows.

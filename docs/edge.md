@@ -15,7 +15,7 @@ FreeSBC is a stateful SIP and media edge proxy. It provides SIP registration pro
                       Switch (FreeSWITCH / Asterisk)
 ```
 
-- **Public side**: SIP over UDP, TCP, TLS, WS and WSS on `public.bind`; RTP; WebRTC (ICE-Lite + DTLS-SRTP). Everything FreeSBC advertises there uses `public.ip`.
+- **Public side**: SIP over UDP, TCP, TLS, WS and WSS on `public.bind`; RTP, optionally SDES-SRTP; WebRTC (ICE-Lite + DTLS-SRTP). Everything FreeSBC advertises there uses `public.ip`.
 - **Private side**: one fixed UDP socket, `private.ip:5060`, for all SIP to and from the switch, plus plain RTP/RTCP.
 - **All signaling and media stay anchored through FreeSBC.** In SDP, Contact and the Request-URI, the switch is never given a public client's address and a public client is never given the switch's. On client calls the Via stack is ordinary proxy behaviour: FreeSBC prepends its own Via and annotates the sender's with `received=`, so the switch does see the client's address there. On carrier legs nothing private crosses to the carrier (see [Carrier path](#carrier-path)).
 
@@ -134,6 +134,30 @@ Failover is passive and transport-driven. A node that fails to accept the datagr
 - A kernel firewall integration, persistence, or clustering. State is in memory and lost on restart.
 - PUBLISH, and any use of the proxy as a presence server: SUBSCRIBE is carried, but the presence logic stays on the switch.
 - TURN and full ICE.
+
+## SDES-SRTP on public legs
+
+SDES (RFC 4568) keys SRTP with `a=crypto` lines carried in the SDP. FreeSBC can use it on the public leg of a call with a registered client (`edge.srtp`) or a carrier (the carrier's `srtp`). The default is `off`: `a=crypto` is ignored and the leg is plain RTP. A WebRTC leg (ws/wss) is always DTLS-SRTP and ignores `srtp`.
+
+The public leg is SRTP/SRTCP on its usual media port pair; the switch leg is always plain `RTP/AVP`. FreeSBC decrypts what the public side sends and encrypts what it sends to it. There is no transcoding, and the switch sees plain RTP only.
+
+**Suites.** `AES_CM_128_HMAC_SHA1_80`, `AES_CM_128_HMAC_SHA1_32` and `AEAD_AES_128_GCM`. FreeSBC generates its own master keys with `crypto/rand`; keys are never copied across legs. An answer must select exactly one of the lines offered (by tag and suite), and its key is the peer's.
+
+**Insecure transports.** The keys travel in the SDP, so SDES is used only where the signaling is encrypted. A client leg qualifies when the client registered over TLS or WSS, decided per call by that registration transport. A carrier qualifies when its `transport` is `tls`, which `check` enforces for a non-`off` `srtp`. `edge.allow_insecure_sdes: true` lifts the rule for both.
+
+| Policy | Behavior |
+|---|---|
+| `off` | `a=crypto` lines are ignored and the answer is plain, as before: an `RTP/SAVP` offer is answered `RTP/AVP`. |
+| `optional` | FreeSBC offers `RTP/SAVP` with three lines (one per suite) to a public callee and accepts a plain `RTP/AVP` answer as plain. An `RTP/SAVP` offer is answered with SRTP and an `RTP/AVP` offer with plain RTP. An `RTP/SAVP` offer with no usable line is refused 488. On an insecure transport without `allow_insecure_sdes` the effective policy is `off`. |
+| `required` | `RTP/SAVP` only. A plain offer is refused 488. If the callee answers our offer in plain RTP, the 2xx is ACKed and then BYEd and the other leg gets 488. On an insecure transport without `allow_insecure_sdes`, every offer and answer is refused 488: `required` is never silently downgraded. |
+
+**Re-INVITE, UPDATE, PRACK and delayed offers** follow the same rules. The same `a=crypto` line again keeps the state (no re-key; the rollover counter and replay window are kept). A new key re-keys the leg in place, without changing ports or the latch. FreeSBC repeats its own key in its re-offers. An offer that would drop SRTP on an SRTP leg is refused 488 and the keys in force stay; the refusal is decided before anything is forwarded, and keys take effect only when the exchange does.
+
+**Media.** There is no `a=rtcp-mux` on an SDES leg: RTCP stays on RTP+1. An SDES leg that does not yet have both keys drops packets in both directions (fail closed) rather than send or accept plaintext. A packet that fails authentication never latches the leg and never feeds the silence watchdog.
+
+**Keys are not logged.** The edge log handler and the sipgo logger rewrite `inline:<key>` to `inline:[redacted]` in every message and string attribute. Keys do not appear in admin output.
+
+Known limitation: there is no automatic retry after a 488 to our `RTP/SAVP` offer under `optional`. An `RTP/SAVP` offer to a plain-only endpoint fails (RFC 3264), and the 488 is relayed as it is; set `srtp: off` for such a peer.
 
 ## Reliable provisionals, UPDATE and delayed offers
 

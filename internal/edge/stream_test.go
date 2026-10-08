@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
@@ -35,6 +36,11 @@ type streamOpts struct {
 	// strict: only a live registration may call).
 	carrierSources string
 	tune           func(*streamLimits)
+	// edgeExtra is more edge: keys, written at two-space indent with a
+	// trailing newline (e.g. "  srtp: optional\n").
+	edgeExtra string
+	// log replaces the harness log handler (default: warnings to stderr).
+	log slog.Handler
 }
 
 // startStreamHarness is startHarnessFull with tcp/tls listeners.
@@ -60,7 +66,15 @@ func startStreamHarness(t *testing.T, o streamOpts) *harness {
 	}
 	mediaBase := nextMediaBase(t)
 	yaml := harnessYAML(t, []string{fmt.Sprintf("127.0.0.1:%d", up)}, pubUDP, pubWS, 0, mediaBase, o.carrierSources, extra...)
-	h := newHarness(t, yaml, priv)
+	if o.edgeExtra != "" {
+		yaml = strings.Replace(yaml, "edge:\n", "edge:\n"+o.edgeExtra, 1)
+	}
+	var h *harness
+	if o.log != nil {
+		h = newHarnessLog(t, yaml, priv, o.log)
+	} else {
+		h = newHarness(t, yaml, priv)
+	}
 	h.upstream = fmt.Sprintf("127.0.0.1:%d", up)
 	h.fs = startFakeSwitch(t, h.upstream)
 	h.fs.mu.Lock()

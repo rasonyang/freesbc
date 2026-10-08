@@ -85,12 +85,25 @@ type EdgeConfig struct {
 	Carriers map[string]CarrierConfig `yaml:"carriers"`
 	// CarrierSources are extra inbound carrier IPs/CIDRs.
 	CarrierSources []string `yaml:"carrier_sources"`
+	// SRTP is the SDES-SRTP policy for registered clients: off (the
+	// default), optional or required. Carriers have their own (CarrierConfig.SRTP).
+	SRTP string `yaml:"srtp"`
+	// AllowInsecureSDES lets SDES be used on a public leg whose signaling
+	// is not TLS or WSS, where the keys travel in the clear.
+	AllowInsecureSDES bool `yaml:"allow_insecure_sdes"`
 
 	// Compiled by validate.
 	switches    []netip.AddrPort
 	carrierNets []netip.Prefix // carrier_sources only
 	carriers    []Carrier      // sorted by name
 }
+
+// SDES-SRTP policies (edge.srtp and edge.carriers.<name>.srtp).
+const (
+	SRTPOff      = "off"
+	SRTPOptional = "optional"
+	SRTPRequired = "required"
+)
 
 // Carrier transports. udp is the default.
 const (
@@ -116,6 +129,10 @@ type CarrierConfig struct {
 	// both or neither. tls only.
 	ClientCert string `yaml:"client_cert"`
 	ClientKey  string `yaml:"client_key"`
+	// SRTP is the SDES-SRTP policy toward this carrier: off (the default),
+	// optional or required. Anything but off needs transport: tls unless
+	// edge.allow_insecure_sdes is set.
+	SRTP string `yaml:"srtp"`
 }
 
 // UnmarshalYAML accepts a scalar (the host) or a strict mapping.
@@ -128,7 +145,7 @@ func (c *CarrierConfig) UnmarshalYAML(b []byte) error {
 	type plain CarrierConfig
 	var p plain
 	if err := yaml.UnmarshalWithOptions(b, &p, yaml.Strict()); err != nil {
-		return fmt.Errorf("edge.carriers: want \"host[:port]\" or a mapping of host, transport, ca_file, client_cert, client_key: %s",
+		return fmt.Errorf("edge.carriers: want \"host[:port]\" or a mapping of host, transport, ca_file, client_cert, client_key, srtp: %s",
 			strings.TrimSpace(yaml.FormatError(err, false, false)))
 	}
 	*c = CarrierConfig(p)
@@ -137,7 +154,8 @@ func (c *CarrierConfig) UnmarshalYAML(b []byte) error {
 
 // Plain reports whether the entry is the bare UDP "host[:port]" form.
 func (c CarrierConfig) Plain() bool {
-	return (c.Transport == "" || c.Transport == CarrierUDP) && c.CAFile == "" && c.ClientCert == "" && c.ClientKey == ""
+	return (c.Transport == "" || c.Transport == CarrierUDP) && c.CAFile == "" && c.ClientCert == "" && c.ClientKey == "" &&
+		(c.SRTP == "" || c.SRTP == SRTPOff)
 }
 
 // Carrier is one validated edge.carriers entry.
@@ -158,6 +176,8 @@ type Carrier struct {
 	// CAFile, ClientCert and ClientKey are the tls settings (paths; empty
 	// when unset).
 	CAFile, ClientCert, ClientKey string
+	// SRTP is the SDES-SRTP policy: off, optional or required.
+	SRTP string
 }
 
 // DialPort is the port the carrier is dialed on when SRV gives none: the
@@ -216,6 +236,9 @@ func withDefaults(c *Config) {
 	}
 	if c.RTP == (PortRange{}) {
 		c.RTP = DefaultRTP
+	}
+	if c.Edge.SRTP == "" {
+		c.Edge.SRTP = SRTPOff
 	}
 	if c.Shield.MaxSessions == 0 {
 		c.Shield.MaxSessions = c.RTP.Pairs()

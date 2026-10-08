@@ -112,6 +112,10 @@ func TeardownRequest(method sip.RequestMethod, res *sip.Response, via sip.Header
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq, MethodName: method})
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
+	// A body-less request on a stream transport must still say so: without
+	// Content-Length the peer's parser waits for a body that never comes.
+	cl := sip.ContentLengthHeader(0)
+	req.AppendHeader(&cl)
 	req.SetTransport(res.Transport())
 	if len(routes) > 0 {
 		if t, ok := routes[0].UriParams.Get("transport"); ok && t != "" {

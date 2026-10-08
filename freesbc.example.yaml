@@ -37,6 +37,9 @@ rtp: 20000-29999             # one range, allocated independently per bind IP
 
 edge:
   switch: [10.77.0.10:5060]  # literal IP:port; more than one = hash-user pool
+  srtp: optional            # SDES-SRTP for registered clients: off (default) | optional | required;
+  #                         #   used only over TLS/WSS signaling, unless allow_insecure_sdes: true
+  # allow_insecure_sdes: false
   switch_carrier_port: 5080  # carriers (FreeSWITCH: external profile port);
                              #   default = the switch port above
   listen:                    # ports on public.bind; present = enabled
@@ -53,6 +56,7 @@ edge:
     secure:                           # mapping form: transport udp (default) | tcp | tls
       host: sip.secure-carrier.com    # tls: SRV _sips._tcp, port 5061; the certificate must name this host
       transport: tls
+      srtp: required                  # SDES-SRTP toward this carrier: off (default) | optional | required; needs tls
       ca_file: /etc/freesbc/secure-carrier-ca.pem   # replaces the system roots; optional
       # client_cert: /etc/freesbc/client.pem        # mutual TLS: both or neither
       # client_key:  /etc/freesbc/client.key

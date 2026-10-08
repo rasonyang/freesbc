@@ -17,8 +17,10 @@ func redactConfig(cfg *config.Config) any {
 			"switch_carrier_port": cfg.Edge.SwitchCarrierPort,
 			"listen": map[string]any{"udp": cfg.Edge.Listen.UDP, "tcp": cfg.Edge.Listen.TCP, "tls": cfg.Edge.Listen.TLS,
 				"ws": cfg.Edge.Listen.WS, "wss": cfg.Edge.Listen.WSS},
-			"carriers":        redactCarriers(cfg.Edge.Carriers),
-			"carrier_sources": cfg.Edge.CarrierSources,
+			"carriers":            redactCarriers(cfg.Edge.Carriers),
+			"carrier_sources":     cfg.Edge.CarrierSources,
+			"srtp":                cfg.Edge.SRTP,
+			"allow_insecure_sdes": cfg.Edge.AllowInsecureSDES,
 		},
 		"shield": map[string]any{
 			"rate_limit":         cfg.Shield.RateLimit,
@@ -52,6 +54,9 @@ func redactCarriers(m map[string]config.CarrierConfig) map[string]any {
 			continue
 		}
 		v := map[string]any{"host": c.Host, "transport": c.Transport}
+		if c.SRTP != "" {
+			v["srtp"] = c.SRTP
+		}
 		for k, p := range map[string]string{"ca_file": c.CAFile, "client_cert": c.ClientCert, "client_key": c.ClientKey} {
 			if p != "" {
 				v[k] = p

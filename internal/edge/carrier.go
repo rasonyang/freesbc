@@ -218,6 +218,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.endUnlessUp()
 	d.setCarrier(carrier)
+	d.setSRTP(s.legSRTPPolicy(carrier, ""))
 
 	// An offerless INVITE is forwarded as it is: the offer is the
 	// carrier's first SDP, built into a private one when it arrives

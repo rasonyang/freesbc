@@ -942,6 +942,8 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	callID := sip.CallIDHeader(b.callID)
 	req.AppendHeader(&callID)
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: b.cseq, MethodName: sip.BYE})
+	cl := sip.ContentLengthHeader(0) // stream transports need it (see TeardownRequest)
+	req.AppendHeader(&cl)
 	req.SetTransport(strings.ToUpper(toward.transport))
 	req.SetDestination(b.remote)
 	if toward.laddr.IP != nil && toward.laddr.Port > 0 {

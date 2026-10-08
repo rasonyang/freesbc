@@ -131,7 +131,7 @@ Non-goals: transcoding, CDR, clustering, and being a registrar in its own right.
 
 - No transcoding; left to the switch.
 - All state is in memory; a restart drops every call, dialog and binding.
-- The edge never offers or reads `a=crypto`: a SIP phone gets plain RTP, and only browser legs get DTLS-SRTP.
+- SDES-SRTP (`a=crypto`) is off unless `edge.srtp` or a carrier's `srtp` enables it, and then only over TLS/WSS signaling (or `edge.allow_insecure_sdes`); browser legs get DTLS-SRTP.
 - Switches and carrier gateways are UDP only; switches are literal `IP:port`, with no DNS.
 - Call-ID passes through the proxy unchanged.
 - No PUBLISH, and no TURN or full ICE.

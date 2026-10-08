@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -313,4 +314,20 @@ func parseCryptoAttrs(values []string) []Crypto {
 		}
 	}
 	return out
+}
+
+// cryptoKeyRe matches the key parameter of an a=crypto line (RFC 4568
+// §9.1): "inline:" and the base64 key||salt, up to the "|" that starts a
+// lifetime or MKI.
+var cryptoKeyRe = regexp.MustCompile(`(?i)inline:[A-Za-z0-9+/=_-]+`)
+
+// RedactCrypto replaces the key material of every "inline:<key>" in s with
+// "inline:[redacted]". It is for text that may carry an SDP body or a
+// quoted a=crypto line on its way to a log; a string without one comes
+// back unchanged.
+func RedactCrypto(s string) string {
+	if !strings.Contains(strings.ToLower(s), "inline:") {
+		return s
+	}
+	return cryptoKeyRe.ReplaceAllString(s, "inline:[redacted]")
 }

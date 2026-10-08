@@ -35,6 +35,9 @@ func TestRestartOnlyChanges(t *testing.T) {
 		{"listen", strings.Replace(base, "udp: 5060", "udp: 5070", 1), []string{"edge.listen"}},
 		{"carriers", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: 1.2.3.4 }", 1), []string{"edge.carriers"}},
 		{"carrier_sources", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [1.2.3.4]", 1), []string{"edge.carrier_sources"}},
+		{"srtp", strings.Replace(base, "edge:\n", "edge:\n  srtp: optional\n", 1), []string{"edge.srtp"}},
+		{"allow_insecure_sdes", strings.Replace(base, "edge:\n", "edge:\n  allow_insecure_sdes: true\n", 1), []string{"edge.allow_insecure_sdes"}},
+		{"carrier srtp", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: {host: 1.2.3.4, srtp: off} }", 1), []string{"edge.carriers"}},
 		{"admin", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\" }\n", []string{"admin"}},
 		{"admin allowed_hosts", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", allowed_hosts: [a.example] }\n", []string{"admin"}},
 	}
