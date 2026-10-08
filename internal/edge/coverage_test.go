@@ -18,20 +18,20 @@ func TestUnhandledMethodGets405WithAllow(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
 
-	req := sip.NewRequest(sip.SUBSCRIBE, sip.Uri{User: "1001", Host: "example.com"})
+	req := sip.NewRequest(sip.PUBLISH, sip.Uri{User: "1001", Host: "example.com"})
 	from := &sip.FromHeader{Address: sip.Uri{User: "1001", Host: "example.com"}, Params: sip.NewParams()}
 	from.Params.Add("tag", sip.GenerateTagN(12))
 	req.AppendHeader(from)
 	req.AppendHeader(&sip.ToHeader{Address: sip.Uri{User: "1001", Host: "example.com"}, Params: sip.NewParams()})
-	callID := sip.CallIDHeader("subscribe-405")
+	callID := sip.CallIDHeader("publish-405")
 	req.AppendHeader(&callID)
-	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.SUBSCRIBE})
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.PUBLISH})
 	req.AppendHeader(sip.NewHeader("Event", "presence"))
 	req.AppendHeader(&sip.ContactHeader{Address: phone.contactURI("1001")})
 
 	res := phone.do(t, req, h.publicUDP)
 	if res.StatusCode != 405 {
-		t.Fatalf("SUBSCRIBE got %d, want 405", res.StatusCode)
+		t.Fatalf("PUBLISH got %d, want 405", res.StatusCode)
 	}
 	allow := res.GetHeader("Allow")
 	if allow == nil {
@@ -40,13 +40,13 @@ func TestUnhandledMethodGets405WithAllow(t *testing.T) {
 	if got, want := allow.Value(), strings.Join(allowedMethods, ", "); got != want {
 		t.Errorf("Allow = %q, want %q", got, want)
 	}
-	if strings.Contains(allow.Value(), "SUBSCRIBE") {
+	if strings.Contains(allow.Value(), "PUBLISH") {
 		t.Error("Allow must not advertise the method that was just refused")
 	}
 	if got := h.srv.Metrics().Snapshot().ResponsesOut["4xx"]; got < 1 {
 		t.Errorf("Metrics().Snapshot().ResponsesOut[4xx] = %d, want the 405 counted", got)
 	}
-	if len(h.fs.received(sip.SUBSCRIBE)) != 0 {
+	if len(h.fs.received(sip.PUBLISH)) != 0 {
 		t.Error("an unhandled method must not be forwarded to FreeSWITCH")
 	}
 }

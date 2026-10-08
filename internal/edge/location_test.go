@@ -275,3 +275,77 @@ func TestLocationSourceIndexConsistency(t *testing.T) {
 		t.Fatalf("per-AoR cap: %d bindings, want %d", got, defaultMaxPerAOR)
 	}
 }
+
+// The removal hook (used to end subscription records) hears about every way
+// a binding leaves the table, after the table's lock is released, and not
+// about a refresh in place.
+func TestLocationRemoveHook(t *testing.T) {
+	newTable := func() (*Location, *[]string) {
+		l := NewLocation()
+		var got []string
+		l.SetOnRemove(func(tokens []string) {
+			// The hook runs outside the lock: it may call back in.
+			_ = l.Count()
+			got = append(got, tokens...)
+		})
+		return l, &got
+	}
+	mustPut := func(t *testing.T, l *Location, b Binding) *Binding {
+		t.Helper()
+		p, err := l.Put(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("Remove", func(t *testing.T) {
+		l, got := newTable()
+		b := mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:5060", time.Hour))
+		l.Remove("1001@example.com", "c1")
+		if len(*got) != 1 || (*got)[0] != b.Token {
+			t.Errorf("hook tokens = %v, want [%s]", *got, b.Token)
+		}
+	})
+	t.Run("RemoveBySource", func(t *testing.T) {
+		l, got := newTable()
+		a := mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:5060", time.Hour))
+		b := mustPut(t, l, binding("1002@example.com", "c2", "198.51.100.5:5060", time.Hour))
+		mustPut(t, l, binding("1003@example.com", "c3", "198.51.100.6:5060", time.Hour))
+		l.RemoveBySource(netip.MustParseAddrPort("198.51.100.5:5060"))
+		if len(*got) != 2 {
+			t.Fatalf("hook tokens = %v, want the two bindings of that source", *got)
+		}
+		seen := map[string]bool{(*got)[0]: true, (*got)[1]: true}
+		if !seen[a.Token] || !seen[b.Token] {
+			t.Errorf("hook tokens = %v", *got)
+		}
+	})
+	t.Run("Prune", func(t *testing.T) {
+		l, got := newTable()
+		old := mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:5060", -time.Second))
+		mustPut(t, l, binding("1002@example.com", "c2", "198.51.100.6:5060", time.Hour))
+		if n := l.Prune(); n != 1 {
+			t.Fatalf("Prune = %d", n)
+		}
+		if len(*got) != 1 || (*got)[0] != old.Token {
+			t.Errorf("hook tokens = %v, want [%s]", *got, old.Token)
+		}
+	})
+	t.Run("sweep inside Put", func(t *testing.T) {
+		l, got := newTable()
+		old := mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:5060", -time.Second))
+		mustPut(t, l, binding("1001@example.com", "c2", "198.51.100.5:5062", time.Hour))
+		if len(*got) != 1 || (*got)[0] != old.Token {
+			t.Errorf("hook tokens = %v, want the lapsed binding [%s]", *got, old.Token)
+		}
+	})
+	t.Run("refresh in place is not a removal", func(t *testing.T) {
+		l, got := newTable()
+		mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:5060", time.Hour))
+		mustPut(t, l, binding("1001@example.com", "c1", "198.51.100.5:6000", time.Hour))
+		if len(*got) != 0 {
+			t.Errorf("hook tokens = %v, want none", *got)
+		}
+	})
+}

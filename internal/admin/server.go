@@ -72,6 +72,9 @@ type Deps struct {
 // call.
 type ProxyStats struct {
 	ActiveRegistrations int64 `json:"active_registrations"`
+	// ActiveSubscriptions is the SUBSCRIBE dialogs the edge routes NOTIFYs
+	// for (pending or active).
+	ActiveSubscriptions int64 `json:"active_subscriptions"`
 	ActiveDialogs       int64 `json:"active_dialogs"`
 	// ActiveSessions is the calls holding a session slot (ringing or up),
 	// the number shield.max_sessions caps.
@@ -101,7 +104,7 @@ type ProxyStats struct {
 
 	// AdmissionDrops counts public requests the edge admission policy
 	// dropped silently, by reason (a fixed set: invite_not_admitted,
-	// register_enumeration).
+	// register_enumeration, subscribe_not_admitted, message_not_admitted).
 	AdmissionDrops map[string]uint64 `json:"admission_drops_total"`
 
 	// CallsEnded counts confirmed calls that ended, by reason (a fixed set,

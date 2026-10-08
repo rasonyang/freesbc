@@ -243,14 +243,16 @@ func TestNotifyStrayToTagPaths(t *testing.T) {
 		via.Params.Add("branch", sip.GenerateBranchN(16))
 		via.Params.Add("rport", "")
 		req.PrependHeader(via)
-		phone.do(t, req, h.publicUDP)
+		// A public NOTIFY that matches no INVITE dialog or subscription is
+		// answered 481 by the edge (issue #112): hashing it upstream would
+		// let a made-up To tag carry it past admission.
+		if got := phone.do(t, req, h.publicUDP); got.StatusCode != 481 {
+			t.Errorf("public-plane stray NOTIFY: got %d, want 481", got.StatusCode)
+		}
 		assertNotDelivered(t, phone, sip.NOTIFY)
-		// Unchanged path: directionFor forwards a public request that names
-		// no dialog to the hashed upstream, which answers it itself (a real
-		// FreeSWITCH with 481; the fake switch answers every method it has
-		// no handler for with 200).
-		if got := h.fs.waitFor(sip.NOTIFY, before+1, 3*time.Second); len(got) != before+1 {
-			t.Errorf("the public-plane NOTIFY did not take the existing upstream path (FreeSWITCH got %d)", len(got))
+		time.Sleep(200 * time.Millisecond)
+		if got := len(h.fs.received(sip.NOTIFY)); got != before {
+			t.Errorf("the public-plane NOTIFY reached the switch (%d, want %d)", got, before)
 		}
 		if d.relaxedNotified() {
 			t.Error("a public-plane NOTIFY was routed by the relaxed lookup")

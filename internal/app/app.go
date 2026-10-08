@@ -130,6 +130,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 			s := edgeSrv.Metrics().Snapshot()
 			return admin.ProxyStats{
 				ActiveRegistrations:    s.ActiveRegistrations,
+				ActiveSubscriptions:    s.ActiveSubscriptions,
 				ActiveDialogs:          s.ActiveDialogs,
 				ActiveSessions:         s.ActiveSessions,
 				ActiveMediaSessions:    s.ActiveMediaSessions,

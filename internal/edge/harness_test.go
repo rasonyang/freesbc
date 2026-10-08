@@ -527,6 +527,10 @@ type fakeSwitch struct {
 	// updateHook, if set, overrides the default UPDATE behaviour (200,
 	// answering a body with the switch's own SDP). Guarded by mu.
 	updateHook func(req *sip.Request, tx sip.ServerTransaction) bool
+	// noRouteHook, if set, answers the methods the switch has no
+	// dedicated handler for (REFER, MESSAGE, NOTIFY...) before the default
+	// 200. Guarded by mu.
+	noRouteHook func(req *sip.Request, tx sip.ServerTransaction) bool
 	// prackHook, if set, overrides the default PRACK behaviour (200).
 	// Guarded by mu.
 	prackHook func(req *sip.Request, tx sip.ServerTransaction) bool
@@ -571,6 +575,12 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 	})
 	srv.OnNoRoute(func(req *sip.Request, tx sip.ServerTransaction) {
 		f.record(req)
+		f.mu.Lock()
+		hook := f.noRouteHook
+		f.mu.Unlock()
+		if hook != nil && hook(req, tx) {
+			return
+		}
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 
@@ -703,6 +713,12 @@ func (f *fakeSwitch) silentHook() func(req *sip.Request, tx sip.ServerTransactio
 func (f *fakeSwitch) setUpdateHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
 	f.mu.Lock()
 	f.updateHook = hook
+	f.mu.Unlock()
+}
+
+func (f *fakeSwitch) setNoRouteHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
+	f.mu.Lock()
+	f.noRouteHook = hook
 	f.mu.Unlock()
 }
 

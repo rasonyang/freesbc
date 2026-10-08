@@ -9,8 +9,9 @@ import (
 // This file keeps what the two endpoints advertise to each other honest
 // about what the proxy can carry (P2-EDG-010).
 //
-// FreeSBC proxies INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, NOTIFY and
-// REGISTER and answers OPTIONS itself; anything else gets 405 (onNoRoute).
+// FreeSBC proxies INVITE, ACK, CANCEL, BYE, PRACK, UPDATE, INFO, NOTIFY,
+// SUBSCRIBE, REFER, MESSAGE and REGISTER and answers OPTIONS itself;
+// anything else (PUBLISH) gets 405 (onNoRoute).
 // So on every request FreeSBC forwards and every response it relays, Allow
 // lists only the methods in allowedMethods.
 //

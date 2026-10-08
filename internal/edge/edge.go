@@ -59,7 +59,14 @@ type Server struct {
 
 	loc     *Location
 	dialogs *dialogTable
-	metrics *Metrics
+	// subs is the SUBSCRIBE dialog records (subscribe.go); subWarn spaces
+	// the WARN of a subscription cap reject.
+	subs    *subTable
+	subWarn subCapWarner
+	// afterSubBegin is a test seam, called between the insertion of a
+	// subscription record and the re-check of its binding.
+	afterSubBegin atomic.Pointer[func()]
+	metrics       *Metrics
 
 	// upstreamCooldown is the passive health penalty of the switch nodes
 	// (see cooldown.go).
@@ -217,6 +224,10 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
 	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
 	s.dialogs = newDialogTable(s.metrics, s.log)
+	s.subs = newSubTable(s.metrics)
+	// A subscription belongs to a registration binding: when the binding
+	// goes (un-REGISTER, WebSocket close, expiry) its records go too.
+	s.loc.SetOnRemove(s.subs.dropTokens)
 	s.dialogs.onMediaEnd = s.byeBothEnds
 	if s.webrtcEnabled {
 		s.identity, err = media.ProcessDTLSIdentity()
@@ -419,6 +430,9 @@ func (s *Server) Run(ctx context.Context) error {
 	srv.OnPrack(s.guard(s.onPrackUpdate))
 	srv.OnUpdate(s.guard(s.onPrackUpdate))
 	srv.OnNotify(s.guard(s.onInDialog))
+	srv.OnSubscribe(s.guard(s.onSubscribe))
+	srv.OnRefer(s.guard(s.onInDialog))
+	srv.OnMessage(s.guard(s.onMessage))
 	srv.OnOptions(s.guard(s.onOptions))
 	srv.OnNoRoute(s.guard(s.onNoRoute))
 
@@ -467,6 +481,7 @@ func (s *Server) Run(ctx context.Context) error {
 		listenCancel()
 		wg.Wait()
 		s.dialogs.closeAll()
+		s.subs.closeAll()
 		return err
 	}
 	s.log.Info("edge proxy listening",
@@ -499,6 +514,9 @@ func (s *Server) Run(ctx context.Context) error {
 				if n := s.loc.Prune(); n > 0 {
 					s.log.Debug("pruned expired registration bindings", "count", n)
 				}
+				if n := s.subs.prune(time.Now()); n > 0 {
+					s.log.Debug("pruned expired subscriptions", "count", n)
+				}
 				if n := s.carrierRegs.prune(); n > 0 {
 					s.log.Debug("pruned expired carrier registrations", "count", n)
 				}
@@ -530,9 +548,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// outlives Run. There is no BYE on this plane's shutdown: the calls
 	// are dropped (docs/design.md §4.5).
 	s.dialogs.close()
+	s.subs.close()
 	listenCancel()
 	wg.Wait()
 	s.dialogs.closeAll()
+	s.subs.closeAll()
 	return runErr
 }
 
@@ -947,7 +967,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inboun
 }
 
 // allowedMethods is what FreeSBC advertises it will proxy.
-var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "PRACK", "UPDATE", "OPTIONS", "INFO", "NOTIFY", "REGISTER"}
+var allowedMethods = []string{"INVITE", "ACK", "CANCEL", "BYE", "PRACK", "UPDATE", "OPTIONS", "INFO", "NOTIFY", "SUBSCRIBE", "REFER", "MESSAGE", "REGISTER"}
 
 // onNoRoute answers any method the proxy does not handle. A 405 naming the
 // methods it does handle is the honest answer; silence would leave a

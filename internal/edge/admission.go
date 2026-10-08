@@ -21,9 +21,11 @@ import (
 //     registration binding (admitPublicInvite);
 //   - a REGISTER is always admitted, except from a source that has had
 //     enumMaxAORs distinct AoRs rejected 403/404 by the registrar within
-//     enumWindow (enumLimiter).
+//     enumWindow (enumLimiter);
+//   - an out-of-dialog MESSAGE (and SUBSCRIBE) on a public listener is
+//     admitted only from a live registration (admitPublicOutOfDialog).
 //
-// Both drops are silent: no response is sent, so a scanner learns nothing
+// All drops are silent: no response is sent, so a scanner learns nothing
 // and sipgo's Timer G never retransmits a final to a spoofed source.
 
 // dropReason is why a public request was dropped by admission. The set is
@@ -33,13 +35,17 @@ type dropReason int
 const (
 	dropInviteNotAdmitted dropReason = iota
 	dropRegisterEnumeration
+	dropSubscribeNotAdmitted
+	dropMessageNotAdmitted
 	numDropReasons
 )
 
 // dropReasonLabels are the metric labels of the drop reasons.
 var dropReasonLabels = [numDropReasons]string{
-	dropInviteNotAdmitted:   "invite_not_admitted",
-	dropRegisterEnumeration: "register_enumeration",
+	dropInviteNotAdmitted:    "invite_not_admitted",
+	dropRegisterEnumeration:  "register_enumeration",
+	dropSubscribeNotAdmitted: "subscribe_not_admitted",
+	dropMessageNotAdmitted:   "message_not_admitted",
 }
 
 func (r dropReason) String() string { return dropReasonLabels[r] }
@@ -86,6 +92,44 @@ func (s *Server) admitPublicInvite(req *sip.Request, src netip.AddrPort) (invite
 		return srcCarrier, name
 	}
 	return srcDrop, ""
+}
+
+// outOfDialogVerdict is what admitPublicOutOfDialog decides.
+type outOfDialogVerdict int
+
+const (
+	// oodAdmitted: the source holds a live registration; the Binding
+	// returned names it.
+	oodAdmitted outOfDialogVerdict = iota
+	// oodCarrier: a carrier source. The request is not supported from
+	// carriers; the handler answers 405.
+	oodCarrier
+	// oodDropped: nobody. The request was counted and dropped silently
+	// (dropSilently); the handler returns without responding.
+	oodDropped
+)
+
+// admitPublicOutOfDialog is the admission check of an out-of-dialog
+// request other than INVITE that arrived on a public listener and that
+// only a registered client may send: MESSAGE, and SUBSCRIBE. Like
+// admitPublicInvite it keys on the transport source alone and a live
+// registration wins over a carrier source. A registered source is
+// admitted with its Binding (the one whose user equals the From user,
+// else the first live one at that source), a carrier source is answered
+// 405, and anything else is dropped silently and counted under reason.
+func (s *Server) admitPublicOutOfDialog(req *sip.Request, src netip.AddrPort, reason dropReason) (Binding, outOfDialogVerdict) {
+	user := ""
+	if f := req.From(); f != nil {
+		user = f.Address.User
+	}
+	if b, ok := s.loc.SourceBinding(sip.NetworkToLower(req.Transport()), src, user); ok {
+		return b, oodAdmitted
+	}
+	if _, ok := s.carriers.snapshot().carrierFor(src); ok {
+		return Binding{}, oodCarrier
+	}
+	s.dropSilently(reason, req, src)
+	return Binding{}, oodDropped
 }
 
 // dropSilently records an admission drop: it counts it by reason and logs
