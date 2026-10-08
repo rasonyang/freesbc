@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1038,3 +1040,336 @@ func TestStreamKeyGroupsIPv6By64(t *testing.T) {
 		t.Errorf("4in6 key = %v", k)
 	}
 }
+
+// ---------------------------------------------------------------------
+// Hardening: slow-loris timer, keep-alive idling, accept errors, ws frames
+// ---------------------------------------------------------------------
+
+// rawRegister is a complete REGISTER for 1001 sent over a raw stream.
+func rawRegister(transport string) string {
+	return "REGISTER sip:example.com SIP/2.0\r\n" +
+		"Via: SIP/2.0/" + strings.ToUpper(transport) + " 127.0.0.1;branch=z9hG4bK-rawreg\r\n" +
+		"Max-Forwards: 70\r\n" +
+		"From: <sip:1001@example.com>;tag=rr1\r\n" +
+		"To: <sip:1001@example.com>\r\n" +
+		"Call-ID: raw-register-1\r\n" +
+		"CSeq: 1 REGISTER\r\n" +
+		"Contact: <sip:1001@127.0.0.1:5999;transport=" + transport + ">\r\n" +
+		"Expires: 600\r\n" +
+		"Content-Length: 0\r\n\r\n"
+}
+
+// The message timeout is per message: pipelined messages cut so that no
+// read ends on a message boundary keep one partial message pending at all
+// times, and that must not make a busy connection look like one slow
+// message. A message that then genuinely stalls is still closed.
+func TestStreamSlowLorisTimerRestartsPerMessage(t *testing.T) {
+	for _, tr := range streamTransportsUnderTest {
+		t.Run(tr, func(t *testing.T) {
+			h := startStreamHarness(t, streamOpts{tcp: true, tls: true,
+				tune: func(l *streamLimits) { l.message = 400 * time.Millisecond }})
+			c := dialRaw(t, tr, h.streamAddr(tr))
+
+			var stream []byte
+			var bounds = map[int]bool{}
+			n := 0
+			for len(stream) < 6000 {
+				n++
+				stream = append(stream, optionsMsg(tr, n, 0)...)
+				bounds[len(stream)] = true
+			}
+			begin := time.Now()
+			for pos := 0; pos < len(stream); {
+				end := min(pos+97, len(stream))
+				if bounds[end] && end < len(stream) {
+					end-- // never end a write, and so a read, on a boundary
+				}
+				if _, err := c.Write(stream[pos:end]); err != nil {
+					t.Fatalf("write at %d after %v: %v", pos, time.Since(begin), err)
+				}
+				pos = end
+				time.Sleep(25 * time.Millisecond)
+			}
+			if took := time.Since(begin); took < 3*h.srv.streamLim.message {
+				t.Fatalf("the stream took %v, too short to prove anything against %v", took, h.srv.streamLim.message)
+			}
+			for i := 0; i < n; i++ {
+				if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+					t.Fatalf("response %d of %d: status %q err %v (the connection was closed mid-stream?)", i+1, n, st, err)
+				}
+			}
+			if v := h.srv.metrics.Snapshot().StreamClosed["slow"]; v != 0 {
+				t.Fatalf("slow closes = %d on a busy connection", v)
+			}
+
+			// A message that starts and then stalls is still closed.
+			if _, err := io.WriteString(c, optionsMsg(tr, 9999, 0)[:40]); err != nil {
+				t.Fatal(err)
+			}
+			c.expectClosed(t, 3*time.Second, "a stalled message after pipelined traffic")
+			waitFor(t, 3*time.Second, "the slow close to be counted", func() bool {
+				return h.srv.metrics.Snapshot().StreamClosed["slow"] == 1
+			})
+		})
+	}
+}
+
+// Keep-alive bytes do not hold an unused connection open: one that starts no
+// message within the idle timeout is closed even though CRLFs keep arriving.
+// One in use (a live registration binding) keeps its connection on
+// keep-alives alone.
+func TestStreamIdleNotHeldByKeepAlives(t *testing.T) {
+	tune := func(l *streamLimits) { l.idle = 250 * time.Millisecond }
+	t.Run("unbound", func(t *testing.T) {
+		h := startStreamHarness(t, streamOpts{tcp: true, tune: tune})
+		c := dialRaw(t, "tcp", h.publicTCP)
+		waitFor(t, 3*time.Second, "the connection to be admitted", func() bool { return h.srv.streams.open() == 1 })
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(60 * time.Millisecond):
+				}
+				if _, err := io.WriteString(c, "\r\n\r\n"); err != nil {
+					return
+				}
+			}
+		}()
+		waitFor(t, 3*time.Second, "the keep-alive-only connection to be closed", func() bool {
+			return h.srv.streams.open() == 0
+		})
+		if n := h.srv.metrics.Snapshot().StreamClosed["idle"]; n != 1 {
+			t.Errorf("idle closes = %d, want 1", n)
+		}
+	})
+	t.Run("registered", func(t *testing.T) {
+		h := startStreamHarness(t, streamOpts{tcp: true, tune: tune})
+		c := dialRaw(t, "tcp", h.publicTCP)
+		if _, err := io.WriteString(c, rawRegister("tcp")); err != nil {
+			t.Fatal(err)
+		}
+		if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+			t.Fatalf("REGISTER: status %q err %v", st, err)
+		}
+		for end := time.Now().Add(4 * h.srv.streamLim.idle); time.Now().Before(end); time.Sleep(60 * time.Millisecond) {
+			if _, err := io.WriteString(c, "\r\n\r\n"); err != nil {
+				t.Fatalf("the registered connection was closed on keep-alives: %v", err)
+			}
+		}
+		if h.srv.streams.open() != 1 || h.srv.loc.Count() != 1 {
+			t.Fatalf("registered connection lost: %d connections, %d bindings", h.srv.streams.open(), h.srv.loc.Count())
+		}
+		if n := h.srv.metrics.Snapshot().StreamClosed["idle"]; n != 0 {
+			t.Errorf("idle closes = %d, want 0", n)
+		}
+	})
+}
+
+// wsUpgrade completes a WebSocket upgrade on a raw connection.
+func wsUpgrade(t *testing.T, c *rawConn) {
+	t.Helper()
+	req := "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: sip\r\n\r\n"
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		line, err := c.br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("ws upgrade response: %v", err)
+		}
+		if line == "\r\n" {
+			return
+		}
+	}
+}
+
+// wsFrame is a masked client frame.
+func wsFrame(fin bool, opcode byte, payload string) []byte {
+	b0 := opcode
+	if fin {
+		b0 |= 0x80
+	}
+	f := []byte{b0, 0x80 | byte(len(payload)), 1, 2, 3, 4}
+	for i := 0; i < len(payload); i++ {
+		f = append(f, payload[i]^byte(1+i%4))
+	}
+	return f
+}
+
+// WebSocket control frames are not SIP messages: a ping flood neither keeps
+// an unused connection open past the idle timeout nor escapes the rate limit.
+func TestStreamWSControlFrames(t *testing.T) {
+	t.Run("idle", func(t *testing.T) {
+		h := startStreamHarness(t, streamOpts{ws: true,
+			tune: func(l *streamLimits) { l.idle = 250 * time.Millisecond }})
+		c := dialRaw(t, "ws", h.publicWS)
+		wsUpgrade(t, c)
+		waitFor(t, 3*time.Second, "the connection to be admitted", func() bool { return h.srv.streams.open() == 1 })
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(60 * time.Millisecond):
+				}
+				if _, err := c.Write(wsFrame(true, 0x9, "")); err != nil {
+					return
+				}
+			}
+		}()
+		waitFor(t, 3*time.Second, "the ping-only connection to be closed", func() bool {
+			return h.srv.streams.open() == 0
+		})
+		if n := h.srv.metrics.Snapshot().StreamClosed["idle"]; n != 1 {
+			t.Errorf("idle closes = %d, want 1", n)
+		}
+	})
+	t.Run("rate", func(t *testing.T) {
+		h := startStreamHarness(t, streamOpts{ws: true})
+		c := dialRaw(t, "ws", h.publicWS)
+		wsUpgrade(t, c)
+		auditReplaceConfig(h, func(c *config.Config) { c.Shield.RateLimit = "6/h per_ip" })
+		go func() {
+			for i := 0; i < 40; i++ {
+				if _, err := c.Write(wsFrame(true, 0x9, "")); err != nil {
+					return
+				}
+			}
+		}()
+		waitFor(t, 3*time.Second, "the ping flood to be closed for rate", func() bool {
+			return h.srv.metrics.Snapshot().StreamClosed["rate"] == 1
+		})
+	})
+}
+
+// A message fragmented into many frames costs a token per frame, though
+// sipgo reads all of them inside one Read.
+func TestStreamWSFragmentsChargedPerFrame(t *testing.T) {
+	h := startStreamHarness(t, streamOpts{ws: true})
+	c := dialRaw(t, "ws", h.publicWS)
+	wsUpgrade(t, c)
+	auditReplaceConfig(h, func(c *config.Config) { c.Shield.RateLimit = "6/h per_ip" })
+	msg := optionsMsg("ws", 1, 0)
+	go func() {
+		_, _ = c.Write(wsFrame(false, 0x1, msg[:1]))
+		for i := 1; i < len(msg)-1; i++ {
+			if _, err := c.Write(wsFrame(false, 0x0, msg[i:i+1])); err != nil {
+				return
+			}
+		}
+		_, _ = c.Write(wsFrame(true, 0x0, msg[len(msg)-1:]))
+	}()
+	waitFor(t, 3*time.Second, "the fragmented message to be closed for rate", func() bool {
+		return h.srv.metrics.Snapshot().StreamClosed["rate"] == 1
+	})
+}
+
+func TestWSFramerCharges(t *testing.T) {
+	req := "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+	f := &wsFramer{max: 4096}
+	f.feed([]byte(req))
+	var in []byte
+	in = append(in, wsFrame(false, 0x1, "ab")...) // first data frame: the read filter's token
+	in = append(in, wsFrame(false, 0x0, "cd")...) // continuation
+	in = append(in, wsFrame(true, 0x0, "ef")...)  // continuation
+	in = append(in, wsFrame(true, 0x9, "")...)    // ping
+	in = append(in, wsFrame(true, 0xA, "")...)    // pong
+	charges, bad := f.feed(in)
+	if bad != closeNone || charges != 4 {
+		t.Fatalf("charges=%d bad=%v, want 4 (2 continuations, ping, pong)", charges, bad)
+	}
+	if began, msg := f.started(); began || !msg {
+		t.Errorf("started = (%v, %v), want (false, true): a complete data frame started", began, msg)
+	}
+	if _, bad := f.feed(wsFrame(true, 0x9, "")); bad != closeNone {
+		t.Fatal(bad)
+	}
+	if _, msg := f.started(); msg {
+		t.Error("a ping counted as a SIP message")
+	}
+}
+
+// fakeListener is a net.Listener whose Accept fails with err until it has
+// been called failures times, then blocks until Close.
+type fakeListener struct {
+	failures int
+	err      error
+	calls    chan struct{}
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func (l *fakeListener) Accept() (net.Conn, error) {
+	l.calls <- struct{}{}
+	if len(l.calls) <= l.failures {
+		return nil, l.err
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+func (l *fakeListener) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
+func (l *fakeListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// An Accept error that is not a shutdown must not leave the listener dead:
+// it is logged at Error and Accept is retried; a closed listener ends the
+// loop quietly.
+func TestStreamAcceptLoopSurvivesErrors(t *testing.T) {
+	var mu sync.Mutex
+	var logged []string
+	h := startStreamHarness(t, streamOpts{tcp: true, log: recordHandler(&mu, &logged)})
+	fl := &fakeListener{failures: 2, err: errors.New("accept: boom"), calls: make(chan struct{}, 64), closed: make(chan struct{})}
+	l := h.srv.newStreamListener(fl, "tcp", nil)
+	// Two failures, each followed by a retry, then the third Accept blocks.
+	waitFor(t, 3*time.Second, "Accept to be retried after errors", func() bool { return len(fl.calls) >= 3 })
+	mu.Lock()
+	errs := 0
+	for _, m := range logged {
+		if strings.Contains(m, "stream accept failed") {
+			errs++
+		}
+	}
+	mu.Unlock()
+	if errs < 2 {
+		t.Errorf("accept errors logged = %d, want at least 2", errs)
+	}
+	_ = l.Close()
+	select {
+	case <-l.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the listener did not end after Close")
+	}
+	n := len(fl.calls)
+	time.Sleep(100 * time.Millisecond)
+	if len(fl.calls) != n {
+		t.Error("Accept kept being called after the listener was closed")
+	}
+}
+
+// recordHandler records the Error-level messages it is given.
+func recordHandler(mu *sync.Mutex, out *[]string) slog.Handler {
+	return &recHandler{mu: mu, out: out}
+}
+
+type recHandler struct {
+	mu  *sync.Mutex
+	out *[]string
+}
+
+func (h *recHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Level >= slog.LevelError {
+		h.mu.Lock()
+		*h.out = append(*h.out, r.Message)
+		h.mu.Unlock()
+	}
+	return nil
+}
+func (h *recHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recHandler) WithGroup(string) slog.Handler      { return h }

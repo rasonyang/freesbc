@@ -52,6 +52,11 @@ var (
 	errSDESNoCrypto = fmt.Errorf("%w: SRTP section without a usable a=crypto line", errSDES)
 	// errSDESAnswer maps to 488: the answer selected no line FreeSBC offered.
 	errSDESAnswer = fmt.Errorf("%w: SRTP answer selects no offered a=crypto line", errSDES)
+	// errSDESSwitch maps to 488: the switch offered or answered RTP/SAVP.
+	// The switch leg is always plain RTP/AVP, so accepting it would put
+	// plaintext on a leg the switch believes is encrypted. Its a=crypto
+	// lines are never read, copied or logged.
+	errSDESSwitch = fmt.Errorf("%w: the switch leg is plain RTP/AVP and the switch offered or answered RTP/SAVP", errSDES)
 )
 
 // legSRTPPolicy is the policy for a public leg. carrier names the carrier

@@ -349,3 +349,21 @@ func TestLocationRemoveHook(t *testing.T) {
 		}
 	})
 }
+
+// A closing stream connection removes only the bindings made over its own
+// transport: a UDP binding from the same IP:port is another client's.
+func TestLocationRemoveBySourceOnTransport(t *testing.T) {
+	l := NewLocation()
+	tcp := binding("1001@example.com", "tcp-a", "203.0.113.9:41000", time.Hour)
+	tcp.Transport = "tcp"
+	udp := binding("1002@example.com", "udp-a", "203.0.113.9:41000", time.Hour)
+	l.Put(tcp)
+	l.Put(udp)
+	src := netip.MustParseAddrPort("203.0.113.9:41000")
+	if n := l.RemoveBySourceOn("TCP", src); n != 1 {
+		t.Fatalf("removed %d, want 1", n)
+	}
+	if !l.HasSource("udp", src) || l.HasSource("tcp", src) || l.Count() != 1 {
+		t.Errorf("udp binding kept=%v tcp binding gone=%v count=%d", l.HasSource("udp", src), !l.HasSource("tcp", src), l.Count())
+	}
+}

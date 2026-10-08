@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -305,6 +306,7 @@ type streamRigOpts struct {
 	serverConf *tls.Config // the carrier's server side (tls)
 	listenTLS  bool        // the edge also serves a tls listener
 	dns        map[string]string
+	tune       func(*streamLimits) // shortens the stream bounds before Run
 }
 
 type streamRig struct {
@@ -353,6 +355,9 @@ func startStreamRig(t *testing.T, o streamRigOpts) *streamRig {
 			stub.ips[name] = []string{ip}
 		}
 		h.srv.carriers.lookupSRV, h.srv.carriers.lookupIP = stub.lookupSRV, stub.lookupIP
+	}
+	if o.tune != nil {
+		o.tune(&h.srv.streamLim)
 	}
 	h.run()
 	rig := &streamRig{carrierRig: &carrierRig{harness: h, cs: cs}, carrier: carrier}
@@ -718,5 +723,70 @@ func TestCarrierAdmissionRequiresCarrierTransport(t *testing.T) {
 	}
 	if got := rig.cs.received(sip.INVITE); len(got) != 0 {
 		t.Errorf("the switch saw %d INVITEs from a tls carrier over UDP, want 0", len(got))
+	}
+}
+
+// Connections to and from carriers are counted apart from the public
+// global cap, so public junk that fills it cannot block a switch-to-carrier
+// call (a dial) or a carrier's own connection (an accept).
+func TestStreamCarrierConnectionsOutsidePublicCap(t *testing.T) {
+	t.Run("dial", func(t *testing.T) {
+		rig := startStreamRig(t, streamRigOpts{transport: "tcp",
+			tune: func(l *streamLimits) { l.maxTotal = 1 }})
+		if why, ok := rig.srv.streams.acquire(netip.MustParseAddr("203.0.113.9"), false, rig.srv.streamLim); !ok {
+			t.Fatalf("filling the public cap: %v", why)
+		}
+		if _, ok := rig.srv.streams.acquire(netip.MustParseAddr("203.0.113.10"), false, rig.srv.streamLim); ok {
+			t.Fatal("the public cap of 1 admitted a second public connection")
+		}
+		inv, res := rig.placeCall(t, "127.0.0.1")
+		rig.fs.sendAckTo2xx(t, res)
+		rig.carrier.waitInbound(t, sip.ACK)
+		_ = inv
+		if n := rig.srv.metrics.Snapshot().StreamRefused["global_cap"]; n != 0 {
+			t.Errorf("global_cap refusals = %d, want 0 for a carrier dial", n)
+		}
+		rig.fs.uacBye(t, res)
+		rig.carrier.waitInbound(t, sip.BYE)
+	})
+	t.Run("accept", func(t *testing.T) {
+		h := startStreamHarness(t, streamOpts{tcp: true, carrierSources: harnessCarrierSources,
+			tune: func(l *streamLimits) { l.maxTotal = 1 }})
+		if _, ok := h.srv.streams.acquire(netip.MustParseAddr("203.0.113.9"), false, h.srv.streamLim); !ok {
+			t.Fatal("filling the public cap")
+		}
+		c := dialRaw(t, "tcp", h.publicTCP) // 127.0.0.1 is a carrier source
+		c.expectServing(t, "tcp", 1)
+		if n := h.srv.metrics.Snapshot().StreamRefused["global_cap"]; n != 0 {
+			t.Errorf("global_cap refusals = %d, want 0 for a carrier source", n)
+		}
+	})
+}
+
+// The carrier pool has its own bound, and each source stays bounded per IP.
+func TestStreamTableCarrierPool(t *testing.T) {
+	tab := newStreamTable()
+	lim := streamLimits{maxPerIP: 2, maxTotal: 1, maxCarrier: 2}
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	if _, ok := tab.acquire(a, false, lim); !ok {
+		t.Fatal("first public slot refused")
+	}
+	if why, ok := tab.acquire(b, false, lim); ok || why != refuseGlobalCap {
+		t.Fatalf("second public slot: ok=%v why=%v, want global cap", ok, why)
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok := tab.acquire(b, true, lim); !ok {
+			t.Fatalf("carrier slot %d refused while the public pool is full", i)
+		}
+	}
+	if why, ok := tab.acquire(b, true, lim); ok || why != refuseGlobalCap {
+		t.Fatalf("third carrier slot: ok=%v why=%v, want the carrier cap", ok, why)
+	}
+	tab.release(b, true)
+	if why, ok := tab.acquire(b, true, lim); !ok {
+		t.Fatalf("carrier slot after a release: %v", why)
+	}
+	if n := tab.open(); n != 3 {
+		t.Errorf("open = %d, want 3", n)
 	}
 }

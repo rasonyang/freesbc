@@ -872,6 +872,14 @@ own listener (`streamListener`) and bounds every stream transport the same way.
   handshake (tls, wss) and, for ws/wss, receives the whole HTTP upgrade
   request, each within `streamHandshakeTimeout` (10 s); a failure is
   `closed{handshake}`.
+- **Carrier connections.** A connection FreeSBC dials to a tcp/tls carrier and
+  one accepted from a carrier source (a resolved carrier address or
+  `edge.carrier_sources`) is counted against `streamMaxCarrierConns` (1024),
+  not `streamMaxConns`, so public junk filling the 10000 cannot block a
+  switch-to-carrier call or a carrier's own connection. Both are still bounded
+  per source IP by `streamMaxConnsPerIP`. A failed `Accept` that is not a
+  shutdown is logged at Error and retried with a pause growing from 5 ms to
+  1 s, so the listener cannot die while the process runs.
 - **Message bounds.** `streamConn.Read` feeds the bytes to a framer that only
   follows message boundaries: for SIP (`sipFramer`) the header block up to the
   empty line and `Content-Length` (or `l:`) bytes of body, with CRLFs between
@@ -882,23 +890,34 @@ own listener (`streamListener`) and bounds every stream transport the same way.
   `Content-Length` that is not a number or two that disagree (`malformed`).
   Each message that starts costs a rate token, as does each keep-alive read;
   an empty bucket closes the connection (`closed{rate}`) rather than dropping
-  a chunk. The framer never parses SIP: sipgo's parser still parses.
+  a chunk. On ws/wss the read filter charges one token per message read, but
+  sipgo reads every frame of a fragmented message, and answers control frames,
+  inside one read; so `wsFramer` also charges one token per continuation frame
+  and per control frame (ping, pong, close), which rate-limits a fragment
+  flood and a ping flood. The framer never parses SIP: sipgo's parser still
+  parses.
 - **Deadlines.** The read deadline is set before each read. While a message is
   arriving it is `streamMessageTimeout` (15 s) from the message's first byte,
   not reset by later bytes, so a client trickling a header cannot hold the
-  connection (`closed{slow}`). Between messages it is `streamIdleTimeout`
+  connection (`closed{slow}`). The 15 s restarts whenever a new message begins, so
+  pipelined traffic whose reads never end on a boundary is not one slow
+  message. Between messages it is `streamIdleTimeout`
   (60 s); when it expires the connection is closed (`closed{idle}`) unless it
   is in use (`streamBusy`): a live registration binding made over it
   (`Location.HasSource`), a dialog routed to it (`dialogTable.usesRemote`), or
   a carrier source. An in-use connection is re-armed and lives as long as the
   binding or dialog, so a phone refreshing its registration every few minutes
   keeps its connection and a registered flow is never reaped for being quiet.
-  Every write has a `streamWriteTimeout` (10 s) deadline, so a client that
+  Keep-alive bytes (CRLF, WebSocket control frames) do not defer that:
+  `streamConn` records when the last SIP message (WebSocket data frame)
+  started and closes a connection that is not in use once none has started
+  within the idle timeout, whatever else arrives. Every write has a
+  `streamWriteTimeout` (10 s) deadline, so a client that
   stops reading cannot pin a transaction goroutine. A policy close returns
   `io.EOF` to sipgo, which logs it at Debug.
 - **Close.** `streamConn.Close` runs once: it frees the connection's slot and
-  calls `Location.RemoveBySource(remote)`, which drops the bindings made over
-  it (and their subscriptions, through the `Location` removal hook). A
+  calls `Location.RemoveBySourceOn(transport, remote)`, which drops the
+  bindings made over it, and not a UDP binding with the same IP:port (and their subscriptions, through the `Location` removal hook). A
   REGISTER over a new connection from the same device (same AoR and Call-ID)
   re-indexes the existing binding under the new source, so the old
   connection closing afterwards removes nothing.
@@ -3793,7 +3812,7 @@ code constant.
 | `streamIdleTimeout` | 60 s | a stream connection silent this long and in no use (no binding, dialog or carrier source) is closed; an in-use one is re-armed |
 | `streamMessageTimeout` | 15 s from the message's first byte | one SIP message or WebSocket frame must arrive complete (slow-loris guard) |
 | `streamWriteTimeout` | 10 s | one write to a stream client |
-| `streamMaxConnsPerIP` / `streamMaxConns` | 256 / 10000 | open stream connections per source (an IPv6 /64) and in all |
+| `streamMaxConnsPerIP` / `streamMaxConns` / `streamMaxCarrierConns` | 256 / 10000 / 1024 | open stream connections per source (an IPv6 /64), in all for public sources, and in all to and from carriers (dialed, or accepted from a carrier source), which do not count against the 10000 |
 | `registerTimeout` | 32 s (`register.go:17`) | one whole REGISTER series, client or carrier |
 | `ackTimeout` | 32 s (`edge.go:249`; Timer H) | an answer owed in an ACK that never arrived: the call is ended with a BYE to both sides (§7.9a) |
 | `sessionCapRetryAfter` | 5 s (`invite.go:152`) | `Retry-After` of a 503 for a full session cap |
@@ -3955,9 +3974,9 @@ Stated because the code establishes them, not as future work.
 - **No active qualification.** There is no outbound OPTIONS keepalive;
   switch-node health is entirely passive, and an OPTIONS from the public side
   is answered locally.
-- **No TCP or SIP-over-TLS toward the switch or a carrier.** The private socket
-  and carrier legs are UDP only. Public tcp/tls serve registered phones and
-  ws/wss serve browsers.
+- **No TCP or SIP-over-TLS toward the switch.** The private socket is UDP
+  only. A carrier may be udp, tcp or tls (§6.10). Public tcp/tls serve
+  registered phones and ws/wss serve browsers.
 - **No DNS toward the switch.** `edge.switch` entries are literal `IP:port`.
   DNS (SRV, then A/AAAA) exists only for `edge.carriers`, on the public side.
 - **No Via-based loop detection** (RFC 3261 §16.3); the only loop protection

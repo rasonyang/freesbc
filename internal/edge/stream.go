@@ -51,6 +51,14 @@ const (
 	// goroutine, a 32 KiB read buffer and a file descriptor, so the process
 	// needs a matching file-descriptor limit.
 	streamMaxConns = 10000
+	// streamMaxCarrierConns caps open stream connections to and from
+	// carriers in all: the connections FreeSBC dials to a carrier and those
+	// accepted from a carrier source (resolved carrier addresses and
+	// edge.carrier_sources). They are counted apart from streamMaxConns so
+	// public junk filling that pool cannot starve switch-to-carrier calls or
+	// a carrier's own connections; each source address is still bounded by
+	// streamMaxConnsPerIP.
+	streamMaxCarrierConns = 1024
 	// streamHandshakeTimeout bounds the TLS handshake and the WebSocket
 	// upgrade request of a new connection.
 	streamHandshakeTimeout = 10 * time.Second
@@ -77,6 +85,7 @@ const (
 type streamLimits struct {
 	maxPerIP   int
 	maxTotal   int
+	maxCarrier int // connections to and from carriers, apart from maxTotal
 	handshake  time.Duration
 	idle       time.Duration
 	message    time.Duration
@@ -86,7 +95,7 @@ type streamLimits struct {
 
 func defaultStreamLimits() streamLimits {
 	return streamLimits{
-		maxPerIP: streamMaxConnsPerIP, maxTotal: streamMaxConns,
+		maxPerIP: streamMaxConnsPerIP, maxTotal: streamMaxConns, maxCarrier: streamMaxCarrierConns,
 		handshake: streamHandshakeTimeout, idle: streamIdleTimeout,
 		message: streamMessageTimeout, write: streamWriteTimeout,
 		maxMessage: fsip.MaxReadSize,
@@ -137,9 +146,10 @@ var streamCloseLabels = [numStreamCloses]string{"", "idle", "slow", "oversize", 
 
 // streamTable counts open stream connections per source and in all.
 type streamTable struct {
-	mu    sync.Mutex
-	total int
-	perIP map[netip.Addr]int
+	mu      sync.Mutex
+	total   int // every open connection
+	carrier int // the part of total that is to or from a carrier
+	perIP   map[netip.Addr]int
 }
 
 func newStreamTable() *streamTable { return &streamTable{perIP: map[netip.Addr]int{}} }
@@ -154,27 +164,38 @@ func streamKey(ip netip.Addr) netip.Addr {
 	return ip
 }
 
-// acquire takes a connection slot for ip, or says which cap refuses it.
-func (t *streamTable) acquire(ip netip.Addr, lim streamLimits) (streamRefusal, bool) {
+// acquire takes a connection slot for ip, or says which cap refuses it. A
+// carrier connection counts against the carrier cap, not the public one.
+func (t *streamTable) acquire(ip netip.Addr, carrier bool, lim streamLimits) (streamRefusal, bool) {
 	k := streamKey(ip)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.total >= lim.maxTotal {
+	if carrier {
+		if t.carrier >= lim.maxCarrier {
+			return refuseGlobalCap, false
+		}
+	} else if t.total-t.carrier >= lim.maxTotal {
 		return refuseGlobalCap, false
 	}
 	if t.perIP[k] >= lim.maxPerIP {
 		return refuseIPCap, false
 	}
 	t.total++
+	if carrier {
+		t.carrier++
+	}
 	t.perIP[k]++
 	return 0, true
 }
 
-func (t *streamTable) release(ip netip.Addr) {
+func (t *streamTable) release(ip netip.Addr, carrier bool) {
 	k := streamKey(ip)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.total--
+	if carrier {
+		t.carrier--
+	}
 	if t.perIP[k] <= 1 {
 		delete(t.perIP, k)
 	} else {
@@ -241,18 +262,29 @@ func (l *streamListener) acceptLoop() {
 	for {
 		c, err := l.Listener.Accept()
 		if err != nil {
-			// Out of file descriptors (or a transient failure) must not end
-			// the listener: sipgo treats an Accept error as fatal to Serve.
-			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || isTimeout(err) {
-				backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
-				select {
-				case <-time.After(backoff):
-					continue
-				case <-l.done:
-					return
-				}
+			// A listener closed on shutdown ends quietly. Any other error
+			// (out of file descriptors, a transient failure) must not end
+			// the listener: it would stay dead while the process runs. Retry
+			// with a growing pause, like net/http's accept loop.
+			select {
+			case <-l.done:
+				return
+			default:
 			}
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			if !errors.Is(err, syscall.EMFILE) && !errors.Is(err, syscall.ENFILE) && !isTimeout(err) {
+				l.s.log.Error("stream accept failed; retrying",
+					"transport", l.transport, "err", err, "retry_in", backoff)
+			}
+			select {
+			case <-time.After(backoff):
+				continue
+			case <-l.done:
+				return
+			}
 		}
 		backoff = 0
 		go l.prepare(c)
@@ -309,12 +341,13 @@ func (l *streamListener) prepare(raw net.Conn) {
 		_ = raw.Close()
 		return
 	}
-	if why, ok := s.streams.acquire(ip, lim); !ok {
+	carrier := s.carriers.snapshot().isSource(ip)
+	if why, ok := s.streams.acquire(ip, carrier, lim); !ok {
 		s.metrics.StreamRefused(why)
 		_ = raw.Close()
 		return
 	}
-	c := &streamConn{Conn: raw, l: l, ap: ap, remote: raw.RemoteAddr().String(), lim: lim}
+	c := &streamConn{Conn: raw, l: l, ap: ap, remote: raw.RemoteAddr().String(), lim: lim, carrier: carrier}
 	s.metrics.StreamConnOpened(l.transport)
 	if sh := s.currentShield(); sh != nil && !sh.AllowRate(ip) {
 		// A connection costs the token a datagram does, so a flood of
@@ -361,6 +394,9 @@ type streamConn struct {
 	remote string
 	lim    streamLimits
 	fr     framer
+	// carrier is whether the connection is to or from a carrier, which
+	// decides the connection cap it was counted against.
+	carrier bool
 
 	// pending is data already read from the connection that sipgo has yet
 	// to see: the WebSocket upgrade request, received during prepare.
@@ -371,6 +407,11 @@ type streamConn struct {
 	// reading goroutine touches them.
 	partial bool
 	since   time.Time
+	// lastMsg is when the last SIP message started on the connection (the
+	// connection's first read stands in until one does). Keep-alive bytes
+	// and WebSocket control frames never move it, so they cannot keep an
+	// otherwise unused connection open.
+	lastMsg time.Time
 
 	closeOnce sync.Once
 }
@@ -464,11 +505,28 @@ func (c *streamConn) observe(data []byte) bool {
 			}
 		}
 	}
-	if p := c.fr.partial(); p && !c.partial {
-		c.since = time.Now()
+	now := time.Now()
+	began, msg := c.fr.started()
+	if msg || c.lastMsg.IsZero() {
+		c.lastMsg = now
+	}
+	if p := c.fr.partial(); p {
+		// The slow-loris bound is per message: it restarts whenever a new
+		// message begins in this read, even if an earlier one was still
+		// partial before it.
+		if !c.partial || began {
+			c.since = now
+		}
 		c.partial = true
-	} else if !p {
+	} else {
 		c.partial = false
+		// Reads that carry only keep-alives never time out, so the idle
+		// bound is checked here as well: a connection that started no
+		// message within idle and carries nothing is closed.
+		if now.Sub(c.lastMsg) > c.lim.idle && !c.l.s.streamBusy(c.l.transport, c.ap) {
+			c.closeFor(closeIdle)
+			return false
+		}
 	}
 	return true
 }
@@ -496,9 +554,9 @@ func (c *streamConn) Close() error {
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
 		s := c.l.s
-		s.streams.release(c.ap.Addr())
+		s.streams.release(c.ap.Addr(), c.carrier)
 		s.metrics.StreamConnClosed(c.l.transport)
-		if n := s.loc.RemoveBySource(c.ap); n > 0 {
+		if n := s.loc.RemoveBySourceOn(c.l.transport, c.ap); n > 0 {
 			s.metrics.SetRegistrations(s.loc.Count())
 			s.log.Debug("stream connection closed; dropped its registration bindings",
 				"transport", c.l.transport, "public_remote", c.remote, "count", n)
@@ -515,6 +573,11 @@ type framer interface {
 	feed(data []byte) (charges int, bad streamClose)
 	// partial reports whether a message has started and not completed.
 	partial() bool
+	// started describes the last feed: began is whether a new unit (a SIP
+	// message, a WebSocket frame) started in it and has not completed;
+	// msg is whether a SIP message (a WebSocket data frame) started in it,
+	// complete or not.
+	started() (began, msg bool)
 }
 
 var crlfcrlf = []byte("\r\n\r\n")
@@ -527,6 +590,7 @@ type sipFramer struct {
 	state int // sipIdle, sipHead, sipBody
 	head  []byte
 	left  int
+	began bool // a message started in the last feed
 }
 
 const (
@@ -537,8 +601,11 @@ const (
 
 func (f *sipFramer) partial() bool { return f.state != sipIdle }
 
+func (f *sipFramer) started() (bool, bool) { return f.began && f.partial(), f.began }
+
 func (f *sipFramer) feed(p []byte) (int, streamClose) {
 	charges := 0
+	f.began = false
 	content := f.state != sipIdle
 	for len(p) > 0 {
 		switch f.state {
@@ -552,6 +619,7 @@ func (f *sipFramer) feed(p []byte) (int, streamClose) {
 				break
 			}
 			content = true
+			f.began = true
 			charges++
 			f.state = sipHead
 			f.head = f.head[:0]
@@ -638,6 +706,8 @@ type wsFramer struct {
 	hn    int
 	need  int
 	left  int64
+	began bool // a frame started in the last feed
+	data  bool // a data frame started in the last feed
 }
 
 const (
@@ -656,10 +726,24 @@ func (f *wsFramer) partial() bool {
 	return true
 }
 
+func (f *wsFramer) started() (bool, bool) { return f.began && f.partial(), f.data }
+
+// feed follows the frames and charges the shield for the ones its read
+// filter does not see. sipgo reads every frame of a fragmented message, and
+// answers control frames, inside one Read, so the filter's one token per
+// read covers a message's first frame only: each continuation frame and each
+// control frame (ping, pong, close) costs a token here, which rate-limits a
+// flood of either and gives a fragmented message a cost in proportion to its
+// frame count.
 func (f *wsFramer) feed(p []byte) (int, streamClose) {
+	charges := 0
+	f.began, f.data = false, false
 	for len(p) > 0 {
 		switch f.state {
 		case wsHTTP:
+			if f.read == 0 {
+				f.began = true
+			}
 			b := p[0]
 			p = p[1:]
 			f.read++
@@ -676,9 +760,12 @@ func (f *wsFramer) feed(p []byte) (int, streamClose) {
 			if f.match == 4 {
 				f.state, f.read, f.hn, f.need = wsHead, 0, 0, 2
 			} else if f.read > streamUpgradeMax {
-				return 0, closeMalformed
+				return charges, closeMalformed
 			}
 		case wsHead:
+			if f.hn == 0 {
+				f.began = true
+			}
 			take := min(f.need-f.hn, len(p))
 			copy(f.hdr[f.hn:], p[:take])
 			f.hn += take
@@ -714,7 +801,13 @@ func (f *wsFramer) feed(p []byte) (int, streamClose) {
 				}
 			}
 			if n < 0 || n > f.max {
-				return 0, closeOversize
+				return charges, closeOversize
+			}
+			switch op := f.hdr[0] & 0x0f; {
+			case op == 1 || op == 2:
+				f.data = true // the read filter charges a message's first frame
+			default:
+				charges++ // continuation or control frame
 			}
 			f.hn, f.need, f.left = 0, 2, n
 			f.state = wsPayload
@@ -730,5 +823,5 @@ func (f *wsFramer) feed(p []byte) (int, streamClose) {
 			}
 		}
 	}
-	return 0, closeNone
+	return charges, closeNone
 }

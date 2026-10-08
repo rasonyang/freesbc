@@ -826,3 +826,81 @@ func TestRedactHandler(t *testing.T) {
 		t.Errorf("RedactCrypto changed text without a key: %q", got)
 	}
 }
+
+// The switch leg is always plain RTP/AVP, so an RTP/SAVP offer or answer
+// from the switch is refused (488) rather than relayed as plaintext toward
+// a switch that believes it is encrypted. Its a=crypto lines are never read.
+func TestSDESSwitchSAVPRefused(t *testing.T) {
+	for _, policy := range []struct{ name, extra string }{{"srtp off", ""}, {"srtp optional", "  srtp: optional\n"}} {
+		savp := func(t *testing.T, r *sdesRig) string {
+			return sdesBody(t, r.h.fs.rtpPort, mustCrypto(t, 1, sdp.SuiteAESCM128HMACSHA180))
+		}
+		t.Run(policy.name+"/offer from the switch", func(t *testing.T) {
+			r := newSDESRig(t, streamOpts{tls: true, edgeExtra: policy.extra}, "tls")
+			got := r.answerCalls(t, "plain", newSDESPeer(t).port())
+			res := r.h.fs.call(t, registeredRuri(t, r.h), r.h.privateSIP, savp(t, r))
+			if res.StatusCode != 488 {
+				t.Fatalf("switch INVITE with an SAVP offer: got %d, want 488", res.StatusCode)
+			}
+			select {
+			case <-got:
+				t.Error("the client was sent an INVITE built from an SAVP switch offer")
+			case <-time.After(300 * time.Millisecond):
+			}
+			if n := r.h.srv.metrics.Snapshot().InviteRejects["media_failed"]; n != 1 {
+				t.Errorf("media_failed rejects = %d, want 1", n)
+			}
+			waitForRelease(t, r.h)
+		})
+		t.Run(policy.name+"/answer from the switch", func(t *testing.T) {
+			r := newSDESRig(t, streamOpts{tls: true, edgeExtra: policy.extra}, "tls")
+			body := savp(t, r)
+			r.h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
+				res := sip.NewResponseFromRequest(req, 200, "OK", []byte(body))
+				res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+				res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(r.h.fs.addr)}})
+				_ = tx.Respond(res)
+				return true
+			})
+			_, res := r.invite(t, phoneOfferSDP(newSDESPeer(t).port()))
+			if res.StatusCode != 488 {
+				t.Fatalf("client INVITE answered with SAVP by the switch: got %d, want 488", res.StatusCode)
+			}
+			// The switch's unusable 2xx is ACKed and the call ended on its side.
+			if len(r.h.fs.waitFor(sip.BYE, 1, 3*time.Second)) != 1 {
+				t.Error("the switch was not sent a BYE for the call it answered with SAVP")
+			}
+			waitForRelease(t, r.h)
+		})
+	}
+	t.Run("re-offer from the switch", func(t *testing.T) {
+		r := newSDESRig(t, streamOpts{tls: true, edgeExtra: "  srtp: optional\n"}, "tls")
+		r.answerCalls(t, "plain", newSDESPeer(t).port())
+		res := r.h.fs.call(t, registeredRuri(t, r.h), r.h.privateSIP, phoneOfferSDP(r.h.fs.rtpPort))
+		if res.StatusCode != 200 {
+			t.Fatalf("switch INVITE: %d", res.StatusCode)
+		}
+		r.h.fs.sendAckTo2xx(t, res)
+		bad := switchReInvite(t, r.h.fs, res, sdesBody(t, r.h.fs.rtpPort, mustCrypto(t, 1, sdp.SuiteAESCM128HMACSHA180)))
+		if bad.StatusCode != 488 {
+			t.Fatalf("SAVP re-INVITE from the switch: got %d, want 488", bad.StatusCode)
+		}
+		// The call is untouched: a plain re-offer still works, and BYE ends it.
+		if ok := switchReInvite(t, r.h.fs, bumpedRes(res, 1), phoneOfferSDP(r.h.fs.rtpPort)); ok.StatusCode != 200 {
+			t.Errorf("plain re-INVITE after the refusal: got %d, want 200", ok.StatusCode)
+		}
+		if bye := r.h.fs.uacBye(t, res); bye.StatusCode != 200 {
+			t.Errorf("BYE: %d", bye.StatusCode)
+		}
+		waitForRelease(t, r.h)
+	})
+}
+
+// bumpedRes returns a copy of res whose CSeq is raised by n, so the next
+// switchReInvite takes a fresh CSeq.
+func bumpedRes(res *sip.Response, n uint32) *sip.Response {
+	c := res.Clone()
+	c.RemoveHeader("CSeq")
+	c.AppendHeader(&sip.CSeqHeader{SeqNo: res.CSeq().SeqNo + n, MethodName: sip.INVITE})
+	return c
+}

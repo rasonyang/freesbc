@@ -491,6 +491,9 @@ func (s *Server) negotiateFork(l *inviteLeg, f *earlyFork, answerBody []byte) ([
 	if err != nil {
 		return nil, fmt.Errorf("proxy: answer: %w", err)
 	}
+	if l.callee == calleeUpstream && answer.Audio.SDES() {
+		return nil, errSDESSwitch
+	}
 	offer := l.offer.offer
 	agreed, err := sdp.Negotiate(filterCodecs(offer.Audio.Codecs), answer.Audio.Codecs)
 	if err != nil {
@@ -672,6 +675,9 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 	if err != nil {
 		return nil, fmt.Errorf("proxy: upstream offer: %w", err)
 	}
+	if offer.Audio.SDES() {
+		return nil, errSDESSwitch
+	}
 	codecs := filterCodecs(offer.Audio.Codecs)
 	if !sdp.HasMedia(codecs) {
 		return nil, fmt.Errorf("%w: upstream offered %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
@@ -837,6 +843,9 @@ func (s *Server) rebuildInDialogOffer(d *dialog, f *earlyFork, body []byte, towa
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog offer: %w", err)
 	}
+	if toward == planePublic && offer.Audio.SDES() {
+		return nil, nil, errSDESSwitch // the offer came from the switch
+	}
 	codecs := filterCodecs(offer.Audio.Codecs)
 	if !sdp.HasMedia(codecs) {
 		return nil, nil, fmt.Errorf("%w: re-offer had %s", errNoUsableCodec, sdp.Describe(offer.Audio.Codecs))
@@ -902,6 +911,9 @@ func (s *Server) rebuildInDialogAnswer(d *dialog, f *earlyFork, offer *sdp.Sessi
 	answer, err := s.parseSDP(body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("proxy: in-dialog answer: %w", err)
+	}
+	if toward == planePublic && answer.Audio.SDES() {
+		return nil, nil, errSDESSwitch // the answer came from the switch
 	}
 	agreed, err := sdp.Negotiate(filterCodecs(offer.Audio.Codecs), answer.Audio.Codecs)
 	if err != nil {

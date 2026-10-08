@@ -218,11 +218,11 @@ func (cc *carrierConns) dial(ctx context.Context, name, network, dest string) er
 	if err != nil {
 		return err
 	}
-	if why, ok := s.streams.acquire(ap.Addr(), lim); !ok {
+	if why, ok := s.streams.acquire(ap.Addr(), true, lim); !ok {
 		_ = raw.Close()
 		return fmt.Errorf("connection cap reached (%s)", streamRefusalLabels[why])
 	}
-	c := &streamConn{Conn: raw, l: l, ap: ap, remote: dest, lim: lim, fr: &sipFramer{max: lim.maxMessage}}
+	c := &streamConn{Conn: raw, l: l, ap: ap, remote: dest, lim: lim, fr: &sipFramer{max: lim.maxMessage}, carrier: true}
 	s.metrics.StreamConnOpened(network)
 	if network == config.CarrierTLS {
 		tc := tls.Client(raw, cc.tls[name])
