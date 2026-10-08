@@ -263,7 +263,7 @@ func TestAuditCancelBeforeInviteSentIsNotLost(t *testing.T) {
 	if !ok {
 		t.Fatal("begin refused")
 	}
-	defer d.end()
+	defer d.end(endShutdown)
 
 	var seriesCancelled bool
 	a := &inviteAttempt{req: req, cancel: func() { seriesCancelled = true }}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/internal/media"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
@@ -37,6 +38,65 @@ const (
 	// the teardown paths safe to race one another.
 	dialogEnded
 )
+
+// endReason is why a confirmed call ended. The first end() to win the
+// dialog's state transition records its reason; the set is fixed, so it is
+// a bounded metric label and a stable log value.
+type endReason int
+
+const (
+	// endByeCaller, endByeCallee: a BYE from that side was accepted.
+	endByeCaller endReason = iota
+	endByeCallee
+	// endByeUnanswered: a BYE was relayed but the far side never answered
+	// it, so FreeSBC ended the dialog and re-sent the BYE itself.
+	endByeUnanswered
+	// endRTPSilence: the media silence watchdog fired.
+	endRTPSilence
+	// endDTLSFailure: the WebRTC leg failed (ICE, DTLS or fingerprint).
+	endDTLSFailure
+	// endReinviteRefused: a re-INVITE 2xx whose answer could not be anchored.
+	endReinviteRefused
+	// endAnswerTimeout: the answer to a delayed offer never arrived.
+	endAnswerTimeout
+	// endAnswerUnusable: the answer to a delayed offer (in an ACK or PRACK),
+	// or to an UPDATE, could not be anchored.
+	endAnswerUnusable
+	// endMediaFault: the media session closed for another reason (a relay
+	// goroutine panicked).
+	endMediaFault
+	// endShutdown: the process is shutting down.
+	endShutdown
+	numEndReasons
+)
+
+// endReasonLabels are the log values and metric labels of the end reasons.
+var endReasonLabels = [numEndReasons]string{
+	endByeCaller:       "bye_caller",
+	endByeCallee:       "bye_callee",
+	endByeUnanswered:   "bye_unanswered",
+	endRTPSilence:      "rtp_silence",
+	endDTLSFailure:     "dtls_failure",
+	endReinviteRefused: "reinvite_refused",
+	endAnswerTimeout:   "answer_timeout",
+	endAnswerUnusable:  "answer_unusable",
+	endMediaFault:      "media_fault",
+	endShutdown:        "shutdown",
+}
+
+func (r endReason) String() string { return endReasonLabels[r] }
+
+// endReasonOf maps why a media session closed onto an end reason.
+func endReasonOf(c media.CloseCause) endReason {
+	switch c {
+	case media.CloseSilence:
+		return endRTPSilence
+	case media.CloseLegFailed:
+		return endDTLSFailure
+	default:
+		return endMediaFault
+	}
+}
 
 // inviteAttempt is the INVITE FreeSBC currently has in flight for an early
 // dialog.
@@ -273,7 +333,7 @@ type dialogTable struct {
 	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
 	// rather than by signaling. Both endpoints still believe the call is
 	// up, so the server tells them. Set once, before any call exists.
-	onMediaEnd func(d *dialog)
+	onMediaEnd func(d *dialog, why endReason)
 
 	metrics *Metrics
 	log     *slog.Logger
@@ -500,7 +560,7 @@ func (t *dialogTable) closeAll() {
 	}
 	t.mu.Unlock()
 	for _, d := range all {
-		d.end()
+		d.end(endShutdown)
 	}
 }
 
@@ -1014,9 +1074,10 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 		<-sess.Done()
 		// Whoever ended the dialog first closed the session; only when the
 		// media ended it — nobody else had — are the endpoints still to be
-		// told.
-		if d.end() && t.onMediaEnd != nil {
-			t.onMediaEnd(d)
+		// told, and the session says why it closed.
+		why := endReasonOf(sess.Cause())
+		if d.end(why) && t.onMediaEnd != nil {
+			t.onMediaEnd(d, why)
 		}
 	}()
 	return true
@@ -1029,7 +1090,8 @@ func (d *dialog) endUnlessUp() {
 	early := d.state == dialogEarly
 	d.tab.mu.Unlock()
 	if early {
-		d.end()
+		// An INVITE that never connected: the reason is never reported.
+		d.end(endShutdown)
 	}
 }
 
@@ -1039,9 +1101,10 @@ func (d *dialog) endUnlessUp() {
 // dialog's end exactly once.
 //
 // Idempotent, and safe to race: the state transition under the table's
-// mutex is what elects the one caller that does the work. It reports
-// whether this call ended a confirmed dialog.
-func (d *dialog) end() bool {
+// mutex is what elects the one caller that does the work, and so the one
+// whose reason is recorded. It reports whether this call ended a confirmed
+// dialog.
+func (d *dialog) end(reason endReason) bool {
 	t := d.tab
 	t.mu.Lock()
 	if d.state == dialogEnded {
@@ -1049,6 +1112,7 @@ func (d *dialog) end() bool {
 		return false
 	}
 	wasUp := d.state == dialogConfirmed
+	confirmedAt, carrier := d.confirmedAt, d.carrier != ""
 	d.state = dialogEnded
 	d.inFlight = nil
 	if d.owed != nil && d.owed.timer != nil {
@@ -1073,6 +1137,9 @@ func (d *dialog) end() bool {
 	}
 	t.metrics.DialogEnded()
 	t.metrics.MediaEnded(webrtc, st)
-	t.log.Info("call ended", "sip_call_id", d.callID, "stats", st)
+	t.metrics.CallEnded(reason)
+	t.log.Info("call ended", "sip_call_id", d.callID, "reason", reason.String(),
+		"duration", time.Since(confirmedAt).Round(time.Millisecond),
+		"webrtc", webrtc, "carrier", carrier, "stats", st)
 	return true
 }

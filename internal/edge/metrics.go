@@ -48,6 +48,14 @@ type Metrics struct {
 	// admission policy, one counter per (fixed) reason (admission.go).
 	admissionDrops [numDropReasons]atomic.Uint64
 
+	// callsEnded counts confirmed calls by the reason they ended
+	// (dialog.go), one counter per (fixed) reason.
+	callsEnded [numEndReasons]atomic.Uint64
+
+	// inviteRejects counts final responses the edge itself originated to an
+	// out-of-dialog INVITE, one counter per (fixed) reason (invite.go).
+	inviteRejects [numInviteRejects]atomic.Uint64
+
 	// carrierReqs counts requests of the carrier path by (carrier,
 	// direction, method) — key "carrier/direction/method". The carrier is a
 	// configured name or "unknown", the direction one of two, the method
@@ -135,6 +143,12 @@ func (m *Metrics) PortAllocationFailed()  { m.portFailures.Add(1) }
 
 // AdmissionDropped counts one public request dropped by admission.
 func (m *Metrics) AdmissionDropped(r dropReason) { m.admissionDrops[r].Add(1) }
+
+// CallEnded counts one confirmed call that ended, by reason.
+func (m *Metrics) CallEnded(r endReason) { m.callsEnded[r].Add(1) }
+
+// InviteRejected counts one out-of-dialog INVITE the edge refused itself.
+func (m *Metrics) InviteRejected(r inviteReject) { m.inviteRejects[r].Add(1) }
 
 // CarrierRequest counts one request of the carrier path.
 func (m *Metrics) CarrierRequest(carrier, direction, method string) {
@@ -238,6 +252,12 @@ type Snapshot struct {
 	// reason is present, zero or not.
 	AdmissionDrops map[string]uint64
 
+	// CallsEnded is keyed by end reason (endReasonLabels), InviteRejects by
+	// reject reason (inviteRejectLabels); every reason is present, zero or
+	// not.
+	CallsEnded    map[string]uint64
+	InviteRejects map[string]uint64
+
 	// CarrierRequests is keyed "carrier/direction/method".
 	CarrierRequests map[string]uint64
 
@@ -265,6 +285,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		WebRTCICEFailures:           m.iceFailures.Load(),
 		WebRTCDTLSFailures:          m.dtlsFailures.Load(),
 		AdmissionDrops:              map[string]uint64{},
+		CallsEnded:                  map[string]uint64{},
+		InviteRejects:               map[string]uint64{},
 		ParseFailures:               map[string]uint64{},
 		CarrierRequests:             map[string]uint64{},
 		CarrierRegistrations:        map[string]int64{},
@@ -287,6 +309,12 @@ func (m *Metrics) Snapshot() Snapshot {
 	}
 	for r := range m.admissionDrops {
 		s.AdmissionDrops[dropReasonLabels[r]] = m.admissionDrops[r].Load()
+	}
+	for r := range m.callsEnded {
+		s.CallsEnded[endReasonLabels[r]] = m.callsEnded[r].Load()
+	}
+	for r := range m.inviteRejects {
+		s.InviteRejects[inviteRejectLabels[r]] = m.inviteRejects[r].Load()
 	}
 	for i := range m.requestsIn {
 		method := metricOther

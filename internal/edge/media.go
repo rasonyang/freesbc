@@ -99,6 +99,14 @@ func (m *mediaSession) Stats() media.Stats {
 	return m.rtp.Stats()
 }
 
+// Cause says why the session closed (media.CloseNone while it is open).
+func (m *mediaSession) Cause() media.CloseCause {
+	if m.webrtc != nil {
+		return m.webrtc.Cause()
+	}
+	return m.rtp.Cause()
+}
+
 // IsWebRTC reports whether the public leg is a browser leg.
 func (m *mediaSession) IsWebRTC() bool { return m.webrtc != nil }
 
@@ -337,7 +345,7 @@ func (s *Server) startWebRTC(ctx context.Context, sess *media.WebRTCSession, fin
 				// our own identity.
 				s.log.Warn("webrtc peer certificate does not match the signalled fingerprint; tearing down media", "err", err)
 				s.metrics.WebRTCFailure(err)
-				_ = sess.Close()
+				_ = sess.Fail()
 				return
 			}
 		}

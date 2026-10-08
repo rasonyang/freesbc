@@ -74,6 +74,67 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 	s.inviteToUpstream(req, tx, src, carrier)
 }
 
+// inviteReject is why the edge itself refused an out-of-dialog INVITE with a
+// final response. The set is fixed, so it is a bounded metric label. A
+// silent admission drop is not one (dropReason), nor is a response relayed
+// from the far side, a re-INVITE refusal, or the 487 a caller's own CANCEL
+// earns.
+type inviteReject int
+
+const (
+	// rejectEarlyCap: the source has too many unanswered calls (503).
+	rejectEarlyCap inviteReject = iota
+	// rejectShuttingDown: the proxy is shutting down (503).
+	rejectShuttingDown
+	// rejectLoopDetected: the INVITE merges with a call in progress (482).
+	rejectLoopDetected
+	// rejectNoPublicSide: no public listener to carry the call (488, 480, 503).
+	rejectNoPublicSide
+	// rejectWebRTCDisabled: a call to a browser with WebRTC off (488).
+	rejectWebRTCDisabled
+	// rejectNoTarget: nowhere to send it: an unknown switch target, a
+	// client with no binding, a carrier with no address (404, 503).
+	rejectNoTarget
+	// rejectTooManyHops: Max-Forwards is exhausted (483).
+	rejectTooManyHops
+	// rejectMediaFailed: the media could not be negotiated or anchored
+	// (488, 500).
+	rejectMediaFailed
+	// rejectPortExhausted: no media port was free (503).
+	rejectPortExhausted
+	// rejectUpstreamFailed: every switch or carrier attempt failed (503).
+	rejectUpstreamFailed
+	// rejectTimeout: the INVITE's own budget ran out (408).
+	rejectTimeout
+	numInviteRejects
+)
+
+// inviteRejectLabels are the metric labels of the reject reasons.
+var inviteRejectLabels = [numInviteRejects]string{
+	rejectEarlyCap:       "early_cap",
+	rejectShuttingDown:   "shutting_down",
+	rejectLoopDetected:   "loop_detected",
+	rejectNoPublicSide:   "no_public_side",
+	rejectWebRTCDisabled: "webrtc_disabled",
+	rejectNoTarget:       "no_target",
+	rejectTooManyHops:    "too_many_hops",
+	rejectMediaFailed:    "media_failed",
+	rejectPortExhausted:  "port_exhausted",
+	rejectUpstreamFailed: "upstream_failed",
+	rejectTimeout:        "timeout",
+}
+
+func (r inviteReject) String() string { return inviteRejectLabels[r] }
+
+// rejectInvite refuses an out-of-dialog INVITE with a final response and
+// counts it. Every handler returns after calling it, and sipgo hands a
+// retransmitted INVITE to the existing server transaction rather than to
+// the handler, so one INVITE is counted once.
+func (s *Server) rejectInvite(req *sip.Request, tx sip.ServerTransaction, code int, reason string, why inviteReject) {
+	s.metrics.InviteRejected(why)
+	s.reject(req, tx, code, reason)
+}
+
 // beginDialog opens the call's record, or answers 482 when the INVITE
 // merges with one still in progress (RFC 3261 §8.2.2.2: same Call-ID and
 // From tag as a transaction the proxy is already working on).
@@ -81,10 +142,10 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 	d, ok := s.dialogs.begin(req, callerPlane)
 	if !ok {
 		if s.dialogs.isClosed() { // closed never reopens, so this is exact
-			s.reject(req, tx, 503, "Service Unavailable")
+			s.rejectInvite(req, tx, 503, "Service Unavailable", rejectShuttingDown)
 			return nil, false
 		}
-		s.reject(req, tx, 482, "Loop Detected")
+		s.rejectInvite(req, tx, 482, "Loop Detected", rejectLoopDetected)
 		return nil, false
 	}
 	return d, true
@@ -106,7 +167,7 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort, carrier string) {
 	from, ok := s.publicSideFor(req)
 	if !ok {
-		s.reject(req, tx, 488, "Not Acceptable Here")
+		s.rejectInvite(req, tx, 488, "Not Acceptable Here", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -116,7 +177,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		if !ok {
 			s.log.Warn("rejecting call: too many unanswered calls from one source",
 				"public_remote", src.String(), "limit", maxEarlyPerSource, "sip_call_id", fsip.CallID(req))
-			s.reject(req, tx, 503, "Service Unavailable")
+			s.rejectInvite(req, tx, 503, "Service Unavailable", rejectEarlyCap)
 			return
 		}
 		defer release()
@@ -150,7 +211,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildUpstreamOffer(ctx, d, body, src.Addr()); err != nil {
-			s.rejectMedia(req, tx, err)
+			s.rejectInviteMedia(req, tx, err)
 			return
 		}
 	} else {
@@ -228,7 +289,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		}
 		out, err := s.prepareForward(req, from, s.topo.private, dest, true)
 		if err != nil {
-			s.reject(req, tx, 483, "Too Many Hops")
+			s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
 			return
 		}
 		if carrier != "" {
@@ -338,11 +399,11 @@ func (s *Server) giveUp(ctx context.Context, d *dialog, req *sip.Request, tx sip
 	switch {
 	case d.callerCancelled():
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		s.reject(req, tx, 408, "Request Timeout")
+		s.rejectInvite(req, tx, 408, "Request Timeout", rejectTimeout)
 	case ctx.Err() != nil || d.wasCancelled():
 		s.reject(req, tx, 487, "Request Terminated")
 	default:
-		s.reject(req, tx, code, reason)
+		s.rejectInvite(req, tx, code, reason, rejectUpstreamFailed)
 	}
 }
 
@@ -389,7 +450,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		// Nothing registered under that contact any more. 404 is the
 		// correct answer and lets FreeSWITCH fail over or play a
 		// treatment, rather than ringing into nothing.
-		s.reject(req, tx, 404, "Not Found")
+		s.rejectInvite(req, tx, 404, "Not Found", rejectNoTarget)
 		return
 	}
 	dest := binding.Source.String()
@@ -397,7 +458,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if !ok {
 		// A registered client FreeSBC cannot reach is 480: the endpoint is
 		// gone, not the service.
-		s.reject(req, tx, 480, "Temporarily Unavailable")
+		s.rejectInvite(req, tx, 480, "Temporarily Unavailable", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -409,7 +470,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if toBrowser && !s.webrtcEnabled {
 		s.log.Warn("rejecting call to WebSocket client: WebRTC is not enabled, so no DTLS-SRTP offer can be built",
 			"sip_call_id", fsip.CallID(req), "aor", binding.AOR, "transport", binding.Transport)
-		s.reject(req, tx, 488, "Not Acceptable Here")
+		s.rejectInvite(req, tx, 488, "Not Acceptable Here", rejectWebRTCDisabled)
 		return
 	}
 
@@ -431,7 +492,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildPublicOffer(d, body, toBrowser); err != nil {
-			s.rejectMedia(req, tx, err)
+			s.rejectInviteMedia(req, tx, err)
 			return
 		}
 	} else {
@@ -441,7 +502,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 
 	out, err := s.prepareForward(req, s.topo.private, to, dest, true)
 	if err != nil {
-		s.reject(req, tx, 483, "Too Many Hops")
+		s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
 		return
 	}
 	// The Request-URI FreeSWITCH used names FreeSBC's own contact; the
@@ -577,6 +638,20 @@ func (s *Server) rejectMedia(req *sip.Request, tx sip.ServerTransaction, err err
 		s.log.Warn("rejecting call: media setup failed", "err", err, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 488, "Not Acceptable Here")
 	}
+}
+
+// rejectInviteMedia is rejectMedia for an out-of-dialog INVITE: it counts
+// the refusal by the same classification that picks the status.
+func (s *Server) rejectInviteMedia(req *sip.Request, tx sip.ServerTransaction, err error) {
+	switch {
+	case errors.Is(err, errShuttingDown):
+		s.metrics.InviteRejected(rejectShuttingDown)
+	case errors.Is(err, media.ErrPortsExhausted):
+		s.metrics.InviteRejected(rejectPortExhausted)
+	default:
+		s.metrics.InviteRejected(rejectMediaFailed)
+	}
+	s.rejectMedia(req, tx, err)
 }
 
 // isInDialog reports whether a request belongs to an established dialog,

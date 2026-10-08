@@ -48,6 +48,8 @@ type WebRTCSession struct {
 	log *slog.Logger // nil = the default logger
 
 	done chan struct{}
+	// cause is why the session closed (see CloseCause).
+	cause atomic.Int32
 	// state is the session's lifecycle (see session.go): allocated →
 	// running → closed. Start claims the allocated→running transition, so
 	// only the first caller runs the handshake wait and launches relays.
@@ -159,7 +161,7 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 	select {
 	case <-s.leg.Ready():
 	case <-ctx.Done():
-		_ = s.Close()
+		_ = s.Fail()
 		return ctx.Err()
 	case <-s.done:
 		// The session was torn down before the handshake finished (the
@@ -169,17 +171,17 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 		return errWebRTCSessionClosed
 	}
 	if err := s.leg.Err(); err != nil {
-		_ = s.Close()
+		_ = s.Fail()
 		return err
 	}
 	in, out, err := s.leg.SRTPContexts()
 	if err != nil {
-		_ = s.Close()
+		_ = s.Fail()
 		return err
 	}
 	conn, err := s.leg.Conn()
 	if err != nil {
-		_ = s.Close()
+		_ = s.Fail()
 		return err
 	}
 	now := time.Now().UnixNano()
@@ -188,7 +190,7 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 	go s.publicToPrivate(conn, in)
 	go s.privateToPublic(conn, out, true)
 	go s.privateToPublic(conn, out, false)
-	go watchdog(s.timeout, &s.lastRx, s.done, s.Close)
+	go watchdog(s.timeout, &s.lastRx, s.done, func() error { return s.closeWith(CloseSilence) })
 	return nil
 }
 
@@ -205,7 +207,7 @@ func (s *WebRTCSession) start(ctx context.Context) error {
 // authenticating SRTP only proves the packet came from whoever finished
 // the handshake, not that it is the browser signaling agreed on.
 func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
-	defer recoverRelayPanic(s.log, s.Close)
+	defer recoverRelayPanic(s.log, func() error { return s.closeWith(CloseFault) })
 	buf := make([]byte, relayBufSize)
 	for {
 		// The demultiplexer never queues more than maxPacketSize bytes.
@@ -250,7 +252,7 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 // privateToPublic reads one of the private sockets, gates it through the
 // latch, encrypts, and writes to the browser.
 func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind bool) {
-	defer recoverRelayPanic(s.log, s.Close)
+	defer recoverRelayPanic(s.log, func() error { return s.closeWith(CloseFault) })
 	sock, lat := s.priv.RTP, s.privRTP
 	if !rtpKind {
 		sock, lat = s.priv.RTCP, s.privRTCP
@@ -295,14 +297,25 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 	}
 }
 
+// Cause says why the session closed; CloseNone until Done is closed.
+func (s *WebRTCSession) Cause() CloseCause { return CloseCause(s.cause.Load()) }
+
+// Fail closes the session because its browser leg is unusable: it never
+// established, or its peer could not be verified. Like Close otherwise.
+func (s *WebRTCSession) Fail() error { return s.closeWith(CloseLegFailed) }
+
 // Close tears the session down: both relay directions stop (their sockets
 // close), the WebRTC leg releases its public port and ICE agent, and the
 // private pair returns to its pool. Idempotent and safe from any
 // goroutine.
-func (s *WebRTCSession) Close() error {
+func (s *WebRTCSession) Close() error { return s.closeWith(CloseRequested) }
+
+// closeWith is Close recording why, before Done fires.
+func (s *WebRTCSession) closeWith(c CloseCause) error {
 	if s.state.Swap(sessClosed) == sessClosed {
 		return nil
 	}
+	s.cause.Store(int32(c))
 	close(s.done)
 	s.priv.Close()
 	s.privPool.release(s.priv.RTPPort())

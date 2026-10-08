@@ -171,7 +171,7 @@ func (s *Server) invitePrivate(req *sip.Request, tx sip.ServerTransaction) {
 	case targetCarrier:
 		s.inviteToCarrier(req, tx, name)
 	default:
-		s.reject(req, tx, 404, "Not Found")
+		s.rejectInvite(req, tx, 404, "Not Found", rejectNoTarget)
 	}
 }
 
@@ -186,12 +186,12 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	dest, ok := s.carrierDest(carrier)
 	if !ok {
 		s.log.Warn("carrier has no resolved address", "carrier", carrier, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 503, "Service Unavailable")
+		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoTarget)
 		return
 	}
 	to, ok := s.topo.publicSide("udp")
 	if !ok {
-		s.reject(req, tx, 503, "Service Unavailable")
+		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -215,7 +215,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildPublicOffer(d, body, false); err != nil {
-			s.rejectMedia(req, tx, err)
+			s.rejectInviteMedia(req, tx, err)
 			return
 		}
 	} else {
@@ -228,7 +228,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 
 	out, err := s.prepareForwardHidden(req, s.topo.private, to, dest, true)
 	if err != nil {
-		s.reject(req, tx, 483, "Too Many Hops")
+		s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
 		return
 	}
 	// The Request-URI is the switch's, unchanged. The Contact is ours: the

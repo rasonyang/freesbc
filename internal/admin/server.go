@@ -101,6 +101,15 @@ type ProxyStats struct {
 	// register_enumeration).
 	AdmissionDrops map[string]uint64 `json:"admission_drops_total"`
 
+	// CallsEnded counts confirmed calls that ended, by reason (a fixed set,
+	// edge endReasonLabels).
+	CallsEnded map[string]uint64 `json:"calls_ended_total"`
+
+	// InviteRejects counts final responses the edge itself sent to an
+	// out-of-dialog INVITE, by reason (a fixed set, edge
+	// inviteRejectLabels).
+	InviteRejects map[string]uint64 `json:"invite_rejects_total"`
+
 	// CarrierRequests counts carrier-path requests, keyed
 	// "carrier/direction/method" (direction: inbound or outbound).
 	CarrierRequests map[string]uint64 `json:"carrier_requests_total"`
