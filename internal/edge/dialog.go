@@ -329,6 +329,13 @@ type dialogTable struct {
 	// allocated (audit P2-EDG-027).
 	closed bool
 
+	// sessions is how many dialogs hold a session slot: every record
+	// from begin (early or confirmed) until end() takes it out of the
+	// table. Checked against shield.max_sessions and incremented in
+	// begin's critical section, decremented in end()'s single state
+	// transition, so it cannot leak or exceed the limit. Guarded by mu.
+	sessions int
+
 	// onMediaEnd is called, once, for a confirmed dialog that ended because
 	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
 	// rather than by signaling. Both endpoints still believe the call is
@@ -343,6 +350,21 @@ func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
 	return &dialogTable{byCallID: map[string][]*dialog{}, metrics: m, log: log}
 }
 
+// beginResult is what begin did.
+type beginResult int
+
+const (
+	// beginOK: the record is open and holds a session slot.
+	beginOK beginResult = iota
+	// beginMerged: an early record with the same Call-ID and caller tag
+	// exists (RFC 3261 §8.2.2.2).
+	beginMerged
+	// beginClosed: the table is closed for shutdown.
+	beginClosed
+	// beginFull: the session cap is reached.
+	beginFull
+)
+
 // begin opens an early dialog for an INVITE a call is being placed with.
 //
 // It refuses (ok false) when an early record with the same Call-ID and
@@ -352,7 +374,10 @@ func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
 // left alone: the new INVITE opens a new record beside it, and only the
 // tags of later requests decide which one they belong to. An INVITE can
 // therefore never tear down somebody else's call by reusing its Call-ID.
-func (t *dialogTable) begin(req *sip.Request, callerPlane plane) (*dialog, bool) {
+//
+// limit is the session cap (<= 0 is unlimited): when that many records
+// already hold a slot the result is beginFull and nothing is opened.
+func (t *dialogTable) begin(req *sip.Request, callerPlane plane, limit int) (*dialog, beginResult) {
 	callID, callerTag := fsip.CallID(req), fsip.FromTag(req)
 	d := &dialog{
 		tab:         t,
@@ -372,15 +397,27 @@ func (t *dialogTable) begin(req *sip.Request, callerPlane plane) (*dialog, bool)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed {
-		return nil, false // shutting down; see isClosed
+		return nil, beginClosed // shutting down; see isClosed
 	}
 	for _, o := range t.byCallID[callID] {
 		if o.state == dialogEarly && o.callerTag == callerTag {
-			return nil, false
+			return nil, beginMerged
 		}
 	}
+	if limit > 0 && t.sessions >= limit {
+		return nil, beginFull
+	}
 	t.byCallID[callID] = append(t.byCallID[callID], d)
-	return d, true
+	t.sessions++
+	t.metrics.SetSessions(t.sessions)
+	return d, beginOK
+}
+
+// sessionCount is how many dialogs hold a session slot right now.
+func (t *dialogTable) sessionCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sessions
 }
 
 // early returns the in-flight record a CANCEL applies to: same Call-ID and
@@ -1122,6 +1159,8 @@ func (d *dialog) end(reason endReason) bool {
 	d.lastAck = nil
 	sess := d.media
 	t.removeLocked(d)
+	t.sessions--
+	t.metrics.SetSessions(t.sessions)
 	t.mu.Unlock()
 
 	if sess == nil {

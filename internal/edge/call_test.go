@@ -283,15 +283,15 @@ func waitForRelease(t *testing.T, h *harness) {
 	for time.Now().Before(deadline) {
 		pubInUse, _ := h.srv.pubPool.Stats()
 		privInUse, _ := h.srv.privPool.Stats()
-		if pubInUse == 0 && privInUse == 0 && h.srv.ActiveCalls() == 0 {
+		if pubInUse == 0 && privInUse == 0 && h.srv.ActiveCalls() == 0 && h.srv.dialogs.sessionCount() == 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	pubInUse, _ := h.srv.pubPool.Stats()
 	privInUse, _ := h.srv.privPool.Stats()
-	t.Fatalf("resources leaked after teardown: public=%d private=%d calls=%d",
-		pubInUse, privInUse, h.srv.ActiveCalls())
+	t.Fatalf("resources leaked after teardown: public=%d private=%d calls=%d sessions=%d",
+		pubInUse, privInUse, h.srv.ActiveCalls(), h.srv.dialogs.sessionCount())
 }
 
 // TestCaseD_WebRTCCallSDP is acceptance criterion 5 at the signaling

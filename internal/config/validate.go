@@ -85,7 +85,7 @@ func (c *Config) validateRTP(fail failFunc) {
 		fail("rtp: must start at or above 1024, got %d-%d", r.Min, r.Max)
 		return
 	}
-	if rtpPairs(int(r.Min), int(r.Max)) < 1 {
+	if r.Pairs() < 1 {
 		fail("rtp: %d-%d holds no RTP/RTCP pair (RTP on an even port, RTCP on RTP+1) — widen it", r.Min, r.Max)
 	}
 }
@@ -290,6 +290,19 @@ func (c *Config) validateShield(fail failFunc) {
 	if c.Shield.Ban <= 0 {
 		fail("shield.ban: must be > 0, got %s", c.Shield.Ban.Std())
 	}
+	if c.Shield.MaxSessions < 0 {
+		fail("shield.max_sessions: must be >= 0, got %d", c.Shield.MaxSessions)
+	} else if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs >= 1 && c.Shield.MaxSessions > pairs {
+		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor (one RTP/RTCP pair per call per plane)",
+			c.Shield.MaxSessions, pairs, c.RTP.Min, c.RTP.Max)
+	}
+	if c.Shield.InviteRateLimit != "" {
+		if rl, err := ParseRateLimit(c.Shield.InviteRateLimit); err != nil {
+			fail("shield.invite_rate_limit: %v", c.envRedact.detail(c.Shield.InviteRateLimit, err))
+		} else if rl.PerIP {
+			fail("shield.invite_rate_limit: per_ip is not allowed, the limit is global (per-source limits are shield.rate_limit)")
+		}
+	}
 }
 
 // validateAdmin checks the optional admin section.
@@ -443,18 +456,6 @@ func allowedPrefix(fail failFunc, label, s string) (netip.Prefix, bool) {
 	// 10.0.1.5/16 matches exactly what the operator intended once
 	// normalized, instead of silently mismatching netip semantics.
 	return pfx.Masked(), true
-}
-
-// rtpPairs is how many RTP/RTCP pairs the media pool can bind in
-// [min, max]: RTP on an even port, RTCP on RTP+1 (media.PlanePool.sweep).
-func rtpPairs(min, max int) int {
-	if min%2 != 0 {
-		min++
-	}
-	if max < min {
-		return 0
-	}
-	return (max - min + 1) / 2
 }
 
 // checkPort fails unless port is unset (0) or 1-65535.

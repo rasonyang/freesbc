@@ -259,8 +259,8 @@ func TestAuditCancelBeforeInviteSentIsNotLost(t *testing.T) {
 	callID := sip.CallIDHeader("audit-cancel-window")
 	req.AppendHeader(&callID)
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
-	d, ok := tab.begin(req, planePublic)
-	if !ok {
+	d, res := tab.begin(req, planePublic, 0)
+	if res != beginOK {
 		t.Fatal("begin refused")
 	}
 	defer d.end(endShutdown)

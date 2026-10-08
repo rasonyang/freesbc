@@ -37,6 +37,7 @@ type collector struct {
 	proxyICEFail    *prometheus.Desc
 	proxyDTLSFail   *prometheus.Desc
 	proxyPanics     *prometheus.Desc
+	proxySessions   *prometheus.Desc
 	proxyAdmission  *prometheus.Desc
 	proxyCallsEnded *prometheus.Desc
 	proxyRejects    *prometheus.Desc
@@ -56,6 +57,7 @@ func newCollector(deps Deps) *collector {
 
 		proxyRegs:       prometheus.NewDesc("freesbc_active_registrations", "Registration bindings the edge proxy currently holds.", nil, nil),
 		proxyDialogs:    prometheus.NewDesc("freesbc_active_sip_dialogs", "Dialogs the edge proxy is currently on the path of.", nil, nil),
+		proxySessions:   prometheus.NewDesc("freesbc_edge_sessions", "Calls holding a session slot, ringing or up; the number shield.max_sessions caps.", nil, nil),
 		proxyMedia:      prometheus.NewDesc("freesbc_active_media_sessions", "Media sessions the edge proxy is anchoring.", nil, nil),
 		proxyWebRTC:     prometheus.NewDesc("freesbc_active_webrtc_sessions", "Anchored media sessions whose public leg is WebRTC.", nil, nil),
 		proxyRegTotal:   prometheus.NewDesc("freesbc_registration_total", "Registrations accepted by the upstream registrar through the proxy.", nil, nil),
@@ -90,7 +92,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
-		c.proxyRegs, c.proxyDialogs, c.proxyMedia, c.proxyWebRTC,
+		c.proxyRegs, c.proxyDialogs, c.proxySessions, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
@@ -123,6 +125,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	g(c.proxyRegs, float64(p.ActiveRegistrations))
 	g(c.proxyDialogs, float64(p.ActiveDialogs))
+	g(c.proxySessions, float64(p.ActiveSessions))
 	g(c.proxyMedia, float64(p.ActiveMediaSessions))
 	g(c.proxyWebRTC, float64(p.ActiveWebRTCSessions))
 	counter(c.proxyRegTotal, float64(p.RegistrationTotal))

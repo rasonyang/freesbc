@@ -131,6 +131,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 			return admin.ProxyStats{
 				ActiveRegistrations:    s.ActiveRegistrations,
 				ActiveDialogs:          s.ActiveDialogs,
+				ActiveSessions:         s.ActiveSessions,
 				ActiveMediaSessions:    s.ActiveMediaSessions,
 				ActiveWebRTCSessions:   s.ActiveWebRTCSessions,
 				RegistrationTotal:      s.RegistrationTotal,

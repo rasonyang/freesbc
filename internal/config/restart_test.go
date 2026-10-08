@@ -25,7 +25,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 		want []string
 	}{
 		{"identical", base, nil},
-		{"hot only: shield", base + "shield: { ban: 2h, rate_limit: 1/s per_ip, carrier_rate_limit: 1/s per_ip }\n", nil},
+		{"hot only: shield", base + "shield: { ban: 2h, rate_limit: 1/s per_ip, carrier_rate_limit: 1/s per_ip, max_sessions: 7, invite_rate_limit: 3/s }\n", nil},
 		{"public", strings.Replace(base, "203.0.113.7", "203.0.113.8", 1), []string{"public"}},
 		{"private", strings.Replace(base, "10.77.0.2", "10.77.0.3", 1), []string{"private"}},
 		{"rtp", base + "rtp: 30000-30999\n", []string{"rtp"}},
