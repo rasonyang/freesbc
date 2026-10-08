@@ -85,7 +85,7 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 | `switch` | required | List of literal `IP:port` (UDP), at least one. |
 | `switch_carrier_port` | `0` (the node's own `switch` port) | `0` or 1-65535. |
 | `listen` | required | At least one of `udp`, `tcp`, `tls`, `ws`, `wss`. |
-| `carriers` | none | Map of name to `host[:port]`. |
+| `carriers` | none | Map of name to `host[:port]`, or to a mapping `{host, transport, ca_file, client_cert, client_key}`. |
 | `carrier_sources` | none | List of IPs or CIDRs. |
 
 #### `edge.switch`
@@ -106,35 +106,49 @@ Ports on `public.bind`; `0` or absent means not enabled; each present value is 1
 
 | Key | Transport |
 |---|---|
-| `udp` | SIP over UDP. Required by `carriers`. |
-| `tcp` | SIP over TCP, for registered clients. |
-| `tls` | SIP over TLS, for registered clients; needs `tls`. Min TLS 1.2. |
+| `udp` | SIP over UDP. Required by a `udp` carrier. |
+| `tcp` | SIP over TCP, for registered clients and `tcp` carriers. |
+| `tls` | SIP over TLS, for registered clients and `tls` carriers; needs `tls`. Min TLS 1.2. |
 | `ws` | Plaintext WebSocket, development only. |
 | `wss` | WebSocket over TLS; needs `tls`. |
 
 `tcp`, `tls`, `ws` and `wss` are all TCP sockets on `public.bind`, so no two may share a port. `udp` is a separate port space and may share a number with `tcp` (the usual `5060` for both). Setting `ws` or `wss` enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux) for WebSocket clients; `tcp` and `tls` clients get plain RTP like UDP phones.
 
-A client on a stream transport is reachable only through the connection it opened: FreeSBC never dials a client (RFC 5626 flow semantics), and the binding goes when the connection does. FreeSBC answers the RFC 5626 double-CRLF keep-alive ping with a single CRLF. Carriers are still UDP only.
+A client on a stream transport is reachable only through the connection it opened: FreeSBC never dials a client (RFC 5626 flow semantics), and the binding goes when the connection does. FreeSBC answers the RFC 5626 double-CRLF keep-alive ping with a single CRLF. A carrier on `tcp` or `tls` is the one exception: FreeSBC opens (and reopens) the connection to it, because its address is configured.
 
 Every stream transport (`tcp`, `tls`, `ws`, `wss`) is bounded by constants, not keys (design.md §15.2): at most 256 open connections per source IP (an IPv6 source by its /64) and 10000 in all, a 10 s TLS handshake and WebSocket upgrade, a 15 s bound on one message once its first byte has arrived, a 60 s idle timeout, and 24 KiB per SIP message. The idle timeout does not apply to a connection with a live registration binding, a dialog or a carrier source. Each new connection costs the source one `shield.rate_limit` token. Open connections and refusals are in `freesbc_edge_stream_connections{transport}`, `freesbc_edge_stream_refused_total{reason}` and `freesbc_edge_stream_closed_total{reason}`. Each connection takes a file descriptor, so raise the process limit (`LimitNOFILE`) above the 10000 cap plus the media ports.
 
 #### `edge.carriers`
 
-An allowlist of the destinations the switch may send carrier traffic to. Each key is a name; each value is `host[:port]`:
+An allowlist of the destinations the switch may send carrier traffic to. Each key is a name; each value is `host[:port]` (a UDP carrier) or a mapping:
+
+```yaml
+carriers:
+  plain: sip.carrier-a.com:5060          # string form: UDP
+  secure:
+    host: sip.carrier-b.com              # same grammar as the string form
+    transport: tls                       # udp (default) | tcp | tls
+    ca_file: /etc/freesbc/carrier-b-ca.pem   # tls only, optional
+    client_cert: /etc/freesbc/client.pem     # tls only; both or neither
+    client_key: /etc/freesbc/client.key
+```
+
+An unknown key in the mapping is an error. `host` is required. Rules for the mapping and the keys it adds:
 
 - The name matches `[A-Za-z0-9._-]+`. It appears in logs and metrics and is stamped on inbound requests as `X-FreeSBC-Carrier`.
 - `host` is a literal IP or a DNS name (labels of letters, digits and interior hyphens; at most 253 characters). A trailing dot is ignored and the host is lower-cased. An unspecified address is rejected.
-- The port defaults to 5060 (UDP). An IPv6 literal with a port needs brackets: `[2001:db8::1]:5060`.
-- A DNS name without a port is resolved through SRV (`_sip._udp`), then A/AAAA. A DNS name with a port is resolved through A/AAAA only (RFC 3263 §4.2). Resolution happens on the public side only and is cached for 300 s.
+- The port written in `host` is the port the switch's Request-URI must carry and the port FreeSBC dials. Without one, the Request-URI port is taken as 5060 and the dial port is 5060 (5061 for `tls`) unless SRV says otherwise. An IPv6 literal with a port needs brackets: `[2001:db8::1]:5060`.
+- A DNS name without a port is resolved through SRV (`_sip._udp`, `_sip._tcp` or `_sips._tcp` for `transport` udp, tcp, tls), then A/AAAA. A DNS name with a port is resolved through A/AAAA only (RFC 3263 §4.2). Resolution happens on the public side only and is cached for 300 s.
 - No two entries may share the same `host:port` (default port applied).
-- A literal-IP entry must not be FreeSBC's own public UDP socket (`public.bind` or `public.ip` with `edge.listen.udp`), nor an `edge.switch` node.
-- A non-empty `carriers` requires `edge.listen.udp`.
+- A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` or `public.ip` with that `edge.listen` port), nor an `edge.switch` node.
+- `transport` is `udp` (default), `tcp` or `tls`. A `udp` carrier requires `edge.listen.udp`. A `tcp` or `tls` carrier needs no listener to be called, because FreeSBC opens the connection; its own requests to FreeSBC (inbound calls, in-dialog requests) need the matching `edge.listen.tcp` or `edge.listen.tls`, or they can only use the connection FreeSBC opened. A `tls` carrier does not need the top-level `tls`, which is FreeSBC's server identity.
+- `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. `check` does not open these files; startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
 
 An entry must equal the `host[:port]` the switch puts in the Request-URI (FreeSWITCH gateway `proxy`, Asterisk aor `contact`). That equality is what makes a request a carrier request.
 
 #### `edge.carrier_sources`
 
-Extra inbound carrier IPs or CIDRs, on top of the resolved addresses of `carriers`, which are sources implicitly. A bare IP is a single-host prefix. Rules:
+Extra inbound carrier IPs or CIDRs, on top of the resolved addresses of `carriers`, which are sources implicitly. A `carriers` address is a source only on its carrier's transport (a `tls` carrier over UDP is not); a `carrier_sources` address matches on any public transport. A bare IP is a single-host prefix. Rules:
 
 - Valid CIDR or IP.
 - No wider than /8 (IPv4) or /32 (IPv6).
@@ -219,7 +233,7 @@ Not configurable. They live in code until there is a concrete need to tune one.
 | Value | Constant | Where |
 |---|---|---|
 | Private SIP port | 5060 | `config.PrivateSIPPort` |
-| Default carrier port | 5060 | `config.DefaultCarrierPort` |
+| Default carrier port | 5060 (5061 for a `tls` carrier) | `config.DefaultCarrierPort`, `config.DefaultCarrierTLSPort` |
 | Retry-After of a session-cap 503 | 5 s | `sessionCapRetryAfter`, `internal/edge/invite.go` |
 | Session-cap and invite-rate WARN spacing | 10 s per reason | `capWarnEvery`, `internal/edge/invite.go` |
 | RTP silence teardown | 5 min | `rtpSilenceTimeout`, `internal/edge/edge.go` |

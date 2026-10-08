@@ -15,9 +15,10 @@ func redactConfig(cfg *config.Config) any {
 		"edge": map[string]any{
 			"switch":              cfg.Edge.Switch,
 			"switch_carrier_port": cfg.Edge.SwitchCarrierPort,
-			"listen":              map[string]any{"udp": cfg.Edge.Listen.UDP, "ws": cfg.Edge.Listen.WS, "wss": cfg.Edge.Listen.WSS},
-			"carriers":            cfg.Edge.Carriers,
-			"carrier_sources":     cfg.Edge.CarrierSources,
+			"listen": map[string]any{"udp": cfg.Edge.Listen.UDP, "tcp": cfg.Edge.Listen.TCP, "tls": cfg.Edge.Listen.TLS,
+				"ws": cfg.Edge.Listen.WS, "wss": cfg.Edge.Listen.WSS},
+			"carriers":        redactCarriers(cfg.Edge.Carriers),
+			"carrier_sources": cfg.Edge.CarrierSources,
 		},
 		"shield": map[string]any{
 			"rate_limit":         cfg.Shield.RateLimit,
@@ -38,4 +39,25 @@ func redactConfig(cfg *config.Config) any {
 		view["admin"] = a
 	}
 	return view
+}
+
+// redactCarriers shows a plain "host[:port]" carrier as that string and any
+// other as a mapping. Certificate and key entries are file paths, not key
+// material, so nothing here is secret.
+func redactCarriers(m map[string]config.CarrierConfig) map[string]any {
+	out := make(map[string]any, len(m))
+	for name, c := range m {
+		if c.Plain() {
+			out[name] = c.Host
+			continue
+		}
+		v := map[string]any{"host": c.Host, "transport": c.Transport}
+		for k, p := range map[string]string{"ca_file": c.CAFile, "client_cert": c.ClientCert, "client_key": c.ClientKey} {
+			if p != "" {
+				v[k] = p
+			}
+		}
+		out[name] = v
+	}
+	return out
 }

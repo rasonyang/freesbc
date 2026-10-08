@@ -303,25 +303,29 @@ var errNoFlow = errors.New("proxy: no connection to the client")
 // as for any transport failure (480 or 408 to an INVITE, nothing sent for
 // the rest).
 //
-// FreeSBC dials no stream connection today. Carrier TCP and TLS, which will,
-// are sent by their own path and need no flow.
-func (s *Server) requireFlow(req *sip.Request) error {
+// The one exception is a tcp or tls carrier: its destination is an address
+// FreeSBC resolved from edge.carriers, so a missing connection is dialed
+// here (carrierconn.go) with that carrier's TLS settings, never by sipgo.
+func (s *Server) requireFlow(ctx context.Context, req *sip.Request) error {
 	network := sip.NetworkToLower(req.Transport())
 	if streamIndex(network) < 0 {
 		return nil
 	}
 	c, err := s.srv.TransportLayer().GetConnection(network, req.Destination())
-	if err != nil || c == nil {
-		return errNoFlow
+	if err == nil && c != nil {
+		_, _ = c.TryClose() // GetConnection took a reference; hand it back
+		return nil
 	}
-	_, _ = c.TryClose() // GetConnection took a reference; hand it back
-	return nil
+	if name, ok := s.carrierTarget(network, req.Destination()); ok {
+		return s.carrierConns.ensure(ctx, name, network, req.Destination())
+	}
+	return errNoFlow
 }
 
 // clientTx starts a client transaction for a request FreeSBC built itself
 // (noBuild), after requireFlow.
 func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
-	if err := s.requireFlow(req); err != nil {
+	if err := s.requireFlow(ctx, req); err != nil {
 		return nil, err
 	}
 	return s.client.TransactionRequest(ctx, req, noBuild)
@@ -330,7 +334,9 @@ func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTran
 // writeRequest sends a request outside any transaction (an ACK), after
 // requireFlow.
 func (s *Server) writeRequest(req *sip.Request) error {
-	if err := s.requireFlow(req); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
+	defer cancel()
+	if err := s.requireFlow(ctx, req); err != nil {
 		return err
 	}
 	return s.client.WriteRequest(req, noBuild)

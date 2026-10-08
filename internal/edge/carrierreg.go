@@ -175,15 +175,18 @@ func (s *Server) switchNodeFor(src netip.AddrPort) (string, bool) {
 }
 
 // carrierContactURI is the Contact toward a carrier for a REGISTER: the
-// switch's user at FreeSBC's public UDP address, carrying the token.
-func (s *Server) carrierContactURI(user, token string) (sip.Uri, bool) {
-	pub, ok := s.topo.publicSide("udp")
-	if !ok {
-		return sip.Uri{}, false
-	}
+// switch's user at FreeSBC's public address on the carrier's transport
+// (;transport=tcp|tls when not udp), carrying the token. For a tcp or tls
+// carrier with no matching public listener the port is the transport's
+// default and nothing listens there: the carrier can only send back over the
+// connection FreeSBC opened to it.
+func (s *Server) carrierContactURI(pub side, user, token string) sip.Uri {
 	params := sip.NewParams()
 	params.Add(contactTokenParam, token)
-	return sip.Uri{User: user, Host: pub.advIP.String(), Port: pub.advPort, UriParams: params}, true
+	if pub.transport != "udp" {
+		params.Add("transport", pub.transport)
+	}
+	return sip.Uri{User: user, Host: pub.advIP.String(), Port: pub.advPort, UriParams: params}
 }
 
 // registerToCarrier proxies a REGISTER the switch sent for a carrier.
@@ -194,7 +197,7 @@ func (s *Server) registerToCarrier(req *sip.Request, tx sip.ServerTransaction, i
 		s.reject(req, tx, 503, "Service Unavailable")
 		return
 	}
-	pub, ok := s.topo.publicSide("udp")
+	pub, ok := s.carrierSide(carrier)
 	node, nodeOK := s.switchNodeFor(in.src)
 	if !ok || !nodeOK {
 		s.reject(req, tx, 503, "Service Unavailable")
@@ -221,7 +224,7 @@ func (s *Server) registerToCarrier(req *sip.Request, tx sip.ServerTransaction, i
 			c := oc.Clone()
 			if hasContact && !wildcard {
 				token = carrierToken(node, orig.String())
-				c.Address, _ = s.carrierContactURI(orig.User, token)
+				c.Address = s.carrierContactURI(pub, orig.User, token)
 			}
 			fsip.RemoveHeaders(out, "Contact")
 			out.AppendHeader(c)

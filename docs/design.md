@@ -23,7 +23,7 @@ It is a **stateful SIP proxy**, not a B2BUA, implemented in one package
 | Far end | Reaches FreeSBC on | Notes |
 |---|---|---|
 | Registered clients: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS (WebRTC) browsers | the public sockets (`edge.listen`, bound on `public.bind`) | REGISTER is proxied to the switch; a public INVITE is admitted only from a live registration |
-| Carriers | the same public UDP socket | named in `edge.carriers` (directory resolved by `carrierdns.go`) or listed in `edge.carrier_sources`; the switch holds the carrier accounts and uses FreeSBC as its outbound proxy |
+| Carriers | the public socket of their transport (UDP, or TCP/TLS: `edge.listen`, or a connection FreeSBC opens to them) | named in `edge.carriers` (directory resolved by `carrierdns.go`) or listed in `edge.carrier_sources`; the switch holds the carrier accounts and uses FreeSBC as its outbound proxy |
 | The switch (FreeSWITCH or Asterisk) | the fixed private socket `private.ip:5060` | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
 
 If the config has no `edge` section that validates, `config.Parse` fails
@@ -466,9 +466,9 @@ shield reads its hot values per check. Custom scalar types (`Duration`,
 
 The carrier path is the edge plane's third kind of far end, next to registered clients and the switch. It carries SIP between the switch (FreeSWITCH or Asterisk, on the private LAN) and carriers (on the public internet), in both directions. FreeSBC is a stateful proxy on this path too, not a B2BUA: Call-ID, tags and CSeq pass through, the Request-URI is never rewritten on the way to a carrier, and FreeSBC holds no carrier credential. What differs from the client path is topology hiding (§6.5): nothing sent toward a carrier names a private address.
 
-Carrier traffic uses the same two sockets as everything else: the public UDP listener (`edge.listen.udp`) and the fixed private socket `private.ip:5060`. Carriers are reachable over UDP only (`edge.carriers` requires `edge.listen.udp`, `internal/config/validate.go:validateCarriers`).
+Carrier traffic uses the fixed private socket `private.ip:5060` toward the switch and, toward the carrier, the transport of its `edge.carriers` entry: UDP (the public UDP listener, `edge.listen.udp`, required by a `udp` carrier), TCP or TLS. For a `tcp` or `tls` carrier FreeSBC dials the connection itself (§6.10); the matching `edge.listen.tcp|tls` is needed only for the carrier's own inbound connections (`validateCarriers`, `internal/config/validate.go`).
 
-Code lives in `internal/edge`: `carrier.go` (classification, `inviteToCarrier`, `optionsToCarrier`), `carrierdns.go` (directory), `carrierreg.go` (registration table and `registerToCarrier`), `hide.go` (topology hiding), plus the carrier branches in `invite.go`, `indialog.go`, `admission.go`, `arrival.go` and `forward.go`.
+Code lives in `internal/edge`: `carrier.go` (classification, `inviteToCarrier`, `optionsToCarrier`), `carrierdns.go` (directory), `carrierreg.go` (registration table and `registerToCarrier`), `carrierconn.go` (outbound tcp/tls connections), `hide.go` (topology hiding), plus the carrier branches in `invite.go`, `indialog.go`, `admission.go`, `arrival.go` and `forward.go`.
 
 ### 6.1 Classification of switch-originated requests
 
@@ -500,10 +500,10 @@ An OPTIONS with a To tag is answered locally without classification (`edge.go:93
 An out-of-dialog INVITE that arrives on a public listener goes through admission (`admitPublicInvite`, `internal/edge/admission.go:81`), in this order:
 
 1. Its exact transport and IP:port is a live client registration (`Location.HasSource`): `srcClient`. A registration wins over a carrier source, so a client behind a carrier's address is never sent down the carrier path.
-2. Its source is a carrier source: `srcCarrier`, with the carrier's name.
+2. Its source is a carrier source on the right transport: `srcCarrier`, with the carrier's name. A resolved `edge.carriers` address counts only when the request arrived over that carrier's own transport (`carrierFor(src, network)`), so a tls carrier's IP over UDP is not admitted; an `edge.carrier_sources` entry matches by IP on any public transport.
 3. Otherwise `srcDrop`: silent drop, counted as `freesbc_edge_admission_drops_total{reason="invite_not_admitted"}` (`internal/edge/invite.go:51-68`).
 
-The carrier source set (`carrierSnapshot.isSource`, `internal/edge/carrierdns.go:61`) is `edge.carrier_sources` plus the host prefix of every literal-IP carrier plus every resolved address of the DNS-name carriers (§6.4). `carrierFor` (`carrierdns.go:76`) names the carrier: an exact IP:port match against a resolved address wins; otherwise the first entry (sorted by name) with that IP; otherwise a source inside `carrier_sources` that matches no entry is named `unknown`.
+The carrier source set for the shield (`carrierSnapshot.isSource`, IP only, so a carrier is rate-limited by `carrier_rate_limit` and never banned on any transport), `internal/edge/carrierdns.go:61`) is `edge.carrier_sources` plus the host prefix of every literal-IP carrier plus every resolved address of the DNS-name carriers (§6.4). `carrierFor` (`carrierdns.go:76`) names the carrier: an exact IP:port match against a resolved address wins; otherwise the first entry (sorted by name) with that IP; otherwise a source inside `carrier_sources` that matches no entry is named `unknown`.
 
 `inviteToUpstream` (`invite.go:272`) serves both clients and carriers; a non-empty carrier name selects the carrier behaviour:
 
@@ -542,7 +542,7 @@ Every header whose name starts with `x-freesbc-` (any case) is internal. Only Fr
 `edge.carriers` is both the allowlist of destinations the switch may use and the source of the carrier source set. `carrierDirectory` (`internal/edge/carrierdns.go:116`) resolves it:
 
 - A literal-IP entry is static: one address, the entry's port.
-- A DNS-name entry without a port resolves through SRV `_sip._udp.<host>` ordered by priority and RFC 2782 weight (`orderSRV`, `carrierdns.go:334`), then A/AAAA per target; with no SRV record it falls back to A/AAAA on port 5060. An entry with an explicit port skips SRV and resolves A/AAAA only (RFC 3263 §4.2; `resolve`, `carrierdns.go:258`).
+- A DNS-name entry without a port resolves through SRV ordered by priority and RFC 2782 weight (`orderSRV`, `carrierdns.go:334`), then A/AAAA per target (the SRV name is `_sip._udp`, `_sip._tcp` or `_sips._tcp` for a udp, tcp or tls carrier, `srvName`); with no SRV record it falls back to A/AAAA on the carrier's default port, 5060 (5061 for tls; `Carrier.DialPort`). An entry with an explicit port skips SRV and resolves A/AAAA only (RFC 3263 §4.2; `resolve`, `carrierdns.go:258`).
 - Resolution runs on the public side only; the switch is never asked and the private leg does no DNS.
 - A good answer is cached `carrierDNSTTL` = 300 s; a failed or empty one `carrierDNSNegTTL` = 10 s; one query is bounded by `carrierLookupTimeout` = 3 s (`carrierdns.go:40-51`). A failed refresh keeps the last good set (`refresh`, `carrierdns.go:196-238`), logged at WARN once per failure run. A failure at startup is not fatal: the carrier is unresolved, its INVITEs are dropped by admission and requests for it get 503, until a lookup succeeds.
 - `Run` (started from `edge.Run`, `edge.go:515`) refreshes once at start and then every 5 s checks which entries have expired (`carrierdns.go:242`). Each refresh publishes an immutable `carrierSnapshot` through an atomic pointer, so admission and the shield read it without locking.
@@ -604,7 +604,7 @@ Carrier-originated in-dialog requests are forwarded to the switch as the carrier
 The switch REGISTERs its gateway at a carrier through FreeSBC (`registerToCarrier`, `carrierreg.go:190`). The carrier must later send inbound calls to a Contact that reaches FreeSBC, and FreeSBC must know which switch node registered it and what the switch's own Contact was.
 
 - The switch node is the `edge.switch` entry whose IP equals the request's source, preferring an equal port, else the first by name (`switchNodeFor`, `carrierreg.go:160`).
-- The Contact toward the carrier becomes `sip:<user>@public.ip:<udp port>;fsbc=<token>` (`carrierContactURI`, `carrierreg.go:179`). Its header parameters (`expires`, `q`) are kept; only the address changes. A wildcard `Contact: *` with `Expires: 0` goes upstream as is; a wildcard that is not a lone un-REGISTER is 400.
+- The Contact toward the carrier becomes `sip:<user>@public.ip:<port>;fsbc=<token>` (plus `;transport=tcp|tls` for those carriers; the port is the carrier transport's listener port, else its default, `carrierSide`) (`carrierContactURI`, `carrierreg.go:179`). Its header parameters (`expires`, `q`) are kept; only the address changes. A wildcard `Contact: *` with `Expires: 0` goes upstream as is; a wildcard that is not a lone un-REGISTER is 400.
 - The token is `base32(sha256(node || "\n" || contact))` truncated to 26 characters, lower-cased (`carrierToken`, `carrierreg.go:140`). It is deterministic, so a FreeSBC restart does not strand the Contact the carrier holds: the switch's next refresh recreates the same token. It is an identifier, not a secret: anyone who can guess a node name and a Contact can compute it, so in principle it can be brute-forced to learn the switch's Contact; the carrier path admits only carrier sources.
 - On a `2xx` the binding `token → {carrier, node, original Contact, expiry}` is stored for the expiry the carrier granted (`GrantedExpires`, `internal/sip/register.go:52`, matched on this token's Contact). A `200` to `Expires: 0`, or a granted expiry of 0, removes it; a wildcard un-REGISTER removes every binding of that node at that carrier (`removeNode`). Challenges and failures change nothing. The response's Contact is restored to the switch's original with the granted expiry (`restoreContact`, `register.go:377`).
 - The table (`carrierRegTable`, `carrierreg.go:44`) is in memory and is separate from the client `Location`: a client token is random and names a public client, a carrier token is derived and names a switch registration, and neither lookup resolves the other's token. Expired bindings are not found by `lookup` and are reclaimed by a 30 s ticker (`edge.go:463-480`, `prune`, `carrierreg.go:92`).
@@ -625,6 +625,16 @@ sequenceDiagram
     Note over F: store T -> {carrier, node, sip:gw@switch, now+3600}
     F-->>S: 200 (Contact: sip:gw@switch)
 ```
+
+### 6.10 Stream transports to and from carriers
+
+A `tcp` or `tls` carrier is a destination FreeSBC resolved from `edge.carriers`, so it is the one stream peer FreeSBC dials (a client's flow is never dialed, §7). Every request to a carrier passes `requireFlow` (`forward.go`): when sipgo's pool holds no connection to the destination and the destination is a resolved address of a carrier of that transport (`carrierTarget`), `carrierConns.ensure` (`carrierconn.go`) opens one.
+
+sipgo v1.4.3 dials a stream destination itself, but with one process-wide `tls.Config` and the destination host it was given (the IP, here), so it cannot carry a per-carrier server name, root set or client certificate. FreeSBC therefore dials, handshakes and verifies the connection (`carrierTLSConfig`: `MinVersion` TLS 1.2, `ServerName` the configured host, `RootCAs` from `ca_file` when set, else the system roots, `Certificates` from `client_cert`/`client_key`; no skip-verify), wraps it in the `streamConn` every accepted connection gets (§7: write deadline, message framer and read deadlines, per-IP and global caps, metrics) and hands it to sipgo through a `dialListener` served beside the public listeners (`Run` appends `carrierConns.listeners()`). sipgo's own `Serve` loop then pools it under the carrier's address and reads it, so responses reach the transaction layer and the carrier's requests on it reach the ordinary handlers. The sipgo user agent's own TLS config trusts nothing (`edge.go`), so a dial sipgo makes itself in a race with a closing connection fails closed. A lost connection leaves the pool through sipgo's read loop and the next request dials again; dials to one address are serialised. Shutdown closes the pool (`UserAgent.Close`) and the unread `dialListener` queue. Certificates are loaded in `edge.New`, so a bad `ca_file` or client pair fails startup.
+
+The leg's `side` is the carrier transport's public side (`carrierSide`): the listener's, or, for a tcp/tls carrier with no listener, a synthetic side at the default port marked `outbound`, whose Via carries `;alias` (RFC 5923). Via, Record-Route and Contact therefore name `TLS`/`;transport=tls`, and the usual double Record-Route covers the udp switch leg.
+
+Inbound admission (§6.2) uses the transport the request arrived on (`req.Transport()`), which is the carrier's for both an accepted connection and one FreeSBC dialed. A carrier source is exempt from the stream idle timeout (`streamBusy`) and shares the per-IP cap of 256. Limits: a TLS 1.3 server that rejects FreeSBC's client certificate after the client handshake has completed is noticed only when the connection fails, so the call times out (408) rather than being refused at once; a request from FreeSBC to a carrier call whose carrier connected to a listener and has since disconnected has no address to dial and fails.
 
 ### 6.9 Observability and admin
 
@@ -3477,6 +3487,18 @@ To-tag cannot carry it past admission (`indialog.go:504`). Subscription
 records are bounded per registration and in all (§15.1) and a SUBSCRIBE over
 either bound gets 503, which is not a drop.
 
+**Carrier transports** (`carrierconn.go`, `carrierFor`). A carrier's resolved
+address is a carrier source only on that carrier's own transport, so a tls
+carrier's IP over UDP (or a udp carrier's over TLS) is dropped like any
+stranger; `edge.carrier_sources` stays IP-only on every public transport. A
+tls carrier's certificate is verified against the configured host name with
+TLS 1.2 or later, from `ca_file` alone when set (else the system roots), and a
+failure refuses the call; there is no skip-verify key. FreeSBC dials only
+addresses it resolved for a carrier of that transport, never a client's
+(`requireFlow`), and the sipgo user agent's own TLS config trusts no root, so a
+connection sipgo would dial itself cannot succeed. Connections FreeSBC opens
+carry the same caps, framing, deadlines and rate token as accepted ones.
+
 **The switch is never an open relay.** A request from the switch is delivered
 only to a registered client (a valid `fsbc` token) or to an `edge.carriers`
 destination, chosen by Request-URI (`classifySwitchRequest`, `carrier.go:91`);
@@ -3730,7 +3752,7 @@ code constant.
 | `rtpSilenceTimeout` | 5 min (`edge.go:122`) | media silence; the only automatic reclaim for a confirmed call whose BYE was lost |
 | `switchCooldown` | 30 s (`edge.go:126`) | a switch node that answered nothing is skipped while alternatives exist |
 | `udpServingTimeout` | 5 s (`edge.go:542`) | startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
-| `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, and a ws/wss connection's HTTP upgrade request (§7.1a) |
+| `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, a ws/wss connection's HTTP upgrade request (§7.1a), and the dial plus handshake of a connection FreeSBC opens to a tcp/tls carrier (§6.10) |
 | `streamIdleTimeout` | 60 s | a stream connection silent this long and in no use (no binding, dialog or carrier source) is closed; an in-use one is re-armed |
 | `streamMessageTimeout` | 15 s from the message's first byte | one SIP message or WebSocket frame must arrive complete (slow-loris guard) |
 | `streamWriteTimeout` | 10 s | one write to a stream client |

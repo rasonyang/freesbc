@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
@@ -47,6 +48,11 @@ type Server struct {
 	// Both are written once in New.
 	carriers    *carrierDirectory
 	carrierURIs map[string]string
+	// carrierByName holds each edge.carriers entry; carrierConns dials and
+	// pools the tcp and tls connections to them (carrierconn.go). Both are
+	// written once in New.
+	carrierByName map[string]config.Carrier
+	carrierConns  *carrierConns
 
 	// carrierRegs holds the switch's live registrations at carriers
 	// (carrierreg.go), by token. Separate from loc, the client table.
@@ -228,6 +234,13 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		streams:          newStreamTable(),
 		streamLim:        defaultStreamLimits(),
 	}
+	s.carrierByName = map[string]config.Carrier{}
+	for _, c := range cfg.CarrierList() {
+		s.carrierByName[c.Name] = c
+	}
+	if s.carrierConns, err = newCarrierConns(s, cfg); err != nil {
+		return nil, err
+	}
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
 	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
 	s.dialogs = newDialogTable(s.metrics, s.log)
@@ -405,6 +418,11 @@ func (s *Server) Run(ctx context.Context) error {
 			sip.WithTransportLayerReadFilter(s.readFilter()),
 		),
 		sipgo.WithUserAgentTransactionLayerOptions(sip.WithTransactionLayerLogger(sipgoLog)),
+		// sipgo never dials a TLS connection to a carrier (carrierconn.go
+		// does, with the carrier's own settings). Should it ever try, in a
+		// race with a connection that just closed, an empty root set makes
+		// the handshake fail closed.
+		sipgo.WithUserAgenTLSConfig(&tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}),
 	)
 	if err != nil {
 		return fmt.Errorf("proxy: sipgo ua: %w", err)
@@ -465,6 +483,9 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		opened = append(opened, ln)
 	}
+	// The connections FreeSBC dials to tcp and tls carriers enter sipgo
+	// through listeners of their own (carrierconn.go).
+	opened = append(opened, s.carrierConns.listeners()...)
 
 	errs := make(chan error, len(opened))
 	var wg sync.WaitGroup
@@ -493,7 +514,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.log.Info("edge proxy listening",
-		"public_listeners", len(s.topo.public),
+		"public_listeners", len(s.publicListeners()),
 		"private", s.privAddr.String(),
 		"switches", len(s.topo.upstreamNames),
 		"switch_nodes", strings.Join(s.topo.upstreamNames, ","),

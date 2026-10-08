@@ -45,3 +45,20 @@ func TestRedactConfigDoesNotMutateLive(t *testing.T) {
 		t.Error("redactConfig mutated the live config's admin password hash")
 	}
 }
+
+// A plain carrier is shown as its host string and a mapping-form one as a
+// mapping with its certificate paths.
+func TestRedactConfigCarriers(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.Edge.Carriers = map[string]config.CarrierConfig{
+		"plain":  {Host: "198.51.100.4:5060"},
+		"secure": {Host: "sip.example.com", Transport: "tls", CAFile: "/etc/ca.pem", ClientCert: "/etc/c.pem", ClientKey: "/etc/c.key"},
+	}
+	b, _ := json.Marshal(redactConfig(cfg))
+	s := string(b)
+	for _, want := range []string{`"plain":"198.51.100.4:5060"`, `"transport":"tls"`, `"ca_file":"/etc/ca.pem"`, `"client_key":"/etc/c.key"`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("%s missing from %s", want, s)
+		}
+	}
+}

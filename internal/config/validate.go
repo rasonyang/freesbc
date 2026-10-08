@@ -242,24 +242,16 @@ func finishCarrierHost(h string, port int) (string, int, netip.Addr, error) {
 	return h, port, netip.Addr{}, nil
 }
 
-// validateCarriers checks edge.carriers and compiles the carrier list.
+// validateCarriers checks edge.carriers and compiles the carrier list. It
+// opens no file: ca_file, client_cert and client_key are loaded when the
+// edge starts.
 func (c *Config) validateCarriers(fail failFunc) {
 	e := &c.Edge
 	e.carriers = nil
 	if len(e.Carriers) == 0 {
 		return
 	}
-	if e.Listen.UDP == 0 {
-		fail("edge.carriers: requires edge.listen.udp (carrier traffic is SIP over UDP on the public side)")
-	}
-	own := netip.AddrPort{}
-	if e.Listen.UDP != 0 {
-		own = netip.AddrPortFrom(c.PublicBind(), uint16(e.Listen.UDP))
-	}
-	pubAdv := netip.AddrPort{}
-	if e.Listen.UDP != 0 {
-		pubAdv = netip.AddrPortFrom(c.PublicIP(), uint16(e.Listen.UDP))
-	}
+	listen := map[string]int{CarrierUDP: e.Listen.UDP, CarrierTCP: e.Listen.TCP, CarrierTLS: e.Listen.TLS}
 	taken := map[string]string{}
 	for _, name := range sortedKeys(e.Carriers) {
 		label := "edge.carriers." + name
@@ -267,9 +259,31 @@ func (c *Config) validateCarriers(fail failFunc) {
 			fail("edge.carriers: name %q must match [A-Za-z0-9._-]+", name)
 			continue
 		}
-		host, port, addr, err := ParseCarrierHost(e.Carriers[name])
+		cc := e.Carriers[name]
+		tr := cc.Transport
+		if tr == "" {
+			tr = CarrierUDP
+		}
+		if tr != CarrierUDP && tr != CarrierTCP && tr != CarrierTLS {
+			fail("%s.transport: must be udp, tcp or tls, got %q", label, tr)
+			continue
+		}
+		if tr == CarrierUDP && e.Listen.UDP == 0 {
+			fail("%s: a udp carrier requires edge.listen.udp (its traffic is SIP over UDP on the public side)", label)
+		}
+		if tr != CarrierTLS {
+			for _, f := range [...]struct{ key, val string }{{"ca_file", cc.CAFile}, {"client_cert", cc.ClientCert}, {"client_key", cc.ClientKey}} {
+				if f.val != "" {
+					fail("%s.%s: only valid with transport: tls", label, f.key)
+				}
+			}
+		}
+		if (cc.ClientCert == "") != (cc.ClientKey == "") {
+			fail("%s: client_cert and client_key must be set together", label)
+		}
+		host, port, addr, err := ParseCarrierHost(cc.Host)
 		if err != nil {
-			fail("%s: %v", label, c.envRedact.detail(e.Carriers[name], err))
+			fail("%s: %v", label, c.envRedact.detail(cc.Host, err))
 			continue
 		}
 		key := net.JoinHostPort(host, strconv.Itoa(port))
@@ -280,8 +294,9 @@ func (c *Config) validateCarriers(fail failFunc) {
 		taken[key] = name
 		if addr.IsValid() {
 			ap := netip.AddrPortFrom(addr, uint16(port))
-			if ap == own || ap == pubAdv {
-				fail("%s: %s is FreeSBC's own public UDP socket", label, key)
+			if lp := listen[tr]; lp != 0 && (ap == netip.AddrPortFrom(c.PublicBind(), uint16(lp)) ||
+				ap == netip.AddrPortFrom(c.PublicIP(), uint16(lp))) {
+				fail("%s: %s is FreeSBC's own public %s socket", label, key, strings.ToUpper(tr))
 				continue
 			}
 			for _, sw := range e.switches {
@@ -292,7 +307,8 @@ func (c *Config) validateCarriers(fail failFunc) {
 			}
 		}
 		e.carriers = append(e.carriers, Carrier{Name: name, Host: host, Port: port, Addr: addr,
-			ExplicitPort: carrierHasPort(e.Carriers[name])})
+			ExplicitPort: carrierHasPort(cc.Host), Transport: tr,
+			CAFile: cc.CAFile, ClientCert: cc.ClientCert, ClientKey: cc.ClientKey})
 	}
 }
 

@@ -50,6 +50,12 @@ edge:
     carrier-a: sip.carrier-a.com      # must equal the switch gateway's host[:port]
     mobile:    223.76.90.4:16060      # name is stamped as X-FreeSBC-Carrier
     fixed:     223.76.90.5:16060      #   on inbound calls from that carrier
+    secure:                           # mapping form: transport udp (default) | tcp | tls
+      host: sip.secure-carrier.com    # tls: SRV _sips._tcp, port 5061; the certificate must name this host
+      transport: tls
+      ca_file: /etc/freesbc/secure-carrier-ca.pem   # replaces the system roots; optional
+      # client_cert: /etc/freesbc/client.pem        # mutual TLS: both or neither
+      # client_key:  /etc/freesbc/client.key
   # carrier_sources: [198.51.100.20, 203.0.113.0/28]   # extra inbound carrier IPs
 
 # --- Operator API, /metrics, WebUI ------------------------------------------

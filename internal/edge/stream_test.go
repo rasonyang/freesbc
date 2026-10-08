@@ -3,6 +3,7 @@ package edge
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -778,7 +779,7 @@ func TestRequireFlowLeavesConnectionRefsAlone(t *testing.T) {
 	req.SetTransport("TCP")
 	req.SetDestination(b.Source.String())
 	for i := 0; i < 5; i++ {
-		if err := h.srv.requireFlow(req); err != nil {
+		if err := h.srv.requireFlow(context.Background(), req); err != nil {
 			t.Fatalf("requireFlow: %v", err)
 		}
 	}
@@ -786,11 +787,11 @@ func TestRequireFlowLeavesConnectionRefsAlone(t *testing.T) {
 		t.Errorf("connection refcount %d -> %d across requireFlow", before, after)
 	}
 	req.SetDestination("127.0.0.1:1")
-	if err := h.srv.requireFlow(req); err != errNoFlow {
+	if err := h.srv.requireFlow(context.Background(), req); err != errNoFlow {
 		t.Errorf("requireFlow with no connection = %v, want errNoFlow", err)
 	}
 	req.SetTransport("UDP")
-	if err := h.srv.requireFlow(req); err != nil {
+	if err := h.srv.requireFlow(context.Background(), req); err != nil {
 		t.Errorf("requireFlow on UDP = %v, want nil", err)
 	}
 }

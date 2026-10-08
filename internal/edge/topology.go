@@ -56,6 +56,11 @@ type side struct {
 	// never dials a client, RFC 5626 flow semantics), so there is exactly
 	// one connection per client and it is already in the pool.
 	laddr sip.Addr
+	// outbound marks the side of a tcp or tls carrier with no matching
+	// public listener: nothing listens at advPort, so the carrier can reach
+	// FreeSBC only over the connection FreeSBC opened. Its Via carries the
+	// RFC 5923 alias parameter to say so.
+	outbound bool
 }
 
 // uri is the SBC's own URI on this side, as it appears in Record-Route,
@@ -100,6 +105,9 @@ func (s side) via(branch string) *sip.ViaHeader {
 	v.Params.Add("branch", branch)
 	if s.transport == "udp" {
 		v.Params.Add("rport", "")
+	}
+	if s.outbound {
+		v.Params.Add("alias", "")
 	}
 	return v
 }
@@ -196,6 +204,19 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 			s.laddr = sipAddr(bind, l.port)
 		}
 		t.public[l.transport] = s
+	}
+	// A tcp or tls carrier is dialed by FreeSBC, so it needs no listener. It
+	// still needs a side to name in Via, Record-Route and Contact; one
+	// without a listener advertises the transport's default port.
+	for _, c := range cfg.CarrierList() {
+		if _, ok := t.public[c.Transport]; ok || c.Transport == config.CarrierUDP {
+			continue
+		}
+		port := 5060
+		if c.Transport == config.CarrierTLS {
+			port = config.DefaultCarrierTLSPort
+		}
+		t.public[c.Transport] = side{plane: planePublic, transport: c.Transport, advIP: pubIP, advPort: port, outbound: true}
 	}
 	return t
 }

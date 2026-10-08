@@ -262,29 +262,38 @@ func TestCarrierDirectoryNegativeCache(t *testing.T) {
 
 func TestCarrierSnapshotCarrierFor(t *testing.T) {
 	snap := &carrierSnapshot{
-		names: []string{"alpha", "beta"},
+		names: []string{"alpha", "beta", "tlsco"},
 		addrs: map[string][]netip.AddrPort{
 			"alpha": {ap("192.0.2.1:5060")},
 			"beta":  {ap("192.0.2.1:5070"), ap("192.0.2.2:5060")},
+			"tlsco": {ap("192.0.2.9:5061")},
 		},
+		transports: map[string]string{"alpha": "udp", "beta": "udp", "tlsco": "tls"},
 		nets: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32"), netip.MustParsePrefix("192.0.2.2/32"),
-			netip.MustParsePrefix("198.51.100.0/24")},
+			netip.MustParsePrefix("192.0.2.9/32"), netip.MustParsePrefix("198.51.100.0/24")},
+		extra: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")},
 	}
 	for _, c := range []struct {
 		src      string
+		network  string
 		wantName string
 		wantOK   bool
 	}{
-		{"192.0.2.1:5070", "beta", true},             // exact IP:port beats the first name by IP
-		{"192.0.2.1:9999", "alpha", true},            // IP only: first by sorted name
-		{"192.0.2.2:9999", "beta", true},             // IP only
-		{"[::ffff:192.0.2.1]:5060", "alpha", true},   // mapped address
-		{"198.51.100.77:5060", carrierUnknown, true}, // in carrier_sources, matches no entry
-		{"203.0.113.1:5060", "", false},              // not a carrier source
+		{"192.0.2.1:5070", "udp", "beta", true},             // exact IP:port beats the first name by IP
+		{"192.0.2.1:9999", "udp", "alpha", true},            // IP only: first by sorted name
+		{"192.0.2.2:9999", "udp", "beta", true},             // IP only
+		{"[::ffff:192.0.2.1]:5060", "udp", "alpha", true},   // mapped address
+		{"198.51.100.77:5060", "udp", carrierUnknown, true}, // in carrier_sources, matches no entry
+		{"198.51.100.77:5060", "tls", carrierUnknown, true}, // carrier_sources match on any transport
+		{"203.0.113.1:5060", "udp", "", false},              // not a carrier source
+		{"192.0.2.9:44000", "tls", "tlsco", true},           // a tls carrier over tls, any source port
+		{"192.0.2.9:5061", "udp", "", false},                // a tls carrier's IP over UDP is nobody
+		{"192.0.2.1:5060", "tls", "", false},                // a udp carrier's IP over tls is nobody
+		{"192.0.2.1:5060", "tcp", "", false},
 	} {
-		name, ok := snap.carrierFor(ap(c.src))
+		name, ok := snap.carrierFor(ap(c.src), c.network)
 		if name != c.wantName || ok != c.wantOK {
-			t.Errorf("carrierFor(%s) = %q, %v; want %q, %v", c.src, name, ok, c.wantName, c.wantOK)
+			t.Errorf("carrierFor(%s, %s) = %q, %v; want %q, %v", c.src, c.network, name, ok, c.wantName, c.wantOK)
 		}
 	}
 }
@@ -306,5 +315,53 @@ func TestOrderSRVWeights(t *testing.T) {
 	}
 	if counts["p1b"] <= counts["p1a"] || counts["p1a"] == 0 {
 		t.Errorf("first-pick counts = %v; the heavy record should lead most often and the zero-weight one sometimes", counts)
+	}
+}
+
+// The SRV name follows the carrier's transport, and a DNS-name carrier with
+// no SRV record is dialed on the transport's default port.
+func TestCarrierDirectorySRVNamePerTransport(t *testing.T) {
+	for _, c := range []struct {
+		transport, wantSRV string
+		wantPort           string
+	}{
+		{"udp", "_sip._udp.sip.carrier.example", "5060"},
+		{"tcp", "_sip._tcp.sip.carrier.example", "5060"},
+		{"tls", "_sips._tcp.sip.carrier.example", "5061"},
+	} {
+		stub := &dnsStub{ips: map[string][]string{"sip.carrier.example": {"192.0.2.7"}}}
+		d := newTestDirectory(stub, &fakeClock{t: time.Unix(1000, 0)}, nil,
+			config.Carrier{Name: "a", Host: "sip.carrier.example", Port: 5060, Transport: c.transport})
+		d.refresh(context.Background())
+		if len(stub.srvCalls) != 1 || stub.srvCalls[0] != c.wantSRV {
+			t.Errorf("%s: SRV queries = %v, want %s", c.transport, stub.srvCalls, c.wantSRV)
+		}
+		got := d.snapshot().addrs["a"]
+		if len(got) != 1 || got[0] != ap("192.0.2.7:"+c.wantPort) {
+			t.Errorf("%s: addrs = %v, want 192.0.2.7:%s", c.transport, got, c.wantPort)
+		}
+	}
+}
+
+// SRV targets and ports are used per transport, and an explicit port skips
+// SRV for tls as well.
+func TestCarrierDirectoryTLSSRVAndExplicitPort(t *testing.T) {
+	stub := &dnsStub{
+		srv: map[string][]*net.SRV{"sip.carrier.example": {{Target: "gw.carrier.example.", Port: 5071, Priority: 1}}},
+		ips: map[string][]string{"gw.carrier.example": {"192.0.2.1"}, "sip.carrier.example": {"192.0.2.2"}},
+	}
+	d := newTestDirectory(stub, &fakeClock{t: time.Unix(1000, 0)}, nil,
+		config.Carrier{Name: "srv", Host: "sip.carrier.example", Port: 5060, Transport: "tls"},
+		config.Carrier{Name: "port", Host: "sip.carrier.example", Port: 7000, ExplicitPort: true, Transport: "tls"})
+	d.refresh(context.Background())
+	snap := d.snapshot()
+	if got := snap.addrs["srv"]; len(got) != 1 || got[0] != ap("192.0.2.1:5071") {
+		t.Errorf("srv addrs = %v, want the SRV target 192.0.2.1:5071", got)
+	}
+	if got := snap.addrs["port"]; len(got) != 1 || got[0] != ap("192.0.2.2:7000") {
+		t.Errorf("explicit-port addrs = %v, want 192.0.2.2:7000 without SRV", got)
+	}
+	if len(stub.srvCalls) != 1 || stub.srvCalls[0] != "_sips._tcp.sip.carrier.example" {
+		t.Errorf("SRV queries = %v, want one _sips._tcp lookup", stub.srvCalls)
 	}
 }

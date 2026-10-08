@@ -1,8 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
+	"strings"
 	"time"
+
+	"github.com/goccy/go-yaml"
 )
 
 // PrivateSIPPort is the port of the one fixed private SIP socket,
@@ -76,8 +80,9 @@ type EdgeConfig struct {
 	// carrier traffic; 0 (the default) means the node's own switch port.
 	SwitchCarrierPort int         `yaml:"switch_carrier_port"`
 	Listen            ListenPorts `yaml:"listen"`
-	// Carriers maps a carrier name to its "host[:port]" destination.
-	Carriers map[string]string `yaml:"carriers"`
+	// Carriers maps a carrier name to its destination: "host[:port]", or a
+	// mapping that adds the transport and its TLS settings (CarrierConfig).
+	Carriers map[string]CarrierConfig `yaml:"carriers"`
 	// CarrierSources are extra inbound carrier IPs/CIDRs.
 	CarrierSources []string `yaml:"carrier_sources"`
 
@@ -85,6 +90,54 @@ type EdgeConfig struct {
 	switches    []netip.AddrPort
 	carrierNets []netip.Prefix // carrier_sources only
 	carriers    []Carrier      // sorted by name
+}
+
+// Carrier transports. udp is the default.
+const (
+	CarrierUDP = "udp"
+	CarrierTCP = "tcp"
+	CarrierTLS = "tls"
+)
+
+// DefaultCarrierTLSPort is the port a tls carrier without an explicit port
+// and without an SRV record is dialed on.
+const DefaultCarrierTLSPort = 5061
+
+// CarrierConfig is one edge.carriers value as written: the string form
+// "host[:port]" (UDP), or a mapping. UnmarshalYAML accepts both.
+type CarrierConfig struct {
+	Host string `yaml:"host"`
+	// Transport is udp (the default), tcp or tls.
+	Transport string `yaml:"transport"`
+	// CAFile replaces the system roots for this carrier's TLS server
+	// certificate. tls only.
+	CAFile string `yaml:"ca_file"`
+	// ClientCert and ClientKey are the PEM pair presented for mutual TLS:
+	// both or neither. tls only.
+	ClientCert string `yaml:"client_cert"`
+	ClientKey  string `yaml:"client_key"`
+}
+
+// UnmarshalYAML accepts a scalar (the host) or a strict mapping.
+func (c *CarrierConfig) UnmarshalYAML(b []byte) error {
+	var host string
+	if err := yaml.Unmarshal(b, &host); err == nil {
+		*c = CarrierConfig{Host: strings.TrimSpace(host)}
+		return nil
+	}
+	type plain CarrierConfig
+	var p plain
+	if err := yaml.UnmarshalWithOptions(b, &p, yaml.Strict()); err != nil {
+		return fmt.Errorf("edge.carriers: want \"host[:port]\" or a mapping of host, transport, ca_file, client_cert, client_key: %s",
+			strings.TrimSpace(yaml.FormatError(err, false, false)))
+	}
+	*c = CarrierConfig(p)
+	return nil
+}
+
+// Plain reports whether the entry is the bare UDP "host[:port]" form.
+func (c CarrierConfig) Plain() bool {
+	return (c.Transport == "" || c.Transport == CarrierUDP) && c.CAFile == "" && c.ClientCert == "" && c.ClientKey == ""
 }
 
 // Carrier is one validated edge.carriers entry.
@@ -100,6 +153,21 @@ type Carrier struct {
 	ExplicitPort bool
 	// Addr is the literal IP when Host is one, else the zero Addr.
 	Addr netip.Addr
+	// Transport is udp, tcp or tls.
+	Transport string
+	// CAFile, ClientCert and ClientKey are the tls settings (paths; empty
+	// when unset).
+	CAFile, ClientCert, ClientKey string
+}
+
+// DialPort is the port the carrier is dialed on when SRV gives none: the
+// written port, else 5061 for tls and 5060 otherwise. Port itself stays the
+// port a switch Request-URI is matched by (5060 when none is written).
+func (c Carrier) DialPort() int {
+	if !c.ExplicitPort && c.Transport == CarrierTLS {
+		return DefaultCarrierTLSPort
+	}
+	return c.Port
 }
 
 // Literal reports whether the carrier host is an IP literal.
@@ -180,6 +248,12 @@ func (c *Config) PrivateAddr() netip.AddrPort {
 
 // Switches returns the edge.switch nodes in file order.
 func (c *Config) Switches() []netip.AddrPort { return c.Edge.switches }
+
+// CarrierSourceNets returns edge.carrier_sources alone: the extra inbound
+// carrier addresses that match on any public transport.
+func (c *Config) CarrierSourceNets() []netip.Prefix {
+	return append([]netip.Prefix(nil), c.Edge.carrierNets...)
+}
 
 // CarrierNets returns every address range that is an inbound carrier
 // source known without DNS: edge.carrier_sources plus the literal-IP
