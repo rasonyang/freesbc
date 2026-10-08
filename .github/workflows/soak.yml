@@ -59,6 +59,7 @@ jobs:
           - { pkg: ./internal/sip, target: FuzzAuditSIPMessageHelpers }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditParseBuild }
           - { pkg: ./internal/sip/sdp, target: FuzzAuditBuildNoSentinelLeak }
+          - { pkg: ./internal/sip/sdp, target: FuzzParseCrypto }
     env:
       FUZZTIME: ${{ inputs.fuzz_time || '5m' }}
     steps:

@@ -36,10 +36,11 @@ type SRTPContext struct {
 }
 
 // srtpMaxOverhead is the most SRTP/SRTCP adds to a packet with the
-// AES_CM_128 profiles and no MKI: a 10-byte auth tag, plus the 4-byte
-// E-flag/index word for SRTCP. Rounded up to 16 for slack. A destination
-// with this much capacity past the plaintext never makes pion allocate.
-const srtpMaxOverhead = 16
+// supported profiles and no MKI: a 10-byte auth tag (16 for AEAD_AES_128_GCM),
+// plus the 4-byte E-flag/index word for SRTCP, so 20 at most. Rounded up
+// to 24 for slack. A destination with this much capacity past the
+// plaintext never makes pion allocate.
+const srtpMaxOverhead = 24
 
 // srtpSlabSize is how much output one slab allocation covers: about 80
 // full-size voice packets.

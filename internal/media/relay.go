@@ -55,11 +55,34 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			if n > maxPacketSize {
 				continue // oversize: forwarding it would forward a truncation
 			}
-			if !inLatch.accept(src) {
+			pkt := buf[:n]
+			if leg := s.sdes[from].Load(); leg != nil {
+				// SDES side: authenticate and decrypt BEFORE the latch may
+				// move, so a forged packet from a vouched address cannot
+				// latch the stream. permits only spares a decrypt for a
+				// source the latch would refuse anyway.
+				if !inLatch.permits(src) {
+					continue
+				}
+				ctx := leg.in.ctx.Load()
+				ok := ctx != nil
+				if ok && rtpKind {
+					pkt, ok = ctx.unprotectRTPInto(pkt, pkt)
+				} else if ok {
+					pkt, ok = ctx.unprotectRTCPInto(pkt, pkt)
+				}
+				if !ok {
+					s.counters.srtpRxDrops[from].Add(1)
+					continue
+				}
+				if !inLatch.accept(src) {
+					continue
+				}
+			} else if !inLatch.accept(src) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
-			pkt := buf[:n]
-			// Only NOW is the packet proven genuine: the latch accepted it.
+			// Only NOW is the packet proven genuine: the latch accepted it
+			// (and, on an SDES side, it authenticated).
 			// Refresh the silence watchdog here, never on latch-accept alone:
 			// A party who knows the latched source address could
 			// feed garbage that failed auth yet renewed rtp_timeout
@@ -67,6 +90,22 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			s.lastRx[from].Store(time.Now().UnixNano())
 			s.counters.recordRx(from, rtpKind, len(pkt))
 			if dst := outLatch.target(); dst != nil {
+				if leg := s.sdes[to].Load(); leg != nil {
+					// Encrypt in place: the read buffer has srtpMaxOverhead
+					// spare. Only done once there is a destination, since
+					// protecting advances the SRTP index.
+					ctx := leg.out.ctx.Load()
+					ok := ctx != nil
+					if ok && rtpKind {
+						pkt, ok = ctx.protectRTPInto(pkt, pkt)
+					} else if ok {
+						pkt, ok = ctx.protectRTCPInto(pkt, pkt)
+					}
+					if !ok {
+						s.counters.srtpTxDrops[to].Add(1)
+						continue
+					}
+				}
 				if n, err := outSock.WriteToUDP(pkt, dst); err == nil {
 					s.counters.recordTx(to, rtpKind, n)
 				}

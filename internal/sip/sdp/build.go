@@ -43,8 +43,8 @@ type Build struct {
 
 	// DTLS turns on the browser-facing block: the UDP/TLS/RTP/SAVPF
 	// profile, ICE-Lite credentials, a host candidate at Address:Port, the
-	// certificate fingerprint and the DTLS role. It is the only secure
-	// profile this package builds; SDES/RTP/SAVP is not built.
+	// certificate fingerprint and the DTLS role. SDES (see Crypto) is the
+	// other secure profile.
 	DTLS bool
 	// RTCPMux writes a=rtcp-mux.
 	RTCPMux     bool
@@ -56,6 +56,15 @@ type Build struct {
 	// when it is the client, and "actpass" in the proxy's own initial
 	// offer to a browser, which leaves the choice to the answerer.
 	Setup string
+
+	// --- SDES-only field. Empty for a plain RTP leg. ---
+
+	// Crypto turns on SDES: the transport becomes RTP/SAVP and each entry
+	// is written as an a=crypto line, in order. An offer carries one line
+	// per suite offered; an answer exactly one, with the selected tag.
+	// Mutually exclusive with DTLS. Plain and DTLS output is unchanged
+	// when it is empty.
+	Crypto []Crypto
 }
 
 // Marshal renders the body.
@@ -110,6 +119,20 @@ func (b Build) marshal(offer *Session) ([]byte, error) {
 	}
 	if b.DTLS && (b.Fingerprint == nil || b.ICEUfrag == "" || b.ICEPwd == "") {
 		return nil, fmt.Errorf("sdp: build: DTLS leg needs a fingerprint and ICE credentials")
+	}
+
+	if len(b.Crypto) > 0 {
+		if b.DTLS {
+			return nil, fmt.Errorf("sdp: build: SDES and DTLS are mutually exclusive")
+		}
+		if len(b.Crypto) > MaxCrypto {
+			return nil, fmt.Errorf("sdp: build: %d crypto lines", len(b.Crypto))
+		}
+		for _, c := range b.Crypto {
+			if err := c.Validate(); err != nil {
+				return nil, fmt.Errorf("sdp: build: %w", err)
+			}
+		}
 	}
 
 	addrType := AddrType(b.Address)
@@ -169,6 +192,9 @@ func (b Build) marshal(offer *Session) ([]byte, error) {
 			md.Attributes = append(md.Attributes, attr("fmtp", fmt.Sprintf("%d %s", c.PayloadType, f)))
 		}
 	}
+	for _, c := range b.Crypto {
+		md.Attributes = append(md.Attributes, attr("crypto", c.Value()))
+	}
 	dir := b.Direction
 	if dir == "" {
 		dir = SendRecv
@@ -207,6 +233,9 @@ func (b Build) protos() []string {
 	if b.DTLS {
 		// SAVPF (RFC 5124) is what every browser offers and answers.
 		return []string{"UDP", "TLS", "RTP", "SAVPF"}
+	}
+	if len(b.Crypto) > 0 {
+		return []string{"RTP", "SAVP"}
 	}
 	return []string{"RTP", "AVP"}
 }

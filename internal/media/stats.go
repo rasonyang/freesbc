@@ -18,12 +18,20 @@ type Stats struct {
 	A, B LegStats
 }
 
-// LegStats is one side's RTP counters. RTCP is relayed but not counted.
+// LegStats is one side's RTP counters. RTCP is relayed but not counted,
+// except in the two SDES drop counters, which cover RTP and RTCP.
 type LegStats struct {
 	RTPPacketsRx uint64
 	RTPPacketsTx uint64
 	RTPBytesRx   uint64
 	RTPBytesTx   uint64
+	// SRTPRxDrops counts packets received from an SDES side that were
+	// dropped: failed authentication, replayed, or arrived before the
+	// side's remote key was set.
+	SRTPRxDrops uint64
+	// SRTPTxDrops counts packets that could not be sent to an SDES side
+	// because they could not be encrypted (no local key yet, or failure).
+	SRTPTxDrops uint64
 }
 
 // Side returns one side's counters.
@@ -41,6 +49,8 @@ func (s Stats) Total() LegStats {
 		RTPPacketsTx: s.A.RTPPacketsTx + s.B.RTPPacketsTx,
 		RTPBytesRx:   s.A.RTPBytesRx + s.B.RTPBytesRx,
 		RTPBytesTx:   s.A.RTPBytesTx + s.B.RTPBytesTx,
+		SRTPRxDrops:  s.A.SRTPRxDrops + s.B.SRTPRxDrops,
+		SRTPTxDrops:  s.A.SRTPTxDrops + s.B.SRTPTxDrops,
 	}
 }
 
@@ -51,6 +61,8 @@ type counters struct {
 	rtpPacketsTx [2]atomic.Uint64
 	rtpBytesRx   [2]atomic.Uint64
 	rtpBytesTx   [2]atomic.Uint64
+	srtpRxDrops  [2]atomic.Uint64
+	srtpTxDrops  [2]atomic.Uint64
 }
 
 // recordRx and recordTx count RTP only; RTCP is relayed but not counted,
@@ -79,6 +91,8 @@ func (c *counters) snapshot() Stats {
 			RTPPacketsTx: c.rtpPacketsTx[side].Load(),
 			RTPBytesRx:   c.rtpBytesRx[side].Load(),
 			RTPBytesTx:   c.rtpBytesTx[side].Load(),
+			SRTPRxDrops:  c.srtpRxDrops[side].Load(),
+			SRTPTxDrops:  c.srtpTxDrops[side].Load(),
 		}
 	}
 	return Stats{A: leg(SideA), B: leg(SideB)}
