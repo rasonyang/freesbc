@@ -174,8 +174,8 @@ func (s *Server) owedExpired(d *dialog, o *owedAnswer) {
 		o.release()
 	}
 	s.log.Warn("answer to a delayed offer never arrived; ending the call", "sip_call_id", d.callID)
-	if d.end() {
-		s.byeBothEnds(d)
+	if d.end(endAnswerTimeout) {
+		s.byeBothEnds(d, endAnswerTimeout)
 	}
 }
 

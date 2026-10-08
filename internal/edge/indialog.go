@@ -214,8 +214,8 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 					refused = true
 					mu.Unlock()
 					s.ack2xx(res, to)
-					if d.end() {
-						s.byeBothEnds(d)
+					if d.end(endReinviteRefused) {
+						s.byeBothEnds(d, endReinviteRefused)
 					}
 				}
 				return
@@ -369,8 +369,8 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if err := s.client.WriteRequest(out, noBuild); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
-	if answerFailed && d.end() {
-		s.byeBothEnds(d)
+	if answerFailed && d.end(endAnswerUnusable) {
+		s.byeBothEnds(d, endAnswerUnusable)
 	}
 }
 
@@ -590,8 +590,8 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		s.log.Warn("UPDATE media negotiation failed", "err", answerErr, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 488, "Not Acceptable Here")
 		if ux != nil && ux.fork == nil {
-			if d.end() {
-				s.byeBothEnds(d)
+			if d.end(endAnswerUnusable) {
+				s.byeBothEnds(d, endAnswerUnusable)
 			}
 		} else {
 			s.cancelCall(d, cancelBackstop)
@@ -602,7 +602,14 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		// The media ends as soon as the dialog does, rather than waiting
 		// for the silence watchdog — the difference between a port
 		// returning to the pool immediately and minutes later.
-		d.end()
+		why := endByeCallee
+		switch {
+		case err != nil:
+			why = endByeUnanswered
+		case from.plane == d.callerPlane:
+			why = endByeCaller
+		}
+		d.end(why)
 	}
 }
 
@@ -797,15 +804,16 @@ func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
 }
 
 // byeBothEnds tells both endpoints of a confirmed dialog that the call is
-// over, when it was the media that ended it (the silence watchdog, or a
-// WebRTC peer whose certificate did not match its fingerprint). Neither
-// endpoint sent a BYE, so both still believe the call is up: FreeSWITCH
-// would keep the channel and answer 481 to its own later BYE, and a phone
-// would sit in a silent call (RFC 3261 §15). FreeSBC sends each one a BYE
-// on behalf of the other, built from the identities and CSeqs the dialog
-// record kept.
-func (s *Server) byeBothEnds(d *dialog) {
-	s.log.Info("media ended the call; sending BYE to both ends", "sip_call_id", d.callID)
+// over, when FreeSBC ended it on its own (the silence watchdog, a WebRTC
+// peer whose certificate did not match its fingerprint, an answer it could
+// not anchor). Neither endpoint sent a BYE, so both still believe the call
+// is up: FreeSWITCH would keep the channel and answer 481 to its own later
+// BYE, and a phone would sit in a silent call (RFC 3261 §15). FreeSBC sends
+// each one a BYE on behalf of the other, built from the identities and CSeqs
+// the dialog record kept. why is the reason end() recorded.
+func (s *Server) byeBothEnds(d *dialog, why endReason) {
+	s.log.Info("ending the call; sending BYE to both ends",
+		"sip_call_id", d.callID, "reason", why.String())
 	for _, b := range d.byes() {
 		go s.sendMiddleBye(b)
 	}

@@ -273,6 +273,24 @@ func (l *latch) target() *net.UDPAddr {
 	return l.remote
 }
 
+// CloseCause is why a session closed. It describes the media plane only; a
+// caller maps it onto whatever its own signaling needs.
+type CloseCause int32
+
+const (
+	// CloseNone: the session has not closed.
+	CloseNone CloseCause = iota
+	// CloseRequested: its owner called Close.
+	CloseRequested
+	// CloseSilence: the silence watchdog fired.
+	CloseSilence
+	// CloseLegFailed: a WebRTC leg failed to establish or to verify its peer
+	// (ICE, DTLS or fingerprint).
+	CloseLegFailed
+	// CloseFault: a relay goroutine panicked.
+	CloseFault
+)
+
 // SessionConfig configures one relayed call.
 type SessionConfig struct {
 	// Latch is the per-side latching mode (zero value = strict).
@@ -301,6 +319,9 @@ type Session struct {
 	lastRx   [2]atomic.Int64 // per sending side: unix nanos of its last genuine packet
 	counters counters
 	done     chan struct{}
+	// cause is why the session closed, stored by the Close that won, before
+	// done is closed (see CloseCause).
+	cause atomic.Int32
 
 	// state is the session's lifecycle, made explicit rather than inferred
 	// from a sync.Once plus "are the goroutines running": every transition
@@ -433,12 +454,20 @@ func (s *Session) Relatch(side Side, addr netip.AddrPort) {
 // Done is closed when the session ends (Close or silence timeout).
 func (s *Session) Done() <-chan struct{} { return s.done }
 
+// Cause says why the session closed; CloseNone until Done is closed.
+func (s *Session) Cause() CloseCause { return CloseCause(s.cause.Load()) }
+
 // Close tears the session down and returns its ports to the pool.
 // Idempotent and safe to call from any goroutine.
-func (s *Session) Close() error {
+func (s *Session) Close() error { return s.closeWith(CloseRequested) }
+
+// closeWith is Close recording why. Only the call that wins the close
+// records a cause, and it does so before Done fires.
+func (s *Session) closeWith(c CloseCause) error {
 	if s.state.Swap(sessClosed) == sessClosed {
 		return nil
 	}
+	s.cause.Store(int32(c))
 	for _, pp := range s.pairs {
 		pp.Close()
 	}

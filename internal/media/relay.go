@@ -27,7 +27,7 @@ func (s *Session) Start() bool {
 	s.forward(SideB, SideA, true)
 	s.forward(SideA, SideB, false)
 	s.forward(SideB, SideA, false)
-	go watchdog(s.timeout, &s.lastRx, s.done, s.Close)
+	go watchdog(s.timeout, &s.lastRx, s.done, func() error { return s.closeWith(CloseSilence) })
 	return true
 }
 
@@ -45,7 +45,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 		outSock, outLatch = s.pairs[to].RTP, s.rtp[to]
 	}
 	go func() {
-		defer recoverRelayPanic(nil, s.Close)
+		defer recoverRelayPanic(nil, func() error { return s.closeWith(CloseFault) })
 		buf := make([]byte, relayBufSize)
 		for {
 			n, src, err := in.ReadFromUDP(buf[:maxPacketSize+1])

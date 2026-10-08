@@ -124,7 +124,7 @@ the kernel's side.
 | `level=WARN msg="webrtc leg failed" err="media: dtls handshake failed: …"` | the DTLS handshake failed for another reason |
 | `level=WARN msg="webrtc leg failed" err="media: dtls peer certificate does not match the signalled fingerprint: …"` | the fingerprint check failed inside the handshake (T5) |
 | `level=WARN msg="webrtc leg failed" err="media: webrtc session closed before establishment"` (or `…leg closed before it was established`) | the call ended while ICE/DTLS was still running (T6) |
-| `level=INFO msg="call ended" sip_call_id=… stats=…` | the dialog ended and its media counters were folded in |
+| `level=INFO msg="call ended" sip_call_id=… reason=… duration=… webrtc=… carrier=… stats=…` | the dialog ended and its media counters were folded in; `reason` says why (`dtls_failure` for a failed browser leg) and moves `freesbc_edge_calls_ended_total{reason}` |
 | `level=WARN msg="rejecting call: media setup failed" err=…` | the browser's offer was refused with 488 before any media was set up, for example an offer without `a=rtcp-mux` |
 
 Neither fingerprint and no ICE password is ever logged. Lines starting

@@ -338,3 +338,34 @@ func TestRelatchForgetsSignalledAddress(t *testing.T) {
 		t.Fatalf("the old SDP address must no longer rank as signalled, rank = %d", l.rank)
 	}
 }
+
+// A session says why it closed: its owner's Close, or the silence watchdog.
+func TestSessionCloseCause(t *testing.T) {
+	p := testPool(21200, 21207)
+	s, err := AllocateAcross(p, p, SessionConfig{Timeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Cause(); got != CloseNone {
+		t.Errorf("open session cause = %v, want CloseNone", got)
+	}
+	_ = s.Close()
+	if got := s.Cause(); got != CloseRequested {
+		t.Errorf("closed session cause = %v, want CloseRequested", got)
+	}
+
+	s, err = AllocateAcross(p, p, SessionConfig{Timeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Start()
+	select {
+	case <-s.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watchdog never closed the session")
+	}
+	_ = s.Close() // a later Close must not rewrite the cause
+	if got := s.Cause(); got != CloseSilence {
+		t.Errorf("watchdog-closed session cause = %v, want CloseSilence", got)
+	}
+}

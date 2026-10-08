@@ -45,6 +45,10 @@ type fakeBrowser struct {
 	agent *ice.Agent
 	ufrag string
 	pwd   string
+	// fpOverride, when set, is the a=fingerprint its answer advertises
+	// instead of its certificate's: a peer whose DTLS certificate does not
+	// match its signalling.
+	fpOverride string
 
 	// ready receives the outcome of ICE + DTLS + SRTP keying, once.
 	ready chan error
@@ -101,7 +105,12 @@ func (b *fakeBrowser) close() {
 }
 
 // fingerprint is the browser certificate's a=fingerprint value.
-func (b *fakeBrowser) fingerprint() string { return sha256Fingerprint(b.cert.Certificate[0]) }
+func (b *fakeBrowser) fingerprint() string {
+	if b.fpOverride != "" {
+		return b.fpOverride
+	}
+	return sha256Fingerprint(b.cert.Certificate[0])
+}
 
 // answerSDP is the browser's answer to offer: its ICE credentials,
 // fingerprint and DTLS role, rtcp-mux, and the offer's first codec plus

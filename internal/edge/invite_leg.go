@@ -262,7 +262,7 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 				// ringing, so its INVITE is CANCELled (RFC 3261 §16.7 step
 				// 10: a proxy that finalises the caller cancels the pending
 				// branches).
-				s.reject(l.req, l.tx, 488, "Not Acceptable Here")
+				s.rejectInvite(l.req, l.tx, 488, "Not Acceptable Here", rejectMediaFailed)
 				if res.StatusCode/100 != 2 {
 					s.abandonAttempt(l)
 				}

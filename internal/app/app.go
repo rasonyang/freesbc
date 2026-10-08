@@ -146,6 +146,8 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 				DTLSFailures:           s.WebRTCDTLSFailures,
 				HandlerPanics:          s.HandlerPanics,
 				AdmissionDrops:         s.AdmissionDrops,
+				CallsEnded:             s.CallsEnded,
+				InviteRejects:          s.InviteRejects,
 				ParseFailures:          s.ParseFailures,
 				CarrierRequests:        s.CarrierRequests,
 				CarrierRegistrations:   s.CarrierRegistrations,
