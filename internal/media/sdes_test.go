@@ -81,6 +81,30 @@ func newSDESRig(t *testing.T, base int, i int) *sdesRig {
 	return r
 }
 
+// latchPlainB latches the plain side B with a well-formed RTP packet and
+// waits until the relay has counted it. A packet sent from A before B is
+// latched is decrypted but has nowhere to go, and a resend of the same
+// bytes is then a replay, so under load the test could never see it arrive.
+// The packet is valid RTP so that, if it is relayed on to A after A latches,
+// it is encrypted normally instead of counting as a TX drop.
+func latchPlainB(t *testing.T, s *Session, b *net.UDPConn) {
+	t.Helper()
+	h := rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: 1, Timestamp: 160, SSRC: 0x0b0b0b0b}
+	raw, err := (&rtp.Packet{Header: h, Payload: []byte("latch")}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _ = b.Write(raw)
+		time.Sleep(20 * time.Millisecond)
+		if s.Stats().B.RTPPacketsRx > 0 {
+			return
+		}
+	}
+	t.Fatal("side B never latched")
+}
+
 func (r *sdesRig) rtpPacket(payload string) []byte {
 	r.seq++
 	h := rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: r.seq, Timestamp: uint32(r.seq) * 160, SSRC: 0xabcdef01}
@@ -138,7 +162,7 @@ func TestSDESRoundTripRTP(t *testing.T) {
 			r := newSDESRig(t, 21300+i*8, i)
 			a := dialSide(t, r.s, SideA)
 			b := dialSide(t, r.s, SideB)
-			_, _ = b.Write([]byte{0x80}) // latch B (dropped: junk RTP is plain, not inspected)
+			latchPlainB(t, r.s, b)
 
 			// SRTP in on A -> plain RTP out on B.
 			n := 0
@@ -201,7 +225,7 @@ func TestSDESBadAuthDroppedAndDoesNotLatch(t *testing.T) {
 	forger := dialSide(t, r.s, SideA)
 	real := dialSide(t, r.s, SideA)
 	b := dialSide(t, r.s, SideB)
-	_, _ = b.Write([]byte{0x80})
+	latchPlainB(t, r.s, b)
 
 	// A good packet with one flipped bit in the auth tag.
 	bad := r.srtpPacket(t, "forged")
@@ -259,7 +283,7 @@ func TestSDESNoKeyFailsClosed(t *testing.T) {
 	s2.Start()
 	a2 := dialSide(t, s2, SideA)
 	b2 := dialSide(t, s2, SideB)
-	_, _ = b2.Write([]byte{0x80}) // latch B so A's packets have somewhere to go
+	latchPlainB(t, s2, b2) // so A's packets have somewhere to go
 	rig := &sdesRig{seq: 9, farEnc: farCtx(t, srtp.ProtectionProfileAes128CmHmacSha1_80, sdesKey(SDESAESCM128HMACSHA180, 14, 0x11))}
 	sendUntil(t, func() { _, _ = a2.Write(rig.srtpPacket(t, "hi")) }, b2, func([]byte) bool { return true })
 	for i := 0; i < 5; i++ {
@@ -277,7 +301,7 @@ func TestSDESRekeyMidStream(t *testing.T) {
 	r := newSDESRig(t, 21372, 0)
 	a := dialSide(t, r.s, SideA)
 	b := dialSide(t, r.s, SideB)
-	_, _ = b.Write([]byte{0x80})
+	latchPlainB(t, r.s, b)
 	sendUntil(t, func() { _, _ = a.Write(r.srtpPacket(t, "k1")) }, b, func(p []byte) bool { return payloadOf(t, p) == "k1" })
 	sendUntil(t, func() { _, _ = b.Write(r.rtpPacket("d1")) }, a, func(p []byte) bool {
 		plain, err := r.farDec.DecryptRTP(nil, p, nil)
@@ -321,7 +345,7 @@ func TestSDESSameKeyKeepsState(t *testing.T) {
 	r := newSDESRig(t, 21380, 0)
 	a := dialSide(t, r.s, SideA)
 	b := dialSide(t, r.s, SideB)
-	_, _ = b.Write([]byte{0x80})
+	latchPlainB(t, r.s, b)
 	pkt := r.srtpPacket(t, "once")
 	sendUntil(t, func() { _, _ = a.Write(pkt) }, b, func(p []byte) bool { return payloadOf(t, p) == "once" })
 
@@ -343,8 +367,12 @@ func TestSDESSameKeyKeepsState(t *testing.T) {
 	if _, got := readOne(b, 150*time.Millisecond); got {
 		t.Fatal("replay accepted after a same-key update")
 	}
-	if r.s.Stats().A.SRTPRxDrops != before+1 {
-		t.Error("replay not counted")
+	// The drop is counted by the relay goroutine, which may lag under load.
+	for end := time.Now().Add(3 * time.Second); r.s.Stats().A.SRTPRxDrops < before+1 && time.Now().Before(end); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := r.s.Stats().A.SRTPRxDrops; got != before+1 {
+		t.Errorf("replay drops = %d, want %d", got, before+1)
 	}
 	// And a fresh packet still flows.
 	sendUntil(t, func() { _, _ = a.Write(r.srtpPacket(t, "next")) }, b, func(p []byte) bool { return payloadOf(t, p) == "next" })
@@ -354,7 +382,7 @@ func TestSDESRekeyUnderTraffic(t *testing.T) {
 	r := newSDESRig(t, 21388, 0)
 	a := dialSide(t, r.s, SideA)
 	b := dialSide(t, r.s, SideB)
-	_, _ = b.Write([]byte{0x80})
+	latchPlainB(t, r.s, b)
 	down := r.rtpPacket("y")
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
