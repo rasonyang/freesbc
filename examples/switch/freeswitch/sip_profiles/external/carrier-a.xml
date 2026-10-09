@@ -1,0 +1,23 @@
+<include>
+  <!-- Carrier line "carrier-a", registered. In freesbc.yaml:
+         edge.carriers: { carrier-a: "203.0.113.60:5060" }
+       Replace username, password and the carrier address (proxy). -->
+  <gateway name="carrier-a">
+    <param name="username" value="acct-a"/>
+    <param name="password" value="CHANGE-ME"/>
+
+    <!-- Request-URI host[:port] of every REGISTER and INVITE, and the host of
+         From/To. It must equal the edge.carriers entry exactly. -->
+    <param name="proxy" value="203.0.113.60:5060"/>
+
+    <!-- Where the datagram goes: FreeSBC's private socket, always UDP.
+         Set BOTH. outbound-proxy alone sends REGISTER straight to the carrier,
+         around FreeSBC, from the switch's private address. -->
+    <param name="outbound-proxy" value="10.77.0.2:5060"/>
+    <param name="register-proxy" value="10.77.0.2:5060"/>
+
+    <param name="register" value="true"/>
+    <param name="expire-seconds" value="300"/>
+    <param name="retry-seconds" value="30"/>
+  </gateway>
+</include>

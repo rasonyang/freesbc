@@ -1,0 +1,18 @@
+<include>
+  <!-- Reached only by an authenticated user (user_context=default). Allows a
+       destination allowlist to users whose directory variable toll_allow contains
+       "domestic", and tries carrier-a, then carrier-b. Narrow the pattern to what
+       you sell. A number that fails either condition falls through to the rest of
+       the context, which has no gateway route once 01_example.com.xml is removed. -->
+  <extension name="outbound-carrier">
+    <condition field="${toll_allow}" expression="domestic"/>
+    <condition field="destination_number" expression="^(\+?(?:1[2-9]\d{9}|44\d{9,10}|86\d{10,11}))$">
+      <action application="log" data="INFO outbound user=${accountcode} to=$1"/>
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="continue_on_fail=true"/>
+      <!-- Failover: next gateway only on a failure, not on answer. -->
+      <action application="bridge" data="sofia/gateway/carrier-a/$1|sofia/gateway/carrier-b/$1"/>
+      <action application="hangup" data="${originate_disposition}"/>
+    </condition>
+  </extension>
+</include>
