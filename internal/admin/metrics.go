@@ -39,6 +39,7 @@ type collector struct {
 	proxyDTLSFail   *prometheus.Desc
 	proxyPanics     *prometheus.Desc
 	proxySessions   *prometheus.Desc
+	proxyDraining   *prometheus.Desc
 	proxyAdmission  *prometheus.Desc
 	proxyCallsEnded *prometheus.Desc
 	proxyRejects    *prometheus.Desc
@@ -63,6 +64,7 @@ func newCollector(deps Deps) *collector {
 		proxySubs:       prometheus.NewDesc("freesbc_edge_subscriptions", "SUBSCRIBE dialogs the edge routes NOTIFYs for, pending or active.", nil, nil),
 		proxyDialogs:    prometheus.NewDesc("freesbc_active_sip_dialogs", "Dialogs the edge proxy is currently on the path of.", nil, nil),
 		proxySessions:   prometheus.NewDesc("freesbc_edge_sessions", "Calls holding a session slot, ringing or up; the number shield.max_sessions caps.", nil, nil),
+		proxyDraining:   prometheus.NewDesc("freesbc_edge_draining", "1 while the edge is in drain mode and refuses new INVITEs, else 0.", nil, nil),
 		proxyMedia:      prometheus.NewDesc("freesbc_active_media_sessions", "Media sessions the edge proxy is anchoring.", nil, nil),
 		proxyWebRTC:     prometheus.NewDesc("freesbc_active_webrtc_sessions", "Anchored media sessions whose public leg is WebRTC.", nil, nil),
 		proxyRegTotal:   prometheus.NewDesc("freesbc_registration_total", "Registrations accepted by the upstream registrar through the proxy.", nil, nil),
@@ -100,7 +102,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	for _, d := range []*prometheus.Desc{
-		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyMedia, c.proxyWebRTC,
+		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
@@ -135,6 +137,11 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	g(c.proxySubs, float64(p.ActiveSubscriptions))
 	g(c.proxyDialogs, float64(p.ActiveDialogs))
 	g(c.proxySessions, float64(p.ActiveSessions))
+	draining := 0.0
+	if p.Draining {
+		draining = 1
+	}
+	g(c.proxyDraining, draining)
 	g(c.proxyMedia, float64(p.ActiveMediaSessions))
 	g(c.proxyWebRTC, float64(p.ActiveWebRTCSessions))
 	counter(c.proxyRegTotal, float64(p.RegistrationTotal))

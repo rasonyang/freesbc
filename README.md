@@ -2,7 +2,7 @@
 
 An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, one YAML file, `./freesbc run`.**
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.27.1-00ADD8.svg)](go.mod)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.27.2-00ADD8.svg)](go.mod)
 
 - **Pure Go, one static binary, zero external dependencies**: no database, no Redis, no kernel modules, and **no external media process**.
 - **Keeps your switch off the public internet**: FreeSBC is the only element with a public address. FreeSWITCH or Asterisk stays on a private LAN and only ever talks to FreeSBC.
@@ -22,7 +22,7 @@ tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
 ./freesbc check -c freesbc.example.yaml
 ```
 
-**From source**: requires Go >= 1.27.1:
+**From source**: requires Go >= 1.27.2:
 
 ```sh
 go build -o freesbc ./cmd/freesbc
@@ -99,7 +99,8 @@ Enable the optional `admin` block (a bcrypt `password_hash`; generate with `htpa
 
 - browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the Config tab: the running file read-only, a candidate editor with Validate (the same checks as `freesbc check`, listing restart-only keys the candidate changes) and a line diff against the running file. The admin API never writes the config: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it, as with nginx. Keep secrets as `${ENV}` references,
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- read live state from `/api/status`, `/api/calls` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing).
+- read live state from `/api/status`, `/api/calls` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
+- drain the node before a restart: `POST /api/drain` refuses new calls with `503` and `Retry-After: 30` while calls and registrations in place continue, `GET /api/drain` reports `active_calls`, `DELETE /api/drain` leaves drain mode (runtime state only; see [`docs/edge.md`](docs/edge.md)).
 
 Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.
 

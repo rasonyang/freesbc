@@ -169,6 +169,11 @@ The data on this console is SIP state, so these rules are the core of
   network blip into a fake outage. `/api/status` and `/api/calls` render
   independently: if only one fails, the other stays current, the failed half
   gets a "Stale" badge and the header says "Partial update, retrying…".
+- **Drain is two steps.** The Drain mode card's button only opens an in-page
+  confirmation (a destructive-variant `.alert` that names the consequence);
+  Confirm sends `POST` or `DELETE /api/drain`. Never `window.confirm`. A poll
+  that finds the state changed under an open confirmation closes it.
+  `/api/drain` renders independently like the other two endpoints.
 - **Polls never overlap.** The next poll is scheduled with `setTimeout` when
   the previous one has settled, and each request is abandoned after 4 s
   (below the 5 s interval). The session banner clears on the next successful

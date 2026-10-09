@@ -68,3 +68,52 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	s.handleConfigGet(w, r)
 }
+
+// drainBody is the /api/drain response. Since is null when not draining.
+type drainBody struct {
+	Draining    bool    `json:"draining"`
+	Since       *string `json:"since"`
+	ActiveCalls int     `json:"active_calls"`
+}
+
+// drainResponse renders the current drain state.
+func (s *Server) drainResponse() drainBody {
+	on, since := s.deps.DrainState()
+	b := drainBody{Draining: on, ActiveCalls: s.deps.ActiveCalls()}
+	if on && !since.IsZero() {
+		t := since.UTC().Format(time.RFC3339)
+		b.Since = &t
+	}
+	return b
+}
+
+// handleDrain serves /api/drain: GET reports the drain state, POST enters
+// drain mode and DELETE leaves it; both mutations are idempotent and answer
+// with the same body as GET. Auth, the Host check and (for POST and DELETE)
+// the Origin check run before it. The state is runtime only (edge
+// drain.go). Each actual change is logged; audit events will go through the
+// audit log (#118) once it lands.
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	if s.deps.DrainState == nil || s.deps.SetDraining == nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+	case http.MethodPost, http.MethodDelete:
+		on := r.Method == http.MethodPost
+		if s.deps.SetDraining(on) {
+			msg := "admin: edge drain left"
+			if on {
+				msg = "admin: edge drain entered"
+			}
+			// TODO(#118): emit an audit event here.
+			s.log.Info(msg, "remote", r.RemoteAddr, "active_calls", s.deps.ActiveCalls())
+		}
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.drainResponse())
+}

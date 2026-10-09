@@ -100,6 +100,34 @@
       </div>
     </div>
 
+      <div class="card" id="drain-card">
+        <div class="card-header">
+          <div class="card-heading">
+            <h2 class="card-title">Drain mode</h2>
+            <p class="card-description">While draining, new calls are refused with 503 (public, carrier and switch alike); calls and registrations in place continue. Runtime only: a restart starts not draining.</p>
+          </div>
+          <div class="card-action"><span class="badge" data-variant="warning" id="drain-stale" hidden>Stale</span><span class="badge" data-variant="secondary" id="drain-badge">—</span></div>
+        </div>
+        <div class="card-content page">
+          <p class="muted" id="drain-detail">—</p>
+          <div class="toolbar">
+            <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-drain" disabled>Enter drain mode</button>
+            <span class="toolbar-status" id="drain-status" role="status" aria-live="polite"></span>
+          </div>
+          <div class="alert" data-variant="destructive" id="drain-confirm" tabindex="-1" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+            <div class="alert-title" id="drain-confirm-title">Enter drain mode?</div>
+            <div class="alert-body">
+              <p id="drain-confirm-text"></p>
+              <div class="toolbar">
+                <button class="btn" data-variant="destructive" data-size="sm" type="button" id="btn-drain-confirm">Confirm</button>
+                <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-drain-cancel">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-header">
           <div class="card-heading">

@@ -61,6 +61,11 @@ type Deps struct {
 	Running func() *config.Config
 	// Proxy reports the edge plane's counters; nil reports none.
 	Proxy func() ProxyStats
+	// DrainState reports whether the edge is draining and since when.
+	// SetDraining enters (true) or leaves (false) drain and reports whether
+	// the state changed. Nil on either makes /api/drain answer 404.
+	DrainState  func() (draining bool, since time.Time)
+	SetDraining func(on bool) (changed bool)
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
@@ -78,7 +83,9 @@ type ProxyStats struct {
 	ActiveDialogs       int64 `json:"active_dialogs"`
 	// ActiveSessions is the calls holding a session slot (ringing or up),
 	// the number shield.max_sessions caps.
-	ActiveSessions       int64 `json:"active_sessions"`
+	ActiveSessions int64 `json:"active_sessions"`
+	// Draining is true while the edge refuses new INVITEs.
+	Draining             bool  `json:"draining"`
 	ActiveMediaSessions  int64 `json:"active_media_sessions"`
 	ActiveWebRTCSessions int64 `json:"active_webrtc_sessions"`
 
@@ -168,6 +175,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
+	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
