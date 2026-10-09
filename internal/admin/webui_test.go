@@ -283,3 +283,26 @@ func TestUIDrainPanel(t *testing.T) {
 		}
 	}
 }
+
+// The Audit tab is wired: nav link, view section, the API it reads, and its
+// rows are built with textContent (no innerHTML).
+func TestUIAuditTab(t *testing.T) {
+	s := testServer(t)
+	page := uiGet(t, s, "/", true).Body.String()
+	for _, want := range []string{`data-view="audit"`, `id="view-audit"`, `id="audit-body"`, `id="audit-empty"`, "256"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	js := uiGet(t, s, "/assets/app.js", true).Body.String()
+	for _, want := range []string{`"/api/audit"`, `"audit"`, "function renderAudit", "function loadAudit"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+	i := strings.Index(js, "function renderAudit")
+	j := strings.Index(js, "function loadAudit")
+	if i < 0 || j < i || strings.Contains(js[i:j], "innerHTML") {
+		t.Error("renderAudit must build rows with textContent, not innerHTML")
+	}
+}
