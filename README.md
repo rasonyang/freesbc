@@ -98,8 +98,9 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 Enable the optional `admin` block (a bcrypt `password_hash`; generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`; the user is always `admin`), then:
 
 - browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the Config tab: the running file read-only, a candidate editor with Validate (the same checks as `freesbc check`, listing restart-only keys the candidate changes) and a line diff against the running file. The admin API never writes the config: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it, as with nginx. Keep secrets as `${ENV}` references,
+- the Audit tab (`GET /api/audit`) lists the last 256 admin events: sign-ins (first successful login, failed login, rate-limited) and drain changes (`drain_on`, `drain_off`); `freesbc_admin_auth_failures_total` counts the failures. The source is the connecting address, so behind a reverse proxy it is the proxy's,
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- read live state from `/api/status`, `/api/calls` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
+- read live state from `/api/status`, `/api/calls`, `/api/audit` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
 - drain the node before a restart: `POST /api/drain` refuses new calls with `503` and `Retry-After: 30` while calls and registrations in place continue, `GET /api/drain` reports `active_calls`, `DELETE /api/drain` leaves drain mode (runtime state only; see [`docs/edge.md`](docs/edge.md)).
 
 Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.

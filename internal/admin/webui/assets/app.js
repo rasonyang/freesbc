@@ -7,6 +7,7 @@
   var STATUS_URL = "/api/status";
   var CALLS_URL = "/api/calls";
   var DRAIN_URL = "/api/drain";
+  var AUDIT_URL = "/api/audit";
   var CONFIG_RAW_URL = "/api/config/raw";
   var CONFIG_VALIDATE_URL = "/api/config/validate";
 
@@ -27,7 +28,7 @@
   // ---- views (hash-routed so a reload keeps the tab) ----
 
   var links = document.querySelectorAll(".nav-link[data-view]");
-  var VIEWS = ["dashboard", "config"];
+  var VIEWS = ["dashboard", "config", "audit"];
 
   function show(name) {
     if (VIEWS.indexOf(name) < 0) name = "dashboard";
@@ -39,6 +40,8 @@
     // First time the Config tab is opened, fetch the running config
     // automatically instead of showing an empty editor.
     if (name === "config") loadConfigIfEmpty();
+    // The audit list is fetched on every open: it is cheap and not polled.
+    if (name === "audit") loadAudit();
   }
 
   window.addEventListener("hashchange", function () { show(location.hash.slice(1)); });
@@ -625,6 +628,52 @@
   }
 
   btnDownload.addEventListener("click", downloadConfig);
+
+  // ---- audit ----
+
+  var auditLoading = false;
+
+  function renderAudit(events) {
+    var body = $("audit-body");
+    body.textContent = "";
+    events = events || [];
+    $("audit-count").textContent = fmtInt(events.length);
+    $("audit-empty").hidden = events.length > 0;
+    body.parentNode.hidden = events.length === 0;
+    events.forEach(function (e) {
+      var tr = document.createElement("tr");
+      var when = el("td", "muted num", "—");
+      var d = new Date(e.time);
+      if (e.time && !isNaN(d)) { when.textContent = fmtClock(d); when.title = e.time; }
+      tr.appendChild(when);
+      tr.appendChild(el("td", "mono", e.type == null ? "—" : e.type));
+      tr.appendChild(el("td", "mono", e.source == null ? "—" : e.source));
+      var res = el("td", null, "");
+      var badge = el("span", "badge", e.result == null ? "—" : e.result);
+      badge.setAttribute("data-variant", e.result === "ok" ? "success" : "warning");
+      res.appendChild(badge);
+      tr.appendChild(res);
+      body.appendChild(tr);
+    });
+  }
+
+  function loadAudit() {
+    if (auditLoading) return;
+    auditLoading = true;
+    $("audit-status").textContent = "Loading…";
+    fetchJSON(AUDIT_URL).then(function (events) {
+      renderAudit(events);
+      $("audit-status").textContent = "Loaded";
+    }).catch(function (err) {
+      if (String(err.message || err) !== "unauthorized") {
+        $("audit-status").textContent = "Load failed";
+      }
+    }).then(function () {
+      auditLoading = false;
+    });
+  }
+
+  $("btn-audit-load").addEventListener("click", loadAudit);
 
   // ---- start ----
 

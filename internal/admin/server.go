@@ -151,9 +151,11 @@ type Server struct {
 	started time.Time
 	cfgPath string
 
-	hosts    *hostPolicy   // accepted Host header values
-	limiter  authLimiter   // per-source auth-failure rate limit
-	verified verifiedCreds // credentials already verified by bcrypt
+	hosts    *hostPolicy      // accepted Host header values
+	limiter  authLimiter      // per-source auth-failure rate limit
+	verified verifiedCreds    // credentials already verified by bcrypt
+	audit    auditLog         // bounded ring of auth events (audit.go)
+	now      func() time.Time // test seam for the limiter clock; nil is time.Now
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -164,6 +166,7 @@ type Server struct {
 // restart-only, so cfg is never re-read from the store.
 func New(cfg *config.AdminConfig, tlsCfg *config.TLSConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
 	s := &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
+	s.audit.log = log
 	s.hosts = newHostPolicy(cfg.Listen, cfg.AllowedHosts, s.useTLS())
 	return s
 }
@@ -176,6 +179,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
 	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
+	mux.HandleFunc("/api/audit", s.requireAuth(s.handleAudit))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
@@ -242,6 +246,15 @@ func (s *Server) Run(ctx context.Context) error {
 // Only an exact, previously verified header passes that way, so it gives a
 // guesser nothing.
 //
+// Auth events are audited (audit.go): login_ok on the first verification of
+// a credential (the verifiedCreds add, not a cached request), login_failed
+// for credentials that do not verify, login_limited for the first 429 of a
+// source's lockout window (the rest only count in
+// freesbc_admin_auth_failures_total, so a locked-out source cannot flush
+// the ring or flood the log). A request with no Authorization header is not
+// an event. Only the source IP is recorded, never the user, password, header
+// or hash.
+//
 // The user is always config.AdminUser; the hash is the startup snapshot's
 // (admin is restart-only, so there is no hot password rotation).
 func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
@@ -258,8 +271,13 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		ip := remoteIP(r)
-		slot, ok := s.limiter.reserve(ip, time.Now())
+		slot, ok, first := s.limiter.reserve(ip, s.clock())
 		if !ok {
+			// Every 429 counts; only the first of a lockout window is an event.
+			s.audit.count(AuditResultRateLimited)
+			if first {
+				s.audit.record(AuditLoginLimited, ip, AuditResultRateLimited)
+			}
 			http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
 			return
 		}
@@ -267,12 +285,15 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 		passOK := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
 		if !userOK || !passOK {
 			// The reserved slot stays: it is this failure.
+			s.audit.count(AuditResultBadCredentials)
+			s.audit.record(AuditLoginFailed, ip, AuditResultBadCredentials)
 			w.Header().Set("WWW-Authenticate", `Basic realm="freesbc"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		s.limiter.refund(slot)
 		s.verified.add(hash, user, pass)
+		s.audit.record(AuditLoginOK, ip, AuditResultOK)
 		h(w, r)
 	}
 }
@@ -323,7 +344,8 @@ type authLimiter struct {
 
 type authFailEntry struct {
 	start    time.Time
-	failures int // includes slots reserved by requests still in bcrypt
+	failures int  // includes slots reserved by requests still in bcrypt
+	denied   bool // a 429 for this window was already reported (audit)
 }
 
 // authSlot is one reservation made by reserve, for refund.
@@ -368,14 +390,21 @@ func (l *authLimiter) recordFail(ip string, now time.Time) {
 // slot if the credentials turn out to be valid. Check and count are one
 // critical section, so N concurrent requests can take at most the
 // remaining budget between them.
-func (l *authLimiter) reserve(ip string, now time.Time) (authSlot, bool) {
+//
+// When ok is false, first reports whether this is the first denial in the
+// source's current window (the flag clears with the window), so the audit
+// log records one login_limited per lockout, not one per 429.
+func (l *authLimiter) reserve(ip string, now time.Time) (slot authSlot, ok, first bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	key := limiterKey(ip)
-	if w, ok := l.perIP[key]; ok && now.Sub(w.start) < authFailWindow && w.failures >= authFailLimit {
-		return authSlot{}, false
+	if w, found := l.perIP[key]; found && now.Sub(w.start) < authFailWindow && w.failures >= authFailLimit {
+		first = !w.denied
+		w.denied = true
+		l.perIP[key] = w
+		return authSlot{}, false, first
 	}
-	return authSlot{key: key, start: l.countLocked(key, now)}, true
+	return authSlot{key: key, start: l.countLocked(key, now)}, true, false
 }
 
 // refund returns a reserved slot. A slot from a window that has since
@@ -559,3 +588,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // are implemented in api.go. handleConfigRaw and handleConfigValidate are
 // implemented in config_validate.go. handleMetrics is implemented in
 // metrics.go. handleUI is implemented in webui.go.
+
+// clock returns the limiter's notion of now.
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}

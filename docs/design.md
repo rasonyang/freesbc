@@ -3176,7 +3176,7 @@ spin.
 |---|---|
 | `edge.guard` (`edge.go:835`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` (`media/relay.go:115`) | every relay goroutine; closes **that session only** |
-| `admin.recoverMW` (`admin/server.go:501`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `admin.recoverMW` (`admin/server.go:530`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` (`config/loader.go:54`) | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` (`config/reload.go:158`) | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
@@ -3312,9 +3312,9 @@ self-signed certificate.
 ### 13.1 Prometheus metrics
 
 All metrics live on a **private** registry built lazily on the first
-`/metrics` scrape (`sync.Once`, `internal/admin/metrics.go:173`), containing the Go
+`/metrics` scrape (`sync.Once`, `internal/admin/metrics.go:205`), containing the Go
 collector plus one `collector` that samples `admin.Deps` on every scrape — no
-duplicated state. `Describe` advertises all 25 descriptors; the whole edge
+duplicated state. `Describe` advertises all 33 descriptors; the whole edge
 block is skipped at `Collect` time when `Deps.Proxy` is nil (it is never nil in
 a running process).
 
@@ -3329,6 +3329,7 @@ permanent series per call."
 | `freesbc_shield_drops_total` | Counter | `reason` ∈ {`banned`, `scanner`, `rate`} | the edge shield's drop counters (`Server.ShieldStats`, `edge.go:279`) |
 | `freesbc_build_info` | Gauge (always 1) | `version` | `Deps.Version` |
 | `freesbc_active_registrations` | Gauge | — | edge `Location.Count()`, stored on every binding change and prune |
+| `freesbc_admin_auth_failures_total` | Counter | `reason` ∈ {`bad_credentials`, `rate_limited`} | admin `requireAuth` (§13.5): a credential that did not verify, a request answered 429 by the limiter; every reason is always exported |
 | `freesbc_edge_subscriptions` | Gauge | — | edge `subTable.total`: SUBSCRIBE dialog records, pending or active (`Metrics.SetSubscriptions`, `metrics.go:146`; read through `Metrics.Snapshot().ActiveSubscriptions`, `metrics.go:236`, `:282`, which `internal/app/app.go:133` copies into `admin.ProxyStats`; the collector is `internal/admin/metrics.go:60`, `:129`); also `active_subscriptions` in the admin status JSON |
 | `freesbc_active_sip_dialogs` | Gauge | — | edge dialogs started and not yet ended |
 | `freesbc_edge_sessions` | Gauge | — | edge `dialogTable.sessions`: calls holding a session slot, ringing or up; the number `shield.max_sessions` caps (`Metrics.SetSessions`) |
@@ -3383,8 +3384,8 @@ The default process log level is `Info` and there is no flag to change it.
 
 ### 13.3 Admin HTTP API
 
-All routes are on one `http.ServeMux` (`server.go:148-158`) behind `recoverMW`
-(`server.go:501`) and `guardMW` (`guard.go`). `recoverMW` sets
+All routes are on one `http.ServeMux` (`server.go:175-187`) behind `recoverMW`
+(`server.go:555`) and `guardMW` (`guard.go`). `recoverMW` sets
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
 `Referrer-Policy: no-referrer` on **every** response, error responses
 included, and `Cache-Control: no-store` on every response except `/healthz`;
@@ -3398,7 +3399,8 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
-| `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; audit events will go through #118 |
+| `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
+| `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
 | `/api/config/validate` | POST (else 405 + `Allow: POST`) | Basic | check a candidate file, write nothing: `{"valid","errors","restart_required"}` |
@@ -3440,7 +3442,7 @@ The admin section is restart-only (`admin` in `RestartOnlyChanges`): the
 hot password rotation. The user name is always `admin` (`config.AdminUser`);
 the password is checked against `admin.password_hash`.
 
-`requireAuth` (`server.go:221`) runs per request:
+`requireAuth` (`server.go:260`) runs per request:
 
 1. A request with **no (parseable) Basic `Authorization` header** gets
    `WWW-Authenticate: Basic realm="freesbc"` and **401 — without running
@@ -3450,7 +3452,7 @@ the password is checked against `admin.password_hash`.
    (`verifiedCreds`), the request is served with no bcrypt and no limiter
    check. Entries are HMAC-SHA256 digests (per-process random key) over the
    configured hash plus the presented username and password; at most **16**
-   are kept (`verifiedCredsMax`, `server.go:409`), each for **1 h** after its
+   are kept (`verifiedCredsMax`, `server.go:464`), each for **1 h** after its
    last use. This is what keeps an operator or the Prometheus scrape working
    when a shared source address (loopback, a reverse proxy) is locked out by
    someone else's failures, and it saves a KDF per scrape. Only an exact
@@ -3468,7 +3470,7 @@ the password is checked against `admin.password_hash`.
    are remembered (step 2).
 
 Limiter constants (`authFailLimit`, `authFailWindow`, `authFailMaxIPs`,
-`server.go:278-280`): **10** failures per **1 minute** fixed window per source,
+`server.go:325-327`): **10** failures per **1 minute** fixed window per source,
 tracking at most **4096** sources. A source (`limiterKey`) is an IPv4 address
 (IPv4-mapped addresses are unmapped) or an IPv6 **/64**, so one host cannot
 mint fresh budgets from its own prefix. There is no background sweeper:
@@ -3480,12 +3482,40 @@ cannot reset an exhausted attacker's budget (audit P2-ADM-003). A refund whose
 window has since rolled over is dropped. A client whose credentials were never
 verified still gets 429 while its source is over budget.
 
-`http.Server` timeouts (`newHTTPServer`, `server.go:260`): `ReadHeaderTimeout`
+`http.Server` timeouts (`newHTTPServer`, `server.go:307`): `ReadHeaderTimeout`
 5 s, `ReadTimeout` 30 s, `WriteTimeout` 30 s, `IdleTimeout` 30 s. Shutdown
 gets a 5 s drain. With `admin.allow_remote` the listener serves HTTPS (TLS 1.2
 minimum) using the top-level `tls` identity, loaded when the admin server
-starts (`server.go:176`); otherwise it serves plain HTTP, which validation
+starts (`server.go:206`); otherwise it serves plain HTTP, which validation
 admits only on a loopback address.
+
+
+### 13.5 Admin audit log
+
+`requireAuth` records auth events (`audit.go`) in a bounded in-memory ring
+(`auditRingSize` = **256**, oldest dropped) and as one `admin audit` log line
+at Info with a fixed field set: `type`, `source`, `result`, `at` (RFC 3339 UTC).
+`GET /api/audit` and the WebUI's Audit tab read the ring, newest first. The
+ring is lost on restart. Event types (`AuditType`, a closed set so a later
+action can reuse the path):
+
+| `type` | `result` | When |
+|---|---|---|
+| `login_ok` | `ok` | the **first** verification of a credential: the `verifiedCreds.add` after a successful bcrypt check. A request served from the cache is not an event, so an unchanged scrape produces none |
+| `login_failed` | `bad_credentials` | Basic credentials were presented and the username or password did not verify |
+| `drain_on` | `ok` | `handleDrain` (`api.go`): a POST /api/drain that actually entered drain mode (`SetDraining` returned changed). A repeated POST, a GET and any request refused before the toggle are not events |
+| `drain_off` | `ok` | a DELETE /api/drain that actually left drain mode, same rule |
+| `login_limited` | `rate_limited` | the per-source limiter answered 429, **once per lockout window per limiter key**: only the first 429 of a window is an event (`authFailEntry.denied`, set by `reserve` under the limiter's lock and cleared when a new window starts), so a locked-out source cannot flush the ring or flood the log |
+
+A request with no (parseable) Basic header is **not** an event: it guesses
+nothing and a browser's first request always looks like that (§13.4 step 1).
+
+`source` is `remoteIP(r)`; `X-Forwarded-For` is never consulted, so behind a
+reverse proxy it is the proxy's address. An event never carries the
+username, password, `Authorization` value or the hash. Every `login_failed` and every 429 (not only the first of a window) counts in `freesbc_admin_auth_failures_total{reason}`
+(`bad_credentials`, `rate_limited`, both always exported); counting is
+separate from recording (`auditLog.count` / `record`) and the counters are not
+bounded by the ring.
 
 ### 13.5 WebUI
 
@@ -3676,7 +3706,7 @@ but `/healthz`; `nosniff`, `X-Frame-Options: DENY` and
 login page, no logout and no idle timeout: the session ends when the browser
 forgets the credentials (closing it, or a 401 that makes it re-prompt), and
 the server separately remembers credentials it has verified for **1 hour**
-after their last use (`verifiedCredsTTL`, `server.go:410`; §13.4), so a
+after their last use (`verifiedCredsTTL`, `server.go:465`; §13.4), so a
 credential that is still cached by a browser keeps working for that long.
 Cookie sessions with CSRF tokens were weighed and not built: the Host and
 Origin checks below close the two web attacks Basic Auth leaves open, and

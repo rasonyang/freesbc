@@ -112,7 +112,7 @@ func TestAuthLimiterRefund(t *testing.T) {
 	var l authLimiter
 	now := time.Unix(1_700_000_000, 0)
 	for i := 0; i < 3*authFailLimit; i++ {
-		slot, ok := l.reserve("192.0.2.1", now)
+		slot, ok, _ := l.reserve("192.0.2.1", now)
 		if !ok {
 			t.Fatalf("reservation %d refused although every one was refunded", i)
 		}

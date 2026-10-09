@@ -178,6 +178,7 @@ The data on this console is SIP state, so these rules are the core of
   the previous one has settled, and each request is abandoned after 4 s
   (below the 5 s interval). The session banner clears on the next successful
   response.
+- **The Audit tab** lists `GET /api/audit` (newest first; sign-ins and drain changes) when it is opened and on Reload; it is not polled. Time is local `HH:MM:SS` with the RFC 3339 original in `title`; the result is a badge (`ok` success, anything else warning).
 - **Restart-only facts say so** where they are shown (listeners, the config
   hint), so nobody expects an edit to rebind a socket.
 
