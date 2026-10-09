@@ -75,7 +75,7 @@ One process, one YAML file, one SIP plane: the **edge** (`internal/edge`), a sta
 
 ## Test environment gotchas
 
-- The edge suite runs on 127.0.0.1 with the private socket moved by `WithPrivateAddr`, and passes on macOS. `TestAuditMED006LooseLatchFirstPacketHijack` (media) binds 127.0.0.2 and skips, not fails, when it is missing. Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.27.1 go test -race -count=1 ./...`.
+- The edge suite runs on 127.0.0.1 with the private socket moved by `WithPrivateAddr`, and passes on macOS. `TestAuditMED006LooseLatchFirstPacketHijack` (media) binds 127.0.0.2 and skips, not fails, when it is missing. Fix with `sudo ifconfig lo0 alias 127.0.0.2 up` (not persistent), or run in Linux: `docker run --rm -v "$PWD":/src -w /src golang:1.27.2 go test -race -count=1 ./...`.
 - Test ports: each package owns a disjoint band, all below 32768 (the start of Linux's ephemeral range, so the kernel never hands a test's fixed port to a client socket; macOS's starts at 49152). Keep new test ports inside the package's band:
 
   | Band | Package | How ports are chosen |

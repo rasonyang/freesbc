@@ -1,6 +1,6 @@
 module github.com/freesbc/freesbc
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/emiago/sipgo v1.4.3
@@ -15,10 +15,10 @@ require (
 	github.com/pion/srtp/v3 v3.0.12
 	github.com/pion/transport/v4 v4.1.0
 	github.com/prometheus/client_golang v1.23.2
-	golang.org/x/crypto v0.54.0
-	golang.org/x/net v0.56.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sync v0.16.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
