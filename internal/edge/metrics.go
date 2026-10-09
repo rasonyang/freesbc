@@ -34,6 +34,7 @@ type Metrics struct {
 
 	dialogs        atomic.Int64 // gauge
 	sessions       atomic.Int64 // gauge: calls holding a session slot
+	draining       atomic.Int64 // gauge: 1 while the edge is in drain mode
 	mediaSessions  atomic.Int64 // gauge
 	webrtcSessions atomic.Int64 // gauge
 
@@ -215,6 +216,15 @@ func (m *Metrics) ParseFailed(transport string) { m.parseFailures[transportIndex
 // SetSessions publishes the dialog table's session count.
 func (m *Metrics) SetSessions(n int) { m.sessions.Store(int64(n)) }
 
+// SetDraining publishes the drain-mode gauge.
+func (m *Metrics) SetDraining(on bool) {
+	if on {
+		m.draining.Store(1)
+	} else {
+		m.draining.Store(0)
+	}
+}
+
 func (m *Metrics) DialogStarted() { m.dialogs.Add(1) }
 func (m *Metrics) DialogEnded()   { m.dialogs.Add(-1) }
 
@@ -266,6 +276,9 @@ type Snapshot struct {
 	ActiveSessions       int64
 	ActiveMediaSessions  int64
 	ActiveWebRTCSessions int64
+
+	// Draining is true while the edge refuses new INVITEs (drain.go).
+	Draining bool
 
 	RegistrationTotal   uint64
 	RegistrationFailure uint64
@@ -320,6 +333,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		ActiveSessions:       m.sessions.Load(),
 		ActiveMediaSessions:  m.mediaSessions.Load(),
 		ActiveWebRTCSessions: m.webrtcSessions.Load(),
+		Draining:             m.draining.Load() == 1,
 		RegistrationTotal:    m.registrationTotal.Load(),
 		RegistrationFailure:  m.registrationFailure.Load(),
 		RequestsIn:           map[string]uint64{},

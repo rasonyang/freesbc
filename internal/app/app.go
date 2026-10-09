@@ -122,6 +122,8 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 			return out
 		},
 		ActiveCalls: edgeSrv.ActiveCalls,
+		DrainState:  edgeSrv.DrainState,
+		SetDraining: edgeSrv.SetDraining,
 		Listeners:   edgeSrv.Listeners,
 		Shield: func() admin.ShieldStats {
 			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
@@ -135,6 +137,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 				ActiveSessions:         s.ActiveSessions,
 				ActiveMediaSessions:    s.ActiveMediaSessions,
 				ActiveWebRTCSessions:   s.ActiveWebRTCSessions,
+				Draining:               s.Draining,
 				RegistrationTotal:      s.RegistrationTotal,
 				RegistrationFailure:    s.RegistrationFailure,
 				RequestsIn:             s.RequestsIn,

@@ -63,3 +63,36 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 		t.Errorf("after a reload moving the public listener, Listeners = %q, want the bound %q", got, want)
 	}
 }
+
+// The drain closures reach the edge's runtime state, and the Proxy snapshot
+// carries the gauge for /metrics.
+func TestAdminDepsDrain(t *testing.T) {
+	cfg, err := config.Parse([]byte(edgeOnlyYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeSrv, err := edge.New(config.NewStore(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)),
+		edge.WithPrivateAddr(netip.MustParseAddrPort("127.0.0.1:10054")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := adminDeps(edgeSrv, "test", cfg)
+	if on, _ := deps.DrainState(); on || deps.Proxy().Draining {
+		t.Fatal("a fresh edge must start not draining")
+	}
+	if !deps.SetDraining(true) {
+		t.Error("entering drain reported no change")
+	}
+	if on, since := deps.DrainState(); !on || since.IsZero() {
+		t.Errorf("DrainState = %v, %v after entering", on, since)
+	}
+	if !deps.Proxy().Draining {
+		t.Error("Proxy().Draining is false while draining")
+	}
+	if !deps.SetDraining(false) {
+		t.Error("leaving drain reported no change")
+	}
+	if on, _ := deps.DrainState(); on {
+		t.Error("still draining after leaving")
+	}
+}

@@ -372,7 +372,7 @@ Every top-level section is restart-only except `shield`. The table is
 
 | Hot (re-read per use) | Restart-only (`config.RestartOnlyChanges` key) |
 |---|---|
-| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`invite.go:230`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`sessionLimit`, `invite.go:196`) | |
+| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`invite.go:240`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`sessionLimit`, `invite.go:204`) | |
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`shield.go:123`), re-parsing a rate-limit string only when it changes (`shield.go:228`) | `public` (`ip`, `bind`) |
 | | `private` (`ip`) |
 | | `rtp` (the media pools read the range from `boot`, `mediapool.go:19`) |
@@ -400,6 +400,11 @@ from the store; the admin server likewise holds its startup `AdminConfig` and
 `TLSConfig` (`admin.New`, `admin/server.go:141`).
 
 ### 4.5 Shutdown
+
+A graceful restart first enters drain mode (§7.1, `POST /api/drain`), waits
+until `active_calls` reaches 0 (or a timeout of the operator's choosing) and
+only then stops the process; drain is not a shutdown step and nothing exits
+the process on its own.
 
 SIGINT/SIGTERM cancels the root context; `app.Run` unblocks at
 `<-gctx.Done()` and calls `g.Wait()`. `cmd/freesbc` (`withSignals`) stops
@@ -817,7 +822,28 @@ logger adds. The wrapper also refuses to forward any `data` attribute added
 through `With`. Matching on the message is a sipgo v1.4.3 workaround
 (`TestSipgoParseFailureLogContract` fails if the string changes).
 
-**Global call admission control.** `beginDialog` (`invite.go:230`) is the one
+**Drain mode.** `Server.SetDraining` (`edge.go:302`) flips a `drainState`
+(`drain.go:19`: an atomic flag read lock-free on every INVITE, plus a mutex
+that guards the `since` time) and the gauge `freesbc_edge_draining`
+(`Metrics.SetDraining`). `beginDialog` checks it first (`invite.go:243`),
+before `dialogTable.begin`, the rate token and any media: while draining, every
+new out-of-dialog INVITE is answered **503** with `Retry-After: 30`
+(`drainRetryAfter`, `invite.go:156`) through `rejectBusy` and counted as
+`freesbc_edge_invite_rejects_total{reason="draining"}` (`rejectDraining`). That
+covers all four entry paths because they all go through `beginDialog`
+(`dialogTable.begin` has no other caller), and the switch is **not** exempt: a
+switch-originated INVITE (a call to a client, a call out through a carrier, a
+transfer leg) is refused like a public one. A public INVITE that admission
+(§7.5) drops silently is still dropped silently, since admission runs first.
+Nothing else changes: re-INVITE and every other in-dialog request, BYE,
+CANCEL, ACK, PRACK/UPDATE, REGISTER, OPTIONS, SUBSCRIBE/NOTIFY/MESSAGE/REFER
+and RTP are handled as usual, so existing calls and bindings live on and end
+normally. The state is runtime only (never in config, not persisted, a
+restart starts not draining) and there is no automatic exit when the calls
+reach zero: the operator polls `GET /api/drain` (§13.3) and restarts. The edge
+logs each actual change at Info (`edge drain entered` / `edge drain left`).
+
+**Global call admission control.** `beginDialog` (`invite.go:240`) is the one
 place every out-of-dialog INVITE passes after its cheap validation and before
 any media is allocated: `inviteToUpstream` (client and carrier to switch,
 `invite.go`), `inviteToClient` (switch to client) and `inviteToCarrier`
@@ -828,7 +854,7 @@ with the limit and increments in the same critical section that appends the
 record, and `dialog.end` decrements in its single state transition
 (`dialog.go:1144`), so every teardown path (BYE, CANCEL, failure, watchdog,
 backstops, shutdown) releases the slot. A full table answers **503** with
-`Retry-After: 5` (`rejectBusy`, `invite.go:179`; `rejectSessionCap`). Then, if
+`Retry-After: 5` (`rejectBusy`, `invite.go:187`; `rejectSessionCap`). Then, if
 `shield.invite_rate_limit` is set, `shield.Limiter.Allow` (a global token
 bucket with burst `n`, parameters passed per call so a reload applies at once,
 `internal/shield/ratelimit.go:129`) is charged once; when it refuses, the
@@ -1185,9 +1211,9 @@ deliver.
    user (or pinned by a carrier registration token) at the node's carrier
    port, stamped `X-FreeSBC-Carrier` (§6).
 
-Every path opens its record with `beginDialog` (`invite.go:230`), which
-answers **482** for a merged request and **503** once shutdown has begun
-(the dialog table is closed).
+Every path opens its record with `beginDialog` (`invite.go:240`), which
+answers **503** while draining (§7.1), **482** for a merged request and **503**
+once shutdown has begun (the dialog table is closed).
 
 An offerless INVITE (empty body) is forwarded as it is in every direction;
 the offer is the callee's first SDP (§7.9a).
@@ -1257,7 +1283,7 @@ tags:
   the handler answers **482 Loop Detected** — when an **early** record with
   the same Call-ID and caller tag exists (a merged request, §8.2.2.2), and
   refuses every INVITE once shutdown has closed the table (`beginDialog`,
-  `invite.go:230`, then answers **503**), and with `beginFull` once
+  `invite.go:240`, then answers **503**), and with `beginFull` once
   `shield.max_sessions` records hold a slot (503 + `Retry-After`, §7.1). A confirmed record with the same
   identifiers is left alone: the new INVITE opens a record beside it. An
   INVITE can therefore never tear down another call by reusing its Call-ID.
@@ -1429,7 +1455,7 @@ with `sip_call_id`, `reason`, `duration` (since `confirmedAt`), `webrtc`,
 `reason` ("ending the call; sending BYE to both ends").
 
 **Why an INVITE was refused.** A final response the edge itself sends to an
-out-of-dialog INVITE goes through `rejectInvite` (`invite.go:145`), which
+out-of-dialog INVITE goes through `rejectInvite` (`invite.go:148`), which
 counts an `inviteReject` (`invite.go:86`) in
 `freesbc_edge_invite_rejects_total{reason}` before answering. The set is
 fixed and every label is exported from the start:
@@ -1437,6 +1463,7 @@ fixed and every label is exported from the start:
 | Reason | Response | Where |
 |---|---|---|
 | `early_cap` | 503 | `maxEarlyPerSource` reached for a client source (§7.5) |
+| `draining` | 503 + `Retry-After: 30` | `beginDialog`: drain mode is on (§7.1); sent by `rejectBusy`, before a slot, a rate token or a port is taken |
 | `shutting_down` | 503 | `beginDialog` once the table is closed; `rejectMedia` for `errShuttingDown` |
 | `loop_detected` | 482 | `beginDialog`, the INVITE merges with a call in progress |
 | `no_public_side` | 488, 480, 503 | no listener for the INVITE's transport, or for the client's or carrier's leg |
@@ -3305,6 +3332,7 @@ permanent series per call."
 | `freesbc_edge_subscriptions` | Gauge | — | edge `subTable.total`: SUBSCRIBE dialog records, pending or active (`Metrics.SetSubscriptions`, `metrics.go:146`; read through `Metrics.Snapshot().ActiveSubscriptions`, `metrics.go:236`, `:282`, which `internal/app/app.go:133` copies into `admin.ProxyStats`; the collector is `internal/admin/metrics.go:60`, `:129`); also `active_subscriptions` in the admin status JSON |
 | `freesbc_active_sip_dialogs` | Gauge | — | edge dialogs started and not yet ended |
 | `freesbc_edge_sessions` | Gauge | — | edge `dialogTable.sessions`: calls holding a session slot, ringing or up; the number `shield.max_sessions` caps (`Metrics.SetSessions`) |
+| `freesbc_edge_draining` | Gauge | — | 1 while the edge is in drain mode, else 0 (`Metrics.SetDraining`, read through `Snapshot().Draining`; `admin.ProxyStats.Draining`) |
 | `freesbc_active_media_sessions` | Gauge | — | edge |
 | `freesbc_active_webrtc_sessions` | Gauge | — | edge |
 | `freesbc_registration_total` | Counter | — | edge `recordBinding` success |
@@ -3323,7 +3351,7 @@ permanent series per call."
 | `freesbc_edge_stream_closed_total` | Counter | `reason` ∈ {`idle`, `slow`, `oversize`, `malformed`, `handshake`, `rate`} | connections closed by stream policy (§7.1a); every reason is always exported |
 | `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`} | edge `dropSilently` (`admission.go:141`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a); every reason is always exported |
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`} | edge `dialog.end` (`dialog.go:1144`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
-| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`} | edge `rejectInvite` / `rejectBusy` (`invite.go:145`, `invite.go:179`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
+| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `rejectInvite` / `rejectBusy` (`invite.go:148`, `invite.go:187`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
 | `freesbc_edge_carrier_requests_total` | Counter | `carrier` (an `edge.carriers` name or `unknown`), `direction` ∈ {`inbound` (carrier to switch), `outbound` (switch to carrier)}, `method` (folded like `sip_requests_total`) | edge `Metrics.CarrierRequest` (§6) |
 | `freesbc_edge_carrier_registrations` | Gauge | `carrier` | live carrier registrations per `edge.carriers` name, republished from the carrier registration table on every change and every prune tick (`carrierreg.go:126`) |
 
@@ -3370,6 +3398,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
+| `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; audit events will go through #118 |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
 | `/api/config/validate` | POST (else 405 + `Allow: POST`) | Basic | check a candidate file, write nothing: `{"valid","errors","restart_required"}` |
@@ -3473,8 +3502,8 @@ admin response carries. The page loads nothing from another origin; inline
 script, style and event handlers are blocked by the CSP and rejected by
 `TestUIHasNoInlineScriptOrStyle`.
 
-Two hash-routed views: an **Overview** polling `/api/status` and
-`/api/calls` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
+Two hash-routed views: an **Overview** polling `/api/status`, `/api/calls`
+and `/api/drain` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
 poll keeps the last data and marks the header "Connection lost"; the two
 endpoints render independently, so one failing marks only its half stale;
 polls are chained with `setTimeout` and each request times out after 4 s, so
@@ -3487,7 +3516,10 @@ over the common-trimmed middle, three lines of context) of the current file
 against the candidate. A **Download config** button fetches
 `/api/config/raw` fresh (not the candidate text) and saves the response bytes as
 `freesbc-<host>-<UTC timestamp>.yaml`; the file is unredacted and the page
-says so. Design rules are in `docs/admin-ui.md`.
+says so. The Overview's **Drain mode** card shows the state, the active calls
+remaining and the time since drain began, with an enter/leave button that
+opens an in-page confirmation (no `window.confirm`) before it sends POST or
+DELETE to `/api/drain`. Design rules are in `docs/admin-ui.md`.
 
 ---
 
@@ -3670,7 +3702,8 @@ the listener serves TLS); with no `Origin`, `Sec-Fetch-Site: same-origin` is
 accepted; anything else (foreign or `null` origin, cross-site or same-site
 fetch metadata, neither header) gets **403**. Browsers always send `Origin`
 on a same-origin `POST`, so the WebUI needs nothing; a script calling
-`POST /api/config/validate` must send a matching `Origin` header.
+`POST /api/config/validate`, `POST /api/drain` or `DELETE /api/drain` must
+send a matching `Origin` header.
 
 **Transport security.** TLS 1.2 minimum on every TLS surface (`tls`, `wss` and the
 admin listener). Both use the one top-level `tls` identity; there is no client
@@ -3815,7 +3848,8 @@ code constant.
 | `streamMaxConnsPerIP` / `streamMaxConns` / `streamMaxCarrierConns` | 256 / 10000 / 1024 | open stream connections per source (an IPv6 /64), in all for public sources, and in all to and from carriers (dialed, or accepted from a carrier source), which do not count against the 10000 |
 | `registerTimeout` | 32 s (`register.go:17`) | one whole REGISTER series, client or carrier |
 | `ackTimeout` | 32 s (`edge.go:249`; Timer H) | an answer owed in an ACK that never arrived: the call is ended with a BYE to both sides (§7.9a) |
-| `sessionCapRetryAfter` | 5 s (`invite.go:152`) | `Retry-After` of a 503 for a full session cap |
+| `sessionCapRetryAfter` | 5 s (`invite.go:160`) | `Retry-After` of a 503 for a full session cap |
+| `drainRetryAfter` | 30 s (`invite.go:156`) | `Retry-After` of a 503 refused because the edge is draining |
 | `capWarnEvery` | 10 s per reason (`invite.go`) | spacing of the session-cap / invite-rate WARN lines |
 | `inviteTimeout` | 5 min (`invite.go:24`) | one whole call setup (client, carrier and switch-originated paths, and re-INVITE) |
 | `cancelDrain` | 300 ms (`invite_leg.go:297`) | post-CANCEL drain of the far end's final response |

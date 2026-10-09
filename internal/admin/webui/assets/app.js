@@ -6,6 +6,7 @@
 
   var STATUS_URL = "/api/status";
   var CALLS_URL = "/api/calls";
+  var DRAIN_URL = "/api/drain";
   var CONFIG_RAW_URL = "/api/config/raw";
   var CONFIG_VALIDATE_URL = "/api/config/validate";
 
@@ -205,23 +206,113 @@
     });
   }
 
-  // pollDashboard fetches both endpoints and renders each on its own, so one
+  // ---- drain mode ----
+
+  var drainState = null; // last GET /api/drain body; null until the first one
+  var drainBusy = false;
+  var drainBtn = $("btn-drain");
+  var drainConfirm = $("drain-confirm");
+
+  function renderDrain(d) {
+    drainState = d;
+    var badge = $("drain-badge");
+    badge.textContent = d.draining ? "Draining" : "Accepting calls";
+    badge.setAttribute("data-variant", d.draining ? "warning" : "success");
+    var detail = "Active calls remaining: " + fmtInt(d.active_calls);
+    if (d.draining && d.since) {
+      var since = new Date(d.since);
+      if (!isNaN(since)) {
+        detail += " · draining for " + fmtDuration((Date.now() - since.getTime()) / 1000);
+        detail += " (since " + fmtClock(since) + ")";
+      }
+      if (d.active_calls === 0) detail += " · safe to restart";
+    }
+    $("drain-detail").textContent = detail;
+    drainBtn.textContent = d.draining ? "Leave drain mode" : "Enter drain mode";
+    drainBtn.disabled = drainBusy || !drainConfirm.hidden;
+    // The confirmation describes the action it was opened for; if the state
+    // changed underneath it (another operator), drop it.
+    if (!drainConfirm.hidden && drainConfirm.getAttribute("data-for") !== (d.draining ? "leave" : "enter")) {
+      closeDrainConfirm();
+    }
+  }
+
+  function closeDrainConfirm() {
+    drainConfirm.hidden = true;
+    drainConfirm.removeAttribute("data-for");
+    if (drainState) drainBtn.disabled = drainBusy;
+  }
+
+  // The button never acts directly: it opens an in-page confirmation that
+  // names the consequence, and only Confirm sends the request.
+  drainBtn.addEventListener("click", function () {
+    if (!drainState || drainBusy) return;
+    var enter = !drainState.draining;
+    drainConfirm.setAttribute("data-for", enter ? "enter" : "leave");
+    $("drain-confirm-title").textContent = enter ? "Enter drain mode?" : "Leave drain mode?";
+    $("drain-confirm-text").textContent = enter
+      ? "New calls will be refused with 503 Service Unavailable, including calls from carriers and from the switch, until you leave drain mode or restart. " +
+        fmtInt(drainState.active_calls) + " active call(s) continue."
+      : "New calls will be accepted again.";
+    drainConfirm.hidden = false;
+    drainBtn.disabled = true;
+    drainConfirm.focus({ preventScroll: true });
+  });
+
+  $("btn-drain-cancel").addEventListener("click", function () {
+    closeDrainConfirm();
+    drainBtn.focus();
+  });
+
+  $("btn-drain-confirm").addEventListener("click", function () {
+    if (drainBusy) return;
+    var enter = drainConfirm.getAttribute("data-for") === "enter";
+    drainBusy = true;
+    $("btn-drain-confirm").disabled = true;
+    setStatus($("drain-status"), enter ? "Entering drain mode…" : "Leaving drain mode…");
+    fetch(DRAIN_URL, { method: enter ? "POST" : "DELETE", credentials: "same-origin" }).then(function (res) {
+      if (res.status === 401) {
+        showSessionExpired();
+        throw new Error("unauthorized");
+      }
+      if (!res.ok) throw new Error("Drain request failed (" + res.status + ")");
+      clearSessionExpired();
+      return res.json();
+    }).then(function (d) {
+      closeDrainConfirm();
+      renderDrain(d);
+      setStatus($("drain-status"), d.draining ? "Draining" : "Accepting calls", "ok");
+    }).catch(function (err) {
+      if (String(err.message || err) !== "unauthorized") {
+        setStatus($("drain-status"), String(err.message || err), "err");
+      }
+    }).then(function () {
+      drainBusy = false;
+      $("btn-drain-confirm").disabled = false;
+      if (drainState) drainBtn.disabled = !drainConfirm.hidden;
+    });
+  });
+
+  // pollDashboard fetches the endpoints and renders each on its own, so one
   // failing endpoint leaves the other half current. A failed half keeps its
-  // last-good data and gets a "stale" badge. It resolves when both settle.
+  // last-good data and gets a "stale" badge. It resolves when all settle.
   function pollDashboard() {
     return Promise.allSettled([
       fetchJSON(STATUS_URL),
-      fetchJSON(CALLS_URL)
+      fetchJSON(CALLS_URL),
+      fetchJSON(DRAIN_URL)
     ]).then(function (results) {
-      var st = results[0], ca = results[1];
+      var st = results[0], ca = results[1], dr = results[2];
       if (st.status === "fulfilled") renderStatus(st.value);
       if (ca.status === "fulfilled") renderCalls(ca.value);
+      if (dr.status === "fulfilled") renderDrain(dr.value);
       $("status-stale").hidden = st.status === "fulfilled";
       $("calls-stale").hidden = ca.status === "fulfilled";
-      var failed = (st.status === "rejected") + (ca.status === "rejected");
+      $("drain-stale").hidden = dr.status === "fulfilled";
+      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected");
       if (sessionExpired) return; // showSessionExpired already set the indicator
       if (failed === 0) setLive("live", "Live · " + fmtClock(new Date()));
-      else if (failed === 1) setLive("stale", "Partial update, retrying…");
+      else if (failed < 3) setLive("stale", "Partial update, retrying…");
       else setLive("stale", "Connection lost, retrying…");
     });
   }

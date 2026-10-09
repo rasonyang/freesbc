@@ -64,6 +64,10 @@ type Server struct {
 
 	loc     *Location
 	dialogs *dialogTable
+
+	// draining refuses new out-of-dialog INVITEs (drain.go). Runtime state
+	// only: never in config, and a restart starts not draining.
+	drain drainState
 	// subs is the SUBSCRIBE dialog records (subscribe.go); subWarn spaces
 	// the WARN of a subscription cap reject.
 	subs    *subTable
@@ -292,6 +296,25 @@ func (s *Server) Metrics() *Metrics { return s.metrics }
 
 // ActiveCalls is the number of proxied dialogs currently tracked.
 func (s *Server) ActiveCalls() int { return s.dialogs.count() }
+
+// SetDraining enters (on) or leaves (!on) drain mode and reports whether the
+// state changed. See drain.go.
+func (s *Server) SetDraining(on bool) (changed bool) {
+	changed = s.drain.set(on)
+	if changed {
+		s.metrics.SetDraining(on)
+		if on {
+			s.log.Info("edge drain entered", "active_calls", s.ActiveCalls())
+		} else {
+			s.log.Info("edge drain left", "active_calls", s.ActiveCalls())
+		}
+	}
+	return changed
+}
+
+// DrainState reports whether the edge is draining and, if so, since when
+// (the zero time otherwise).
+func (s *Server) DrainState() (draining bool, since time.Time) { return s.drain.get() }
 
 // Calls lists the confirmed dialogs ActiveCalls counts, for the admin call
 // list.

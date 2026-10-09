@@ -116,6 +116,8 @@ const (
 	// rejectInviteRate: shield.invite_rate_limit is exhausted (503 +
 	// Retry-After).
 	rejectInviteRate
+	// rejectDraining: the edge is in drain mode (503 + Retry-After).
+	rejectDraining
 	numInviteRejects
 )
 
@@ -134,6 +136,7 @@ var inviteRejectLabels = [numInviteRejects]string{
 	rejectTimeout:        "timeout",
 	rejectSessionCap:     "session_cap",
 	rejectInviteRate:     "invite_rate",
+	rejectDraining:       "draining",
 }
 
 func (r inviteReject) String() string { return inviteRejectLabels[r] }
@@ -146,6 +149,11 @@ func (s *Server) rejectInvite(req *sip.Request, tx sip.ServerTransaction, code i
 	s.metrics.InviteRejected(why)
 	s.reject(req, tx, code, reason)
 }
+
+// drainRetryAfter is the Retry-After (seconds) of a 503 refused because the
+// edge is draining: long enough for a carrier or the switch to try another
+// route, short enough to come back soon after a restart.
+const drainRetryAfter = 30
 
 // sessionCapRetryAfter is the Retry-After (seconds) of a 503 for a full
 // session cap: a call has to end to free a slot, so the hint is a constant.
@@ -215,6 +223,8 @@ func inviteRetryAfter(rl config.RateLimit) int {
 // the global admission control applies, once per out-of-dialog INVITE and
 // before any media is allocated:
 //
+//   - 503 + Retry-After while the edge is draining (drain.go), checked
+//     first so a refused call takes no slot and no rate token;
 //   - 482 when the INVITE merges with one still in progress (RFC 3261
 //     §8.2.2.2: same Call-ID and From tag as a transaction the proxy is
 //     already working on);
@@ -229,6 +239,12 @@ func inviteRetryAfter(rl config.RateLimit) int {
 // re-INVITEs never do (they go through onReInvite).
 func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane) (*dialog, bool) {
 	cfg := s.store.Current()
+	if s.drain.on() {
+		// Before any slot, rate token or media port: drain refuses every
+		// new call, the switch's included.
+		s.rejectBusy(req, tx, drainRetryAfter, rejectDraining, "rejecting call: draining")
+		return nil, false
+	}
 	limit := s.sessionLimit(cfg)
 	d, res := s.dialogs.begin(req, callerPlane, limit)
 	switch res {

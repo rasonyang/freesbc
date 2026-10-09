@@ -45,7 +45,7 @@ func TestUIServedBehindAuth(t *testing.T) {
 	}
 	// the SPA must actually wire the API endpoints it depends on
 	app := uiGet(t, s, "/assets/app.js", true).Body.String()
-	for _, ep := range []string{"/api/status", "/api/calls", "/api/config/raw", "/api/config"} {
+	for _, ep := range []string{"/api/status", "/api/calls", "/api/drain", "/api/config/raw", "/api/config"} {
 		if !strings.Contains(app, ep) {
 			t.Errorf("app.js does not reference %q — is the SPA wired?", ep)
 		}
@@ -248,6 +248,38 @@ func TestUIConfigIsReadOnly(t *testing.T) {
 	for _, id := range []string{"validate-errors-text", "validate-restart-keys"} {
 		if !strings.Contains(js, `$("`+id+`").textContent =`) {
 			t.Errorf("%s must be filled via textContent", id)
+		}
+	}
+}
+
+// The Drain panel shows state, remaining calls and elapsed time, and never
+// acts without the in-page confirmation (no window.confirm or alert).
+func TestUIDrainPanel(t *testing.T) {
+	read := func(name string) string {
+		b, err := webuiFS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	html := read("webui/index.html")
+	for _, want := range []string{
+		`id="drain-card"`, `id="drain-badge"`, `id="drain-detail"`, `id="btn-drain"`,
+		`id="drain-confirm"`, `id="btn-drain-confirm"`, `id="btn-drain-cancel"`, `id="drain-status"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	js := read("webui/assets/app.js")
+	for _, want := range []string{`"/api/drain"`, `"POST"`, `"DELETE"`, "function renderDrain", "fetchJSON(DRAIN_URL)", `$("drain-detail").textContent =`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+	for _, bad := range []string{"confirm(", "alert(", "prompt(", "innerHTML"} {
+		if strings.Contains(js, bad) {
+			t.Errorf("app.js uses %q", bad)
 		}
 	}
 }
