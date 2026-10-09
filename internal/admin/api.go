@@ -90,9 +90,9 @@ func (s *Server) drainResponse() drainBody {
 // handleDrain serves /api/drain: GET reports the drain state, POST enters
 // drain mode and DELETE leaves it; both mutations are idempotent and answer
 // with the same body as GET. Auth, the Host check and (for POST and DELETE)
-// the Origin check run before it. The state is runtime only (edge
-// drain.go). Each actual change is logged; audit events will go through the
-// audit log (#118) once it lands.
+// the Origin check run before it. The state is runtime only (edge drain.go).
+// Each actual change is logged and audited (drain_on, drain_off, audit.go).
+// A request that changes nothing records nothing.
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	if s.deps.DrainState == nil || s.deps.SetDraining == nil {
 		http.NotFound(w, r)
@@ -103,11 +103,11 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost, http.MethodDelete:
 		on := r.Method == http.MethodPost
 		if s.deps.SetDraining(on) {
-			msg := "admin: edge drain left"
+			msg, typ := "admin: edge drain left", AuditDrainOff
 			if on {
-				msg = "admin: edge drain entered"
+				msg, typ = "admin: edge drain entered", AuditDrainOn
 			}
-			// TODO(#118): emit an audit event here.
+			s.audit.record(typ, remoteIP(r), AuditResultOK)
 			s.log.Info(msg, "remote", r.RemoteAddr, "active_calls", s.deps.ActiveCalls())
 		}
 	default:

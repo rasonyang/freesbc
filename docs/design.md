@@ -3399,7 +3399,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
-| `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; audit events will go through #118 |
+| `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
 | `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
@@ -3503,6 +3503,8 @@ action can reuse the path):
 |---|---|---|
 | `login_ok` | `ok` | the **first** verification of a credential: the `verifiedCreds.add` after a successful bcrypt check. A request served from the cache is not an event, so an unchanged scrape produces none |
 | `login_failed` | `bad_credentials` | Basic credentials were presented and the username or password did not verify |
+| `drain_on` | `ok` | `handleDrain` (`api.go`): a POST /api/drain that actually entered drain mode (`SetDraining` returned changed). A repeated POST, a GET and any request refused before the toggle are not events |
+| `drain_off` | `ok` | a DELETE /api/drain that actually left drain mode, same rule |
 | `login_limited` | `rate_limited` | the per-source limiter answered 429, **once per lockout window per limiter key**: only the first 429 of a window is an event (`authFailEntry.denied`, set by `reserve` under the limiter's lock and cleared when a new window starts), so a locked-out source cannot flush the ring or flood the log |
 
 A request with no (parseable) Basic header is **not** an event: it guesses

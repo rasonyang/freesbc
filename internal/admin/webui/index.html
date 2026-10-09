@@ -239,13 +239,13 @@
   <section id="view-audit" class="page" aria-labelledby="h-audit" hidden>
     <div class="page-header">
       <h1 class="page-title" id="h-audit">Audit</h1>
-      <p class="page-description">Admin sign-in events since this process started, newest first. The last 256 are kept in memory. The source is the connecting address, which is the proxy's address behind a reverse proxy.</p>
+      <p class="page-description">Admin events (sign-ins and drain changes) since this process started, newest first. The last 256 are kept in memory. The source is the connecting address, which is the proxy's address behind a reverse proxy.</p>
     </div>
 
     <div class="card">
       <div class="card-header">
         <div class="card-heading">
-          <h2 class="card-title">Sign-ins</h2>
+          <h2 class="card-title">Events</h2>
           <div class="toolbar">
             <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-audit-load">
               <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Reload
@@ -267,7 +267,7 @@
         <div class="empty" id="audit-empty">
           <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
           <span class="empty-title">No events</span>
-          <span>Sign-ins and failures appear here.</span>
+          <span>Sign-ins, failures and drain changes appear here.</span>
         </div>
       </div>
     </div>

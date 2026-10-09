@@ -23,6 +23,13 @@ const (
 	// AuditLoginLimited is a request answered 429 by the per-source
 	// auth-failure limiter.
 	AuditLoginLimited AuditType = "login_limited"
+	// AuditDrainOn is an authenticated POST /api/drain that moved the edge
+	// into drain mode. A repeated POST that changes nothing is not an event.
+	AuditDrainOn AuditType = "drain_on"
+	// AuditDrainOff is an authenticated DELETE /api/drain that took the edge
+	// out of drain mode. A repeated DELETE that changes nothing is not an
+	// event.
+	AuditDrainOff AuditType = "drain_off"
 )
 
 // AuditResult is the outcome recorded with an event; a fixed set, also the

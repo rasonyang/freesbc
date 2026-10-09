@@ -175,3 +175,95 @@ func TestDrainGaugeExported(t *testing.T) {
 		t.Errorf("gauge missing from /metrics:\n%s", rr.Body.String())
 	}
 }
+
+// drainAuditTypes returns the drain events in the ring (newest first) with
+// their sources; sign-in events are filtered out.
+func drainAuditTypes(s *Server) (types []AuditType, sources []string) {
+	for _, ev := range s.audit.snapshot() {
+		if ev.Type == AuditDrainOn || ev.Type == AuditDrainOff {
+			types = append(types, ev.Type)
+			sources = append(sources, ev.Source)
+			if ev.Result != AuditResultOK {
+				types = append(types, "bad-result")
+			}
+		}
+	}
+	return
+}
+
+func drainDoFrom(s *Server, method, remote string) *httptest.ResponseRecorder {
+	req := newReq(method, "/api/drain", nil)
+	req.RemoteAddr = remote
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, req)
+	return rr
+}
+
+// Only an actual change is an audit event, with the request's source IP, and
+// the ring lists them newest first.
+func TestDrainAuditOnlyActualChanges(t *testing.T) {
+	s, _ := drainServer(t, 3)
+	check := func(step string, want ...AuditType) {
+		t.Helper()
+		got, _ := drainAuditTypes(s)
+		if len(got) != len(want) {
+			t.Fatalf("%s: drain events %v, want %v", step, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: drain events %v, want %v", step, got, want)
+			}
+		}
+	}
+	check("start")
+	if rr := drainDoFrom(s, "GET", "192.0.2.9:1111"); rr.Code != 200 {
+		t.Fatalf("GET: %d", rr.Code)
+	}
+	check("GET")
+	drainDoFrom(s, "POST", "192.0.2.10:2222")
+	check("POST", AuditDrainOn)
+	if _, src := drainAuditTypes(s); src[0] != "192.0.2.10" {
+		t.Errorf("source %q, want 192.0.2.10", src[0])
+	}
+	drainDoFrom(s, "POST", "192.0.2.10:2222")
+	check("second POST", AuditDrainOn)
+	drainDoFrom(s, "DELETE", "192.0.2.11:3333")
+	check("DELETE", AuditDrainOff, AuditDrainOn)
+	if _, src := drainAuditTypes(s); src[0] != "192.0.2.11" {
+		t.Errorf("source %q, want 192.0.2.11", src[0])
+	}
+	drainDoFrom(s, "DELETE", "192.0.2.11:3333")
+	drainDoFrom(s, "GET", "192.0.2.11:3333")
+	check("second DELETE and GET", AuditDrainOff, AuditDrainOn)
+	if n := s.audit.failures()[AuditResultBadCredentials] + s.audit.failures()[AuditResultRateLimited]; n != 0 {
+		t.Errorf("drain events touched the auth failure counters: %d", n)
+	}
+}
+
+// A mutation refused by the Origin check, a bad method or missing deps
+// records nothing.
+func TestDrainAuditRefusedRequestsRecordNothing(t *testing.T) {
+	s, f := drainServer(t, 0)
+	req := newReq("POST", "/api/drain", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	req.SetBasicAuth("admin", "secret")
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin POST: %d, want 403", rr.Code)
+	}
+	if rr2 := drainDoFrom(s, "PUT", "192.0.2.9:1"); rr2.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT: %d", rr2.Code)
+	}
+	if got, _ := drainAuditTypes(s); len(got) != 0 || f.calls != 0 {
+		t.Errorf("refused requests recorded %v (toggle calls %d)", got, f.calls)
+	}
+	s2 := newTestServer(t, emptyDeps())
+	if rr3 := drainDoFrom(s2, "POST", "192.0.2.9:1"); rr3.Code != http.StatusNotFound {
+		t.Fatalf("nil deps POST: %d", rr3.Code)
+	}
+	if got, _ := drainAuditTypes(s2); len(got) != 0 {
+		t.Errorf("nil deps recorded %v", got)
+	}
+}
