@@ -1,0 +1,37 @@
+<!-- Carrier port: edge.switch_carrier_port = 10.77.0.10:5080. Carrier calls arrive
+     here from private.ip only, after FreeSBC has admitted them as carrier sources.
+     This is also the profile that owns the carrier gateways (sip_profiles/external/*.xml). -->
+<profile name="external">
+  <gateways>
+    <X-PRE-PROCESS cmd="include" data="external/*.xml"/>
+  </gateways>
+  <aliases/>
+  <domains>
+    <!-- parse="false": do not import the stock directory gateway (example.com). -->
+    <domain name="all" alias="false" parse="false"/>
+  </domains>
+  <settings>
+    <param name="sip-ip" value="10.77.0.10"/>
+    <param name="rtp-ip" value="10.77.0.10"/>
+    <param name="sip-port" value="$${external_sip_port}"/>
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+    <param name="dialplan" value="XML"/>
+    <!-- Inbound carrier calls go to their own context, never to "default". -->
+    <param name="context" value="carrier-in"/>
+
+    <!-- The only profile allowed to skip digest authentication, and only for private.ip. -->
+    <param name="auth-calls" value="$${external_auth_calls}"/>
+    <param name="apply-inbound-acl" value="freesbc_carrier"/>
+    <!-- Nothing registers here. -->
+    <param name="disable-register" value="true"/>
+
+    <param name="inbound-codec-prefs" value="PCMU,PCMA,OPUS"/>
+    <param name="outbound-codec-prefs" value="PCMU,PCMA,OPUS"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+  </settings>
+</profile>

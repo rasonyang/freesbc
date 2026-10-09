@@ -91,6 +91,7 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
 - [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, non-goals, known limitations
 - [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
+- [`examples/switch/`](examples/switch/README.md): verified FreeSWITCH and Asterisk configurations for the reference topology
 - [`freesbc.example.yaml`](freesbc.example.yaml): annotated example
 
 ## Admin & WebUI
@@ -112,7 +113,7 @@ A feature is in scope only if it passes one of these:
 1. Only the edge can see or do it: the public wire before rewrite, TLS/WSS/WebRTC termination, NAT and latching, topology hiding, media anchoring, public-side admission, or FreeSBC's own state (sockets, ports, bindings, bans, reloads).
 2. The switch cannot do it well from behind the edge.
 
-Everything else stays on the switch; FreeSBC's contribution is a documented switch-side example, not a feature. Concrete examples that stay on the switch:
+Everything else stays on the switch; FreeSBC's contribution is a documented switch-side example (see [`examples/switch/`](examples/switch/README.md)), not a feature. Concrete examples that stay on the switch:
 
 - Per-carrier and per-user concurrency and CPS limits: FreeSWITCH `limit`, `max-sessions`, `sessions-per-second`; Asterisk `GROUP()` / `GROUP_COUNT()`.
 - Maximum call duration: FreeSWITCH `sched_hangup`; Asterisk `Dial` `L()` and `TIMEOUT(absolute)`.

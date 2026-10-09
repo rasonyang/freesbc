@@ -1,0 +1,29 @@
+<include>
+  <!-- Pulled in by a line at the end of the stock vars.xml (see README). A later
+       "set" overrides an earlier one, so the stock lines stay as they are. -->
+
+  <!-- The SIP domain / digest realm clients use. It must equal the host part of
+       the client's AoR (sip:1000@<domain>) and the directory <domain name>.
+       Use FreeSBC's public.ip, or the DNS name that points at it. -->
+  <X-PRE-PROCESS cmd="set" data="domain=203.0.113.7"/>
+  <X-PRE-PROCESS cmd="set" data="domain_name=$${domain}"/>
+
+  <!-- The stock directory users 1000-1019 all use this password, and the stock
+       dialplan delays every call 10 s while it is "1234". Anything on the public
+       internet can reach these users through FreeSBC: set a strong one, or delete
+       the stock users (see README, toll fraud). -->
+  <X-PRE-PROCESS cmd="set" data="default_password=CHANGE-ME-NOW"/>
+
+  <!-- FreeSBC anchors all media and rewrites Contact and SDP to private.ip, so
+       FreeSWITCH is never behind NAT as far as it can tell. The stock vars.xml
+       resolves these two through stun.freeswitch.org and would advertise that
+       result as the SDP address. Pin both to the switch's own private address. -->
+  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=10.77.0.10"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_ip=10.77.0.10"/>
+
+  <!-- Stock values, repeated so the intent is explicit. -->
+  <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060"/>
+  <X-PRE-PROCESS cmd="set" data="internal_auth_calls=true"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_port=5080"/>
+  <X-PRE-PROCESS cmd="set" data="external_auth_calls=false"/>
+</include>

@@ -1,0 +1,16 @@
+<configuration name="acl.conf" description="Network Lists">
+  <network-lists>
+    <!-- Used by the external profile (5080, no digest auth): only FreeSBC's
+         private.ip may send to it. Default deny. -->
+    <list name="freesbc_carrier" default="deny">
+      <node type="allow" cidr="10.77.0.2/32"/>
+    </list>
+
+    <!-- Stock "domains" list. It is NOT applied to the internal profile (see
+         sip_profiles/internal.xml). Do not add cidr= to directory users or a
+         10.77.0.2/32 node here: that would make every client call trusted. -->
+    <list name="domains" default="deny">
+      <node type="allow" domain="$${domain}"/>
+    </list>
+  </network-lists>
+</configuration>

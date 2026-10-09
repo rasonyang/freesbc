@@ -1,0 +1,9 @@
+<include>
+  <!-- Second carrier line, IP-authenticated (no registration), used for failover.
+         edge.carriers: { carrier-b: "203.0.113.60:5061" } -->
+  <gateway name="carrier-b">
+    <param name="proxy" value="203.0.113.60:5061"/>
+    <param name="outbound-proxy" value="10.77.0.2:5060"/>
+    <param name="register" value="false"/>
+  </gateway>
+</include>

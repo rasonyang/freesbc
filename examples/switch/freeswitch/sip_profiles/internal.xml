@@ -1,0 +1,49 @@
+<!-- Client port: edge.switch = 10.77.0.10:5060. Phones and browsers, through FreeSBC.
+     Every client request, REGISTER included, arrives from private.ip. -->
+<profile name="internal">
+  <aliases/>
+  <gateways/>
+  <domains>
+    <domain name="all" alias="true" parse="false"/>
+  </domains>
+  <settings>
+    <param name="sip-ip" value="10.77.0.10"/>
+    <param name="rtp-ip" value="10.77.0.10"/>
+    <param name="sip-port" value="$${internal_sip_port}"/>
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+    <param name="dialplan" value="XML"/>
+    <!-- Unauthenticated callers land here; authenticated ones get the user_context. -->
+    <param name="context" value="public"/>
+
+    <!-- Authentication. A request from private.ip proves nothing. -->
+    <param name="auth-calls" value="$${internal_auth_calls}"/>
+    <param name="auth-subscriptions" value="true"/>
+    <param name="inbound-reg-force-matching-username" value="true"/>
+    <param name="challenge-realm" value="$${domain}"/>
+    <param name="force-register-domain" value="$${domain}"/>
+    <param name="force-subscription-domain" value="$${domain}"/>
+    <param name="force-register-db-domain" value="$${domain}"/>
+    <param name="nonce-ttl" value="60"/>
+    <!-- No apply-inbound-acl (stock: "domains") and no apply-register-acl: an ACL
+         that matches private.ip skips digest authentication for every client. -->
+
+    <!-- No NAT handling: FreeSBC is the NAT boundary and rewrites Contact and SDP.
+         No apply-nat-acl (stock: nat.auto), no aggressive-nat-detection, no NDLB-*.
+         Contact is stored as FreeSBC sent it, including its fsbc= parameter. -->
+
+    <!-- Plain RTP/AVP only; FreeSBC does DTLS-SRTP/SDES on the public leg. -->
+    <param name="inbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="outbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <param name="rtp-timeout-sec" value="300"/>
+    <param name="rtp-hold-timeout-sec" value="1800"/>
+    <param name="manage-presence" value="true"/>
+
+    <!-- Registration database: for an edge.switch pool, share it (ODBC) so every
+         node can authenticate and route every user. -->
+    <!-- <param name="odbc-dsn" value="pgsql://..."/> -->
+  </settings>
+</profile>

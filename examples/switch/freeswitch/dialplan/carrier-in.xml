@@ -1,0 +1,42 @@
+<include>
+  <!-- Context of the external profile (5080). Reached only from private.ip
+       (acl.conf.xml), by calls FreeSBC admitted as carrier traffic.
+       Nothing here can place an outbound call: no "default" context, no bridge to a gateway. -->
+  <context name="carrier-in">
+
+    <!-- Which carrier? FreeSBC stamps X-FreeSBC-Carrier: <edge.carriers name> (or "unknown"
+         for an edge.carrier_sources address that matches no entry). -->
+    <extension name="identify-carrier" continue="true">
+      <condition field="${sip_h_X-FreeSBC-Carrier}" expression="^(.+)$">
+        <action application="set" data="carrier=$1"/>
+        <action application="export" data="carrier=$1"/>
+        <action application="log" data="INFO inbound carrier=${carrier} did=${destination_number} caller=${caller_id_number} sip_req_uri=${sip_req_uri}"/>
+      </condition>
+    </extension>
+
+    <!-- A call to the Contact this switch registered for gateway "carrier-a".
+         FreeSBC delivers it with the Request-URI restored to sip:gw+carrier-a@10.77.0.10:5080,
+         so sofia sets ${sip_gateway}=carrier-a (the dialplan destination_number is the
+         gateway's "extension" param, by default its username). -->
+    <extension name="registered-line-a">
+      <condition field="${sip_gateway}" expression="^carrier-a$">
+        <action application="set" data="line=carrier-a"/>
+        <action application="bridge" data="user/1000@$${domain}"/>
+      </condition>
+    </extension>
+
+    <!-- A call to a DID (the carrier addressed the number, not a registration). -->
+    <extension name="did-15550100">
+      <condition field="destination_number" expression="^\+?(15550100\d\d)$">
+        <action application="bridge" data="user/1000@$${domain}"/>
+      </condition>
+    </extension>
+
+    <!-- Default: refuse. -->
+    <extension name="refuse">
+      <condition field="destination_number" expression="^.*$">
+        <action application="respond" data="404"/>
+      </condition>
+    </extension>
+  </context>
+</include>

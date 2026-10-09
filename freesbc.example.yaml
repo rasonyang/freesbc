@@ -41,7 +41,8 @@ edge:
   #                         #   used only over TLS/WSS signaling, unless allow_insecure_sdes: true
   # allow_insecure_sdes: false
   switch_carrier_port: 5080  # carriers (FreeSWITCH: external profile port);
-                             #   default = the switch port above
+                             #   default = the switch port above;
+                             #   switch-side configs: examples/switch/
   listen:                    # ports on public.bind; present = enabled
     udp: 5060
     tcp: 5060                # SIP/TCP; shares the number with udp, they are separate sockets

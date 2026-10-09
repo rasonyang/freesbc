@@ -82,22 +82,26 @@ There is no AoR fallback.
 
 - Admitted only from a carrier source; anything else that is not a registered client is dropped silently. A carrier's resolved address counts only on that carrier's transport: a `tls` carrier is admitted only on a TLS connection, whether FreeSBC opened it or the carrier made it to `edge.listen.tls`, and its address over UDP is not a carrier source. `edge.carrier_sources` addresses match by IP on any public transport. A carrier on `tcp` or `tls` needs the matching `edge.listen` entry for its own inbound connections; without one it can only send on the connection FreeSBC opened.
 - Every carrier to switch request is sent to `<node IP>:<edge.switch_carrier_port>`, never to the client port.
-- A Request-URI carrying an outbound-registration token goes to the node that registered, with the Request-URI restored to that node's original Contact (so Asterisk `line=yes` and FreeSWITCH `gw+<name>` identification work).
+- A Request-URI carrying an outbound-registration token goes to the node that registered, with the Request-URI restored to that node's original Contact (so Asterisk `line=yes` and FreeSWITCH `${sip_gateway}` identification work).
 - With no token (the carrier addressed the DID) the request goes to a node chosen by the `hash-user` pool, Request-URI unchanged. An unknown or expired token is treated as no token.
 - FreeSBC adds `X-FreeSBC-Carrier: <name>`. A request from a `carrier_sources` address that matches no entry by address gets `X-FreeSBC-Carrier: unknown`.
 
 ## Switch-side requirements
 
-FreeSBC enforces an allowlist and rewrites addresses; the switch must be set up so that this is safe.
+FreeSBC enforces an allowlist and rewrites addresses; the switch must be set up so that this is safe. Verified FreeSWITCH and Asterisk configurations that follow this list are in [`examples/switch/`](../examples/switch/README.md); this list stays normative.
 
 - **Point every carrier gateway, endpoint and registration at FreeSBC as outbound proxy.**
-  - FreeSWITCH, standard two-profile layout: the `internal` profile (5060, `auth-calls=true`) is the `edge.switch` port, for phones and browsers. The `external` profile (5080, `auth-calls=false`) is `edge.switch_carrier_port`; its gateways set `outbound-proxy=<private.ip>:5060` and `proxy=<carrier host[:port]>`.
+  - FreeSWITCH, standard two-profile layout: the `internal` profile (5060, `auth-calls=true`) is the `edge.switch` port, for phones and browsers. The `external` profile (5080, `auth-calls=false`) is `edge.switch_carrier_port`; its gateways set `proxy=<carrier host[:port]>`, `outbound-proxy=<private.ip>:5060` and `register-proxy=<private.ip>:5060`. Without `register-proxy` the REGISTER goes straight to the carrier, around FreeSBC.
   - Asterisk: `outbound_proxy = sip:<private.ip>:5060\;lr` on the endpoint, aor and registration. `;lr` is required. The aor `contact` must equal the `edge.carriers` entry.
 - **The `edge.carriers` entry must equal the host[:port] the switch puts in the Request-URI** (FreeSWITCH gateway `proxy`, Asterisk aor `contact`); that equality is what routes the request to a carrier.
-- **Identify inbound carrier calls** by `X-FreeSBC-Carrier` (Asterisk `identify` with `match_header`, FreeSWITCH `${sip_h_X-FreeSBC-Carrier}`), by registration line (Asterisk `line=yes`, FreeSWITCH `gw+<name>`), or by DID.
+- **Identify inbound carrier calls** by `X-FreeSBC-Carrier` (Asterisk `identify` with `match_header`, FreeSWITCH `${sip_h_X-FreeSBC-Carrier}`), by registration line (Asterisk `line=yes`, FreeSWITCH `${sip_gateway}`), or by DID.
+  - FreeSWITCH: for a registered line `destination_number` is the gateway's `extension` (by default its username), not `gw+<name>`; match `${sip_gateway}` instead.
+  - Asterisk applies `identify` and `acl` to the source address and headers, not to the transport a request arrived on, so the 5060/5080 split alone does not separate clients from carriers. `X-FreeSBC-Carrier` can be trusted only because FreeSBC strips `X-FreeSBC-*` from public input and only `private.ip` reaches the switch. Put `header` first in `endpoint_identifier_order`, with no `ip` and no `anonymous`.
+  - Asterisk's `line=` token changes on every Asterisk restart; the carrier must accept the new Contact.
 - **Never identify or trust a request by FreeSBC's IP on the client port.** Client calls also arrive from `private.ip`. In Asterisk, no `identify match=<private.ip>` and no `ip` in `endpoint_identifier_order`. In FreeSWITCH, no inbound ACL for `private.ip` on the `internal` profile. Otherwise client calls bypass digest authentication.
-- Only the carrier port may skip authentication, because FreeSBC delivers nothing else there. Restrict it to `private.ip` (FreeSWITCH `external` profile `apply-inbound-acl`, or a host firewall) so no other LAN host reaches it.
+- Only the carrier port may skip authentication, because FreeSBC delivers nothing else there. Restrict it to `private.ip` so no other LAN host reaches it: FreeSWITCH `apply-inbound-acl` on the `external` profile gates INVITE only (OPTIONS, INFO, REFER, MESSAGE and others from other hosts are still answered), and Asterisk needs `acl` on the carrier endpoints, so also firewall the carrier port in both cases.
 - **Subscriptions, transfers and messages are the switch's to accept and route.** A client's SUBSCRIBE (MWI, BLF), REFER and MESSAGE reach the switch from `private.ip` on the client port like its calls, and the switch authenticates and routes them by its own policy (for REFER, including where a `Refer-To` may point). The switch sends its NOTIFYs back with the dialog's own tags, to the Contact FreeSBC gave it, and addresses an unsolicited NOTIFY or MESSAGE to a client by the `fsbc=` token in its Request-URI.
+- **Switch-side address-based brute-force protection (fail2ban, IP bans) sees every client request as coming from `private.ip`** and would ban FreeSBC itself. Leave source banning to FreeSBC's shield.
 - **Line selection and failover are the switch's job**: FreeSWITCH `bridge sofia/gateway/a/N|sofia/gateway/b/N`, Asterisk sequential `Dial` on `DIALSTATUS`. FreeSBC never retries a carrier request on another carrier.
 
 ### The private socket's ingress rule
