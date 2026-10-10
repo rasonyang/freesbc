@@ -365,3 +365,27 @@ func TestCarrierDirectoryTLSSRVAndExplicitPort(t *testing.T) {
 		t.Errorf("SRV queries = %v, want one _sips._tcp lookup", stub.srvCalls)
 	}
 }
+
+// snapshotInfo (behind /api/carriers and the health conditions) must not
+// wait on a lookup in flight.
+func TestCarrierSnapshotInfoDoesNotWaitOnLookup(t *testing.T) {
+	stub := &dnsStub{ips: map[string][]string{"gw.example": {"192.0.2.1"}}}
+	d := newTestDirectory(stub, &fakeClock{t: time.Unix(1000, 0)}, nil,
+		config.Carrier{Name: "a", Host: "gw.example", Port: 5060, ExplicitPort: true})
+	stub.mu.Lock() // every lookup now blocks
+	done := make(chan struct{})
+	go func() { d.refresh(context.Background()); close(done) }()
+	time.Sleep(50 * time.Millisecond) // let refresh reach the blocked lookup
+	got := make(chan []CarrierInfo, 1)
+	go func() { got <- d.snapshotInfo() }()
+	select {
+	case info := <-got:
+		if len(info) != 1 || info[0].Name != "a" {
+			t.Errorf("snapshotInfo = %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("snapshotInfo blocked behind a lookup in flight")
+	}
+	stub.mu.Unlock()
+	<-done
+}

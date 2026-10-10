@@ -65,8 +65,8 @@ jobs:
           set -euo pipefail
           tar -xzf "dist/freesbc_${TAG}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
           dir="${RUNNER_TEMP}/freesbc_${TAG}_linux_amd64"
-          # The CLI has no version flag, so confirm the stamped version is in the binary.
-          grep -aqF "$TAG" "${dir}/freesbc"
+          got=$("${dir}/freesbc" version | awk '{print $2}')
+          [ "$got" = "$TAG" ] || { echo "version is $got, want $TAG" >&2; exit 1; }
           file "${dir}/freesbc"
           "${dir}/freesbc" check -c "${dir}/freesbc.example.yaml"
 

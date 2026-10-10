@@ -1,8 +1,13 @@
 package admin
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 // testServerWithMetrics returns a test server whose Deps are overridden with
@@ -85,5 +90,46 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\n---\n%s", want, body)
 		}
+	}
+}
+
+// The certificate expiry gauge carries not-after as Unix seconds under the
+// cert file path, and is absent when no certificate is loaded.
+func TestMetricsTLSCertExpiry(t *testing.T) {
+	notAfter := time.Now().Add(40 * 24 * time.Hour).Truncate(time.Second)
+	cert, key := writeTLSPair(t, t.TempDir(), "m.example.test", notAfter, false)
+	body := string(authGET(t, tlsServer(t, cert, key), "/metrics"))
+	want := fmt.Sprintf("freesbc_tls_cert_expiry_timestamp_seconds{path=%q} %s", cert, strconv.FormatFloat(float64(notAfter.Unix()), 'g', -1, 64))
+	if !strings.Contains(body, want) {
+		t.Errorf("/metrics missing %q\n---\n%s", want, body)
+	}
+	if body := string(authGET(t, testServer(t), "/metrics")); strings.Contains(body, "freesbc_tls_cert_expiry_timestamp_seconds") {
+		t.Errorf("gauge exported with no certificate loaded")
+	}
+}
+
+// The config reload gauges are exported when Deps.Reload is wired and
+// absent when it is not.
+func TestMetricsConfigReload(t *testing.T) {
+	deps := emptyDeps()
+	deps.Reload = func() config.ReloadStatus {
+		return config.ReloadStatus{RestartRequired: []string{"public", "rtp"}, LastError: "boom"}
+	}
+	str := string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{"freesbc_config_restart_required 2", "freesbc_config_reload_failed 1"} {
+		if !strings.Contains(str, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	deps.Reload = func() config.ReloadStatus { return config.ReloadStatus{} }
+	str = string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{"freesbc_config_restart_required 0", "freesbc_config_reload_failed 0"} {
+		if !strings.Contains(str, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	str = string(authGET(t, testServer(t), "/metrics"))
+	if strings.Contains(str, "freesbc_config_") {
+		t.Error("config gauges exported with no Reload dep")
 	}
 }

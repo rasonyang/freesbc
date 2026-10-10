@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -66,6 +67,34 @@ type Deps struct {
 	// the state changed. Nil on either makes /api/drain answer 404.
 	DrainState  func() (draining bool, since time.Time)
 	SetDraining func(on bool) (changed bool)
+	// TLSCert reports the leaf of the top-level tls pair the edge's tls and
+	// wss listeners loaded, when, and which transports use it; a nil leaf
+	// means none did. Nil reports none. The pair is restart-only.
+	TLSCert func() (leaf *x509.Certificate, loadedAt time.Time, listeners []string)
+	// Reload reports the config watcher's last outcome: the pending
+	// restart-only keys and the last failed reload. Nil reports none.
+	Reload func() config.ReloadStatus
+
+	// Live-state snapshots (state.go). Each returns copies, never internal
+	// tables. A nil closure makes its endpoint answer 404.
+	//
+	// Registrations returns one page of the client bindings whose user part
+	// contains user (case-insensitive) and the total matching.
+	Registrations func(user string, limit, offset int) (page []Registration, total int)
+	// CarrierRegistrations lists the switch's registrations at carriers.
+	CarrierRegistrations func() []CarrierRegistration
+	// Bans returns one page of the live shield bans, the total, and the
+	// cumulative ban additions refused at the table cap.
+	Bans func(limit, offset int) (page []Ban, total int, addsRejected int64)
+	// SwitchNodes reports the passive health of each switch node.
+	SwitchNodes func() []SwitchNode
+	// Carriers reports the resolution state of each configured carrier.
+	Carriers func() []Carrier
+
+	// Health returns the conditions active right now, derived from live
+	// state with no memory of its own (since and the history are the admin
+	// tracker's, health.go). Nil reports none.
+	Health func() []HealthCondition
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
@@ -155,7 +184,13 @@ type Server struct {
 	limiter  authLimiter      // per-source auth-failure rate limit
 	verified verifiedCreds    // credentials already verified by bcrypt
 	audit    auditLog         // bounded ring of auth events (audit.go)
+	health   healthTracker    // active conditions and their history (health.go)
 	now      func() time.Time // test seam for the limiter clock; nil is time.Now
+
+	// tlsLeaf is the leaf this server loaded for remote HTTPS, set by Run.
+	tlsMu     sync.Mutex
+	tlsLeaf   *x509.Certificate
+	tlsLoaded time.Time
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -167,6 +202,8 @@ type Server struct {
 func New(cfg *config.AdminConfig, tlsCfg *config.TLSConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
 	s := &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
 	s.audit.log = log
+	s.health.src = s.healthConditions
+	s.health.now = s.clock
 	s.hosts = newHostPolicy(cfg.Listen, cfg.AllowedHosts, s.useTLS())
 	return s
 }
@@ -178,8 +215,16 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
+	mux.HandleFunc("/api/registrations", s.requireAuth(s.handleRegistrations))
+	mux.HandleFunc("/api/carrier-registrations", s.requireAuth(s.handleCarrierRegistrations))
+	mux.HandleFunc("/api/shield/bans", s.requireAuth(s.handleBans))
+	mux.HandleFunc("/api/switch-nodes", s.requireAuth(s.handleSwitchNodes))
+	mux.HandleFunc("/api/carriers", s.requireAuth(s.handleCarriers))
 	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
+	mux.HandleFunc("/api/tls", s.requireAuth(s.handleTLS))
 	mux.HandleFunc("/api/audit", s.requireAuth(s.handleAudit))
+	mux.HandleFunc("/api/health", s.requireAuth(s.handleHealth))
+	mux.HandleFunc("/api/health/history", s.requireAuth(s.handleHealthHistory))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
@@ -197,6 +242,16 @@ func (s *Server) useTLS() bool { return s.cfg.AllowRemote && s.tls != nil }
 // otherwise it serves plain HTTP, which validation only admits on loopback.
 func (s *Server) Run(ctx context.Context) error {
 	srv := s.newHTTPServer()
+	// The tracker evaluates on a ticker too, so the history is accurate with
+	// nobody polling; Run does not return before that goroutine has.
+	hctx, hcancel := context.WithCancel(ctx)
+	var hwg sync.WaitGroup
+	hwg.Add(1)
+	go func() {
+		defer hwg.Done()
+		s.health.run(hctx, healthInterval)
+	}()
+	defer func() { hcancel(); hwg.Wait() }()
 	errc := make(chan error, 1)
 	go func() {
 		if !s.useTLS() {
@@ -208,6 +263,15 @@ func (s *Server) Run(ctx context.Context) error {
 			errc <- fmt.Errorf("admin tls cert/key: %w", err)
 			return
 		}
+		if cert.Leaf == nil {
+			if cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+				errc <- fmt.Errorf("admin tls cert/key: %w", err)
+				return
+			}
+		}
+		s.tlsMu.Lock()
+		s.tlsLeaf, s.tlsLoaded = cert.Leaf, time.Now()
+		s.tlsMu.Unlock()
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 		errc <- srv.ListenAndServeTLS("", "")
 	}()

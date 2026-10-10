@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ edge:
 		{"check", "-c", good, "other.yaml"},
 		{"check", "other.yaml"},
 		{"run", "other.yaml"},
+		{"version", "x"},
+		{"version", "-c", good},
 	} {
 		if got := run(args); got != 2 {
 			t.Errorf("run(%q) = %d, want 2 (usage error)", args, got)
@@ -41,6 +44,17 @@ edge:
 	}
 	if got := run([]string{"check", "-c", good}); got != 0 {
 		t.Errorf("check -c %s = %d, want 0", good, got)
+	}
+}
+
+// `freesbc version` prints one line starting with the build version and
+// exits 0; the plain test build carries the default "dev".
+func TestVersion(t *testing.T) {
+	if got := versionLine(); !strings.HasPrefix(got, "freesbc dev go") || strings.Contains(got, "\n") {
+		t.Errorf("versionLine() = %q, want one line starting with %q", got, "freesbc dev go")
+	}
+	if got := run([]string{"version"}); got != 0 {
+		t.Errorf("run(version) = %d, want 0", got)
 	}
 }
 
@@ -103,5 +117,37 @@ func TestSecondSignalForcesExit(t *testing.T) {
 			<-done
 			t.Fatal("further SIGINTs did not end a hung shutdown")
 		}
+	}
+}
+
+// `freesbc init` takes no positional argument and rejects unknown flags,
+// like run and check, and never touches the filesystem when it does.
+func TestInitArgumentHandling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
+	for _, args := range [][]string{
+		{"init", "-c", path, "other.yaml"},
+		{"init", "--bogus"},
+		{"init", "-c", path, "--udp-port", "abc"},
+	} {
+		if got := run(args); got != 2 {
+			t.Errorf("run(%q) = %d, want 2", args, got)
+		}
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("init wrote %s on a usage error", path)
+	}
+	// With stdin not a terminal a missing switch is an error (exit 1), not a
+	// prompt. Pin stdin so the test never prompts when run from a terminal.
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	stdin := os.Stdin
+	os.Stdin = devnull
+	defer func() { os.Stdin = stdin }()
+	t.Setenv("FREESBC_SWITCH", "")
+	if got := run([]string{"init", "-c", path, "--no-public-lookup"}); got != 1 {
+		t.Errorf("init without a switch = %d, want 1", got)
 	}
 }

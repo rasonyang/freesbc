@@ -50,10 +50,22 @@ The config and any TLS cert and key it names must be readable by the `freesbc` g
 > **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (networking and deployment topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
 ```sh
-cp freesbc.example.yaml freesbc.yaml   # then edit the addresses
+./freesbc init  -c freesbc.yaml        # asks for the switch, detects the addresses
 ./freesbc check -c freesbc.yaml        # validate; errors name the line and key
 ./freesbc run   -c freesbc.yaml
+./freesbc version                      # print the build version
 ```
+
+`freesbc init` writes a minimal config (mode 0600) and refuses to overwrite an existing file. On a terminal it prompts for each value, showing a detected default that Enter accepts: `edge.switch` first (no default), then `private.ip` (the local address that routes to the switch), `public.bind` (the local address toward the default route), `public.ip` and the UDP port, and finally an optional admin password (no echo, stored as a bcrypt hash). It asks before contacting `https://api.ipify.org` for `public.ip` (falling back to cloud instance metadata); `public.bind` is omitted when it equals `public.ip`. It fails if `private.ip` equals `public.bind`: the topology needs a second IP or NIC. When stdin is not a terminal it never prompts; give flags or environment variables (flag, then env, then detected default):
+
+```sh
+./freesbc init -c freesbc.yaml --switch 10.77.0.10:5060 \
+    --private-ip 10.77.0.2 --public-ip 203.0.113.7 --public-bind 172.31.5.10
+# also: --udp-port N, --no-public-lookup; env FREESBC_SWITCH, FREESBC_PRIVATE_IP,
+# FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT
+```
+
+Alternatively copy the annotated `freesbc.example.yaml` and edit it by hand.
 
 A minimal config (every key is documented in [`docs/config.md`](docs/config.md)):
 
@@ -113,12 +125,13 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 
 ## Admin & WebUI
 
-Enable the optional `admin` block (a bcrypt `password_hash`; generate with `htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'`; the user is always `admin`), then:
+Enable the optional `admin` block (a bcrypt `password_hash`; generate with `freesbc hash-password`; the user is always `admin`), then:
 
 - browse `http://<admin.listen>/` (HTTP Basic Auth) for the live dashboard and the Config tab: the running file read-only, a candidate editor with Validate (the same checks as `freesbc check`, listing restart-only keys the candidate changes) and a line diff against the running file. The admin API never writes the config: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it, as with nginx. Keep secrets as `${ENV}` references,
 - the Audit tab (`GET /api/audit`) lists the last 256 admin events: sign-ins (first successful login, failed login, rate-limited) and drain changes (`drain_on`, `drain_off`); `freesbc_admin_auth_failures_total` counts the failures. The source is the connecting address, so behind a reverse proxy it is the proxy's,
+- the Health tab and header badge (`GET /api/health`, `GET /api/health/history`) show whether anything needs attention: a switch node cooling down, carrier DNS failing, the RTP pool at 90 % or more, the shield ban table at its cap, the TLS certificate under 30 days from expiry or expired, plus the last 200 raise and clear events (in memory; thresholds are fixed, alerting stays in Prometheus; `freesbc_admin_health_status` exposes the status as 0, 1 or 2),
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- read live state from `/api/status`, `/api/calls`, `/api/audit` and `/api/config`, and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
+- read live state from `/api/status` (including a `reload` object: restart-only keys pending and the last failed reload), `/api/calls`, `/api/health` (overall status and the active conditions), `/api/audit`, `/api/tls` (the loaded TLS certificate, its expiry and whether the file on disk has been renewed; also the Overview's TLS card and `freesbc_tls_cert_expiry_timestamp_seconds`) and `/api/config`, and the live tables `/api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` (read-only; the WebUI's State tab shows them), and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
 - drain the node before a restart: `POST /api/drain` refuses new calls with `503` and `Retry-After: 30` while calls and registrations in place continue, `GET /api/drain` reports `active_calls`, `DELETE /api/drain` leaves drain mode (runtime state only; see [`docs/edge.md`](docs/edge.md)).
 
 Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.
