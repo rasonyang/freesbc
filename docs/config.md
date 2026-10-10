@@ -1,6 +1,6 @@
 # FreeSBC configuration reference
 
-One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
+One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). `freesbc init -c <file>` writes a minimal valid file (`public`, `private`, `edge.switch`, `edge.listen.udp`, optionally `admin`) from detected addresses, flags or `FREESBC_*` environment variables, and refuses to overwrite an existing file. The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
 
 Principles of the schema:
 
