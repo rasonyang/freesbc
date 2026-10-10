@@ -38,7 +38,7 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test", cfg)
+	deps := adminDeps(edgeSrv, "test", cfg, store)
 
 	if inUse, total := deps.Ports(); inUse != 0 || total != 10 {
 		t.Errorf("Ports = %d/%d, want 0/10 (the public and private pools' 5 pairs each)", inUse, total)
@@ -76,7 +76,7 @@ func TestAdminDepsDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test", cfg)
+	deps := adminDeps(edgeSrv, "test", cfg, config.NewStore(cfg))
 	if on, _ := deps.DrainState(); on || deps.Proxy().Draining {
 		t.Fatal("a fresh edge must start not draining")
 	}

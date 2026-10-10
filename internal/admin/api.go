@@ -4,12 +4,37 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 // writeJSON encodes v as the JSON response body.
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// reloadBody is the "reload" object of /api/status. Times are RFC3339 UTC;
+// last_ok, last_error and last_error_at are null until they apply, and
+// restart_required is always an array.
+type reloadBody struct {
+	LastOK          *string  `json:"last_ok"`
+	RestartRequired []string `json:"restart_required"`
+	LastError       *string  `json:"last_error"`
+	LastErrorAt     *string  `json:"last_error_at"`
+}
+
+func reloadResponse(st config.ReloadStatus) reloadBody {
+	b := reloadBody{RestartRequired: append([]string{}, st.RestartRequired...)}
+	if !st.LastOK.IsZero() {
+		t := st.LastOK.UTC().Format(time.RFC3339)
+		b.LastOK = &t
+	}
+	if st.LastError != "" {
+		at := st.LastErrorAt.UTC().Format(time.RFC3339)
+		b.LastError, b.LastErrorAt = &st.LastError, &at
+	}
+	return b
 }
 
 // handleStatus reports process/service-level status: version, uptime, active
@@ -22,12 +47,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.deps.Listeners != nil {
 		listeners = append(listeners, s.deps.Listeners()...)
 	}
+	var rs config.ReloadStatus
+	if s.deps.Reload != nil {
+		rs = s.deps.Reload()
+	}
 	writeJSON(w, map[string]any{
 		"version":        s.deps.Version,
 		"uptime_seconds": int(time.Since(s.started).Seconds()),
 		"active_calls":   s.deps.ActiveCalls(),
 		"ports":          map[string]int{"in_use": inUse, "total": total},
 		"listeners":      listeners,
+		"reload":         reloadResponse(rs),
 	})
 }
 

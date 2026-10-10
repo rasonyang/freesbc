@@ -218,7 +218,7 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 
 ### 4.1 Entry point
 
-`cmd/freesbc/main.go` accepts three subcommands and one flag (`-c`, for `check` and `run`):
+`cmd/freesbc/main.go` accepts exactly five subcommands (`check`, `run` and `init` take `-c`; `init` adds its own flags):
 
 | Invocation | Behaviour | Exit |
 |---|---|---|
@@ -226,9 +226,12 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 | `-h` / `--help` / `help` | usage to stdout | 0 |
 | `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"`. It parses and validates only: it opens no certificate or key file, assigns no address and binds no socket, so a missing cert file, an address that is not local, or a port another process holds is found by `run` alone. Everything validation can decide from the file (literal switch addresses, socket collisions between the admin listener and WS/WSS) `check` rejects exactly as `run` would | 0 / 1 |
 | `run [-c path]` | `app.Run` under `signal.NotifyContext(SIGINT, SIGTERM)` (`withSignals`) | 0 / 1 |
+| `init [-c path] [--switch …]` | `app.Init` (`internal/app/init.go`): detects `private.ip` (UDP connect toward the switch), `public.bind` (UDP connect toward the default route) and `public.ip` (echo service, then instance metadata; announced on stderr and skippable), prompts only when stdin is a terminal, validates the bytes with `config.Parse` and creates the file `O_EXCL`, mode 0600; refuses an existing file and `private.ip == public.bind` | 0 / 1 |
+| `version` | prints `freesbc <version> <go version> <os>/<arch>` (for example `freesbc v1.2.3 go1.27.2 linux/amd64`) to stdout; handled before flag parsing | 0 |
+| `version` with any argument or flag (`freesbc version -c x`) | `unexpected argument` plus usage to stderr | 2 |
 | `hash-password` | prints the bcrypt hash (cost `config.MinBcryptCost`) of a password to stdout, for `admin.password_hash`. On a terminal it prompts twice on stderr without echo and the entries must match; otherwise it reads one line of stdin (a trailing `\n` or `\r\n` is stripped, nothing else). An empty password, a mismatch or a password over bcrypt's 72 bytes is an error on stderr. It takes no `-c` and never the password as an argument: any argument but `-h`/`--help` is a usage error | 0 / 1 / 2 |
-| `check`/`run` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
-| `check`/`run` with a positional argument (`freesbc run other.yaml`) | `unexpected argument "other.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
+| `check`/`run`/`init` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
+| `check`/`run`/`init` with a positional argument (`freesbc run other.yaml`) | `unexpected argument "other.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
 | anything else | usage to stderr | 2 |
 
 `-c` defaults to `freesbc.yaml`. A positional argument is a usage error
@@ -399,6 +402,17 @@ The edge never acts on the new values: it keeps the snapshot it was built
 from (`edge.Server.boot`) and reads every restart-only setting from it, never
 from the store; the admin server likewise holds its startup `AdminConfig` and
 `TLSConfig` (`admin.New`, `admin/server.go:141`).
+
+`Watch` also records its last outcome on the store for the life of the process
+(`config.ReloadStatus`, read through `Store.ReloadStatus()`, which returns a
+copy; only `Watch` writes it): the time of the last published reload, the
+sorted `RestartOnlyChanges` list after it (empty once the file is back to the
+boot values), and the last failed reload's error and time. A failure leaves
+the list as it was, because the snapshot did not change; the next success
+clears the error. Nothing is persisted. `app` hands `Store.ReloadStatus` to
+the admin server as `Deps.Reload`; it surfaces as the `reload` object of
+`GET /api/status`, two web UI banners and the gauges
+`freesbc_config_restart_required` and `freesbc_config_reload_failed`.
 
 ### 4.5 Shutdown
 
@@ -3334,6 +3348,8 @@ permanent series per call."
 | `freesbc_edge_subscriptions` | Gauge | — | edge `subTable.total`: SUBSCRIBE dialog records, pending or active (`Metrics.SetSubscriptions`, `metrics.go:146`; read through `Metrics.Snapshot().ActiveSubscriptions`, `metrics.go:236`, `:282`, which `internal/app/app.go:133` copies into `admin.ProxyStats`; the collector is `internal/admin/metrics.go:60`, `:129`); also `active_subscriptions` in the admin status JSON |
 | `freesbc_active_sip_dialogs` | Gauge | — | edge dialogs started and not yet ended |
 | `freesbc_edge_sessions` | Gauge | — | edge `dialogTable.sessions`: calls holding a session slot, ringing or up; the number `shield.max_sessions` caps (`Metrics.SetSessions`) |
+| `freesbc_config_restart_required` | Gauge | — | restart-only keys changed on disk and not applied until restart (`len(Deps.Reload().RestartRequired)`, §4.4); exported only when `Deps.Reload` is wired |
+| `freesbc_config_reload_failed` | Gauge | — | 1 while the last config reload failed and the previous config is still active, else 0 (`Deps.Reload().LastError`) |
 | `freesbc_edge_draining` | Gauge | — | 1 while the edge is in drain mode, else 0 (`Metrics.SetDraining`, read through `Snapshot().Draining`; `admin.ProxyStats.Draining`) |
 | `freesbc_active_media_sessions` | Gauge | — | edge |
 | `freesbc_active_webrtc_sessions` | Gauge | — | edge |
@@ -3398,7 +3414,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 |---|---|---|---|
 | `/healthz` | any | **none** | `{"status":"ok"}` |
 | `/metrics` | any | Basic | Prometheus text |
-| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)` |
+| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
 | `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
 | `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |

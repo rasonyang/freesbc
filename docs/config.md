@@ -1,6 +1,6 @@
 # FreeSBC configuration reference
 
-One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
+One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). `freesbc init -c <file>` writes a minimal valid file (`public`, `private`, `edge.switch`, `edge.listen.udp`, optionally `admin`) from detected addresses, flags or `FREESBC_*` environment variables, and refuses to overwrite an existing file. The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
 
 Principles of the schema:
 
@@ -241,6 +241,8 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 | `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
+
+The watcher keeps its last outcome in memory (lost on restart) and the admin surface shows it, so the running process and the file on disk can be compared without reading logs. `GET /api/status` has a `reload` object: `last_ok` (RFC 3339 UTC time of the last published reload, null before the first), `restart_required` (the restart-only keys the file changes compared with the startup values, `[]` for none; edit a key back and it leaves the list), and `last_error` with `last_error_at` (the last reload that failed to load or validate, null otherwise; the previous config stays active and `restart_required` is unchanged, and the next successful reload clears both). The web UI shows "Restart required: <keys>" and "Reload failed, previous config still active: <error>" banners on every tab, and `/metrics` exports `freesbc_config_restart_required` (count of pending keys) and `freesbc_config_reload_failed` (0 or 1).
 
 ## Constants
 
