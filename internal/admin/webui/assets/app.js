@@ -10,6 +10,12 @@
   var AUDIT_URL = "/api/audit";
   var HEALTH_URL = "/api/health";
   var HEALTH_HISTORY_URL = "/api/health/history";
+  var REGISTRATIONS_URL = "/api/registrations";
+  var CARRIER_REGS_URL = "/api/carrier-registrations";
+  var BANS_URL = "/api/shield/bans";
+  var SWITCH_NODES_URL = "/api/switch-nodes";
+  var CARRIERS_URL = "/api/carriers";
+  var PAGE_SIZE = 50;
   var CONFIG_RAW_URL = "/api/config/raw";
   var CONFIG_VALIDATE_URL = "/api/config/validate";
 
@@ -30,7 +36,7 @@
   // ---- views (hash-routed so a reload keeps the tab) ----
 
   var links = document.querySelectorAll(".nav-link[data-view]");
-  var VIEWS = ["dashboard", "config", "health", "audit"];
+  var VIEWS = ["dashboard", "config", "state", "health", "audit"];
 
   function show(name) {
     if (VIEWS.indexOf(name) < 0) name = "dashboard";
@@ -46,6 +52,8 @@
     if (name === "health") loadHealthHistory();
     // The audit list is fetched on every open: it is cheap and not polled.
     if (name === "audit") loadAudit();
+    // Live-state tables are fetched on every open, not polled.
+    if (name === "state") loadState();
   }
 
   window.addEventListener("hashchange", function () { show(location.hash.slice(1)); });
@@ -141,6 +149,20 @@
     $("stat-active-calls").textContent = fmtInt(data.active_calls);
     renderPorts(data.ports || {});
     renderListeners(data.listeners || []);
+    renderReload(data.reload || {});
+  }
+
+  // renderReload shows the two page-wide config banners: restart-only keys
+  // changed on disk that the running process does not use yet, and a last
+  // reload that failed (the previous config is still active). Both texts
+  // come from the API, so they are set through textContent.
+  function renderReload(rl) {
+    var keys = rl.restart_required || [];
+    $("restart-banner").hidden = keys.length === 0;
+    $("restart-banner-text").textContent = keys.length ? "Restart required: " + keys.join(", ") : "";
+    var failed = !!rl.last_error;
+    $("reload-banner").hidden = !failed;
+    $("reload-banner-text").textContent = failed ? "Reload failed, previous config still active: " + rl.last_error : "";
   }
 
   function renderPorts(ports) {
@@ -785,6 +807,190 @@
   }
 
   $("btn-audit-load").addEventListener("click", loadAudit);
+
+  // ---- state tables ----
+  //
+  // Registrations, carrier registrations, bans, switch nodes and carriers
+  // are fetched when the tab opens and on Reload. Every API string reaches
+  // the DOM through textContent (el), never markup.
+
+  var regPage = { offset: 0, total: 0, user: "" };
+  var bansPage = { offset: 0, total: 0 };
+  var stateLoading = false;
+  var statePending = false; // a reload asked for while one was in flight
+
+  function dash(v) { return v == null || v === "" ? "—" : String(v); }
+
+  // fillTable replaces tbody rows with one tr per item; cells(item) returns
+  // the tds. It also toggles the count badge and the empty state.
+  function fillTable(prefix, items, count, cells) {
+    var body = $(prefix + "-body");
+    body.textContent = "";
+    $(prefix + "-count").textContent = fmtInt(count);
+    $(prefix + "-empty").hidden = items.length > 0;
+    body.parentNode.hidden = items.length === 0;
+    items.forEach(function (it) {
+      var tr = document.createElement("tr");
+      cells(it).forEach(function (td) { tr.appendChild(td); });
+      body.appendChild(tr);
+    });
+  }
+
+  function monoCell(v) {
+    var td = el("td", "mono", dash(v));
+    if (v != null && v !== "") td.title = String(v);
+    return td;
+  }
+
+  function secCell(sec) {
+    return el("td", "num", sec == null ? "—" : fmtDuration(sec));
+  }
+
+  function timeCell(iso) {
+    var td = el("td", "muted num", "—");
+    var d = new Date(iso);
+    if (iso && !isNaN(d)) { td.textContent = fmtClock(d); td.title = iso; }
+    return td;
+  }
+
+  function badgeCell(text, variant) {
+    var td = el("td", null, "");
+    var b = el("span", "badge", dash(text));
+    b.setAttribute("data-variant", variant);
+    td.appendChild(b);
+    return td;
+  }
+
+  // setPager shows "from-to of total" and enables Previous/Next.
+  function setPager(prefix, page, shown) {
+    var from = shown ? page.offset + 1 : 0;
+    $(prefix + "-range").textContent = fmtInt(from) + "–" + fmtInt(page.offset + shown) + " of " + fmtInt(page.total);
+    $(prefix + "-prev").disabled = page.offset <= 0;
+    $(prefix + "-next").disabled = page.offset + shown >= page.total;
+    $(prefix + "-pager").hidden = page.total === 0;
+  }
+
+  function renderRegistrations(data) {
+    var items = (data && data.items) || [];
+    regPage.total = (data && data.total) || 0;
+    fillTable("reg", items, regPage.total, function (r) {
+      return [monoCell(r.aor), monoCell(r.user), badgeCell(r.transport, "outline"),
+        monoCell(r.source), secCell(r.expires_in)];
+    });
+    setPager("reg", regPage, items.length);
+  }
+
+  function renderCarrierRegs(items) {
+    items = items || [];
+    fillTable("creg", items, items.length, function (r) {
+      return [monoCell(r.carrier), monoCell(r.user), monoCell(r.token), monoCell(r.node), secCell(r.expires_in)];
+    });
+  }
+
+  function renderBans(data) {
+    var items = (data && data.items) || [];
+    bansPage.total = (data && data.total) || 0;
+    $("bans-rejected").textContent = fmtInt((data && data.ban_adds_rejected) || 0);
+    fillTable("bans", items, bansPage.total, function (b) {
+      return [monoCell(b.source), badgeCell(b.kind, "outline"), badgeCell(b.reason, "warning"),
+        timeCell(b.since), secCell(b.remaining)];
+    });
+    setPager("bans", bansPage, items.length);
+  }
+
+  function renderNodes(items) {
+    items = items || [];
+    fillTable("nodes", items, items.length, function (n) {
+      var cooling = n.state === "cooling_down";
+      return [monoCell(n.address), badgeCell(cooling ? "cooling down" : n.state, cooling ? "warning" : "success"),
+        cooling ? secCell(n.cooldown_remaining) : el("td", "num", "—"), timeCell(n.last_failure)];
+    });
+  }
+
+  function addressesCell(addrs) {
+    var td = el("td", "mono", "");
+    if (!addrs || !addrs.length) { td.textContent = "—"; return td; }
+    addrs.forEach(function (a) {
+      var line = el("div", null, a.address + (a.in_use ? " (in use)" : ""));
+      td.appendChild(line);
+    });
+    return td;
+  }
+
+  function renderCarriers(items) {
+    items = items || [];
+    fillTable("carriers", items, items.length, function (c) {
+      var status = el("td", null, "");
+      var b = el("span", "badge", c.failing ? "failing" : "ok");
+      b.setAttribute("data-variant", c.failing ? "destructive" : "success");
+      status.appendChild(b);
+      if (c.last_error) {
+        var why = el("div", "muted mono", c.last_error);
+        why.title = c.last_error;
+        status.appendChild(why);
+      }
+      var expires = timeCell(c.expires_at);
+      var resolved = timeCell(c.resolved_at);
+      if (c.cache_age_seconds != null) resolved.title = (resolved.title ? resolved.title + " · " : "") + "age " + fmtDuration(c.cache_age_seconds);
+      return [monoCell(c.name), monoCell(c.host), monoCell(c.transport), monoCell(c.mode),
+        addressesCell(c.addresses), resolved, expires, status];
+    });
+  }
+
+  function regURL() {
+    var q = "?limit=" + PAGE_SIZE + "&offset=" + regPage.offset;
+    if (regPage.user) q += "&user=" + encodeURIComponent(regPage.user);
+    return REGISTRATIONS_URL + q;
+  }
+
+  function bansURL() {
+    return BANS_URL + "?limit=" + PAGE_SIZE + "&offset=" + bansPage.offset;
+  }
+
+  function loadState() {
+    if (stateLoading) { statePending = true; return; }
+    stateLoading = true;
+    $("state-status").textContent = "Loading…";
+    var failed = 0;
+    function one(url, render) {
+      return fetchJSON(url).then(render).catch(function (err) {
+        if (String(err.message || err) !== "unauthorized") failed++;
+      });
+    }
+    Promise.all([
+      one(regURL(), renderRegistrations),
+      one(CARRIER_REGS_URL, renderCarrierRegs),
+      one(bansURL(), renderBans),
+      one(SWITCH_NODES_URL, renderNodes),
+      one(CARRIERS_URL, renderCarriers)
+    ]).then(function () {
+      $("state-status").textContent = failed ? "Load failed for " + failed + " of 5 tables" : "Loaded";
+      stateLoading = false;
+      if (statePending) { statePending = false; loadState(); }
+    });
+  }
+
+  function pageBy(page, delta) {
+    page.offset = Math.max(0, page.offset + delta * PAGE_SIZE);
+    loadState();
+  }
+
+  $("btn-state-load").addEventListener("click", loadState);
+  $("reg-prev").addEventListener("click", function () { pageBy(regPage, -1); });
+  $("reg-next").addEventListener("click", function () { pageBy(regPage, 1); });
+  $("bans-prev").addEventListener("click", function () { pageBy(bansPage, -1); });
+  $("bans-next").addEventListener("click", function () { pageBy(bansPage, 1); });
+
+  // The search runs 300 ms after the last keystroke and restarts at page 1.
+  var regSearchTimer = null;
+  $("reg-user").addEventListener("input", function () {
+    clearTimeout(regSearchTimer);
+    regSearchTimer = setTimeout(function () {
+      regPage.user = $("reg-user").value.trim();
+      regPage.offset = 0;
+      loadState();
+    }, 300);
+  });
 
   // ---- start ----
 

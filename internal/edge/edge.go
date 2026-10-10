@@ -297,6 +297,27 @@ func (s *Server) Metrics() *Metrics { return s.metrics }
 // ActiveCalls is the number of proxied dialogs currently tracked.
 func (s *Server) ActiveCalls() int { return s.dialogs.count() }
 
+// Registrations is one page of the live client bindings, optionally
+// filtered by user, with the total matching. See Location.Registrations.
+func (s *Server) Registrations(user string, limit, offset int) ([]RegistrationInfo, int) {
+	return s.loc.Registrations(user, limit, offset)
+}
+
+// CarrierRegistrations lists the switch's live registrations at carriers.
+func (s *Server) CarrierRegistrations() []CarrierRegistrationInfo {
+	return s.carrierRegs.snapshot()
+}
+
+// SwitchNodes reports the passive health of every configured switch node,
+// sorted by address.
+func (s *Server) SwitchNodes() []SwitchNodeInfo {
+	return s.upstreamCooldown.snapshot(s.topo.upstreamNames, time.Now())
+}
+
+// Carriers reports the resolution state of every configured carrier, sorted
+// by name.
+func (s *Server) Carriers() []CarrierInfo { return s.carriers.snapshotInfo() }
+
 // SetDraining enters (on) or leaves (!on) drain mode and reports whether the
 // state changed. See drain.go.
 func (s *Server) SetDraining(on bool) (changed bool) {
@@ -340,25 +361,19 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
-// SwitchNode is one edge.switch node as the admin health view sees it.
-type SwitchNode struct {
-	Addr    string // the node's IP:port, the name the cooldown table uses
-	Cooling bool   // inside a passive cooldown window (cooldown.go)
-}
-
-// SwitchNodes lists the switch nodes in sorted order with their passive
-// cooldown state. The set is fixed at startup; only Cooling changes.
-func (s *Server) SwitchNodes() []SwitchNode {
-	out := make([]SwitchNode, 0, len(s.topo.upstreamNames))
-	for _, name := range s.topo.upstreamNames {
-		out = append(out, SwitchNode{Addr: name, Cooling: !s.upstreamCooldown.Available(name)})
+// Bans is one page of the shield's live bans, the total, and the cumulative
+// ban additions refused at the table cap. Before Run has created the shield
+// it is an empty page.
+func (s *Server) Bans(limit, offset int) (page []shield.BanInfo, total int, addsRejected int64) {
+	s.shieldMu.RLock()
+	sh := s.shield
+	s.shieldMu.RUnlock()
+	if sh == nil {
+		return []shield.BanInfo{}, 0, 0
 	}
-	return out
+	page, total = sh.Bans(limit, offset)
+	return page, total, sh.Stats().BanAddsRejected
 }
-
-// CarrierDNS is the DNS resolution state of the DNS-name carriers, for the
-// admin health view.
-func (s *Server) CarrierDNS() []CarrierDNS { return s.carriers.states() }
 
 // Listeners is the listener set Run binds, as transport://host:port, from
 // the startup snapshot (the set is restart-only).

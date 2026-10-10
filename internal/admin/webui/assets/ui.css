@@ -448,6 +448,21 @@ a.badge:hover { filter: brightness(0.95); }
   resize: vertical;
   transition: border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
 }
+.input {
+  display: block;
+  width: min(100%, 18rem);
+  height: calc(var(--spacing) * 8);
+  padding: 0 calc(var(--spacing) * 3);
+  border-width: 1px;
+  border-color: var(--input);
+  border-radius: var(--radius-md);
+  background: var(--control);
+  box-shadow: var(--shadow-xs);
+  transition: border-color var(--duration) var(--ease), box-shadow var(--duration) var(--ease);
+}
+.input::placeholder { color: var(--muted-foreground); }
+.input:focus-visible { border-color: var(--ring); box-shadow: var(--focus-ring); }
+.pager { padding: calc(var(--spacing) * 3) calc(var(--spacing) * 6); border-top: 1px solid var(--border); }
 .textarea::placeholder { color: var(--muted-foreground); }
 .textarea:focus-visible { border-color: var(--ring); box-shadow: var(--focus-ring); }
 .textarea[aria-invalid="true"] {

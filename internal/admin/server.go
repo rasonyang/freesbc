@@ -66,6 +66,26 @@ type Deps struct {
 	// the state changed. Nil on either makes /api/drain answer 404.
 	DrainState  func() (draining bool, since time.Time)
 	SetDraining func(on bool) (changed bool)
+	// Reload reports the config watcher's last outcome: the pending
+	// restart-only keys and the last failed reload. Nil reports none.
+	Reload func() config.ReloadStatus
+
+	// Live-state snapshots (state.go). Each returns copies, never internal
+	// tables. A nil closure makes its endpoint answer 404.
+	//
+	// Registrations returns one page of the client bindings whose user part
+	// contains user (case-insensitive) and the total matching.
+	Registrations func(user string, limit, offset int) (page []Registration, total int)
+	// CarrierRegistrations lists the switch's registrations at carriers.
+	CarrierRegistrations func() []CarrierRegistration
+	// Bans returns one page of the live shield bans, the total, and the
+	// cumulative ban additions refused at the table cap.
+	Bans func(limit, offset int) (page []Ban, total int, addsRejected int64)
+	// SwitchNodes reports the passive health of each switch node.
+	SwitchNodes func() []SwitchNode
+	// Carriers reports the resolution state of each configured carrier.
+	Carriers func() []Carrier
+
 	// Health returns the conditions active right now, derived from live
 	// state with no memory of its own (since and the history are the admin
 	// tracker's, health.go). Nil reports none.
@@ -185,6 +205,11 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
+	mux.HandleFunc("/api/registrations", s.requireAuth(s.handleRegistrations))
+	mux.HandleFunc("/api/carrier-registrations", s.requireAuth(s.handleCarrierRegistrations))
+	mux.HandleFunc("/api/shield/bans", s.requireAuth(s.handleBans))
+	mux.HandleFunc("/api/switch-nodes", s.requireAuth(s.handleSwitchNodes))
+	mux.HandleFunc("/api/carriers", s.requireAuth(s.handleCarriers))
 	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
 	mux.HandleFunc("/api/audit", s.requireAuth(s.handleAudit))
 	mux.HandleFunc("/api/health", s.requireAuth(s.handleHealth))

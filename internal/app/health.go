@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,16 +28,16 @@ const (
 //     and a serve error afterwards makes edge.Server.Run return, which
 //     cancels the errgroup and ends the process, so no running process has
 //     a stopped listener to report.
-//   - Last config reload failed / restart-only keys pending: absent until
-//     #115 retains that state.
 //   - TLS certificate near expiry: absent until #119 lands.
 //   - Drain mode is not a condition: it has its own gauge and endpoint.
 
 // healthInputs is everything the conditions are derived from, as plain
 // values, so a test can set each one without a running edge.
 type healthInputs struct {
-	Switch     []edge.SwitchNode
-	CarrierDNS []edge.CarrierDNS
+	Switch   []edge.SwitchNodeInfo
+	Carriers []edge.CarrierInfo
+	// Reload is the config watcher's last outcome.
+	Reload     config.ReloadStatus
 	PortsInUse int
 	PortsTotal int
 	// BanRejected is the shield's BanAddsRejected counter.
@@ -58,13 +59,18 @@ type healthSource struct {
 	lastRise time.Time // when it last increased; zero if it never has
 }
 
-func newHealthSource(edgeSrv *edge.Server, running *config.Config) *healthSource {
+func newHealthSource(edgeSrv *edge.Server, running *config.Config, reload func() config.ReloadStatus) *healthSource {
 	plain := adminPlainRemote(running.Admin, running.TLS)
 	return &healthSource{read: func() healthInputs {
 		inUse, total := edgeSrv.PortStats()
+		var rs config.ReloadStatus
+		if reload != nil {
+			rs = reload()
+		}
 		return healthInputs{
 			Switch:           edgeSrv.SwitchNodes(),
-			CarrierDNS:       edgeSrv.CarrierDNS(),
+			Carriers:         edgeSrv.Carriers(),
+			Reload:           rs,
 			PortsInUse:       inUse,
 			PortsTotal:       total,
 			BanRejected:      edgeSrv.ShieldStats().BanAddsRejected,
@@ -100,18 +106,18 @@ func (h *healthSource) derive(in healthInputs) []admin.HealthCondition {
 
 	cooling := 0
 	for _, n := range in.Switch {
-		if n.Cooling {
+		if n.State == edge.NodeCoolingDown {
 			cooling++
 		}
 	}
 	for _, n := range in.Switch {
-		if !n.Cooling {
+		if n.State != edge.NodeCoolingDown {
 			continue
 		}
 		c := admin.HealthCondition{
-			ID:       "switch_cooldown:" + n.Addr,
+			ID:       "switch_cooldown:" + n.Address,
 			Severity: admin.HealthDegraded,
-			Message:  fmt.Sprintf("switch node %s answered nothing and is cooling down", n.Addr),
+			Message:  fmt.Sprintf("switch node %s answered nothing and is cooling down", n.Address),
 		}
 		if cooling == len(in.Switch) {
 			c.Severity = admin.HealthCritical
@@ -120,20 +126,38 @@ func (h *healthSource) derive(in healthInputs) []admin.HealthCondition {
 		out = append(out, c)
 	}
 
-	for _, d := range in.CarrierDNS {
+	for _, d := range in.Carriers {
 		if !d.Failing {
 			continue
 		}
 		c := admin.HealthCondition{
 			ID:       "carrier_dns:" + d.Name,
 			Severity: admin.HealthDegraded,
-			Message:  fmt.Sprintf("carrier %s: DNS lookup failing, serving a stale set of %d address(es)", d.Name, d.Addrs),
+			Message:  fmt.Sprintf("carrier %s: DNS lookup failing, serving a stale set of %d address(es)", d.Name, len(d.Addresses)),
+			Detail:   d.LastError,
 		}
-		if d.Addrs == 0 {
+		if len(d.Addresses) == 0 {
 			c.Severity = admin.HealthCritical
 			c.Message = fmt.Sprintf("carrier %s: DNS lookup failing and no address is known", d.Name)
 		}
 		out = append(out, c)
+	}
+
+	if in.Reload.LastError != "" {
+		out = append(out, admin.HealthCondition{
+			ID:       "config_reload_failed",
+			Severity: admin.HealthDegraded,
+			Message:  "the last config reload failed; the previous configuration is still running: " + in.Reload.LastError,
+			Detail:   "failed at " + in.Reload.LastErrorAt.UTC().Format(time.RFC3339),
+		})
+	}
+	if len(in.Reload.RestartRequired) > 0 {
+		out = append(out, admin.HealthCondition{
+			ID:       "config_restart_required",
+			Severity: admin.HealthDegraded,
+			Message:  "the config file changes settings that need a restart",
+			Detail:   "restart-only keys: " + strings.Join(in.Reload.RestartRequired, ", "),
+		})
 	}
 
 	if in.PortsTotal > 0 && in.PortsInUse*100 >= in.PortsTotal*portsDegradedPercent {

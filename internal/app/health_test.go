@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,10 +43,18 @@ func ids(conds []admin.HealthCondition) []string {
 	return out
 }
 
+func nodeInfo(addr string, cooling bool) edge.SwitchNodeInfo {
+	n := edge.SwitchNodeInfo{Address: addr, State: edge.NodeHealthy}
+	if cooling {
+		n.State = edge.NodeCoolingDown
+	}
+	return n
+}
+
 func TestHealthSwitchCooldown(t *testing.T) {
 	h, _ := newTestHealth()
 	nodes := func(a, b bool) healthInputs {
-		return healthInputs{Switch: []edge.SwitchNode{{Addr: "10.0.0.1:5060", Cooling: a}, {Addr: "10.0.0.2:5060", Cooling: b}}}
+		return healthInputs{Switch: []edge.SwitchNodeInfo{nodeInfo("10.0.0.1:5060", a), nodeInfo("10.0.0.2:5060", b)}}
 	}
 	if got := h.derive(nodes(false, false)); len(got) != 0 {
 		t.Fatalf("healthy = %v", ids(got))
@@ -68,11 +77,11 @@ func TestHealthSwitchCooldown(t *testing.T) {
 		t.Errorf("after the first recovered = %+v", got)
 	}
 	// A single-node pool that cools is every node.
-	one := healthInputs{Switch: []edge.SwitchNode{{Addr: "10.0.0.1:5060", Cooling: true}}}
+	one := healthInputs{Switch: []edge.SwitchNodeInfo{nodeInfo("10.0.0.1:5060", true)}}
 	if got := h.derive(one); len(got) != 1 || got[0].Severity != admin.HealthCritical {
 		t.Errorf("single node cooling = %+v, want critical", got)
 	}
-	one.Switch[0].Cooling = false
+	one.Switch[0] = nodeInfo("10.0.0.1:5060", false)
 	if got := h.derive(one); len(got) != 0 {
 		t.Errorf("single node recovered = %v", ids(got))
 	}
@@ -80,20 +89,63 @@ func TestHealthSwitchCooldown(t *testing.T) {
 
 func TestHealthCarrierDNS(t *testing.T) {
 	h, _ := newTestHealth()
-	with := func(d edge.CarrierDNS) healthInputs { return healthInputs{CarrierDNS: []edge.CarrierDNS{d}} }
-	if got := h.derive(with(edge.CarrierDNS{Name: "acme", Addrs: 2})); len(got) != 0 {
+	addrs := func(n int) []edge.CarrierAddress {
+		out := []edge.CarrierAddress{}
+		for i := 0; i < n; i++ {
+			out = append(out, edge.CarrierAddress{Address: "192.0.2.1:5060", InUse: i == 0})
+		}
+		return out
+	}
+	with := func(failing bool, n int) healthInputs {
+		return healthInputs{Carriers: []edge.CarrierInfo{{Name: "acme", Failing: failing, LastError: "resolver down", Addresses: addrs(n)}}}
+	}
+	if got := h.derive(with(false, 2)); len(got) != 0 {
 		t.Fatalf("healthy = %v", ids(got))
 	}
-	got := h.derive(with(edge.CarrierDNS{Name: "acme", Failing: true, Addrs: 2}))
-	if c, ok := find(t, got, "carrier_dns:acme"); !ok || c.Severity != admin.HealthDegraded {
-		t.Fatalf("stale set = %+v, want degraded", got)
+	got := h.derive(with(true, 2))
+	if c, ok := find(t, got, "carrier_dns:acme"); !ok || c.Severity != admin.HealthDegraded || c.Detail != "resolver down" {
+		t.Fatalf("stale set = %+v, want degraded with the error", got)
 	}
-	got = h.derive(with(edge.CarrierDNS{Name: "acme", Failing: true}))
+	got = h.derive(with(true, 0))
 	if c, ok := find(t, got, "carrier_dns:acme"); !ok || c.Severity != admin.HealthCritical {
 		t.Fatalf("no address = %+v, want critical", got)
 	}
-	if got := h.derive(with(edge.CarrierDNS{Name: "acme", Addrs: 1})); len(got) != 0 {
+	if got := h.derive(with(false, 1)); len(got) != 0 {
 		t.Errorf("recovered = %v", ids(got))
+	}
+}
+
+// config_reload_failed is raised by a failed reload (the error is in the
+// message, since the previous snapshot keeps running) and cleared by the
+// next good one.
+func TestHealthConfigReloadFailed(t *testing.T) {
+	h, _ := newTestHealth()
+	if got := h.derive(healthInputs{Reload: config.ReloadStatus{RestartRequired: []string{}}}); len(got) != 0 {
+		t.Fatalf("clean = %v", ids(got))
+	}
+	failed := config.ReloadStatus{LastError: "edge.switch: bad address", LastErrorAt: time.Unix(1000, 0)}
+	got := h.derive(healthInputs{Reload: failed})
+	c, ok := find(t, got, "config_reload_failed")
+	if !ok || len(got) != 1 || c.Severity != admin.HealthDegraded || !strings.Contains(c.Message, "edge.switch: bad address") {
+		t.Fatalf("failed reload = %+v", got)
+	}
+	if got := h.derive(healthInputs{Reload: config.ReloadStatus{LastOK: time.Unix(2000, 0)}}); len(got) != 0 {
+		t.Errorf("after a good reload = %v", ids(got))
+	}
+}
+
+// config_restart_required lists the pending restart-only keys and clears
+// once none is pending.
+func TestHealthConfigRestartRequired(t *testing.T) {
+	h, _ := newTestHealth()
+	got := h.derive(healthInputs{Reload: config.ReloadStatus{RestartRequired: []string{"edge.switch", "rtp"}}})
+	c, ok := find(t, got, "config_restart_required")
+	if !ok || len(got) != 1 || c.Severity != admin.HealthDegraded ||
+		!strings.Contains(c.Detail, "edge.switch") || !strings.Contains(c.Detail, "rtp") {
+		t.Fatalf("pending keys = %+v", got)
+	}
+	if got := h.derive(healthInputs{Reload: config.ReloadStatus{RestartRequired: []string{}}}); len(got) != 0 {
+		t.Errorf("after restart = %v", ids(got))
 	}
 }
 
@@ -201,7 +253,7 @@ func TestAdminDepsHealthWired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test", cfg)
+	deps := adminDeps(edgeSrv, "test", cfg, config.NewStore(cfg))
 	if deps.Health == nil {
 		t.Fatal("Deps.Health is nil")
 	}

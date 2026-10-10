@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -127,7 +128,21 @@ type carrierEntry struct {
 	addrs   []netip.AddrPort // last good set (empty until a lookup succeeded)
 	expiry  time.Time
 	failing bool
+	// resolvedAt is when addrs was last set; zero until a lookup succeeded.
+	resolvedAt time.Time
+	// mode is how addrs resolved (carrierModeSRV or carrierModeA).
+	mode string
+	// lastErr is the text of the most recent failed lookup, cleared on
+	// success.
+	lastErr string
 }
+
+// Carrier resolution modes.
+const (
+	carrierModeLiteral = "literal"
+	carrierModeSRV     = "srv"
+	carrierModeA       = "a"
+)
 
 // carrierDirectory resolves edge.carriers and publishes the result.
 type carrierDirectory struct {
@@ -144,11 +159,6 @@ type carrierDirectory struct {
 	mu      sync.Mutex // serialises refresh; guards entries and rnd
 	entries map[string]*carrierEntry
 	rnd     *rand.Rand
-
-	// state is the per-carrier view behind CarrierDNS, under its own lock
-	// so a health request never waits on a lookup that holds mu.
-	stateMu sync.Mutex
-	state   map[string]CarrierDNS
 
 	snap atomic.Pointer[carrierSnapshot]
 }
@@ -175,42 +185,6 @@ func newCarrierDirectory(cfg *config.Config, log *slog.Logger) *carrierDirectory
 
 // snapshot is the current published view.
 func (d *carrierDirectory) snapshot() *carrierSnapshot { return d.snap.Load() }
-
-// CarrierDNS is the resolution state of one DNS-name carrier.
-type CarrierDNS struct {
-	Name string
-	// Failing is true while the last lookup failed.
-	Failing bool
-	// Addrs is how many addresses the last good set holds (0 until a
-	// lookup has succeeded). A failing carrier with Addrs > 0 still routes
-	// on that stale set.
-	Addrs int
-}
-
-// states lists the DNS-name carriers whose resolution has been attempted,
-// sorted by name. Literal-IP carriers do no DNS and never appear. It reads
-// stateMu, not mu, so it never waits on a lookup in flight.
-func (d *carrierDirectory) states() []CarrierDNS {
-	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	out := make([]CarrierDNS, 0, len(d.state))
-	for _, st := range d.state {
-		out = append(out, st)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
-// recordState publishes one carrier's resolution state for states. The
-// caller holds mu.
-func (d *carrierDirectory) recordState(name string, e *carrierEntry) {
-	d.stateMu.Lock()
-	if d.state == nil {
-		d.state = map[string]CarrierDNS{}
-	}
-	d.state[name] = CarrierDNS{Name: name, Failing: e.failing, Addrs: len(e.addrs)}
-	d.stateMu.Unlock()
-}
 
 // publish builds and stores a snapshot from the literal carriers, the
 // static prefixes and the cached resolutions. The caller holds mu, or is
@@ -257,50 +231,68 @@ func (d *carrierDirectory) publish() {
 
 // refresh resolves every DNS-name carrier whose cache entry is missing or
 // expired, then publishes a new snapshot.
+//
+// mu is held only to read and to apply an outcome, never across a lookup, so
+// the operator views (snapshotInfo, and the health conditions built on it)
+// never wait on a slow resolver. refresh itself is called from one goroutine.
 func (d *carrierDirectory) refresh(ctx context.Context) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	changed := false
 	for _, c := range d.carriers {
 		if c.Literal() {
 			continue
 		}
+		d.mu.Lock()
 		now := d.now()
 		e := d.entries[c.Name]
-		if e != nil && now.Before(e.expiry) {
+		fresh := e != nil && now.Before(e.expiry)
+		d.mu.Unlock()
+		if fresh {
 			continue
 		}
-		addrs, err := d.resolve(ctx, c)
-		if e == nil {
-			e = &carrierEntry{}
-			d.entries[c.Name] = e
+		addrs, mode, err := d.resolve(ctx, c)
+		if d.apply(c, now, addrs, mode, err) {
+			changed = true
 		}
-		if err != nil || len(addrs) == 0 {
-			if err == nil {
-				err = errors.New("no addresses")
-			}
-			// Keep the last good set; retry soon.
-			e.expiry = now.Add(carrierDNSNegTTL)
-			if !e.failing {
-				d.log.Warn("carrier DNS lookup failed; keeping the last good addresses",
-					"carrier", c.Name, "host", c.Host, "err", err, "have", len(e.addrs))
-			} else {
-				d.log.Debug("carrier DNS lookup still failing", "carrier", c.Name, "err", err)
-			}
-			e.failing = true
-			d.recordState(c.Name, e)
-			continue
-		}
-		if e.failing || fmt.Sprint(e.addrs) != fmt.Sprint(addrs) {
-			d.log.Info("carrier resolved", "carrier", c.Name, "host", c.Host, "addrs", fmt.Sprint(addrs))
-		}
-		e.addrs, e.expiry, e.failing = addrs, now.Add(carrierDNSTTL), false
-		d.recordState(c.Name, e)
-		changed = true
 	}
 	if changed {
+		d.mu.Lock()
 		d.publish()
+		d.mu.Unlock()
 	}
+}
+
+// apply records one lookup outcome and reports whether the resolved set
+// changed state (a success). It takes mu.
+func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.AddrPort, mode string, err error) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.entries[c.Name]
+	if e == nil {
+		e = &carrierEntry{}
+		d.entries[c.Name] = e
+	}
+	if err != nil || len(addrs) == 0 {
+		if err == nil {
+			err = errors.New("no addresses")
+		}
+		// Keep the last good set; retry soon.
+		e.expiry = now.Add(carrierDNSNegTTL)
+		if !e.failing {
+			d.log.Warn("carrier DNS lookup failed; keeping the last good addresses",
+				"carrier", c.Name, "host", c.Host, "err", err, "have", len(e.addrs))
+		} else {
+			d.log.Debug("carrier DNS lookup still failing", "carrier", c.Name, "err", err)
+		}
+		e.failing = true
+		e.lastErr = err.Error()
+		return false
+	}
+	if e.failing || fmt.Sprint(e.addrs) != fmt.Sprint(addrs) {
+		d.log.Info("carrier resolved", "carrier", c.Name, "host", c.Host, "addrs", fmt.Sprint(addrs))
+	}
+	e.addrs, e.expiry, e.failing = addrs, now.Add(carrierDNSTTL), false
+	e.resolvedAt, e.mode, e.lastErr = now, mode, ""
+	return true
 }
 
 // Run refreshes the directory until ctx ends: once at once, then whenever
@@ -320,10 +312,11 @@ func (d *carrierDirectory) Run(ctx context.Context) {
 }
 
 // resolve returns the destinations of one DNS-name carrier, in preference
-// order.
-func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]netip.AddrPort, error) {
+// order, and how they resolved (carrierModeSRV or carrierModeA).
+func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]netip.AddrPort, string, error) {
 	if c.ExplicitPort {
-		return d.hostAddrs(ctx, c.Host, uint16(c.Port))
+		addrs, err := d.hostAddrs(ctx, c.Host, uint16(c.Port))
+		return addrs, carrierModeA, err
 	}
 	service, proto := srvName(c.Transport)
 	sctx, cancel := context.WithTimeout(ctx, carrierLookupTimeout)
@@ -332,7 +325,7 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 	if err != nil {
 		var dnsErr *net.DNSError
 		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
-			return nil, fmt.Errorf("srv lookup: %w", err)
+			return nil, "", fmt.Errorf("srv lookup: %w", err)
 		}
 		recs = nil // no SRV record: fall back to the host itself
 	}
@@ -347,12 +340,13 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 		out = append(out, addrs...)
 	}
 	if len(out) > 0 {
-		return dedupeAddrPorts(out), nil
+		return dedupeAddrPorts(out), carrierModeSRV, nil
 	}
 	if len(recs) > 0 && lastErr != nil {
-		return nil, lastErr // SRV exists but none of its targets resolved
+		return nil, "", lastErr // SRV exists but none of its targets resolved
 	}
-	return d.hostAddrs(ctx, c.Host, uint16(c.DialPort()))
+	addrs, err := d.hostAddrs(ctx, c.Host, uint16(c.DialPort()))
+	return addrs, carrierModeA, err
 }
 
 // srvName is the SRV service and protocol of a carrier transport (RFC 3263
@@ -461,5 +455,67 @@ func orderSRV(recs []*net.SRV, rnd *rand.Rand) []srvTarget {
 			group = append(group[:pick], group[pick+1:]...)
 		}
 	}
+	return out
+}
+
+// CarrierInfo is the operator view of one configured carrier.
+type CarrierInfo struct {
+	Name string
+	// Host is the configured host[:port] as written.
+	Host      string
+	Transport string
+	// Mode is "literal", "srv" or "a" (A/AAAA). Empty until a lookup has
+	// succeeded.
+	Mode string
+	// Addresses are the resolved destinations in preference order; the
+	// first is the one in use.
+	Addresses []CarrierAddress
+	// ResolvedAt and ExpiresAt bound the cache window; both are zero for a
+	// literal or an unresolved carrier. A failing carrier's ExpiresAt is
+	// its next retry.
+	ResolvedAt time.Time
+	ExpiresAt  time.Time
+	// Failing is true while the latest lookup failed (the addresses, if
+	// any, are the last good set). LastError is its text.
+	Failing   bool
+	LastError string
+}
+
+// CarrierAddress is one resolved carrier destination.
+type CarrierAddress struct {
+	Address string // "IP:port"
+	InUse   bool
+}
+
+// snapshotInfo copies the state of every configured carrier under mu, sorted by
+// name. The result is never nil.
+func (d *carrierDirectory) snapshotInfo() []CarrierInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]CarrierInfo, 0, len(d.carriers))
+	for _, c := range d.carriers {
+		host := c.Host
+		if c.ExplicitPort {
+			host = net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+		}
+		info := CarrierInfo{Name: c.Name, Host: host, Transport: c.Transport, Addresses: []CarrierAddress{}}
+		if info.Transport == "" {
+			info.Transport = config.CarrierUDP
+		}
+		var addrs []netip.AddrPort
+		if c.Literal() {
+			info.Mode = carrierModeLiteral
+			addrs = []netip.AddrPort{netip.AddrPortFrom(c.Addr, uint16(c.DialPort()))}
+		} else if e := d.entries[c.Name]; e != nil {
+			addrs = e.addrs
+			info.Mode, info.ResolvedAt, info.ExpiresAt = e.mode, e.resolvedAt, e.expiry
+			info.Failing, info.LastError = e.failing, e.lastErr
+		}
+		for i, a := range addrs {
+			info.Addresses = append(info.Addresses, CarrierAddress{Address: a.String(), InUse: i == 0})
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }

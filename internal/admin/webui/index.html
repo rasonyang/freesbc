@@ -40,6 +40,20 @@
   </div>
 </div>
 
+<div id="restart-banner" class="banner" role="status" hidden>
+  <div class="container">
+    <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+    <span id="restart-banner-text"></span>
+  </div>
+</div>
+
+<div id="reload-banner" class="banner" role="alert" hidden>
+  <div class="container">
+    <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+    <span id="reload-banner-text"></span>
+  </div>
+</div>
+
 <header class="site-header">
   <div class="container">
     <div class="brand">
@@ -50,6 +64,7 @@
     <nav class="nav" aria-label="Sections">
       <a class="nav-link" href="#dashboard" data-view="dashboard" aria-current="page">Overview</a>
       <a class="nav-link" href="#config" data-view="config">Config</a>
+      <a class="nav-link" href="#state" data-view="state">State</a>
       <a class="nav-link" href="#health" data-view="health">Health</a>
       <a class="nav-link" href="#audit" data-view="audit">Audit</a>
     </nav>
@@ -234,6 +249,156 @@
 
         <h3 class="subhead" id="h-diff">Diff, current file to candidate</h3>
         <pre class="diff mono" id="config-diff" role="region" aria-labelledby="h-diff" tabindex="0"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-state" class="page" aria-labelledby="h-state" hidden>
+    <div class="page-header">
+      <h1 class="page-title" id="h-state">State</h1>
+      <p class="page-description">Registrations, shield bans, switch node health and carrier DNS, read from memory when you open the tab or press Reload. Nothing here can be changed.</p>
+      <div class="toolbar">
+        <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-state-load">
+          <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Reload
+        </button>
+        <span class="toolbar-status" id="state-status" role="status" aria-live="polite"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Registrations</h2>
+          <div class="toolbar">
+            <label class="visually-hidden" for="reg-user">Search by user</label>
+            <input class="input" type="search" id="reg-user" placeholder="Search by user" autocomplete="off" spellcheck="false" maxlength="256">
+          </div>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="reg-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">AoR</th><th scope="col">User</th><th scope="col">Transport</th><th scope="col">Source</th><th scope="col">Expires in</th></tr>
+            </thead>
+            <tbody id="reg-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="reg-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <span class="empty-title">No registrations</span>
+          <span>Clients that REGISTER through this edge appear here until they expire.</span>
+        </div>
+        <div class="toolbar pager" id="reg-pager">
+          <button class="btn" data-variant="outline" data-size="sm" type="button" id="reg-prev">Previous</button>
+          <button class="btn" data-variant="outline" data-size="sm" type="button" id="reg-next">Next</button>
+          <span class="toolbar-status num" id="reg-range"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Carrier registrations</h2>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="creg-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Carrier</th><th scope="col">User</th><th scope="col">Token</th><th scope="col">Switch node</th><th scope="col">Expires in</th></tr>
+            </thead>
+            <tbody id="creg-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="creg-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <span class="empty-title">No carrier registrations</span>
+          <span>The switch's REGISTERs at carriers appear here for their granted expiry.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Shield bans</h2>
+          <div class="toolbar">
+            <span class="toolbar-status">Additions refused at the table cap: <span class="num" id="bans-rejected">0</span></span>
+          </div>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="bans-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Source</th><th scope="col">Kind</th><th scope="col">Reason</th><th scope="col">Since</th><th scope="col">Remaining</th></tr>
+            </thead>
+            <tbody id="bans-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="bans-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <span class="empty-title">No bans</span>
+          <span>Scanner bans appear here until they lapse. Rate limiting and enumeration only drop requests.</span>
+        </div>
+        <div class="toolbar pager" id="bans-pager">
+          <button class="btn" data-variant="outline" data-size="sm" type="button" id="bans-prev">Previous</button>
+          <button class="btn" data-variant="outline" data-size="sm" type="button" id="bans-next">Next</button>
+          <span class="toolbar-status num" id="bans-range"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Switch nodes</h2>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="nodes-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Address</th><th scope="col">State</th><th scope="col">Cooldown remaining</th><th scope="col">Last failure</th></tr>
+            </thead>
+            <tbody id="nodes-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="nodes-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <span class="empty-title">No switch nodes</span>
+          <span>Configured switch nodes appear here with their passive health.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">Carriers</h2>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="carriers-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Name</th><th scope="col">Host</th><th scope="col">Transport</th><th scope="col">Mode</th><th scope="col">Addresses</th><th scope="col">Resolved</th><th scope="col">Expires</th><th scope="col">Status</th></tr>
+            </thead>
+            <tbody id="carriers-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="carriers-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
+          <span class="empty-title">No carriers</span>
+          <span>Entries of edge.carriers appear here with how they resolved.</span>
+        </div>
       </div>
     </div>
   </section>

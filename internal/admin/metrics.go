@@ -53,6 +53,9 @@ type collector struct {
 	proxyStreamCls  *prometheus.Desc
 	proxyCarrierReq *prometheus.Desc
 	proxyCarrierReg *prometheus.Desc
+
+	restartRequired *prometheus.Desc
+	reloadFailed    *prometheus.Desc
 }
 
 func newCollector(deps Deps, audit *auditLog, health *healthTracker) *collector {
@@ -67,6 +70,9 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker) *collector 
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
+
+		restartRequired: prometheus.NewDesc("freesbc_config_restart_required", "Restart-only config keys changed on disk and not applied until restart.", nil, nil),
+		reloadFailed:    prometheus.NewDesc("freesbc_config_reload_failed", "1 while the last config reload failed and the previous config is still active, else 0.", nil, nil),
 
 		proxyRegs:       prometheus.NewDesc("freesbc_active_registrations", "Registration bindings the edge proxy currently holds.", nil, nil),
 		proxySubs:       prometheus.NewDesc("freesbc_edge_subscriptions", "SUBSCRIBE dialogs the edge routes NOTIFYs for, pending or active.", nil, nil),
@@ -110,6 +116,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	ch <- c.authFail
+	ch <- c.restartRequired
+	ch <- c.reloadFailed
 	ch <- c.healthSt
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
@@ -139,6 +147,16 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	fails := c.audit.failures()
 	for _, reason := range authFailureReasons {
 		ch <- prometheus.MustNewConstMetric(c.authFail, prometheus.CounterValue, float64(fails[reason]), string(reason))
+	}
+
+	if c.deps.Reload != nil {
+		rs := c.deps.Reload()
+		failed := 0.0
+		if rs.LastError != "" {
+			failed = 1
+		}
+		g(c.restartRequired, float64(len(rs.RestartRequired)))
+		g(c.reloadFailed, failed)
 	}
 
 	if c.deps.Proxy == nil {

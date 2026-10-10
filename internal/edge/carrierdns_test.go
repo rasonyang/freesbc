@@ -366,50 +366,26 @@ func TestCarrierDirectoryTLSSRVAndExplicitPort(t *testing.T) {
 	}
 }
 
-// CarrierDNS reports a failing lookup with the size of the stale set it
-// still routes on, and clears when a lookup succeeds again.
-func TestCarrierDNSStatesRaiseAndClear(t *testing.T) {
+// snapshotInfo (behind /api/carriers and the health conditions) must not
+// wait on a lookup in flight.
+func TestCarrierSnapshotInfoDoesNotWaitOnLookup(t *testing.T) {
 	stub := &dnsStub{ips: map[string][]string{"gw.example": {"192.0.2.1"}}}
-	clk := &fakeClock{t: time.Unix(1000, 0)}
-	d := newTestDirectory(stub, clk, nil,
-		config.Carrier{Name: "a", Host: "gw.example", Port: 5060, ExplicitPort: true},
-		config.Carrier{Name: "lit", Host: "198.51.100.4", Port: 5060, ExplicitPort: true, Addr: netip.MustParseAddr("198.51.100.4")})
-	s := &Server{carriers: d}
-	if got := s.CarrierDNS(); len(got) != 0 {
-		t.Fatalf("states before any lookup = %v, want none", got)
-	}
-	d.refresh(context.Background())
-	if got := s.CarrierDNS(); len(got) != 1 || got[0] != (CarrierDNS{Name: "a", Addrs: 1}) {
-		t.Fatalf("healthy states = %v (a literal carrier must not appear)", got)
-	}
-
-	stub.mu.Lock()
-	stub.ipErr = errors.New("resolver down")
-	stub.mu.Unlock()
-	clk.advance(carrierDNSTTL + time.Second)
-	d.refresh(context.Background())
-	if got := s.CarrierDNS(); len(got) != 1 || got[0] != (CarrierDNS{Name: "a", Failing: true, Addrs: 1}) {
-		t.Fatalf("failing states = %v, want failing with the stale set", got)
-	}
-
-	stub.mu.Lock()
-	stub.ipErr = nil
-	stub.mu.Unlock()
-	clk.advance(carrierDNSNegTTL + time.Second)
-	d.refresh(context.Background())
-	if got := s.CarrierDNS(); len(got) != 1 || got[0].Failing {
-		t.Fatalf("states after recovery = %v, want not failing", got)
-	}
-}
-
-// A carrier that never resolved is failing with no addresses.
-func TestCarrierDNSStatesNeverResolved(t *testing.T) {
-	stub := &dnsStub{ipErr: errors.New("resolver down")}
 	d := newTestDirectory(stub, &fakeClock{t: time.Unix(1000, 0)}, nil,
 		config.Carrier{Name: "a", Host: "gw.example", Port: 5060, ExplicitPort: true})
-	d.refresh(context.Background())
-	got := (&Server{carriers: d}).CarrierDNS()
-	if len(got) != 1 || got[0] != (CarrierDNS{Name: "a", Failing: true}) {
-		t.Fatalf("states = %v, want failing with no addresses", got)
+	stub.mu.Lock() // every lookup now blocks
+	done := make(chan struct{})
+	go func() { d.refresh(context.Background()); close(done) }()
+	time.Sleep(50 * time.Millisecond) // let refresh reach the blocked lookup
+	got := make(chan []CarrierInfo, 1)
+	go func() { got <- d.snapshotInfo() }()
+	select {
+	case info := <-got:
+		if len(info) != 1 || info[0].Name != "a" {
+			t.Errorf("snapshotInfo = %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("snapshotInfo blocked behind a lookup in flight")
 	}
+	stub.mu.Unlock()
+	<-done
 }
