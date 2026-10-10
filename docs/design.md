@@ -661,7 +661,7 @@ Inbound admission (§6.2) uses the transport the request arrived on (`req.Transp
 ### 6.9 Observability and admin
 
 - Metrics: `freesbc_edge_carrier_requests_total{carrier,direction,method}` (`direction` is `inbound` for carrier to switch, `outbound` for switch to carrier; `internal/edge/metrics.go:155`, `internal/admin/metrics.go:83`) and `freesbc_edge_carrier_registrations{carrier}`, the live registration count per configured carrier with zeros included (`SetCarrierRegistrations`, `edge/metrics.go:165`; `publishCarrierRegistrations`, `carrierreg.go:126`). Admission drops count in `freesbc_edge_admission_drops_total`.
-- The admin status JSON carries the same two values as `carrier_requests_total` and `carrier_registrations` (`internal/admin/server.go:98-104`). There is no carrier-specific API endpoint.
+- The admin status JSON carries the same two values as `carrier_requests_total` and `carrier_registrations` (`internal/admin/server.go:98-104`). The carriers' resolution state and the switch's carrier registrations are listed by `GET /api/carriers` and `GET /api/carrier-registrations` (§13.3).
 - The call list names the ends of a carrier call as `carrier:<name>` and `switch:<ip:port>` (`dialogTable.calls`, `dialog.go:557-563`).
 - The redacted config view shows `edge.carriers` (`internal/admin/redact.go:19`).
 
@@ -3401,8 +3401,8 @@ The default process log level is `Info` and there is no flag to change it.
 
 ### 13.3 Admin HTTP API
 
-All routes are on one `http.ServeMux` (`server.go:175-187`) behind `recoverMW`
-(`server.go:555`) and `guardMW` (`guard.go`). `recoverMW` sets
+All routes are on one `http.ServeMux` (`server.go:192-207`) behind `recoverMW`
+(`server.go:576`) and `guardMW` (`guard.go`). `recoverMW` sets
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
 `Referrer-Policy: no-referrer` on **every** response, error responses
 included, and `Cache-Control: no-store` on every response except `/healthz`;
@@ -3416,6 +3416,11 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…]}`; `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
+| `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`handleRegistrations`, `state.go:133`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go:404`) under its read lock. No Contact, token or Call-ID |
+| `/api/carrier-registrations` | GET (else 405) | Basic | array of `{"carrier","user","token","node","expires_in"}`; always an array. The switch's live registrations at carriers (`carrierRegTable.snapshot`, `carrierreg.go:312`); `token` is the opaque `fsbc` value in the carrier Contact, `node` the registering switch node |
+| `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`handleBans`, `state.go:184`): `{"items":[{"source","kind" ("ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. Both ban tables merged, newest first (`Shield.Bans`, `shield.go:273`); limit and offset as for registrations. `reason` is `scanner`, the only path that bans (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
+| `/api/switch-nodes` | GET (else 405) | Basic | array of `{"address","state" ("healthy" or "cooling_down"),"cooldown_remaining" (seconds),"last_failure" (RFC 3339 or null)}`; always an array, one per `edge.switch` entry, sorted by address (`cooldownTable.snapshot`, `cooldown.go:76`) |
+| `/api/carriers` | GET (else 405) | Basic | array of `{"name","host","transport","mode" ("literal", "srv", "a" or "" until resolved),"addresses":[{"address","in_use"}],"resolved_at","expires_at" (RFC 3339 or null),"cache_age_seconds" (or null),"failing","last_error"}`; always an array, sorted by name (`carrierDirectory.snapshotInfo`, `carrierdns.go:474`). `in_use` marks the first address, the one the edge sends to. While `failing`, `expires_at` is the next retry and the addresses are the last good set |
 | `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
 | `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
@@ -3549,7 +3554,7 @@ admin response carries. The page loads nothing from another origin; inline
 script, style and event handlers are blocked by the CSP and rejected by
 `TestUIHasNoInlineScriptOrStyle`.
 
-Two hash-routed views: an **Overview** polling `/api/status`, `/api/calls`
+Four hash-routed views: an **Overview** polling `/api/status`, `/api/calls`
 and `/api/drain` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
 poll keeps the last data and marks the header "Connection lost"; the two
 endpoints render independently, so one failing marks only its half stale;
@@ -3566,7 +3571,22 @@ against the candidate. A **Download config** button fetches
 says so. The Overview's **Drain mode** card shows the state, the active calls
 remaining and the time since drain began, with an enter/leave button that
 opens an in-page confirmation (no `window.confirm`) before it sends POST or
-DELETE to `/api/drain`. Design rules are in `docs/admin-ui.md`.
+DELETE to `/api/drain`. A **State** tab lists the five live-state tables
+(`/api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`,
+`/api/switch-nodes`, `/api/carriers`), each with an empty state. It is fetched
+when the tab opens and on Reload, not polled. Registrations have a user search
+(300 ms debounce, back to page 1) and Previous/Next paging of 50; bans page the
+same way and show the total and `ban_adds_rejected`. All are read-only. Design
+rules are in `docs/admin-ui.md`.
+
+The State tab's tables read state the planes record for this purpose, all in
+memory and copied under the owning lock: a ban's reason and start time
+(`banEntry`, `banlist.go:37`; `BanInfo`, `shield.go:254`), a switch node's last
+penalty time (`cooldownTable.lastFail`, `cooldown.go:24`, set in `Penalize`,
+`cooldown.go:41`), and a carrier's resolution mode and last DNS error
+(`carrierEntry.mode` and `lastErr`, `carrierdns.go:134`, `:137`, set on a
+lookup at `carrierdns.go:265` and `:272`). The app adapts them to admin's own
+types in `adminDeps` (`app.go`); admin imports neither `edge` nor `shield`.
 
 ---
 

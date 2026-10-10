@@ -3,6 +3,7 @@ package edge
 import (
 	fsip "github.com/freesbc/freesbc/internal/sip"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -379,4 +380,54 @@ func (l *Location) pruneAORLocked(aor string, now time.Time) int {
 		}
 	}
 	return n
+}
+
+// RegistrationInfo is the operator view of one live binding. It leaves out
+// the fsbc token and the Call-ID.
+type RegistrationInfo struct {
+	AOR       string
+	User      string
+	Transport string
+	Source    string // transport source "IP:port"
+	ExpiresAt time.Time
+}
+
+// maxRegistrationPage bounds one Registrations page.
+const maxRegistrationPage = 1000
+
+// Registrations returns one page of the live bindings and the total number
+// matching. A non-empty user keeps the bindings whose user part contains it,
+// case-insensitively. The order is AoR, then source, then transport, so
+// pages are stable. limit is clamped to 1..maxRegistrationPage and a
+// negative offset is 0. Matches are copied under the read lock; sorting and
+// slicing happen after it. The page is never nil.
+func (l *Location) Registrations(user string, limit, offset int) (page []RegistrationInfo, total int) {
+	limit = min(max(limit, 1), maxRegistrationPage)
+	offset = max(offset, 0)
+	user = strings.ToLower(strings.TrimSpace(user))
+	now := time.Now()
+	l.mu.RLock()
+	all := make([]RegistrationInfo, 0, len(l.byToken))
+	for _, b := range l.byToken {
+		if b.Expired(now) || (user != "" && !strings.Contains(strings.ToLower(b.User), user)) {
+			continue
+		}
+		all = append(all, RegistrationInfo{AOR: b.AOR, User: b.User, Transport: b.Transport,
+			Source: b.Source.String(), ExpiresAt: b.ExpiresAt})
+	}
+	l.mu.RUnlock()
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].AOR != all[j].AOR {
+			return all[i].AOR < all[j].AOR
+		}
+		if all[i].Source != all[j].Source {
+			return all[i].Source < all[j].Source
+		}
+		return all[i].Transport < all[j].Transport
+	})
+	total = len(all)
+	if offset >= total {
+		return []RegistrationInfo{}, total
+	}
+	return append([]RegistrationInfo{}, all[offset:min(offset+limit, total)]...), total
 }

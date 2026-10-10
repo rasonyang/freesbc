@@ -19,10 +19,13 @@ import (
 type cooldownTable struct {
 	mu    sync.Mutex
 	until map[string]time.Time // name → cooldown-until
+	// lastFail is when each name was last Penalized. Recover clears the
+	// cooldown but keeps this, so an operator still sees the last failure.
+	lastFail map[string]time.Time
 }
 
 func newCooldownTable() *cooldownTable {
-	return &cooldownTable{until: make(map[string]time.Time)}
+	return &cooldownTable{until: make(map[string]time.Time), lastFail: make(map[string]time.Time)}
 }
 
 // Available reports whether the target may be used now — true unless it is
@@ -38,7 +41,9 @@ func (h *cooldownTable) Available(name string) bool {
 func (h *cooldownTable) Penalize(name string, cooldown time.Duration) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.until[name] = time.Now().Add(cooldown)
+	now := time.Now()
+	h.until[name] = now.Add(cooldown)
+	h.lastFail[name] = now
 }
 
 // Recover clears any cooldown on the target, making it immediately
@@ -47,4 +52,39 @@ func (h *cooldownTable) Recover(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.until, name)
+}
+
+// Switch node states.
+const (
+	NodeHealthy     = "healthy"
+	NodeCoolingDown = "cooling_down"
+)
+
+// SwitchNodeInfo is the operator view of one switch node's passive health.
+type SwitchNodeInfo struct {
+	Address string // "IP:port", the node's name
+	State   string // NodeHealthy or NodeCoolingDown
+	// CooldownRemaining and CooldownUntil are zero unless cooling down.
+	CooldownRemaining time.Duration
+	CooldownUntil     time.Time
+	// LastFailure is when the node was last penalized; zero if never.
+	LastFailure time.Time
+}
+
+// snapshot reports the state of each of names, in the order given, as of
+// now. A name the table has never seen is healthy.
+func (h *cooldownTable) snapshot(names []string, now time.Time) []SwitchNodeInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]SwitchNodeInfo, 0, len(names))
+	for _, n := range names {
+		info := SwitchNodeInfo{Address: n, State: NodeHealthy, LastFailure: h.lastFail[n]}
+		if until, ok := h.until[n]; ok && now.Before(until) {
+			info.State = NodeCoolingDown
+			info.CooldownUntil = until
+			info.CooldownRemaining = until.Sub(now)
+		}
+		out = append(out, info)
+	}
+	return out
 }

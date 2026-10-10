@@ -9,7 +9,7 @@ to keep it consistent.
 | Decision | Reason |
 |---|---|
 | shadcn/ui **tokens**, not shadcn **components** | The token set is plain CSS variables. The components need React, Tailwind, Radix and a Node build in a Go repo with zero runtime dependencies. We take the look and leave the toolchain. |
-| No framework, no build step | The UI is two views over six endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
+| No framework, no build step | The UI is a few views over the admin endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
 | Separate files under `assets/`, nothing inline | Lets the UI run under a strict CSP (`script-src 'self'; style-src 'self'`, no `unsafe-inline`). The admin plane exposes the unredacted config file, so it is worth protecting from script injection and framing. |
 | `light-dark()` instead of a `.dark` block | Each colour is written once. The OS preference works with no script and no flash; `data-theme` pins a choice. |
 | Browser floor: Chrome/Edge 123, Firefox 120, Safari 17.5 | Required by `light-dark()` (2024). Older browsers lose colours; this is an operator console, not a public page. |
@@ -178,6 +178,7 @@ The data on this console is SIP state, so these rules are the core of
   the previous one has settled, and each request is abandoned after 4 s
   (below the 5 s interval). The session banner clears on the next successful
   response.
+- **The State tab** lists `GET /api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` as five cards, each with its own empty state and count badge. It is fetched when opened and on Reload, not polled, and the five requests fail independently (the status line says how many). Registrations have a user search (debounced) and bans show `ban_adds_rejected`; both page 50 at a time with Previous and Next. Times are local `HH:MM:SS` with the RFC 3339 original in `title`; durations use `fmtDuration`; a missing value is `—`. Node and carrier state is a badge with a word (`cooling down`, `failing`), never colour alone. The search box is the `.input` control.
 - **The Audit tab** lists `GET /api/audit` (newest first; sign-ins and drain changes) when it is opened and on Reload; it is not polled. Time is local `HH:MM:SS` with the RFC 3339 original in `title`; the result is a badge (`ok` success, anything else warning).
 - **Restart-only facts say so** where they are shown (listeners, the config
   hint), so nobody expects an edit to rebind a socket.
