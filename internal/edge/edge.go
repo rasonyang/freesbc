@@ -36,6 +36,14 @@ type Server struct {
 	// shield is hot, and the shield reads it itself. Written once in New.
 	boot *config.Config
 
+	// tlsLeaf is the leaf (Certificate[0]) of the top-level tls pair, kept
+	// the first time a tls or wss listener loads it, with the load time and
+	// the transports that loaded it. Read by TLSCert for the admin surface.
+	tlsMu     sync.Mutex
+	tlsLeaf   *x509.Certificate
+	tlsLoaded time.Time
+	tlsUsers  []string
+
 	// privAddr is the private SIP socket: private.ip:5060, unless a test
 	// overrode it with WithPrivateAddr. Written once in New.
 	privAddr netip.AddrPort
@@ -297,6 +305,27 @@ func (s *Server) Metrics() *Metrics { return s.metrics }
 // ActiveCalls is the number of proxied dialogs currently tracked.
 func (s *Server) ActiveCalls() int { return s.dialogs.count() }
 
+// Registrations is one page of the live client bindings, optionally
+// filtered by user, with the total matching. See Location.Registrations.
+func (s *Server) Registrations(user string, limit, offset int) ([]RegistrationInfo, int) {
+	return s.loc.Registrations(user, limit, offset)
+}
+
+// CarrierRegistrations lists the switch's live registrations at carriers.
+func (s *Server) CarrierRegistrations() []CarrierRegistrationInfo {
+	return s.carrierRegs.snapshot()
+}
+
+// SwitchNodes reports the passive health of every configured switch node,
+// sorted by address.
+func (s *Server) SwitchNodes() []SwitchNodeInfo {
+	return s.upstreamCooldown.snapshot(s.topo.upstreamNames, time.Now())
+}
+
+// Carriers reports the resolution state of every configured carrier, sorted
+// by name.
+func (s *Server) Carriers() []CarrierInfo { return s.carriers.snapshotInfo() }
+
 // SetDraining enters (on) or leaves (!on) drain mode and reports whether the
 // state changed. See drain.go.
 func (s *Server) SetDraining(on bool) (changed bool) {
@@ -340,6 +369,20 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
+// Bans is one page of the shield's live bans, the total, and the cumulative
+// ban additions refused at the table cap. Before Run has created the shield
+// it is an empty page.
+func (s *Server) Bans(limit, offset int) (page []shield.BanInfo, total int, addsRejected int64) {
+	s.shieldMu.RLock()
+	sh := s.shield
+	s.shieldMu.RUnlock()
+	if sh == nil {
+		return []shield.BanInfo{}, 0, 0
+	}
+	page, total = sh.Bans(limit, offset)
+	return page, total, sh.Stats().BanAddsRejected
+}
+
 // Listeners is the listener set Run binds, as transport://host:port, from
 // the startup snapshot (the set is restart-only).
 func (s *Server) Listeners() []string {
@@ -349,6 +392,40 @@ func (s *Server) Listeners() []string {
 	}
 	out = append(out, "udp://"+s.privAddr.String()+" (private)")
 	return out
+}
+
+// noteTLSLeaf records the leaf of a pair a tls or wss listener just loaded.
+// The pair is the one top-level tls pair, so the first load is the record
+// and later ones only add their transport.
+func (s *Server) noteTLSLeaf(cert tls.Certificate, transport string) {
+	s.tlsMu.Lock()
+	defer s.tlsMu.Unlock()
+	if s.tlsLeaf == nil {
+		leaf := cert.Leaf
+		if leaf == nil {
+			var err error
+			if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+				return // LoadX509KeyPair already parsed it; unreachable
+			}
+		}
+		s.tlsLeaf, s.tlsLoaded = leaf, time.Now()
+	}
+	for _, u := range s.tlsUsers {
+		if u == transport {
+			return
+		}
+	}
+	s.tlsUsers = append(s.tlsUsers, transport)
+}
+
+// TLSCert returns the leaf of the top-level tls pair the tls and wss
+// listeners loaded, when it was loaded and which transports use it. The
+// leaf is nil when no listener loaded it. The pair is restart-only, so this
+// is what the process serves, whatever is on disk now.
+func (s *Server) TLSCert() (leaf *x509.Certificate, loadedAt time.Time, users []string) {
+	s.tlsMu.Lock()
+	defer s.tlsMu.Unlock()
+	return s.tlsLeaf, s.tlsLoaded, append([]string(nil), s.tlsUsers...)
 }
 
 type bound struct {
@@ -748,6 +825,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if err != nil {
 			return l, fmt.Errorf("%s certificate: %w", transport, err)
 		}
+		s.noteTLSLeaf(cert, transport)
 		tlsConf := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {

@@ -27,7 +27,8 @@ const reloadDebounce = 200 * time.Millisecond
 // the one the process started with, and every reload is diffed against it
 // with RestartOnlyChanges. A reload that edits restart-only settings is
 // still published, for its hot settings, with a warning naming the
-// settings that will only take effect on restart.
+// settings that will only take effect on restart. The outcome of the last
+// reload is kept on the store (Store.ReloadStatus).
 func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) error {
 	boot := store.Current()
 	abs, err := filepath.Abs(path)
@@ -83,13 +84,16 @@ func Watch(ctx context.Context, path string, store *Store, log *slog.Logger) err
 			cfg, err := loadNoPanic(abs)
 			if err != nil {
 				log.Error("config reload failed, keeping previous config", "err", err)
+				store.reloadFailed(time.Now(), err)
 				continue
 			}
-			if changed := RestartOnlyChanges(boot, cfg); len(changed) > 0 {
+			changed := RestartOnlyChanges(boot, cfg)
+			if len(changed) > 0 {
 				log.Warn("config reload changes restart-only settings; the running process keeps its startup values until restart",
 					"settings", changed)
 			}
 			store.Replace(cfg)
+			store.reloadOK(time.Now(), changed)
 			log.Info("config reloaded", "path", abs)
 		}
 	}

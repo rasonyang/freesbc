@@ -1,0 +1,56 @@
+[Unit]
+Description=FreeSBC edge session border controller
+Documentation=https://github.com/rasonyang/freesbc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=freesbc
+Group=freesbc
+ExecStart=/usr/local/bin/freesbc run -c /etc/freesbc/freesbc.yaml
+# Optional file of KEY=value lines for ${VAR} values in the config, such as
+# the admin.password_hash. Keep it root:freesbc, mode 0640.
+EnvironmentFile=-/etc/freesbc/freesbc.env
+# No ExecReload: there is no SIGHUP handler. The shield.* keys reload by
+# themselves when the file changes; every other key needs a restart.
+# SIGTERM (the default stop signal) starts a graceful shutdown.
+Restart=on-failure
+# A bad config or a bind error (such as an address not yet assigned at boot)
+# exits 1 and is retried every 5 s; run freesbc check before a restart.
+RestartSec=5s
+# Up to 10000 stream connections plus the RTP sockets. Go raises its soft
+# limit to this hard limit at start.
+LimitNOFILE=65536
+
+# Only needed when a listen port is below 1024 (for example wss: 443). Delete
+# both lines to run with no capabilities.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening. The process writes no files: logs go to stderr (journald), and
+# it only reads the config, the env file and the TLS files. Keep the config
+# and TLS files readable by the freesbc group.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_NETLINK: Go lists local interface addresses over netlink at startup.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

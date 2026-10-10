@@ -2,6 +2,7 @@ package shield
 
 import (
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,15 +21,34 @@ const banCap = 65536
 // pruneLoop keeps clearing expired entries regardless.
 const sweepEvery = time.Second
 
+// Ban reasons recorded at insert. A scanner User-Agent verdict is the only
+// path that bans today; rate limiting and enumeration only drop.
+const (
+	BanReasonScanner = "scanner"
+)
+
+// Ban kinds: which of the two tables an entry lives in.
+const (
+	BanKindIP        = "ip"
+	BanKindUDPSocket = "udp_socket"
+)
+
+// banEntry is one ban: when it expires, when it was first recorded and why.
+type banEntry struct {
+	until  time.Time
+	since  time.Time
+	reason string
+}
+
 // banList is an in-memory ban table: a source key mapped to the instant
-// its ban expires, with lazy expiry on read. The Shield keeps two: source
-// IPs (a verdict on a connection-oriented transport) and UDP source sockets
-// (see Shield.CheckFrom). Separate tables mean a forged-datagram flood that
-// fills the socket table can never keep a real scanner's IP out of the IP
-// table.
+// its ban expires (plus when and why it started), with lazy expiry on read.
+// The Shield keeps two: source IPs (a verdict on a connection-oriented
+// transport) and UDP source sockets (see Shield.CheckFrom). Separate tables
+// mean a forged-datagram flood that fills the socket table can never keep a
+// real scanner's IP out of the IP table.
 type banList[K comparable] struct {
 	mu    sync.Mutex
-	until map[K]time.Time
+	until map[K]banEntry
 	now   func() time.Time
 
 	// lastSweep is the (b.now-based) instant of the most recent full sweep
@@ -44,7 +64,7 @@ type banList[K comparable] struct {
 func newBanList() *banList[netip.Addr] { return newBanTable[netip.Addr]() }
 
 func newBanTable[K comparable]() *banList[K] {
-	return &banList[K]{until: make(map[K]time.Time), now: time.Now}
+	return &banList[K]{until: make(map[K]banEntry), now: time.Now}
 }
 
 // ban blocks key for dur. An existing ban is extended, never shortened: the
@@ -52,14 +72,14 @@ func newBanTable[K comparable]() *banList[K] {
 // the ban was recorded: when the table is at banCap and key is not already
 // banned, expired entries are swept lazily first, and if the table is still
 // full the addition is refused (the overflow counter increments).
-func (b *banList[K]) ban(key K, dur time.Duration) bool {
+func (b *banList[K]) ban(key K, dur time.Duration, reason string) bool {
 	b.mu.Lock()
-	_, tracked := b.until[key]
+	old, tracked := b.until[key]
 	if !tracked && len(b.until) >= banCap {
 		if b.now().Sub(b.lastSweep) >= sweepEvery {
 			now := b.now()
-			for k, t := range b.until {
-				if !now.Before(t) {
+			for k, e := range b.until {
+				if !now.Before(e.until) {
 					delete(b.until, k)
 				}
 			}
@@ -71,8 +91,13 @@ func (b *banList[K]) ban(key K, dur time.Duration) bool {
 			return false
 		}
 	}
-	if until := b.now().Add(dur); !tracked || until.After(b.until[key]) {
-		b.until[key] = until
+	now := b.now()
+	if !tracked {
+		b.until[key] = banEntry{until: now.Add(dur), since: now, reason: reason}
+	} else if until := now.Add(dur); until.After(old.until) {
+		// An extension keeps the original start time and reason.
+		old.until = until
+		b.until[key] = old
 	}
 	b.mu.Unlock()
 	return true
@@ -87,11 +112,11 @@ func (b *banList[K]) overflowed() int64 { return b.overflow.Load() }
 func (b *banList[K]) banned(key K) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	t, ok := b.until[key]
+	e, ok := b.until[key]
 	if !ok {
 		return false
 	}
-	if !b.now().Before(t) { // now >= expiry
+	if !b.now().Before(e.until) { // now >= expiry
 		delete(b.until, key)
 		return false
 	}
@@ -110,9 +135,44 @@ func (b *banList[K]) prune() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
-	for key, t := range b.until {
-		if !now.Before(t) {
+	for key, e := range b.until {
+		if !now.Before(e.until) {
 			delete(b.until, key)
 		}
 	}
+}
+
+// listed is one live ban copied out of the table.
+type listed[K comparable] struct {
+	key K
+	banEntry
+}
+
+// live copies the unexpired entries out under the lock, without deleting
+// any. The caller sorts and slices outside it.
+func (b *banList[K]) live() []listed[K] {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	out := make([]listed[K], 0, len(b.until))
+	for k, e := range b.until {
+		if now.Before(e.until) {
+			out = append(out, listed[K]{k, e})
+		}
+	}
+	return out
+}
+
+// sortBans orders newest first, then by source string, so a page boundary
+// is stable between calls.
+func sortBans(in []BanInfo) {
+	sort.Slice(in, func(i, j int) bool {
+		if !in[i].Since.Equal(in[j].Since) {
+			return in[i].Since.After(in[j].Since)
+		}
+		if in[i].Source != in[j].Source {
+			return in[i].Source < in[j].Source
+		}
+		return in[i].Kind < in[j].Kind
+	})
 }

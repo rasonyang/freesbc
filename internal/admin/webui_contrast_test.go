@@ -68,6 +68,9 @@ func TestUITokenContrast(t *testing.T) {
 			{"destructive ink on banner", ink("destructive"), tk("destructive").alpha(0.10).rgb().over(bg), 4.5},
 			{"destructive ink on destructive alert", ink("destructive"), mixOKLCH(tk("destructive"), 0.06, tk("card")).rgb(), 4.5},
 		}
+		pairs = append(pairs,
+			pair{"warning ink on warning alert", ink("warning"), mixOKLCH(okl{L: tk("warning").L, C: tk("warning").C, H: 85, A: 1}, 0.14, tk("card")).rgb(), 4.5},
+		)
 		for _, s := range []string{"success", "warning", "info", "destructive"} {
 			pairs = append(pairs,
 				pair{s + " on card", tk(s).rgb(), card, 4.5},

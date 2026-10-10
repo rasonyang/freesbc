@@ -150,12 +150,12 @@ func (s *Shield) CheckScanner(srcAP netip.AddrPort, userAgent string, transport 
 			// one spoofed packet lock a third party out, and a spoofed flood
 			// fill the IP table. Ban the socket instead, briefly.
 			if isUDP(transport) && srcAP.Port() != 0 {
-				s.socketBans.ban(srcAP, min(cfg.Shield.Ban.Std(), socketBanMax))
+				s.socketBans.ban(srcAP, min(cfg.Shield.Ban.Std(), socketBanMax), BanReasonScanner)
 			}
 			s.log.Debug("shield dropped scanner datagram", "source", srcAP, "ua", userAgent)
 			return Drop
 		}
-		if !s.bans.ban(src, cfg.Shield.Ban.Std()) {
+		if !s.bans.ban(src, cfg.Shield.Ban.Std(), BanReasonScanner) {
 			s.log.Debug("shield ban table at hard cap; scanner ban refused", "source", src, "ua", userAgent)
 		} else {
 			s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
@@ -248,4 +248,44 @@ func (s *Shield) pruneLoop(ctx context.Context) {
 			s.socketBans.prune()
 		}
 	}
+}
+
+// BanInfo is one live ban, copied out of a ban table.
+type BanInfo struct {
+	// Source is the banned IP, or IP:port for a UDP socket ban.
+	Source string
+	// Kind is BanKindIP or BanKindUDPSocket.
+	Kind string
+	// Reason is why the ban was recorded (BanReasonScanner).
+	Reason string
+	// Since is when the ban was first recorded; Until when it lapses.
+	Since, Until time.Time
+}
+
+// maxBanPage bounds one Bans page.
+const maxBanPage = 1000
+
+// Bans returns one page of the live (unexpired) bans of both tables, newest
+// first then by source, and the total number of live bans. limit is clamped
+// to 1..maxBanPage and a negative offset is 0. The tables are copied under
+// their own locks; sorting and slicing happen outside them. The page is a
+// non-nil slice.
+func (s *Shield) Bans(limit, offset int) (page []BanInfo, total int) {
+	limit = min(max(limit, 1), maxBanPage)
+	offset = max(offset, 0)
+	ips, socks := s.bans.live(), s.socketBans.live()
+	all := make([]BanInfo, 0, len(ips)+len(socks))
+	for _, e := range ips {
+		all = append(all, BanInfo{Source: e.key.String(), Kind: BanKindIP, Reason: e.reason, Since: e.since, Until: e.until})
+	}
+	for _, e := range socks {
+		all = append(all, BanInfo{Source: e.key.String(), Kind: BanKindUDPSocket, Reason: e.reason, Since: e.since, Until: e.until})
+	}
+	sortBans(all)
+	total = len(all)
+	if offset >= total {
+		return []BanInfo{}, total
+	}
+	end := min(offset+limit, total)
+	return append([]BanInfo{}, all[offset:end]...), total
 }

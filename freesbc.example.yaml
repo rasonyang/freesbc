@@ -67,5 +67,5 @@ edge:
 
 # admin:
 #   listen: 127.0.0.1:8080
-#   password_hash: "REPLACE-WITH-BCRYPT-HASH"   # htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'
+#   password_hash: "REPLACE-WITH-BCRYPT-HASH"   # freesbc hash-password
 #   allowed_hosts: [sbc.example.net]            # extra Host names (no port); loopback and listen are implied

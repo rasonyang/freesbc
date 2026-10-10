@@ -187,3 +187,63 @@ func TestWatchFollowsSymlinkTargetInOtherDir(t *testing.T) {
 		return store.Current().Shield.Ban.Std() == 99*time.Minute
 	})
 }
+
+func TestWatchRecordsReloadStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
+	write := func(s string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(minimalYAML)
+	initial, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(initial)
+	startWatch(t, path, store)
+
+	st := store.ReloadStatus()
+	if !st.LastOK.IsZero() || st.LastError != "" || st.RestartRequired == nil || len(st.RestartRequired) != 0 {
+		t.Fatalf("initial status = %+v, want zero times and an empty non-nil list", st)
+	}
+
+	// A restart-only edit is published and named.
+	write(minimalYAML + "rtp: 30000-30099\n")
+	waitFor(t, 3*time.Second, func() bool { return !store.ReloadStatus().LastOK.IsZero() })
+	st = store.ReloadStatus()
+	if len(st.RestartRequired) != 1 || st.RestartRequired[0] != "rtp" {
+		t.Fatalf("restart_required = %v, want [rtp]", st.RestartRequired)
+	}
+	firstOK := st.LastOK
+
+	// A bad file records the error, keeps the snapshot and the list.
+	published := store.Current()
+	write("public: [")
+	waitFor(t, 3*time.Second, func() bool { return store.ReloadStatus().LastError != "" })
+	st = store.ReloadStatus()
+	if st.LastErrorAt.IsZero() || !st.LastOK.Equal(firstOK) {
+		t.Fatalf("failed status = %+v, want LastErrorAt set and LastOK unchanged", st)
+	}
+	if len(st.RestartRequired) != 1 || st.RestartRequired[0] != "rtp" {
+		t.Fatalf("restart_required after failure = %v, want [rtp]", st.RestartRequired)
+	}
+	if store.Current() != published {
+		t.Fatal("failed reload replaced the snapshot")
+	}
+
+	// Editing back to the boot values empties the list and clears the error.
+	write(minimalYAML)
+	waitFor(t, 3*time.Second, func() bool { return store.ReloadStatus().LastError == "" })
+	st = store.ReloadStatus()
+	if len(st.RestartRequired) != 0 || st.LastErrorAt != (time.Time{}) || !st.LastOK.After(firstOK) {
+		t.Fatalf("recovered status = %+v, want empty list, cleared error, newer LastOK", st)
+	}
+
+	// The returned slice is a copy.
+	st.RestartRequired = append(st.RestartRequired, "x")
+	if len(store.ReloadStatus().RestartRequired) != 0 {
+		t.Fatal("ReloadStatus leaked its slice")
+	}
+}

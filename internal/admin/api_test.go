@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 func TestAPIStatus(t *testing.T) {
@@ -54,5 +56,50 @@ func TestAPIConfigRedactsSecrets(t *testing.T) {
 	}
 	if !strings.Contains(str, "***") {
 		t.Fatal("redaction marker missing")
+	}
+}
+
+func statusReload(t *testing.T, s *Server) map[string]any {
+	t.Helper()
+	var st map[string]any
+	if err := json.Unmarshal(authGET(t, s, "/api/status"), &st); err != nil {
+		t.Fatalf("status json: %v", err)
+	}
+	rl, ok := st["reload"].(map[string]any)
+	if !ok {
+		t.Fatalf("status has no reload object: %v", st)
+	}
+	return rl
+}
+
+// With no Reload dep the reload object is still present, with an empty
+// (never null) restart_required and null times and error.
+func TestAPIStatusReloadNilDeps(t *testing.T) {
+	rl := statusReload(t, testServer(t))
+	keys, ok := rl["restart_required"].([]any)
+	if !ok || len(keys) != 0 {
+		t.Errorf("restart_required = %#v, want []", rl["restart_required"])
+	}
+	for _, k := range []string{"last_ok", "last_error", "last_error_at"} {
+		if v, present := rl[k]; !present || v != nil {
+			t.Errorf("%s = %#v, want null", k, v)
+		}
+	}
+}
+
+func TestAPIStatusReloadPopulated(t *testing.T) {
+	ok := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	bad := ok.Add(time.Minute)
+	deps := emptyDeps()
+	deps.Reload = func() config.ReloadStatus {
+		return config.ReloadStatus{LastOK: ok, RestartRequired: []string{"edge.listen", "public"}, LastError: "bad yaml", LastErrorAt: bad}
+	}
+	rl := statusReload(t, newTestServer(t, deps))
+	if rl["last_ok"] != "2026-01-02T03:04:05Z" || rl["last_error"] != "bad yaml" || rl["last_error_at"] != "2026-01-02T03:05:05Z" {
+		t.Errorf("reload = %v", rl)
+	}
+	keys, _ := rl["restart_required"].([]any)
+	if len(keys) != 2 || keys[0] != "edge.listen" || keys[1] != "public" {
+		t.Errorf("restart_required = %v", rl["restart_required"])
 	}
 }
