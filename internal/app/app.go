@@ -128,6 +128,53 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 		Shield: func() admin.ShieldStats {
 			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
 		},
+		Registrations: func(user string, limit, offset int) ([]admin.Registration, int) {
+			page, total := edgeSrv.Registrations(user, limit, offset)
+			out := make([]admin.Registration, 0, len(page))
+			for _, r := range page {
+				out = append(out, admin.Registration{AOR: r.AOR, User: r.User, Transport: r.Transport,
+					Source: r.Source, ExpiresAt: r.ExpiresAt})
+			}
+			return out, total
+		},
+		CarrierRegistrations: func() []admin.CarrierRegistration {
+			out := []admin.CarrierRegistration{}
+			for _, c := range edgeSrv.CarrierRegistrations() {
+				out = append(out, admin.CarrierRegistration{Carrier: c.Carrier, User: c.User,
+					Token: c.Token, Node: c.Node, Expires: c.Expires})
+			}
+			return out
+		},
+		Bans: func(limit, offset int) ([]admin.Ban, int, int64) {
+			page, total, rejected := edgeSrv.Bans(limit, offset)
+			out := make([]admin.Ban, 0, len(page))
+			for _, b := range page {
+				out = append(out, admin.Ban{Source: b.Source, Kind: b.Kind, Reason: b.Reason,
+					Since: b.Since, Until: b.Until})
+			}
+			return out, total, rejected
+		},
+		SwitchNodes: func() []admin.SwitchNode {
+			out := []admin.SwitchNode{}
+			for _, n := range edgeSrv.SwitchNodes() {
+				out = append(out, admin.SwitchNode{Address: n.Address, State: n.State,
+					CooldownRemaining: n.CooldownRemaining, LastFailure: n.LastFailure})
+			}
+			return out
+		},
+		Carriers: func() []admin.Carrier {
+			out := []admin.Carrier{}
+			for _, c := range edgeSrv.Carriers() {
+				addrs := make([]admin.CarrierAddress, 0, len(c.Addresses))
+				for _, a := range c.Addresses {
+					addrs = append(addrs, admin.CarrierAddress{Address: a.Address, InUse: a.InUse})
+				}
+				out = append(out, admin.Carrier{Name: c.Name, Host: c.Host, Transport: c.Transport,
+					Mode: c.Mode, Addresses: addrs, ResolvedAt: c.ResolvedAt, ExpiresAt: c.ExpiresAt,
+					Failing: c.Failing, LastError: c.LastError})
+			}
+			return out
+		},
 		Proxy: func() admin.ProxyStats {
 			s := edgeSrv.Metrics().Snapshot()
 			return admin.ProxyStats{

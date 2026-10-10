@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -294,4 +295,43 @@ func (s *Server) carrierRURI(req *sip.Request, carrier string) (carrierBinding, 
 	s.log.Warn("carrier request names an unknown or expired registration token; treating it as addressed to the DID",
 		"carrier", carrier, "sip_call_id", fsip.CallID(req))
 	return carrierBinding{}, false
+}
+
+// CarrierRegistrationInfo is the operator view of one live carrier
+// registration. The switch's original Contact is not included.
+type CarrierRegistrationInfo struct {
+	Carrier string
+	User    string // user part of the switch's Contact
+	Token   string
+	Node    string // switch node "IP:port"
+	Expires time.Time
+}
+
+// snapshot copies the live bindings under the lock, ordered by carrier,
+// user, node and token. The result is never nil.
+func (t *carrierRegTable) snapshot() []CarrierRegistrationInfo {
+	now := time.Now()
+	t.mu.Lock()
+	out := make([]CarrierRegistrationInfo, 0, len(t.byToken))
+	for _, b := range t.byToken {
+		if now.Before(b.expires) {
+			out = append(out, CarrierRegistrationInfo{Carrier: b.carrier, User: b.contact.User,
+				Token: b.token, Node: b.node, Expires: b.expires})
+		}
+	}
+	t.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Carrier != b.Carrier {
+			return a.Carrier < b.Carrier
+		}
+		if a.User != b.User {
+			return a.User < b.User
+		}
+		if a.Node != b.Node {
+			return a.Node < b.Node
+		}
+		return a.Token < b.Token
+	})
+	return out
 }
