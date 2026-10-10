@@ -33,10 +33,21 @@ go build -o freesbc ./cmd/freesbc
 > **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (networking and deployment topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
 ```sh
-cp freesbc.example.yaml freesbc.yaml   # then edit the addresses
+./freesbc init  -c freesbc.yaml        # asks for the switch, detects the addresses
 ./freesbc check -c freesbc.yaml        # validate; errors name the line and key
 ./freesbc run   -c freesbc.yaml
 ```
+
+`freesbc init` writes a minimal config (mode 0600) and refuses to overwrite an existing file. On a terminal it prompts for each value, showing a detected default that Enter accepts: `edge.switch` first (no default), then `private.ip` (the local address that routes to the switch), `public.bind` (the local address toward the default route), `public.ip` and the UDP port, and finally an optional admin password (no echo, stored as a bcrypt hash). It asks before contacting `https://api.ipify.org` for `public.ip` (falling back to cloud instance metadata); `public.bind` is omitted when it equals `public.ip`. It fails if `private.ip` equals `public.bind`: the topology needs a second IP or NIC. When stdin is not a terminal it never prompts; give flags or environment variables (flag, then env, then detected default):
+
+```sh
+./freesbc init -c freesbc.yaml --switch 10.77.0.10:5060 \
+    --private-ip 10.77.0.2 --public-ip 203.0.113.7 --public-bind 172.31.5.10
+# also: --udp-port N, --no-public-lookup; env FREESBC_SWITCH, FREESBC_PRIVATE_IP,
+# FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT
+```
+
+Alternatively copy the annotated `freesbc.example.yaml` and edit it by hand.
 
 A minimal config (every key is documented in [`docs/config.md`](docs/config.md)):
 

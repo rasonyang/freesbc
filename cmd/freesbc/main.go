@@ -10,7 +10,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+
+	"golang.org/x/term"
 
 	"github.com/freesbc/freesbc/internal/app"
 )
@@ -20,6 +23,10 @@ const usage = `FreeSBC — SIP/WebRTC edge session border controller
 Usage:
   freesbc run   [-c freesbc.yaml]   start the SBC
   freesbc check [-c freesbc.yaml]   validate a config file and exit
+  freesbc init  [-c freesbc.yaml]   write a minimal config with detected addresses
+        [--switch IP[:port]] [--private-ip IP] [--public-ip IP] [--public-bind IP]
+        [--udp-port N] [--no-public-lookup]   (env: FREESBC_SWITCH, FREESBC_PRIVATE_IP,
+        FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT)
 `
 
 // version is the build version, overridable via `-ldflags "-X main.version=…"`.
@@ -43,6 +50,16 @@ func run(args []string) int {
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "freesbc.yaml", "path to config file")
+	var initOpts app.InitOptions
+	var udpPort string
+	if cmd == "init" {
+		fs.StringVar(&initOpts.Switch, "switch", os.Getenv("FREESBC_SWITCH"), "switch address, IP[:port]")
+		fs.StringVar(&initOpts.PrivateIP, "private-ip", os.Getenv("FREESBC_PRIVATE_IP"), "private.ip (default: detected)")
+		fs.StringVar(&initOpts.PublicIP, "public-ip", os.Getenv("FREESBC_PUBLIC_IP"), "public.ip (default: looked up)")
+		fs.StringVar(&initOpts.PublicBind, "public-bind", os.Getenv("FREESBC_PUBLIC_BIND"), "public.bind (default: detected)")
+		fs.StringVar(&udpPort, "udp-port", os.Getenv("FREESBC_UDP_PORT"), "edge.listen.udp (default 5060)")
+		fs.BoolVar(&initOpts.NoPublicLookup, "no-public-lookup", false, "do not ask a public service for public.ip")
+	}
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -59,6 +76,33 @@ func run(args []string) int {
 	}
 
 	switch cmd {
+	case "init":
+		if udpPort != "" {
+			n, err := strconv.Atoi(udpPort)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "freesbc init: --udp-port %q is not a number\n", udpPort)
+				return 2
+			}
+			initOpts.UDPPort = n
+		}
+		fd := int(os.Stdin.Fd())
+		initOpts.Path = *cfgPath
+		initOpts.Interactive = term.IsTerminal(fd)
+		initOpts.In = os.Stdin
+		initOpts.Out = os.Stdout
+		initOpts.Err = os.Stderr
+		initOpts.ReadPassword = func() (string, error) {
+			b, err := term.ReadPassword(fd)
+			return string(b), err
+		}
+		initOpts.PrivateIPToward = app.PrivateIPToward
+		initOpts.DefaultRouteIP = app.DefaultRouteIP
+		initOpts.LookupPublicIP = app.LookupPublicIP
+		if err := app.Init(context.Background(), initOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "freesbc: %v\n", err)
+			return 1
+		}
+		return 0
 	case "check":
 		if err := app.Check(*cfgPath); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
