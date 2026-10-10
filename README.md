@@ -129,7 +129,7 @@ Everything else stays on the switch; FreeSBC's contribution is a documented swit
 
 ## Status & limitations
 
-FreeSBC targets small and medium deployments on a single node. The repo carries no benchmarks and no load-test harness.
+FreeSBC targets small and medium deployments on a single node. Preliminary single-host numbers (Docker on an Apple M3 Max VM, FreeSBC pinned to 2 cores, generator and switch on the same physical CPU, SIPp as the switch): about 1500 call setups per second, about 450 concurrent G.711 calls and about 800 concurrent WebRTC SRTP calls under 80% of the two cores, about 400 DTLS handshakes per second, and 19000 registrations held. These are not three-host or soak results and will differ on real hardware. Method, caveats, profiles and the first bottlenecks are in [docs/performance.md](docs/performance.md); the rerunnable harness is in [test/perf/](test/perf/README.md).
 
 Non-goals: transcoding, CDR, clustering, and being a registrar in its own right. The edge proxy proxies registrations to the switch rather than owning users or credentials.
 
