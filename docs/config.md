@@ -195,6 +195,7 @@ Optional. The section being present enables the HTTP API, `/metrics` and the Web
 | `password_hash` | required | bcrypt hash, cost at least 10. The user name is always `admin`. |
 | `allow_remote` | `false` | Permits a non-loopback `listen`; requires top-level `tls` (served over HTTPS). |
 | `allowed_hosts` | none | Extra host names or IP literals, no port, scheme or wildcard, no duplicates, that the `Host` header may carry (with the `listen` port). |
+| `pprof` | `false` | Serves Go `net/http/pprof` under `/debug/pprof/` on the admin listener, behind the same Basic Auth (no extra listener, no unauthenticated path). Off, the path answers 404. It exposes stacks and heap contents, so keep `listen` private. |
 
 Web security (restart-only like the rest of `admin`):
 
@@ -207,7 +208,7 @@ Web security (restart-only like the rest of `admin`):
        --data-binary @freesbc.yaml http://127.0.0.1:8080/api/config/validate
   ```
 
-- Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
+- Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before. It carries the Go runtime series and the Prometheus process series (`process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`, ...; Linux only, except `process_start_time_seconds`). `freesbc_rtp_{packets,bytes}_{rx,tx}_total` count finished and live media sessions.
 
 `admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
 
@@ -238,7 +239,7 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`, `shield.max_sessions`, `shield.invite_rate_limit` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
 | `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
-| `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
+| `admin` (every key, including `allowed_hosts` and `pprof`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
 

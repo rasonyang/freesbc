@@ -79,9 +79,12 @@ type Metrics struct {
 	carrierRegsMu sync.Mutex
 	carrierRegs   map[string]int64
 
-	// Media byte/packet totals, accumulated at call teardown from each
-	// session's own counters. Sampling live sessions instead would need a
-	// registry walk on every scrape.
+	// Media byte/packet totals of finished sessions, folded in at call
+	// teardown. A scrape adds the live sessions' own atomic counters on top
+	// (rtpTotals). mediaMu makes "drop from live, add to finished" one step
+	// against a scrape, so a session is never counted twice or missed.
+	mediaMu      sync.Mutex
+	liveMedia    map[any]func() media.Stats
 	rtpPacketsRx atomic.Uint64
 	rtpPacketsTx atomic.Uint64
 	rtpBytesRx   atomic.Uint64
@@ -228,25 +231,62 @@ func (m *Metrics) SetDraining(on bool) {
 func (m *Metrics) DialogStarted() { m.dialogs.Add(1) }
 func (m *Metrics) DialogEnded()   { m.dialogs.Add(-1) }
 
-func (m *Metrics) MediaStarted(webrtc bool) {
+// MediaStarted counts a confirmed session and registers its counters as
+// live: key identifies the session and stats reads its atomic counters.
+func (m *Metrics) MediaStarted(webrtc bool, key any, stats func() media.Stats) {
 	m.mediaSessions.Add(1)
 	if webrtc {
 		m.webrtcSessions.Add(1)
 	}
+	m.mediaMu.Lock()
+	if m.liveMedia == nil {
+		m.liveMedia = map[any]func() media.Stats{}
+	}
+	m.liveMedia[key] = stats
+	m.mediaMu.Unlock()
 }
 
-// MediaEnded folds a finished session's counters into the process totals
-// and drops the gauges.
-func (m *Metrics) MediaEnded(webrtc bool, st media.Stats) {
+// MediaEnded moves a finished session from live to the process totals and
+// drops the gauges. The final counters are read again under mediaMu, after
+// the session closed: counters only grow, so the folded value is never below
+// what an earlier scrape saw live and the totals never go backwards.
+func (m *Metrics) MediaEnded(webrtc bool, key any, stats func() media.Stats) {
 	m.mediaSessions.Add(-1)
 	if webrtc {
 		m.webrtcSessions.Add(-1)
 	}
-	t := st.Total()
+	m.mediaMu.Lock()
+	defer m.mediaMu.Unlock()
+	if _, ok := m.liveMedia[key]; !ok {
+		return
+	}
+	delete(m.liveMedia, key)
+	t := stats().Total()
 	m.rtpPacketsRx.Add(t.RTPPacketsRx)
 	m.rtpPacketsTx.Add(t.RTPPacketsTx)
 	m.rtpBytesRx.Add(t.RTPBytesRx)
 	m.rtpBytesTx.Add(t.RTPBytesTx)
+}
+
+// rtpTotals is the finished sessions' totals plus the live sessions'
+// current counters, sampled now.
+func (m *Metrics) rtpTotals() media.LegStats {
+	m.mediaMu.Lock()
+	defer m.mediaMu.Unlock()
+	t := media.LegStats{
+		RTPPacketsRx: m.rtpPacketsRx.Load(),
+		RTPPacketsTx: m.rtpPacketsTx.Load(),
+		RTPBytesRx:   m.rtpBytesRx.Load(),
+		RTPBytesTx:   m.rtpBytesTx.Load(),
+	}
+	for _, stats := range m.liveMedia {
+		l := stats().Total()
+		t.RTPPacketsRx += l.RTPPacketsRx
+		t.RTPPacketsTx += l.RTPPacketsTx
+		t.RTPBytesRx += l.RTPBytesRx
+		t.RTPBytesTx += l.RTPBytesTx
+	}
+	return t
 }
 
 // WebRTCFailure classifies a browser-leg failure as ICE or DTLS, so an
@@ -326,6 +366,7 @@ type Snapshot struct {
 }
 
 func (m *Metrics) Snapshot() Snapshot {
+	rtp := m.rtpTotals()
 	s := Snapshot{
 		ActiveRegistrations:  m.registrations.Load(),
 		ActiveSubscriptions:  m.subscriptions.Load(),
@@ -338,10 +379,10 @@ func (m *Metrics) Snapshot() Snapshot {
 		RegistrationFailure:  m.registrationFailure.Load(),
 		RequestsIn:           map[string]uint64{},
 		ResponsesOut:         map[string]uint64{},
-		RTPPacketsRx:         m.rtpPacketsRx.Load(),
-		RTPPacketsTx:         m.rtpPacketsTx.Load(),
-		RTPBytesRx:           m.rtpBytesRx.Load(),
-		RTPBytesTx:           m.rtpBytesTx.Load(),
+		RTPPacketsRx:         rtp.RTPPacketsRx,
+		RTPPacketsTx:         rtp.RTPPacketsTx,
+		RTPBytesRx:           rtp.RTPBytesRx,
+		RTPBytesTx:           rtp.RTPBytesTx,
 
 		MediaPortAllocationFailures: m.portFailures.Load(),
 		HandlerPanics:               m.handlerPanics.Load(),

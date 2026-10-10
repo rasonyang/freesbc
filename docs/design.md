@@ -182,7 +182,7 @@ Created once, alive for the process lifetime:
    `Watch` returns and returns nil itself, `app.go:70-76`).
 2. `edge.Server.Run`: always; its error is fatal (`app.go:81-87`).
 3. `admin.Server.Run`: if `admin:` exists at startup; fatal. Its HTTP serve
-   goroutine is the only one it starts (`admin/server.go:171`).
+   goroutine is the only one it starts (`admin/server.go:205`).
 
 `cmd/freesbc`'s `withSignals` adds one more, which releases signal capture
 after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
@@ -384,7 +384,7 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.srtp` |
 | | `edge.allow_insecure_sdes` |
 | | `edge.carrier_sources` |
-| | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, and whether the section exists) |
+| | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, `pprof`, and whether the section exists) |
 
 Which plane code runs is not a setting: the edge always runs, and the admin
 server runs when an `admin:` section existed at startup.
@@ -397,7 +397,7 @@ P2-CFG-007), diffed against the snapshot current when the watcher started.
 The edge never acts on the new values: it keeps the snapshot it was built
 from (`edge.Server.boot`) and reads every restart-only setting from it, never
 from the store; the admin server likewise holds its startup `AdminConfig` and
-`TLSConfig` (`admin.New`, `admin/server.go:141`).
+`TLSConfig` (`admin.New`, `admin/server.go:168`).
 
 ### 4.5 Shutdown
 
@@ -428,7 +428,7 @@ session timers or media timeouts. `defer sh.Close()` on the shield (and the
 sipgo client and user agent) fires after all of this.
 
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout
-(`admin/server.go:186-189`). In-flight HTTP requests are drained up to that
+(`admin/server.go:222-226`). In-flight HTTP requests are drained up to that
 budget.
 
 **Shield.Close**: cancel the prune loop and wait for it. Bans are in memory
@@ -646,7 +646,7 @@ Inbound admission (§6.2) uses the transport the request arrived on (`req.Transp
 ### 6.9 Observability and admin
 
 - Metrics: `freesbc_edge_carrier_requests_total{carrier,direction,method}` (`direction` is `inbound` for carrier to switch, `outbound` for switch to carrier; `internal/edge/metrics.go:155`, `internal/admin/metrics.go:83`) and `freesbc_edge_carrier_registrations{carrier}`, the live registration count per configured carrier with zeros included (`SetCarrierRegistrations`, `edge/metrics.go:165`; `publishCarrierRegistrations`, `carrierreg.go:126`). Admission drops count in `freesbc_edge_admission_drops_total`.
-- The admin status JSON carries the same two values as `carrier_requests_total` and `carrier_registrations` (`internal/admin/server.go:98-104`). There is no carrier-specific API endpoint.
+- The admin status JSON carries the same two values as `carrier_requests_total` and `carrier_registrations` (`internal/admin/server.go:136-142`). There is no carrier-specific API endpoint.
 - The call list names the ends of a carrier call as `carrier:<name>` and `switch:<ip:port>` (`dialogTable.calls`, `dialog.go:557-563`).
 - The redacted config view shows `edge.carriers` (`internal/admin/redact.go:19`).
 
@@ -1401,7 +1401,7 @@ applies to a 2xx FreeSBC cannot anchor and to one that races a CANCEL.
 (`edge.go:263`). `freesbc_active_sip_dialogs` is a separate mechanism over
 the same set: the `Metrics.dialogs` gauge moved by `DialogStarted`/
 `DialogEnded` in `confirm`/`end` (`edge/metrics.go:185-186`), sampled
-through `Snapshot().ActiveDialogs` (`admin/metrics.go:127`).
+through `Snapshot().ActiveDialogs` (`admin/metrics.go:147`).
 
 An `inviteAttempt` (`dialog.go:117`) holds the request **as forwarded** (so a
 CANCEL carries the same top-Via branch) and the **series** cancel function
@@ -3176,7 +3176,7 @@ spin.
 |---|---|
 | `edge.guard` (`edge.go:835`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` (`media/relay.go:115`) | every relay goroutine; closes **that session only** |
-| `admin.recoverMW` (`admin/server.go:530`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
+| `admin.recoverMW` (`admin/server.go:562`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` (`config/loader.go:54`) | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` (`config/reload.go:158`) | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
 
@@ -3312,9 +3312,11 @@ self-signed certificate.
 ### 13.1 Prometheus metrics
 
 All metrics live on a **private** registry built lazily on the first
-`/metrics` scrape (`sync.Once`, `internal/admin/metrics.go:205`), containing the Go
-collector plus one `collector` that samples `admin.Deps` on every scrape — no
-duplicated state. `Describe` advertises all 33 descriptors; the whole edge
+`/metrics` scrape (`sync.Once`, `internal/admin/metrics.go:211`), containing the Go
+collector, the process collector (`collectors.NewProcessCollector`; the
+`process_*` series other than `process_start_time_seconds` exist on Linux only)
+plus one `collector` that samples `admin.Deps` on every scrape — no
+duplicated state. `Describe` advertises all 33 descriptors of the freesbc collector; the whole edge
 block is skipped at `Collect` time when `Deps.Proxy` is nil (it is never nil in
 a running process).
 
@@ -3340,8 +3342,8 @@ permanent series per call."
 | `freesbc_registration_failure_total` | Counter | — | edge: series exhaustion, a rejected registration, and a full binding table |
 | `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `guard`, for every request the shield admits (`edge.go:835`) |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | every response the edge sends or relays |
-| `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` (`dialog.go:1144`) |
-| `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | edge, folded in at `dialog.end()` |
+| `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end()` (`dialog.go:1196`, `Metrics.MediaEnded`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
+| `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_media_port_allocation_failure_total` | Counter | — | edge `rejectMedia` on `ErrPortsExhausted` (`invite.go:731`) |
 | `freesbc_webrtc_ice_failure_total` | Counter | — | edge `WebRTCFailure`: every leg failure that is not a DTLS one (`ErrICEFailed`, `ErrWebRTCNotReady`, a leg closed before it established) |
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
@@ -3361,7 +3363,9 @@ permanent series per call."
 reachable there. Current ban counts and ban-table overflow are kept in
 `shield.Stats` but not exported as metrics, and there is no unban API.
 
-The Go runtime collector (`collectors.NewGoCollector`) is registered too.
+The Go runtime collector (`collectors.NewGoCollector`) and the process collector (`collectors.NewProcessCollector`: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and the like, Linux only apart from `process_start_time_seconds`) are registered too.
+
+With `admin.pprof: true` the admin listener also serves `net/http/pprof` under `/debug/pprof/` (`handlePprof`, `admin/server.go:606`), routed behind the same `requireAuth` as every other route; with it off that path answers 404. A CPU profile or trace lifts the 30 s write deadline for its own response. pprof exposes goroutine stacks and heap contents, so keep the listener private.
 There is no config-reload metric and no carrier DNS metric.
 
 ### 13.2 Log levels

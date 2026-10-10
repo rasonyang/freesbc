@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -85,5 +88,60 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\n---\n%s", want, body)
 		}
+	}
+}
+
+// The process collector is registered next to the Go collector. Its series
+// beyond process_start_time_seconds are Linux-only, so only that one is
+// required everywhere.
+func TestMetricsProcessCollector(t *testing.T) {
+	str := string(authGET(t, testServer(t), "/metrics"))
+	for _, want := range []string{"go_goroutines", "process_start_time_seconds"} {
+		if !strings.Contains(str, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	if runtime.GOOS == "linux" {
+		for _, want := range []string{"process_cpu_seconds_total", "process_resident_memory_bytes", "process_open_fds"} {
+			if !strings.Contains(str, want) {
+				t.Errorf("/metrics missing %q", want)
+			}
+		}
+	}
+}
+
+func pprofServer(t *testing.T, on bool) *Server {
+	t.Helper()
+	s := testServer(t)
+	s.cfg.Pprof = on
+	return s
+}
+
+func TestPprofOffIs404(t *testing.T) {
+	s := pprofServer(t, false)
+	rr := httptest.NewRecorder()
+	req := newReq("GET", "/debug/pprof/", nil)
+	req.SetBasicAuth("admin", "secret")
+	s.handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("pprof off: got %d want 404", rr.Code)
+	}
+}
+
+func TestPprofOnNeedsAuth(t *testing.T) {
+	s := pprofServer(t, true)
+	rr := httptest.NewRecorder()
+	s.handler().ServeHTTP(rr, newReq("GET", "/debug/pprof/", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("pprof without creds: got %d want 401", rr.Code)
+	}
+	if body := string(authGET(t, s, "/debug/pprof/")); !strings.Contains(body, "goroutine") {
+		t.Errorf("pprof index lacks goroutine profile: %s", body)
+	}
+	if body := authGET(t, s, "/debug/pprof/cmdline"); len(body) == 0 {
+		t.Error("pprof cmdline empty")
+	}
+	if body := authGET(t, s, "/debug/pprof/heap?debug=1"); len(body) == 0 {
+		t.Error("pprof heap empty")
 	}
 }

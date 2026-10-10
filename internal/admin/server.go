@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"runtime/debug"
 	"sync"
@@ -183,6 +184,12 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
+	if s.cfg.Pprof {
+		mux.HandleFunc("/debug/pprof/", s.requireAuth(s.handlePprof))
+	} else {
+		// Without this the SPA catch-all would answer 200 here.
+		mux.HandleFunc("/debug/pprof/", s.requireAuth(http.NotFound))
+	}
 	mux.HandleFunc("/", s.requireAuth(s.handleUI)) // SPA catch-all (behind auth)
 	return s.recoverMW(s.guardMW(mux))
 }
@@ -595,4 +602,27 @@ func (s *Server) clock() time.Time {
 		return s.now()
 	}
 	return time.Now()
+}
+
+// handlePprof serves net/http/pprof under /debug/pprof/ (admin.pprof). It
+// sits behind requireAuth like every other route. A CPU profile or trace
+// outlives the server's 30 s WriteTimeout, so those two lift the write
+// deadline for their own response.
+func (s *Server) handlePprof(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/debug/pprof/profile", "/debug/pprof/trace":
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	}
+	switch r.URL.Path {
+	case "/debug/pprof/cmdline":
+		pprof.Cmdline(w, r)
+	case "/debug/pprof/profile":
+		pprof.Profile(w, r)
+	case "/debug/pprof/symbol":
+		pprof.Symbol(w, r)
+	case "/debug/pprof/trace":
+		pprof.Trace(w, r)
+	default:
+		pprof.Index(w, r)
+	}
 }

@@ -1154,7 +1154,7 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 	t.mu.Unlock()
 
 	t.metrics.DialogStarted()
-	t.metrics.MediaStarted(sess.IsWebRTC())
+	t.metrics.MediaStarted(sess.IsWebRTC(), sess, sess.Stats)
 
 	// One goroutine per call watching for the media session to end. It has
 	// an explicit exit (the session's Done channel, closed by Close or by
@@ -1227,7 +1227,7 @@ func (d *dialog) end(reason endReason) bool {
 		return false
 	}
 	t.metrics.DialogEnded()
-	t.metrics.MediaEnded(webrtc, st)
+	t.metrics.MediaEnded(webrtc, sess, sess.Stats)
 	t.metrics.CallEnded(reason)
 	t.log.Info("call ended", "sip_call_id", d.callID, "reason", reason.String(),
 		"duration", time.Since(confirmedAt).Round(time.Millisecond),
