@@ -52,6 +52,7 @@ jobs:
             chmod 0755 "${stage}/freesbc"
             cp README.md freesbc.example.yaml "$stage"/
             if [ -f LICENSE ]; then cp LICENSE "$stage"/; fi
+            if [ "$os" = linux ]; then cp packaging/freesbc.service "$stage"/; fi
             tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "$stage"
           done

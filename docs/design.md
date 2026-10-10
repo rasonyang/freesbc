@@ -3309,8 +3309,8 @@ self-signed certificate.
 | Only the carrier port may skip authentication, and only for `private.ip` | **Assumed.** FreeSBC delivers only requests admitted from a carrier source to `edge.switch_carrier_port`, never client traffic; the switch or a host firewall must stop any other LAN host from reaching that port |
 | The switch addresses each carrier exactly as the `edge.carriers` entry reads, through FreeSBC as outbound proxy | **Enforced for requests that reach the private socket**: a request whose Request-URI is neither a live client token nor an `edge.carriers` entry gets 404, so FreeSBC is not an open relay |
 | `admin.listen` binds loopback | **Enforced**, opt out with `admin.allow_remote: true` (which requires `tls`) |
-| The process runs non-root with CAP_NET_BIND_SERVICE if a listen port is below 1024 | **Not enforced, no unit file shipped** |
-| Config file mode 0600 | **Not enforced**; FreeSBC only reads the file |
+| The process runs non-root with CAP_NET_BIND_SERVICE if a listen port is below 1024 | **Shipped, not enforced**: the linux release tarball carries `packaging/freesbc.service` (`User=freesbc`, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, hardening); a hand-run process is unrestricted |
+| Config file mode 0600 | **Not enforced**; FreeSBC only reads the file. The README service setup uses `root:freesbc` mode 0640, so the service cannot rewrite its own config |
 | A single routable media address (no TURN) | **Assumed** |
 | Public and private media pools do not collide | **Enforced by construction**: different bind IPs |
 | Switch nodes are UDP at literal IPs | **Enforced** by validation (`check` and `run`) and at topology build |

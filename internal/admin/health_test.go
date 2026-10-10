@@ -276,8 +276,13 @@ func TestHealthTickerRecordsAndStops(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not return after cancel")
 	}
-	if after := runtime.NumGoroutine(); after > before {
-		t.Errorf("goroutines %d -> %d after stop", before, after)
+	// The goroutine that closed done may not have exited yet: poll.
+	deadline = time.Now().Add(5 * time.Second)
+	for after := runtime.NumGoroutine(); after > before; after = runtime.NumGoroutine() {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines %d -> %d after stop", before, after)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
