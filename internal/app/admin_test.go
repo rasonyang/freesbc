@@ -38,7 +38,7 @@ func TestAdminDepsReportRunningPlanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test", cfg)
+	deps := adminDeps(edgeSrv, "test", cfg, store)
 
 	if inUse, total := deps.Ports(); inUse != 0 || total != 10 {
 		t.Errorf("Ports = %d/%d, want 0/10 (the public and private pools' 5 pairs each)", inUse, total)
@@ -76,7 +76,7 @@ func TestAdminDepsDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deps := adminDeps(edgeSrv, "test", cfg)
+	deps := adminDeps(edgeSrv, "test", cfg, config.NewStore(cfg))
 	if on, _ := deps.DrainState(); on || deps.Proxy().Draining {
 		t.Fatal("a fresh edge must start not draining")
 	}
@@ -94,5 +94,37 @@ func TestAdminDepsDrain(t *testing.T) {
 	}
 	if on, _ := deps.DrainState(); on {
 		t.Error("still draining after leaving")
+	}
+}
+
+// The live-state closures reach the edge and return non-nil, empty results
+// on a fresh edge.
+func TestAdminDepsLiveState(t *testing.T) {
+	cfg, err := config.Parse([]byte(edgeOnlyYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeSrv, err := edge.New(config.NewStore(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)),
+		edge.WithPrivateAddr(netip.MustParseAddrPort("127.0.0.1:10055")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := adminDeps(edgeSrv, "test", cfg, config.NewStore(cfg))
+
+	if page, total := deps.Registrations("", 10, 0); page == nil || len(page) != 0 || total != 0 {
+		t.Errorf("Registrations = %v, %d; want empty non-nil, 0", page, total)
+	}
+	if got := deps.CarrierRegistrations(); got == nil || len(got) != 0 {
+		t.Errorf("CarrierRegistrations = %v, want empty non-nil", got)
+	}
+	if page, total, rejected := deps.Bans(10, 0); page == nil || len(page) != 0 || total != 0 || rejected != 0 {
+		t.Errorf("Bans = %v, %d, %d; want empty non-nil, 0, 0", page, total, rejected)
+	}
+	nodes := deps.SwitchNodes()
+	if len(nodes) != 1 || nodes[0].Address != "127.0.0.1:10052" || nodes[0].State != "healthy" || !nodes[0].LastFailure.IsZero() {
+		t.Errorf("SwitchNodes = %+v, want one healthy node 127.0.0.1:10052", nodes)
+	}
+	if got := deps.Carriers(); got == nil || len(got) != 0 {
+		t.Errorf("Carriers = %v, want empty non-nil", got)
 	}
 }

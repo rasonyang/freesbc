@@ -190,3 +190,36 @@ func (s *Server) handleTLS(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, rec.body(s.clock()))
 }
+
+// healthConditions is the health tracker's source: Deps.Health plus the
+// certificate expiry condition. It reads no file (the tracker also runs on a
+// timer), so a renewal on disk is /api/tls's to report, not a condition.
+func (s *Server) healthConditions() []HealthCondition {
+	var out []HealthCondition
+	if s.deps.Health != nil {
+		out = s.deps.Health()
+	}
+	rec := s.tlsRecord()
+	if rec == nil {
+		return out
+	}
+	days, expired, soon := expiry(rec.leaf, s.clock())
+	notAfter := rec.leaf.NotAfter.UTC().Format(time.RFC3339)
+	switch {
+	case expired:
+		out = append(out, HealthCondition{
+			ID:       "tls_cert_expiry",
+			Severity: HealthCritical,
+			Message:  "the loaded TLS certificate has expired",
+			Detail:   "not after " + notAfter,
+		})
+	case soon:
+		out = append(out, HealthCondition{
+			ID:       "tls_cert_expiry",
+			Severity: HealthDegraded,
+			Message:  fmt.Sprintf("the loaded TLS certificate expires in %d day(s)", days),
+			Detail:   "not after " + notAfter,
+		})
+	}
+	return out
+}

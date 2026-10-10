@@ -1,7 +1,7 @@
 # Admin UI
 
 How the embedded WebUI (`internal/admin/webui`) is built and the rules for
-changing it. `docs/design.md` §13.5 describes what it does; this file says how
+changing it. `docs/design.md` §13.7 describes what it does; this file says how
 to keep it consistent.
 
 ## Decisions
@@ -9,7 +9,7 @@ to keep it consistent.
 | Decision | Reason |
 |---|---|
 | shadcn/ui **tokens**, not shadcn **components** | The token set is plain CSS variables. The components need React, Tailwind, Radix and a Node build in a Go repo with zero runtime dependencies. We take the look and leave the toolchain. |
-| No framework, no build step | The UI is two views over six endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
+| No framework, no build step | The UI is a few views over the admin endpoints. Everything is `//go:embed`ed and served as written; `git diff` shows exactly what ships. |
 | Separate files under `assets/`, nothing inline | Lets the UI run under a strict CSP (`script-src 'self'; style-src 'self'`, no `unsafe-inline`). The admin plane exposes the unredacted config file, so it is worth protecting from script injection and framing. |
 | `light-dark()` instead of a `.dark` block | Each colour is written once. The OS preference works with no script and no flash; `data-theme` pins a choice. |
 | Browser floor: Chrome/Edge 123, Firefox 120, Safari 17.5 | Required by `light-dark()` (2024). Older browsers lose colours; this is an operator console, not a public page. |
@@ -128,7 +128,7 @@ shadcn's `cva` variant names and keeps one base class per component.
 | Table | `.table-wrap > table.table` | Horizontal scroll inside the card, never a squeezed column. `th scope="col"`. |
 | List | `ul.list` (`data-layout="grid"` for short lists) | Key/value or label/address rows. |
 | Alert | `.alert[data-variant] > svg.icon + .alert-title + .alert-body` | Inline, in place. `role="alert"` only for errors. |
-| Banner | `.banner` | Page-wide and persistent (session expired). At most one. |
+| Banner | `.banner` | Page-wide and persistent: session expired, restart required (restart-only keys changed on disk) and reload failed. Each is its own banner and hidden when it does not apply; the last two follow `reload` in `/api/status`. |
 | Empty state | `.empty` | Says what is missing and what will fill it. Never an empty table. |
 | Live status | `.status[data-state] > .dot + text` | `live`, `stale`, `expired`; `role="status"`. |
 
@@ -179,7 +179,19 @@ The data on this console is SIP state, so these rules are the core of
   the previous one has settled, and each request is abandoned after 4 s
   (below the 5 s interval). The session banner clears on the next successful
   response.
+- **The State tab** lists `GET /api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` as five cards, each with its own empty state and count badge. It is fetched when opened and on Reload, not polled, and the five requests fail independently (the status line says how many). Registrations have a user search (debounced) and bans show `ban_adds_rejected`; both page 50 at a time with Previous and Next. Times are local `HH:MM:SS` with the RFC 3339 original in `title`; durations use `fmtDuration`; a missing value is `—`. Node and carrier state is a badge with a word (`cooling down`, `failing`), never colour alone. The search box is the `.input` control.
 - **The Audit tab** lists `GET /api/audit` (newest first; sign-ins and drain changes) when it is opened and on Reload; it is not polled. Time is local `HH:MM:SS` with the RFC 3339 original in `title`; the result is a badge (`ok` success, anything else warning).
+- **The header health badge** shows `GET /api/health`'s status as a word
+  (`OK`, `Degraded`, `Critical`, plus the condition count) in the existing
+  `success`, `warning` and `destructive` badge variants, so no new token is
+  needed, and links to the Health tab. A failed health poll turns it grey
+  ("Health: unknown") instead of leaving a stale green.
+- **The Health tab** has the Active conditions table (severity badge, id,
+  message with optional detail, since) rendered from the Overview poll, and the
+  history from `GET /api/health/history` (newest first), fetched when the tab
+  opens, on Reload and after each poll while the tab is visible. Empty states
+  say so ("No active conditions", "No events"). All API strings go in through
+  `textContent`.
 - **Restart-only facts say so** where they are shown (listeners, the config
   hint), so nobody expects an edit to rebind a socket.
 
@@ -257,5 +269,5 @@ and leave the shadcn tokens alone:
    wide.
 5. Empty, loading, stale (API down) and error states are all designed.
 6. API strings go through `textContent`.
-7. `go test -race ./internal/admin` passes. `docs/design.md` §13.5 still
+7. `go test -race ./internal/admin` passes. `docs/design.md` §13.7 still
    describes the UI.

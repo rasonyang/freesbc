@@ -257,3 +257,42 @@ func TestAdminRunRecordsTLSLeaf(t *testing.T) {
 		t.Fatalf("malformed pair: Run err=%v, record=%v", err, bad.tlsRecord())
 	}
 }
+
+// Certificate expiry feeds the health conditions: none for a healthy leaf,
+// degraded within 30 days, critical once expired.
+func TestHealthTLSCertExpiry(t *testing.T) {
+	cases := []struct {
+		name     string
+		notAfter time.Duration
+		want     HealthSeverity
+	}{
+		{"healthy", 90 * 24 * time.Hour, ""},
+		{"expiring", 10 * 24 * time.Hour, HealthDegraded},
+		{"expired", -time.Hour, HealthCritical},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cert, key := writeTLSPair(t, t.TempDir(), "h.example.test", time.Now().Add(tc.notAfter), false)
+			var found []ActiveCondition
+			for _, c := range getHealth(t, tlsServer(t, cert, key)).Conditions {
+				if c.ID == "tls_cert_expiry" {
+					found = append(found, c)
+				}
+			}
+			if tc.want == "" {
+				if len(found) != 0 {
+					t.Fatalf("unexpected condition %+v", found)
+				}
+				return
+			}
+			if len(found) != 1 || found[0].Severity != tc.want {
+				t.Fatalf("conditions = %+v, want one %s", found, tc.want)
+			}
+		})
+	}
+	for _, c := range getHealth(t, testServer(t)).Conditions {
+		if c.ID == "tls_cert_expiry" {
+			t.Errorf("condition raised with no certificate loaded")
+		}
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/freesbc/freesbc/internal/config"
 )
 
 // testServerWithMetrics returns a test server whose Deps are overridden with
@@ -103,5 +105,31 @@ func TestMetricsTLSCertExpiry(t *testing.T) {
 	}
 	if body := string(authGET(t, testServer(t), "/metrics")); strings.Contains(body, "freesbc_tls_cert_expiry_timestamp_seconds") {
 		t.Errorf("gauge exported with no certificate loaded")
+	}
+}
+
+// The config reload gauges are exported when Deps.Reload is wired and
+// absent when it is not.
+func TestMetricsConfigReload(t *testing.T) {
+	deps := emptyDeps()
+	deps.Reload = func() config.ReloadStatus {
+		return config.ReloadStatus{RestartRequired: []string{"public", "rtp"}, LastError: "boom"}
+	}
+	str := string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{"freesbc_config_restart_required 2", "freesbc_config_reload_failed 1"} {
+		if !strings.Contains(str, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	deps.Reload = func() config.ReloadStatus { return config.ReloadStatus{} }
+	str = string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{"freesbc_config_restart_required 0", "freesbc_config_reload_failed 0"} {
+		if !strings.Contains(str, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+	str = string(authGET(t, testServer(t), "/metrics"))
+	if strings.Contains(str, "freesbc_config_") {
+		t.Error("config gauges exported with no Reload dep")
 	}
 }

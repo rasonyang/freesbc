@@ -87,7 +87,7 @@ func Run(ctx context.Context, opts Options) error {
 	})
 
 	if adminCfg := cfg.Admin; adminCfg != nil {
-		deps := adminDeps(edgeSrv, opts.Version, cfg)
+		deps := adminDeps(edgeSrv, opts.Version, cfg, store)
 		adminSrv := admin.New(adminCfg, cfg.TLS, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
 			if err := adminSrv.Run(gctx); err != nil && gctx.Err() == nil {
@@ -98,7 +98,7 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 
-	log.Info("freesbc started", "config", opts.ConfigPath)
+	log.Info("freesbc started", "config", opts.ConfigPath, "version", opts.Version)
 
 	<-gctx.Done()
 	log.Info("shutting down")
@@ -106,11 +106,12 @@ func Run(ctx context.Context, opts Options) error {
 }
 
 // adminDeps assembles the admin API's view of the running edge plane.
-func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) admin.Deps {
+func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, store *config.Store) admin.Deps {
 	return admin.Deps{
 		Version: version,
 		// The startup snapshot: the baseline for restart-only comparison.
 		Running: func() *config.Config { return running },
+		Reload:  store.ReloadStatus,
 		Ports:   edgeSrv.PortStats,
 		Calls: func() []admin.Call {
 			out := []admin.Call{}
@@ -126,8 +127,56 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 		SetDraining: edgeSrv.SetDraining,
 		Listeners:   edgeSrv.Listeners,
 		TLSCert:     edgeSrv.TLSCert,
+		Health:      newHealthSource(edgeSrv, running, store.ReloadStatus).conditions,
 		Shield: func() admin.ShieldStats {
 			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
+		},
+		Registrations: func(user string, limit, offset int) ([]admin.Registration, int) {
+			page, total := edgeSrv.Registrations(user, limit, offset)
+			out := make([]admin.Registration, 0, len(page))
+			for _, r := range page {
+				out = append(out, admin.Registration{AOR: r.AOR, User: r.User, Transport: r.Transport,
+					Source: r.Source, ExpiresAt: r.ExpiresAt})
+			}
+			return out, total
+		},
+		CarrierRegistrations: func() []admin.CarrierRegistration {
+			out := []admin.CarrierRegistration{}
+			for _, c := range edgeSrv.CarrierRegistrations() {
+				out = append(out, admin.CarrierRegistration{Carrier: c.Carrier, User: c.User,
+					Token: c.Token, Node: c.Node, Expires: c.Expires})
+			}
+			return out
+		},
+		Bans: func(limit, offset int) ([]admin.Ban, int, int64) {
+			page, total, rejected := edgeSrv.Bans(limit, offset)
+			out := make([]admin.Ban, 0, len(page))
+			for _, b := range page {
+				out = append(out, admin.Ban{Source: b.Source, Kind: b.Kind, Reason: b.Reason,
+					Since: b.Since, Until: b.Until})
+			}
+			return out, total, rejected
+		},
+		SwitchNodes: func() []admin.SwitchNode {
+			out := []admin.SwitchNode{}
+			for _, n := range edgeSrv.SwitchNodes() {
+				out = append(out, admin.SwitchNode{Address: n.Address, State: n.State,
+					CooldownRemaining: n.CooldownRemaining, LastFailure: n.LastFailure})
+			}
+			return out
+		},
+		Carriers: func() []admin.Carrier {
+			out := []admin.Carrier{}
+			for _, c := range edgeSrv.Carriers() {
+				addrs := make([]admin.CarrierAddress, 0, len(c.Addresses))
+				for _, a := range c.Addresses {
+					addrs = append(addrs, admin.CarrierAddress{Address: a.Address, InUse: a.InUse})
+				}
+				out = append(out, admin.Carrier{Name: c.Name, Host: c.Host, Transport: c.Transport,
+					Mode: c.Mode, Addresses: addrs, ResolvedAt: c.ResolvedAt, ExpiresAt: c.ExpiresAt,
+					Failing: c.Failing, LastError: c.LastError})
+			}
+			return out
 		},
 		Proxy: func() admin.ProxyStats {
 			s := edgeSrv.Metrics().Snapshot()

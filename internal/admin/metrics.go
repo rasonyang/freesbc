@@ -14,7 +14,9 @@ type collector struct {
 	deps     Deps
 	audit    *auditLog
 	tlsRec   func() *tlsRecord // nil result: no certificate loaded
+	health   *healthTracker
 	authFail *prometheus.Desc
+	healthSt *prometheus.Desc
 	// descriptors
 	activeCalls *prometheus.Desc
 	portsInUse  *prometheus.Desc
@@ -53,13 +55,18 @@ type collector struct {
 	proxyStreamCls  *prometheus.Desc
 	proxyCarrierReq *prometheus.Desc
 	proxyCarrierReg *prometheus.Desc
+
+	restartRequired *prometheus.Desc
+	reloadFailed    *prometheus.Desc
 }
 
-func newCollector(deps Deps, audit *auditLog, tlsRec func() *tlsRecord) *collector {
+func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func() *tlsRecord) *collector {
 	return &collector{
 		deps:        deps,
 		audit:       audit,
+		health:      health,
 		tlsRec:      tlsRec,
+		healthSt:    prometheus.NewDesc("freesbc_admin_health_status", "Overall health from the admin conditions view: 0 ok, 1 degraded, 2 critical.", nil, nil),
 		tlsExpiry:   prometheus.NewDesc("freesbc_tls_cert_expiry_timestamp_seconds", "Not-after of the loaded top-level tls leaf certificate as Unix seconds; absent when none is loaded.", []string{"path"}, nil),
 		authFail:    prometheus.NewDesc("freesbc_admin_auth_failures_total", "Admin API authentication failures, by reason (bad_credentials, rate_limited).", []string{"reason"}, nil),
 		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
@@ -67,6 +74,9 @@ func newCollector(deps Deps, audit *auditLog, tlsRec func() *tlsRecord) *collect
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
+
+		restartRequired: prometheus.NewDesc("freesbc_config_restart_required", "Restart-only config keys changed on disk and not applied until restart.", nil, nil),
+		reloadFailed:    prometheus.NewDesc("freesbc_config_reload_failed", "1 while the last config reload failed and the previous config is still active, else 0.", nil, nil),
 
 		proxyRegs:       prometheus.NewDesc("freesbc_active_registrations", "Registration bindings the edge proxy currently holds.", nil, nil),
 		proxySubs:       prometheus.NewDesc("freesbc_edge_subscriptions", "SUBSCRIBE dialogs the edge routes NOTIFYs for, pending or active.", nil, nil),
@@ -111,6 +121,9 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.buildInfo
 	ch <- c.authFail
 	ch <- c.tlsExpiry
+	ch <- c.restartRequired
+	ch <- c.reloadFailed
+	ch <- c.healthSt
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
@@ -135,6 +148,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
 	}
 	g(c.buildInfo, 1, c.deps.Version)
+	g(c.healthSt, healthLevel(healthStatus(c.health.evaluate())))
 	fails := c.audit.failures()
 	for _, reason := range authFailureReasons {
 		ch <- prometheus.MustNewConstMetric(c.authFail, prometheus.CounterValue, float64(fails[reason]), string(reason))
@@ -142,6 +156,16 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 
 	if rec := c.tlsRec(); rec != nil {
 		g(c.tlsExpiry, float64(rec.leaf.NotAfter.Unix()), rec.certFile)
+	}
+
+	if c.deps.Reload != nil {
+		rs := c.deps.Reload()
+		failed := 0.0
+		if rs.LastError != "" {
+			failed = 1
+		}
+		g(c.restartRequired, float64(len(rs.RestartRequired)))
+		g(c.reloadFailed, failed)
 	}
 
 	if c.deps.Proxy == nil {
@@ -221,7 +245,7 @@ func (s *Server) registry() http.Handler {
 	s.metricsOnce.Do(func() {
 		reg := prometheus.NewRegistry()
 		reg.MustRegister(collectors.NewGoCollector())
-		reg.MustRegister(newCollector(s.deps, &s.audit, s.tlsRecord))
+		reg.MustRegister(newCollector(s.deps, &s.audit, &s.health, s.tlsRecord))
 		s.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	})
 	return s.metricsHandler

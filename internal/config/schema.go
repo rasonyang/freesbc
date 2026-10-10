@@ -226,6 +226,10 @@ type AdminConfig struct {
 // AdminUser is the only admin user name.
 const AdminUser = "admin"
 
+// MinBcryptCost is the lowest bcrypt cost admin.password_hash may carry, and
+// the cost `freesbc hash-password` generates.
+const MinBcryptCost = 10
+
 // DefaultRTP is the RTP range used when rtp is unset.
 var DefaultRTP = PortRange{Min: 20000, Max: 29999}
 
