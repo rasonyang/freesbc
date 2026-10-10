@@ -15,6 +15,7 @@ NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
 		rx0 = num($col["rtp_pkts_rx"]); tx0 = num($col["rtp_pkts_tx"])
 		rxb0 = num($col["rtp_bytes_rx"]); txb0 = num($col["rtp_bytes_tx"])
 		rej0 = num($col["invite_rejects"]); adm0 = num($col["admission_drops"]); shd0 = num($col["shield_drops"])
+		rbe0 = num($col["udp_rcvbuf_errors"])
 		af0 = num($col["port_alloc_fail"])
 	} else if (cpu >= 0 && pcpu >= 0 && t > pt) {
 		c = (cpu - pcpu) / (t - pt) * 100
@@ -34,6 +35,7 @@ NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
 	rxl = num($col["rtp_pkts_rx"]); txl = num($col["rtp_pkts_tx"])
 	rxbl = num($col["rtp_bytes_rx"]); txbl = num($col["rtp_bytes_tx"])
 	rejl = num($col["invite_rejects"]); adml = num($col["admission_drops"]); shdl = num($col["shield_drops"])
+	rbel = num($col["udp_rcvbuf_errors"])
 	afl = num($col["port_alloc_fail"])
 }
 END {
@@ -59,4 +61,5 @@ END {
 	if (rejl >= 0) printf "invite_rejects=%d\n", rejl - rej0
 	if (adml >= 0) printf "admission_drops=%d\n", adml - adm0
 	if (shdl >= 0) printf "shield_drops=%d\n", shdl - shd0
+	if (rbel >= 0) printf "udp_rcvbuf_errors=%d   (datagrams the kernel dropped on FreeSBC's UDP sockets: receive buffer full)\n", rbel - rbe0
 }

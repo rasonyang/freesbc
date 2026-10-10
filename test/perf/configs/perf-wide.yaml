@@ -91,4 +91,5 @@ shield:
 # a load rig: do not reuse this file in production.
 admin:
   listen: 127.0.0.1:8081
+  pprof: true                # /debug/pprof/ behind the same Basic Auth, for profiling under load
   password_hash: "$2y$10$sbCGIYv.0V/JCrqC.ZBQEuzSWlVidnXE898iuyV8L1lbOTHzqabju"

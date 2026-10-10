@@ -25,4 +25,7 @@ if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
 	echo "perf_proc_cpu_seconds_total $(awk -v t="$ticks" -v h="$hz" 'BEGIN{printf "%.2f", t/h}')"
 	echo "perf_proc_rss_bytes $((rss_kb * 1024))"
 	echo "perf_proc_open_fds $fds"
+	# Datagrams the kernel dropped because a UDP receive buffer was full, in the
+	# network namespace of the process (RcvbufErrors of /proc/<pid>/net/snmp).
+	awk '/^Udp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "RcvbufErrors") c = i; h = 1 } else print "perf_proc_udp_rcvbuf_errors " $c }' "/proc/$pid/net/snmp"
 fi

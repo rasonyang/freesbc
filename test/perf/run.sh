@@ -180,7 +180,7 @@ trap 'echo; note "interrupted"; exit 130' INT TERM
 
 # ---------------------------------------------------------------- sampler
 METRICS="$RUN_DIR/metrics.csv"
-echo "ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops" > "$METRICS"
+echo "ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors" > "$METRICS"
 sample_once() {
 	local ts out
 	ts=$(date +%s)
@@ -300,15 +300,19 @@ elif [[ -n $STEP ]]; then
 	[[ $SCEN == call ]] && preregister
 	BEST=0 FIRST_BAD=""
 	STEPS="$RUN_DIR/steps.csv"
-	echo "rate,created,failed_pct,verdict" > "$STEPS"
+	echo "rate,created,failed_pct,verdict,cpu_avg_pct,cpu_peak_pct,rss_peak_mb,goroutines_peak,ports_peak,rtp_rx_pps,rtp_tx_pps,udp_rcvbuf_errors" > "$STEPS"
 	r=$S_FROM
 	while (( r <= S_TO )); do
 		total=$((r * S_SECS))
 		note "step: $r calls/s for ${S_SECS}s ($total calls, hold ${HOLD}s)"
+		st0=$(date +%s)
 		one_load "r$r" "$r" "$total"
+		st1=$(date +%s)
+		# resources over the step, skipping its first 5 s (ramp-up)
+		res=$(awk -F, -v w0=$((st0 + 5)) -v w1="$st1" -f "$HERE/window_metrics.awk" "$METRICS" | tr ' ' ',')
 		created=$(sipp_created "r$r"); fp=$(sipp_fail_pct "r$r")
 		if [[ $fp == "?" ]]; then verdict=nostats; elif awk -v f="$fp" -v m="$STEP_FAIL_PCT" 'BEGIN { exit !(f > m) }'; then verdict=FAIL; else verdict=pass; fi
-		echo "$r,${created:-0},${fp:-?},$verdict" | tee -a "$STEPS"
+		echo "$r,${created:-0},${fp:-?},$verdict,$res" | tee -a "$STEPS"
 		if [[ $verdict == pass ]]; then BEST=$r; else FIRST_BAD=$r; break; fi
 		sleep 3
 		r=$((r + S_INC))
@@ -360,4 +364,6 @@ if [[ $SCEN == webrtc ]]; then
 fi
 echo "--- FreeSBC (sampled every ${INTERVAL}s, $METRICS) ---"
 awk -F, -f "$HERE/summarize_metrics.awk" "$METRICS"
+echo "--- plateau ---"
+awk -F, -f "$HERE/plateau_metrics.awk" "$METRICS"
 echo "(RTP quality: SIPp does not measure received loss/jitter. Use the webrtc scenario, or FreeSBC's rtp rx vs tx above; see README.)"

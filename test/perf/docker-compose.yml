@@ -9,9 +9,18 @@
 #   docker compose -f test/perf/docker-compose.yml up -d --build
 #   docker compose -f test/perf/docker-compose.yml down
 #
-# Everything here shares the Docker VM's CPUs (Colima/Docker Desktop), so
-# absolute numbers from this rig are for method checks, not for publishing;
-# publish from three real hosts (README, "Three real hosts").
+# Everything here shares the Docker VM's CPUs (Colima/Docker Desktop). To keep
+# FreeSBC, not the generator, the bottleneck, each role is pinned to its own
+# CPU set (cpuset, VM CPU numbers):
+#   SBC_CPUS      FreeSBC                       default 0-1   (2 cores)
+#   LOADGEN_CPUS  loadgen and carriergen        default 2-4
+#   SWITCH_CPUS   switch and carrier (SIPp UAS) default 5-7
+#   SBC_MEM       FreeSBC memory limit          default 8g
+# The defaults assume an 8-CPU VM; set the variables for a different VM size
+# (`colima list` shows it). Pinning gives honest per-core figures, but this is
+# still one host: the roles share the same physical CPU, caches and memory
+# bandwidth. For numbers to quote as a deployment's, use three real hosts
+# (README, "Three real hosts").
 
 name: freesbc-perf
 
@@ -38,6 +47,8 @@ services:
     command: ["run", "-c", "/perf/configs/${FREESBC_CONFIG:-perf.yaml}"]
     volumes:
       - ./:/perf:ro
+    cpuset: ${SBC_CPUS:-0-1}
+    mem_limit: ${SBC_MEM:-8g}   # an OOM here kills FreeSBC, not the rest of the Docker VM
     ulimits:
       nofile: 1048576      # 4 sockets per call + stream connections
     networks:
@@ -52,6 +63,7 @@ services:
     build:
       context: ../..
       dockerfile: test/perf/docker/Dockerfile.tools
+    cpuset: ${LOADGEN_CPUS:-2-4}
     networks:
       public:
         ipv4_address: 172.28.1.20
@@ -59,6 +71,7 @@ services:
   # Public side, listed in edge.carrier_sources: carrier-inbound scenario.
   carriergen:
     <<: *tools
+    cpuset: ${LOADGEN_CPUS:-2-4}
     networks:
       public:
         ipv4_address: 172.28.1.25
@@ -67,6 +80,7 @@ services:
   # (edge.carriers.perfcarrier = 172.28.1.30:5060).
   carrier:
     <<: *tools
+    cpuset: ${SWITCH_CPUS:-5-7}
     networks:
       public:
         ipv4_address: 172.28.1.30
@@ -75,6 +89,7 @@ services:
   # carrier-outbound runs uses :5070 from the same IP).
   switch:
     <<: *tools
+    cpuset: ${SWITCH_CPUS:-5-7}
     networks:
       private:
         ipv4_address: 172.28.2.20

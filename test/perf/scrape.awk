@@ -13,7 +13,7 @@ function val(a) { return (a in v) ? v[a] : "" }
 	v[name] += $NF
 }
 END {
-	printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
+	printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", \
 		ts, \
 		pick("process_cpu_seconds_total", "perf_proc_cpu_seconds_total"), \
 		pick("process_resident_memory_bytes", "perf_proc_rss_bytes"), \
@@ -32,5 +32,6 @@ END {
 		val("freesbc_media_port_allocation_failure_total"), \
 		val("freesbc_edge_invite_rejects_total"), \
 		val("freesbc_edge_admission_drops_total"), \
-		val("freesbc_shield_drops_total")
+		val("freesbc_shield_drops_total"), \
+		val("perf_proc_udp_rcvbuf_errors")
 }

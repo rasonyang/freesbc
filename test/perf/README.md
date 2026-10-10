@@ -60,9 +60,16 @@ pcap and the UAS echoes it, but SIPp does not analyse what returns. Use:
   PCAP play and RTP echo) and `webrtcload`.
 * On the host that runs `run.sh`: `bash`, `awk`, `sed`, and `python3` only when
   a scenario holds calls longer than 8 s (it generates a longer pcap).
-* The rig shares the Docker VM's CPUs between generator, FreeSBC and switch.
-  Use it to validate the method and look for bugs; publish numbers from three
-  separate hosts.
+* The rig shares the Docker VM's CPUs between generator, FreeSBC and switch,
+  so it pins each role to its own CPU set (`cpuset` in `docker-compose.yml`):
+  FreeSBC `SBC_CPUS` (default `0-1`, two cores), generators `LOADGEN_CPUS`
+  (`2-4`), switches/carrier `SWITCH_CPUS` (`5-7`), and a memory limit
+  `SBC_MEM` (default `8g`, so an OOM kills FreeSBC and not the VM). The defaults
+  assume an 8-CPU VM; set the variables for another size, before `run.sh up`.
+  Per-core figures are then honest for FreeSBC, but all roles still share one
+  physical CPU, its caches and the VM's virtual network: the published
+  numbers are a preliminary single-host run (`docs/performance.md`); the
+  three-host run is still to be done.
 
 ## Quick start (compose rig)
 
@@ -103,7 +110,9 @@ test/perf/run.sh    -s 20:400:20:30 -H 30 carrier-in   # with media
 `-s FROM:TO:INC[:SECS]` runs each rate for SECS seconds (20 by default), stops at
 the first step whose failed-call percentage exceeds `STEP_FAIL_PCT` (0.1) and
 prints a table plus `max sustained rate under 0.1% failures`. `steps.csv` has the
-table. Each step is its own SIPp process (own stats file); the metrics CSV spans
+table: per step the failure rate plus FreeSBC's CPU (average and peak, one core =
+100), peak RSS, goroutines, ports, RTP pps and `udp_rcvbuf_errors` over the step
+(its first 5 s skipped). Each step is its own SIPp process (own stats file); the metrics CSV spans
 the whole ramp.
 
 **Soak** (issue: 8-24 h at about 70% of the maximum): pick 70% of the step-mode
@@ -127,10 +136,15 @@ Each run creates `out/<timestamp>-<scenario>/`:
 | File | Content |
 |---|---|
 | `summary.txt` | The printed summary. |
-| `metrics.csv` | `ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops`; counters are cumulative. CPU% is the delta of `cpu_s` over the delta of `ts` (100 = one core). |
+| `metrics.csv` | `ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors`; counters are cumulative. `udp_rcvbuf_errors` is the kernel's `RcvbufErrors` for the FreeSBC process's network namespace (datagrams dropped because a UDP receive buffer was full; in hosts mode it is host-wide). CPU% is the delta of `cpu_s` over the delta of `ts` (100 = one core). |
 | `sipp-*.csv`, `sipp-*.log` | SIPp's raw stats (`prereg`, `main`, `main.rdN` for register rounds, `rNNN` for step mode) and screen output. |
 | `webrtc.csv`, `webrtc.log` | Per-call rows and the report of `webrtcload`. |
 | `users.csv`, `g711u.pcap` | Inputs generated for the run. |
+
+The summary ends with a `plateau` block: the samples where active calls are at
+least 90% of their peak, with CPU average/peak, maxima of RSS, goroutines, fds
+and ports, and the RTP pps and `tx/rx` ratio over that window. This is the line
+to quote for a concurrent-calls run.
 
 Summary lines worth knowing:
 
@@ -166,6 +180,20 @@ here so you can recognise the symptom:
 | Stream connections | 256 per source IP, 10000 total | WS/WSS connects refused | `webrtcload -conns` (default 20) multiplexes many users over few connections; beyond 256 concurrent connections add source IPs |
 | File descriptors | OS limit | `too many open files` | compose sets `nofile` 1048576; on a real host raise `LimitNOFILE` (4 UDP sockets per call plus connections) |
 | Silence watchdog | 5 min of no RTP ends a confirmed call | long holds without RTP die | pcap covers the hold |
+
+## Profiling under load
+
+The perf configs set `admin.pprof: true`. While a scenario runs (start it in
+another shell), take a CPU profile from inside the FreeSBC container and read
+it on the host with the binary that produced it:
+
+```sh
+C=freesbc-perf-freesbc-1
+docker exec $C curl -s -u admin:perf -o /tmp/cpu.pb.gz 'localhost:8081/debug/pprof/profile?seconds=30'
+docker cp $C:/tmp/cpu.pb.gz . && docker cp $C:/usr/local/bin/freesbc ./freesbc-linux
+go tool pprof -top -nodecount=30 freesbc-linux cpu.pb.gz
+docker exec $C curl -s -u admin:perf 'localhost:8081/debug/pprof/goroutine?debug=1' | head -40
+```
 
 ## WebRTC load client
 
