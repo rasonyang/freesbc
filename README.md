@@ -14,7 +14,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 **Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml` (linux archives add `freesbc.service`, see [Run as a service](#run-as-a-service)):
 
 ```sh
-v=v0.1.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
+v=v0.2.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_${os}_${arch}.tar.gz
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
@@ -102,7 +102,7 @@ On SIGINT/SIGTERM FreeSBC drops its calls with their media released; no BYE is s
 
 - **Clients.** REGISTER is proxied to the switch verbatim (the switch is the registrar; FreeSBC holds no credential) with the Contact rewritten to carry an `fsbc=` token. Calls to clients and from clients are proxied with FreeSBC on the path.
 - **Carriers.** The switch owns carrier accounts, line selection and failover, and points each gateway at FreeSBC as outbound proxy. Requests to a host listed in `edge.carriers` are proxied to that carrier with the switch's private addresses hidden; inbound carrier requests are delivered to the switch's carrier port with an `X-FreeSBC-Carrier` header.
-- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. A public party never gets the switch's address, and the switch never gets the public party's address in SDP, Contact or Request-URI.
+- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. No SDP, Contact or Request-URI carries the switch's address to a public party, or the public party's address to the switch. Carrier legs also hide the switch in Via, Record-Route and identity headers; client legs do not yet (see [Known limitations](docs/edge.md#known-limitations)).
 - **Shield.** Per-IP rate limiting (separate limits for carrier sources) and scanner fingerprinting with an in-memory ban; every denial is a silent drop. FreeSBC touches no kernel firewall state. The private socket is trusted and exempt, so keep it unreachable from anywhere else.
 
 Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
