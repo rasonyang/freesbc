@@ -7,6 +7,7 @@
   var STATUS_URL = "/api/status";
   var CALLS_URL = "/api/calls";
   var DRAIN_URL = "/api/drain";
+  var TLS_URL = "/api/tls";
   var AUDIT_URL = "/api/audit";
   var CONFIG_RAW_URL = "/api/config/raw";
   var CONFIG_VALIDATE_URL = "/api/config/validate";
@@ -209,6 +210,63 @@
     });
   }
 
+  // ---- TLS certificate ----
+
+  // renderTLS shows the card only when a certificate is loaded. The banner
+  // follows the server's expired / expiring_soon verdict (30 days).
+  function renderTLS(t) {
+    var card = $("tls-card");
+    if (!t || !t.loaded) { card.hidden = true; return; }
+    card.hidden = false;
+    var badge = $("tls-badge");
+    var banner = $("tls-banner");
+    if (t.expired) {
+      badge.textContent = "Expired";
+      badge.setAttribute("data-variant", "destructive");
+      banner.setAttribute("data-variant", "destructive");
+      $("tls-banner-title").textContent = "Certificate expired " + fmtInt(-t.days_to_expiry) + " day(s) ago";
+    } else if (t.expiring_soon) {
+      badge.textContent = "Expires in " + fmtInt(t.days_to_expiry) + "d";
+      badge.setAttribute("data-variant", "warning");
+      banner.setAttribute("data-variant", "warning");
+      $("tls-banner-title").textContent = "Certificate expires in " + fmtInt(t.days_to_expiry) + " day(s)";
+    } else {
+      badge.textContent = "Valid · " + fmtInt(t.days_to_expiry) + "d left";
+      badge.setAttribute("data-variant", "success");
+    }
+    banner.hidden = !(t.expired || t.expiring_soon);
+    $("tls-banner-text").textContent = t.expired || t.expiring_soon
+      ? "Replace the files at " + t.cert_file + " and restart; the running process keeps serving the old certificate."
+      : "";
+
+    var key = t.key_type + (t.key_curve ? " " + t.key_curve : t.key_size ? " " + t.key_size : "");
+    var rows = [
+      ["Subject", t.subject],
+      ["SANs", (t.sans || []).join(", ")],
+      ["Issuer", t.issuer],
+      ["Not before", t.not_before],
+      ["Not after", t.not_after],
+      ["Key", key],
+      ["SHA-256", t.fingerprint_sha256],
+      ["Certificate", t.cert_file],
+      ["Private key", t.key_file],
+      ["Loaded", t.loaded_at],
+      ["Used by", (t.listeners || []).join(", ")]
+    ];
+    if (t.disk_error) rows.push(["Disk", "cannot read: " + t.disk_error]);
+    else if (t.disk_differs) rows.push(["Disk", "differs from loaded: renewed on disk, restart to apply"]);
+    var ul = $("tls-fields");
+    ul.textContent = "";
+    rows.forEach(function (r) {
+      var li = el("li");
+      li.appendChild(el("span", "muted", r[0]));
+      var v = el("span", "mono", r[1] ? r[1] : "—");
+      v.title = r[1] || "";
+      li.appendChild(v);
+      ul.appendChild(li);
+    });
+  }
+
   // ---- drain mode ----
 
   var drainState = null; // last GET /api/drain body; null until the first one
@@ -303,19 +361,22 @@
     return Promise.allSettled([
       fetchJSON(STATUS_URL),
       fetchJSON(CALLS_URL),
-      fetchJSON(DRAIN_URL)
+      fetchJSON(DRAIN_URL),
+      fetchJSON(TLS_URL)
     ]).then(function (results) {
-      var st = results[0], ca = results[1], dr = results[2];
+      var st = results[0], ca = results[1], dr = results[2], tl = results[3];
       if (st.status === "fulfilled") renderStatus(st.value);
       if (ca.status === "fulfilled") renderCalls(ca.value);
       if (dr.status === "fulfilled") renderDrain(dr.value);
+      if (tl.status === "fulfilled") renderTLS(tl.value);
       $("status-stale").hidden = st.status === "fulfilled";
       $("calls-stale").hidden = ca.status === "fulfilled";
       $("drain-stale").hidden = dr.status === "fulfilled";
-      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected");
+      $("tls-stale").hidden = tl.status === "fulfilled";
+      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected") + (tl.status === "rejected");
       if (sessionExpired) return; // showSessionExpired already set the indicator
       if (failed === 0) setLive("live", "Live · " + fmtClock(new Date()));
-      else if (failed < 3) setLive("stale", "Partial update, retrying…");
+      else if (failed < 4) setLive("stale", "Partial update, retrying…");
       else setLive("stale", "Connection lost, retrying…");
     });
   }

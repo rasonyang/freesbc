@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -66,6 +67,10 @@ type Deps struct {
 	// the state changed. Nil on either makes /api/drain answer 404.
 	DrainState  func() (draining bool, since time.Time)
 	SetDraining func(on bool) (changed bool)
+	// TLSCert reports the leaf of the top-level tls pair the edge's tls and
+	// wss listeners loaded, when, and which transports use it; a nil leaf
+	// means none did. Nil reports none. The pair is restart-only.
+	TLSCert func() (leaf *x509.Certificate, loadedAt time.Time, listeners []string)
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
@@ -157,6 +162,11 @@ type Server struct {
 	audit    auditLog         // bounded ring of auth events (audit.go)
 	now      func() time.Time // test seam for the limiter clock; nil is time.Now
 
+	// tlsLeaf is the leaf this server loaded for remote HTTPS, set by Run.
+	tlsMu     sync.Mutex
+	tlsLeaf   *x509.Certificate
+	tlsLoaded time.Time
+
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
 }
@@ -179,6 +189,7 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/status", s.requireAuth(s.handleStatus))
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
 	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
+	mux.HandleFunc("/api/tls", s.requireAuth(s.handleTLS))
 	mux.HandleFunc("/api/audit", s.requireAuth(s.handleAudit))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
@@ -208,6 +219,15 @@ func (s *Server) Run(ctx context.Context) error {
 			errc <- fmt.Errorf("admin tls cert/key: %w", err)
 			return
 		}
+		if cert.Leaf == nil {
+			if cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+				errc <- fmt.Errorf("admin tls cert/key: %w", err)
+				return
+			}
+		}
+		s.tlsMu.Lock()
+		s.tlsLeaf, s.tlsLoaded = cert.Leaf, time.Now()
+		s.tlsMu.Unlock()
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 		errc <- srv.ListenAndServeTLS("", "")
 	}()

@@ -165,6 +165,24 @@
           <ul class="list" data-layout="grid" id="listeners"><li class="muted">—</li></ul>
         </div>
       </div>
+
+      <div class="card" id="tls-card" hidden>
+        <div class="card-header">
+          <div class="card-heading">
+            <h2 class="card-title">TLS certificate</h2>
+            <p class="card-description">The top-level <span class="mono">tls</span> leaf this process loaded at startup (WSS, SIP TLS, remote admin). Renewing the files needs a restart.</p>
+          </div>
+          <div class="card-action"><span class="badge" data-variant="warning" id="tls-stale" hidden>Stale</span><span class="badge" data-variant="secondary" id="tls-badge">—</span></div>
+        </div>
+        <div class="card-content page">
+          <div class="alert" data-variant="warning" id="tls-banner" role="alert" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+            <div class="alert-title" id="tls-banner-title"></div>
+            <div class="alert-body" id="tls-banner-text"></div>
+          </div>
+          <ul class="list" data-layout="grid" id="tls-fields"></ul>
+        </div>
+      </div>
   </section>
 
   <section id="view-config" class="page" aria-labelledby="h-config" hidden>

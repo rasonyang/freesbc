@@ -528,6 +528,14 @@ main.container { padding-block: calc(var(--spacing) * 8); }
 }
 .alert[data-variant="destructive"] .alert-body { color: color-mix(in oklch, var(--destructive) 85%, var(--foreground)); }
 
+.alert[data-variant="warning"] {
+  --tone: var(--warning);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+  border-color: color-mix(in oklch, var(--warning) 40%, transparent);
+  background: color-mix(in oklch, var(--warning) 6%, var(--card));
+}
+.alert[data-variant="warning"] .alert-body { color: color-mix(in oklch, var(--warning) 85%, var(--foreground)); }
+
 .banner {
   border-bottom-width: 1px;
   border-color: color-mix(in oklch, var(--destructive) 40%, transparent);

@@ -125,6 +125,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config) adm
 		DrainState:  edgeSrv.DrainState,
 		SetDraining: edgeSrv.SetDraining,
 		Listeners:   edgeSrv.Listeners,
+		TLSCert:     edgeSrv.TLSCert,
 		Shield: func() admin.ShieldStats {
 			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
 		},
