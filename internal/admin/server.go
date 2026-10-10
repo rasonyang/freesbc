@@ -66,6 +66,9 @@ type Deps struct {
 	// the state changed. Nil on either makes /api/drain answer 404.
 	DrainState  func() (draining bool, since time.Time)
 	SetDraining func(on bool) (changed bool)
+	// Reload reports the config watcher's last outcome: the pending
+	// restart-only keys and the last failed reload. Nil reports none.
+	Reload func() config.ReloadStatus
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
