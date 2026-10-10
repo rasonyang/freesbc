@@ -36,6 +36,7 @@ go build -o freesbc ./cmd/freesbc
 ./freesbc init  -c freesbc.yaml        # asks for the switch, detects the addresses
 ./freesbc check -c freesbc.yaml        # validate; errors name the line and key
 ./freesbc run   -c freesbc.yaml
+./freesbc version                      # print the build version
 ```
 
 `freesbc init` writes a minimal config (mode 0600) and refuses to overwrite an existing file. On a terminal it prompts for each value, showing a detected default that Enter accepts: `edge.switch` first (no default), then `private.ip` (the local address that routes to the switch), `public.bind` (the local address toward the default route), `public.ip` and the UDP port, and finally an optional admin password (no echo, stored as a bcrypt hash). It asks before contacting `https://api.ipify.org` for `public.ip` (falling back to cloud instance metadata); `public.bind` is omitted when it equals `public.ip`. It fails if `private.ip` equals `public.bind`: the topology needs a second IP or NIC. When stdin is not a terminal it never prompts; give flags or environment variables (flag, then env, then detected default):

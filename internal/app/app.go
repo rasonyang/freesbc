@@ -98,7 +98,7 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 
-	log.Info("freesbc started", "config", opts.ConfigPath)
+	log.Info("freesbc started", "config", opts.ConfigPath, "version", opts.Version)
 
 	<-gctx.Done()
 	log.Info("shutting down")

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 
@@ -27,10 +28,17 @@ Usage:
         [--switch IP[:port]] [--private-ip IP] [--public-ip IP] [--public-bind IP]
         [--udp-port N] [--no-public-lookup]   (env: FREESBC_SWITCH, FREESBC_PRIVATE_IP,
         FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT)
+  freesbc version                   print the version and exit
 `
 
 // version is the build version, overridable via `-ldflags "-X main.version=…"`.
 var version = "dev"
+
+// versionLine is the one line `freesbc version` prints: the build version,
+// the Go toolchain that built it and the target platform.
+func versionLine() string {
+	return fmt.Sprintf("freesbc %s %s %s/%s", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -46,6 +54,16 @@ func run(args []string) int {
 	cmd := args[0]
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
 		fmt.Print(usage)
+		return 0
+	}
+	// version takes neither flags nor arguments, so it is handled before
+	// flag parsing: `freesbc version -c x` is a usage error, not a config path.
+	if cmd == "version" {
+		if len(args) > 1 {
+			fmt.Fprintf(os.Stderr, "freesbc version: unexpected argument %q (version takes no arguments)\n\n%s", args[1], usage)
+			return 2
+		}
+		fmt.Println(versionLine())
 		return 0
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
