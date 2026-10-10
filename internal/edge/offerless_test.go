@@ -282,11 +282,22 @@ func TestOfferlessReliable183OfferPrackAnswer(t *testing.T) {
 		}
 	})
 	h := o.h
-	plain := o.call.provisional(t, 183)
+	var plain, rel *sip.Response
+	for plain == nil || rel == nil {
+		r := o.call.provisional(t, 183)
+		if headerValue(r, "RSeq") != "" || headerTokens(r, "Require")["100REL"] {
+			if rel == nil {
+				rel = r
+			}
+		} else {
+			if plain == nil {
+				plain = r
+			}
+		}
+	}
 	if len(plain.Body()) != 0 {
 		t.Errorf("an unreliable 183 of an offerless call reached the phone with a body: %q", plain.Body())
 	}
-	rel := o.call.provisional(t, 183)
 	sess := earlySession(t, h, o.invite)
 	offer := mustSDP(t, "reliable 183", rel.Body())
 	if offer.Audio.Port != sess.publicPort {
