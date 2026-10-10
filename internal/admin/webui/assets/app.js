@@ -145,6 +145,20 @@
     $("stat-active-calls").textContent = fmtInt(data.active_calls);
     renderPorts(data.ports || {});
     renderListeners(data.listeners || []);
+    renderReload(data.reload || {});
+  }
+
+  // renderReload shows the two page-wide config banners: restart-only keys
+  // changed on disk that the running process does not use yet, and a last
+  // reload that failed (the previous config is still active). Both texts
+  // come from the API, so they are set through textContent.
+  function renderReload(rl) {
+    var keys = rl.restart_required || [];
+    $("restart-banner").hidden = keys.length === 0;
+    $("restart-banner-text").textContent = keys.length ? "Restart required: " + keys.join(", ") : "";
+    var failed = !!rl.last_error;
+    $("reload-banner").hidden = !failed;
+    $("reload-banner-text").textContent = failed ? "Reload failed, previous config still active: " + rl.last_error : "";
   }
 
   function renderPorts(ports) {

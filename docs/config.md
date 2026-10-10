@@ -1,6 +1,6 @@
 # FreeSBC configuration reference
 
-One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
+One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). `freesbc init -c <file>` writes a minimal valid file (`public`, `private`, `edge.switch`, `edge.listen.udp`, optionally `admin`) from detected addresses, flags or `FREESBC_*` environment variables, and refuses to overwrite an existing file. The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
 
 Principles of the schema:
 
@@ -209,7 +209,7 @@ Web security (restart-only like the rest of `admin`):
 
 - Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
 
-`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
+`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `freesbc hash-password` (it prompts twice without echo; in a script, `printf '%s' "$PW" | freesbc hash-password` reads one line from stdin). It never takes the password as an argument.
 
 Read-only live state (all `GET`, Basic auth, in memory, also shown in the WebUI's State tab): `/api/registrations?user=&limit=&offset=` (client bindings: `aor`, `user`, `transport`, `source`, `expires_in`; `user` is a case-insensitive substring; `limit` default 100, at most 1000; bad or negative values are `400`; the reply wraps `items` with `total`, `limit`, `offset`), `/api/carrier-registrations` (`carrier`, `user`, `token`, `node`, `expires_in`), `/api/shield/bans?limit=&offset=` (`source`, `kind` `ip` or `udp_socket`, `reason`, `since`, `remaining`, with `total` and `ban_adds_rejected`), `/api/switch-nodes` (`address`, `state` `healthy` or `cooling_down`, `cooldown_remaining`, `last_failure`) and `/api/carriers` (`name`, `host`, `transport`, `mode`, `addresses` with `in_use`, `resolved_at`, `expires_at`, `cache_age_seconds`, `failing`, `last_error`). The lists are arrays, never `null`; see `docs/design.md` §13.3 for each shape.
 
@@ -243,6 +243,8 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 | `admin` (every key, including `allowed_hosts`, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
+
+The watcher keeps its last outcome in memory (lost on restart) and the admin surface shows it, so the running process and the file on disk can be compared without reading logs. `GET /api/status` has a `reload` object: `last_ok` (RFC 3339 UTC time of the last published reload, null before the first), `restart_required` (the restart-only keys the file changes compared with the startup values, `[]` for none; edit a key back and it leaves the list), and `last_error` with `last_error_at` (the last reload that failed to load or validate, null otherwise; the previous config stays active and `restart_required` is unchanged, and the next successful reload clears both). The web UI shows "Restart required: <keys>" and "Reload failed, previous config still active: <error>" banners on every tab, and `/metrics` exports `freesbc_config_restart_required` (count of pending keys) and `freesbc_config_reload_failed` (0 or 1).
 
 ## Constants
 

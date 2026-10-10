@@ -128,7 +128,7 @@ shadcn's `cva` variant names and keeps one base class per component.
 | Table | `.table-wrap > table.table` | Horizontal scroll inside the card, never a squeezed column. `th scope="col"`. |
 | List | `ul.list` (`data-layout="grid"` for short lists) | Key/value or label/address rows. |
 | Alert | `.alert[data-variant] > svg.icon + .alert-title + .alert-body` | Inline, in place. `role="alert"` only for errors. |
-| Banner | `.banner` | Page-wide and persistent (session expired). At most one. |
+| Banner | `.banner` | Page-wide and persistent: session expired, restart required (restart-only keys changed on disk) and reload failed. Each is its own banner and hidden when it does not apply; the last two follow `reload` in `/api/status`. |
 | Empty state | `.empty` | Says what is missing and what will fill it. Never an empty table. |
 | Live status | `.status[data-state] > .dot + text` | `live`, `stale`, `expired`; `role="status"`. |
 
