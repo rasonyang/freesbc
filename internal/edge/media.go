@@ -455,6 +455,9 @@ func (s *Server) startOfferedWebRTC(sess *media.WebRTCSession, answer *sdp.Sessi
 func (s *Server) forkAnswer(l *inviteLeg, res *sip.Response) ([]byte, error) {
 	d := l.dialog()
 	f := d.fork(fsip.ToTag(res))
+	if l.offerless != nil && res.StatusCode/100 != 2 && !requiresTag(res, "100rel") {
+		return nil, nil
+	}
 	if prev := d.forkAnswer(f); prev != nil {
 		// A restated answer (the 200 echoing a body-bearing 183, say): the
 		// body this fork already has — re-negotiating would re-latch media
