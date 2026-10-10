@@ -20,6 +20,8 @@ const usage = `FreeSBC — SIP/WebRTC edge session border controller
 Usage:
   freesbc run   [-c freesbc.yaml]   start the SBC
   freesbc check [-c freesbc.yaml]   validate a config file and exit
+  freesbc hash-password             print a bcrypt hash for admin.password_hash
+                                    (prompts on a terminal, else reads one line of stdin)
 `
 
 // version is the build version, overridable via `-ldflags "-X main.version=…"`.
@@ -40,6 +42,11 @@ func run(args []string) int {
 	if cmd == "-h" || cmd == "--help" || cmd == "help" {
 		fmt.Print(usage)
 		return 0
+	}
+	// hash-password takes no -c, and never a password argument: it would land
+	// in shell history and the process list.
+	if cmd == "hash-password" {
+		return hashPasswordCmd(args[1:])
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "freesbc.yaml", "path to config file")

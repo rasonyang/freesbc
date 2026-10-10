@@ -209,7 +209,7 @@ Web security (restart-only like the rest of `admin`):
 
 - Auth model: HTTP Basic Auth stays. There is no logout and no idle timeout. The session ends when the browser forgets the credentials, and the server remembers credentials it has verified for 1 hour after their last use (`verifiedCredsTTL`). `/metrics` is scraped with Basic Auth as before.
 
-`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `htpasswd -bnBC 10 "" 'pw' | tr -d ':\n'`.
+`admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `freesbc hash-password` (it prompts twice without echo; in a script, `printf '%s' "$PW" | freesbc hash-password` reads one line from stdin). It never takes the password as an argument.
 
 `GET /api/drain` reports `{"draining", "since", "active_calls"}`; `POST` enters and `DELETE` leaves drain mode (idempotent, runtime state only, not a config key). While draining, new INVITEs get `503` with `Retry-After: 30` and are counted in `freesbc_edge_invite_rejects_total{reason="draining"}`; see `docs/edge.md`.
 
