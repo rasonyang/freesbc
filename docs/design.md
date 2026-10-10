@@ -181,8 +181,10 @@ Created once, alive for the process lifetime:
 1. `config.Watch`: always; never fatal (`app.Run`'s wrapper logs whatever
    `Watch` returns and returns nil itself, `app.go:70-76`).
 2. `edge.Server.Run`: always; its error is fatal (`app.go:81-87`).
-3. `admin.Server.Run`: if `admin:` exists at startup; fatal. Its HTTP serve
-   goroutine is the only one it starts (`admin/server.go:263`).
+3. `admin.Server.Run`: if `admin:` exists at startup; fatal. It starts two
+   goroutines: the health tracker's ticker (every 5 s, `healthInterval`,
+   `admin/server.go:257-260`), which `Run` cancels and waits for before it
+   returns, and the HTTP serve goroutine (`admin/server.go:263`).
 
 `cmd/freesbc`'s `withSignals` adds one more, which releases signal capture
 after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
