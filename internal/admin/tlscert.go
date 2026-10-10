@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -50,7 +49,8 @@ type tlsBody struct {
 	LoadedAt    string   `json:"loaded_at,omitempty"`
 	Listeners   []string `json:"listeners,omitempty"`
 
-	// DaysToExpiry is whole days left, rounded down; negative once expired.
+	// DaysToExpiry is whole days left, truncated toward zero; negative once expired,
+	// 0 within a day either side of not-after (Expired tells which).
 	DaysToExpiry int  `json:"days_to_expiry"`
 	Expired      bool `json:"expired"`
 	// ExpiringSoon is true within 30 days of not-after, expired excluded.
@@ -91,7 +91,7 @@ func keyInfo(c *x509.Certificate) (typ string, bits int, curve string) {
 // expiry computes days to expiry, expired and expiring-soon at now.
 func expiry(c *x509.Certificate, now time.Time) (days int, expired, soon bool) {
 	left := c.NotAfter.Sub(now)
-	days = int(math.Floor(left.Hours() / 24))
+	days = int(left.Hours() / 24) // truncates toward zero
 	expired = left <= 0
 	return days, expired, !expired && left < tlsExpiryWarn
 }

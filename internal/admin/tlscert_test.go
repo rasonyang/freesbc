@@ -124,7 +124,10 @@ func TestAPITLSExpiry(t *testing.T) {
 		{"valid", 90*24*time.Hour + time.Hour, 90, false, false},
 		{"exactly30d", 30*24*time.Hour + time.Hour, 30, false, false},
 		{"expiring", 10*24*time.Hour + time.Hour, 10, false, true},
-		{"expired", -(2*24*time.Hour + time.Hour), -3, true, false},
+		{"almost10d", 10*24*time.Hour - time.Hour, 9, false, true},
+		{"expired", -(2*24*time.Hour + time.Hour), -2, true, false},
+		{"expired3d4m", -(3*24*time.Hour + 4*time.Minute), -3, true, false},
+		{"expiredHours", -5 * time.Hour, 0, true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

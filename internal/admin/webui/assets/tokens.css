@@ -76,6 +76,9 @@
 :root {
   --success: light-dark(oklch(0.527 0.154 150.069), oklch(0.792 0.209 151.711)); /* green-700 / green-400 */
   --warning: light-dark(oklch(0.555 0.163 48.998),  oklch(0.828 0.189 84.429));  /* amber-700 / amber-400 */
+  /* --warning at the amber hue (85) for tints: the light step's own hue (49)
+   * reads pink once mixed into a white card. */
+  --warning-amber: oklch(from var(--warning) l c 85);
   --info:    light-dark(oklch(0.546 0.245 262.881), oklch(0.707 0.165 254.624)); /* blue-600  / blue-400  */
 
   /* shadcn v4 dropped this pair and hard-codes text-white on destructive

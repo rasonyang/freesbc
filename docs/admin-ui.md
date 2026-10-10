@@ -174,7 +174,7 @@ The data on this console is SIP state, so these rules are the core of
   Confirm sends `POST` or `DELETE /api/drain`. Never `window.confirm`. A poll
   that finds the state changed under an open confirmation closes it.
   `/api/drain` renders independently like the other endpoints.
-- **The TLS certificate card** renders `/api/tls` with the other polled endpoints and is hidden while `loaded` is false. Its banner (an `.alert`, warning variant under 30 days, destructive once expired) follows the server's `expired` and `expiring_soon` fields; the 30-day rule lives in the server, not the script. Values are set with `textContent`, and a `disk_differs` or `disk_error` row says to restart.
+- **The TLS certificate card** renders `/api/tls` with the other polled endpoints and is hidden while `loaded` is false. Its banner (an `.alert`, warning variant under 30 days, destructive once expired) follows the server's `expired` and `expiring_soon` fields; the 30-day rule lives in the server, not the script. A valid certificate whose file on disk now differs (`disk_differs`) gets the warning banner "Renewed certificate on disk" and the badge "Restart to apply"; when it is also expired or expiring, the expiry title stays and the text says a renewed certificate is already on disk. Long values (SHA-256, the two paths, the Disk row) take a full-width row (`data-wide`) and wrap instead of truncating. Values are set with `textContent`, and a `disk_differs` or `disk_error` row says to restart.
 - **Polls never overlap.** The next poll is scheduled with `setTimeout` when
   the previous one has settled, and each request is abandoned after 4 s
   (below the 5 s interval). The session banner clears on the next successful

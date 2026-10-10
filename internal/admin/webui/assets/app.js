@@ -212,32 +212,51 @@
 
   // ---- TLS certificate ----
 
+  // Rows whose long values span the grid and wrap instead of truncating.
+  var WIDE_TLS_ROWS = ["SHA-256", "Certificate", "Private key", "Disk"];
+
   // renderTLS shows the card only when a certificate is loaded. The banner
-  // follows the server's expired / expiring_soon verdict (30 days).
+  // follows the server's expired / expiring_soon verdict (30 days), or a
+  // renewed certificate waiting on disk.
   function renderTLS(t) {
     var card = $("tls-card");
     if (!t || !t.loaded) { card.hidden = true; return; }
     card.hidden = false;
     var badge = $("tls-badge");
     var banner = $("tls-banner");
+    var pending = t.disk_differs && !t.disk_error;
+    var bad = t.expired || t.expiring_soon;
     if (t.expired) {
       badge.textContent = "Expired";
       badge.setAttribute("data-variant", "destructive");
       banner.setAttribute("data-variant", "destructive");
-      $("tls-banner-title").textContent = "Certificate expired " + fmtInt(-t.days_to_expiry) + " day(s) ago";
+      var ago = -t.days_to_expiry;
+      $("tls-banner-title").textContent = ago > 0
+        ? "Certificate expired " + fmtInt(ago) + " day(s) ago"
+        : "Certificate expired less than a day ago";
     } else if (t.expiring_soon) {
       badge.textContent = "Expires in " + fmtInt(t.days_to_expiry) + "d";
       badge.setAttribute("data-variant", "warning");
       banner.setAttribute("data-variant", "warning");
-      $("tls-banner-title").textContent = "Certificate expires in " + fmtInt(t.days_to_expiry) + " day(s)";
+      $("tls-banner-title").textContent = t.days_to_expiry > 0
+        ? "Certificate expires in " + fmtInt(t.days_to_expiry) + " day(s)"
+        : "Certificate expires in less than a day";
     } else {
-      badge.textContent = "Valid · " + fmtInt(t.days_to_expiry) + "d left";
-      badge.setAttribute("data-variant", "success");
+      badge.textContent = pending ? "Restart to apply" : "Valid · " + fmtInt(t.days_to_expiry) + "d left";
+      badge.setAttribute("data-variant", pending ? "warning" : "success");
+      banner.setAttribute("data-variant", "warning");
+      $("tls-banner-title").textContent = "Renewed certificate on disk";
     }
-    banner.hidden = !(t.expired || t.expiring_soon);
-    $("tls-banner-text").textContent = t.expired || t.expiring_soon
-      ? "Replace the files at " + t.cert_file + " and restart; the running process keeps serving the old certificate."
-      : "";
+    banner.hidden = !(bad || pending);
+    if (bad) {
+      $("tls-banner-text").textContent = pending
+        ? "A renewed certificate is already on disk at " + t.cert_file + "; a restart applies it. The running process keeps serving the old certificate until then."
+        : "Replace the files at " + t.cert_file + " and restart; the running process keeps serving the old certificate.";
+    } else {
+      $("tls-banner-text").textContent = pending
+        ? "A different certificate is now at " + t.cert_file + "; a restart applies it. The running process keeps serving the loaded certificate until then."
+        : "";
+    }
 
     var key = t.key_type + (t.key_curve ? " " + t.key_curve : t.key_size ? " " + t.key_size : "");
     var rows = [
@@ -259,6 +278,7 @@
     ul.textContent = "";
     rows.forEach(function (r) {
       var li = el("li");
+      if (WIDE_TLS_ROWS.indexOf(r[0]) >= 0) li.setAttribute("data-wide", "");
       li.appendChild(el("span", "muted", r[0]));
       var v = el("span", "mono", r[1] ? r[1] : "—");
       v.title = r[1] || "";
