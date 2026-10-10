@@ -319,6 +319,10 @@ main.container { padding-block: calc(var(--spacing) * 8); }
 .badge[data-variant="info"]        { --tone: var(--info); }
 .badge[data-variant="destructive"] { --tone: var(--destructive); }
 
+/* The header health badge is a link: no underline, a visible hover. */
+a.badge { text-decoration: none; }
+a.badge:hover { filter: brightness(0.95); }
+
 /* ---- status dot --------------------------------------------------------- */
 .status {
   display: inline-flex;

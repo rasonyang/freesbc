@@ -231,50 +231,68 @@ func (d *carrierDirectory) publish() {
 
 // refresh resolves every DNS-name carrier whose cache entry is missing or
 // expired, then publishes a new snapshot.
+//
+// mu is held only to read and to apply an outcome, never across a lookup, so
+// the operator views (snapshotInfo, and the health conditions built on it)
+// never wait on a slow resolver. refresh itself is called from one goroutine.
 func (d *carrierDirectory) refresh(ctx context.Context) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	changed := false
 	for _, c := range d.carriers {
 		if c.Literal() {
 			continue
 		}
+		d.mu.Lock()
 		now := d.now()
 		e := d.entries[c.Name]
-		if e != nil && now.Before(e.expiry) {
+		fresh := e != nil && now.Before(e.expiry)
+		d.mu.Unlock()
+		if fresh {
 			continue
 		}
 		addrs, mode, err := d.resolve(ctx, c)
-		if e == nil {
-			e = &carrierEntry{}
-			d.entries[c.Name] = e
+		if d.apply(c, now, addrs, mode, err) {
+			changed = true
 		}
-		if err != nil || len(addrs) == 0 {
-			if err == nil {
-				err = errors.New("no addresses")
-			}
-			// Keep the last good set; retry soon.
-			e.expiry = now.Add(carrierDNSNegTTL)
-			if !e.failing {
-				d.log.Warn("carrier DNS lookup failed; keeping the last good addresses",
-					"carrier", c.Name, "host", c.Host, "err", err, "have", len(e.addrs))
-			} else {
-				d.log.Debug("carrier DNS lookup still failing", "carrier", c.Name, "err", err)
-			}
-			e.failing = true
-			e.lastErr = err.Error()
-			continue
-		}
-		if e.failing || fmt.Sprint(e.addrs) != fmt.Sprint(addrs) {
-			d.log.Info("carrier resolved", "carrier", c.Name, "host", c.Host, "addrs", fmt.Sprint(addrs))
-		}
-		e.addrs, e.expiry, e.failing = addrs, now.Add(carrierDNSTTL), false
-		e.resolvedAt, e.mode, e.lastErr = now, mode, ""
-		changed = true
 	}
 	if changed {
+		d.mu.Lock()
 		d.publish()
+		d.mu.Unlock()
 	}
+}
+
+// apply records one lookup outcome and reports whether the resolved set
+// changed state (a success). It takes mu.
+func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.AddrPort, mode string, err error) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := d.entries[c.Name]
+	if e == nil {
+		e = &carrierEntry{}
+		d.entries[c.Name] = e
+	}
+	if err != nil || len(addrs) == 0 {
+		if err == nil {
+			err = errors.New("no addresses")
+		}
+		// Keep the last good set; retry soon.
+		e.expiry = now.Add(carrierDNSNegTTL)
+		if !e.failing {
+			d.log.Warn("carrier DNS lookup failed; keeping the last good addresses",
+				"carrier", c.Name, "host", c.Host, "err", err, "have", len(e.addrs))
+		} else {
+			d.log.Debug("carrier DNS lookup still failing", "carrier", c.Name, "err", err)
+		}
+		e.failing = true
+		e.lastErr = err.Error()
+		return false
+	}
+	if e.failing || fmt.Sprint(e.addrs) != fmt.Sprint(addrs) {
+		d.log.Info("carrier resolved", "carrier", c.Name, "host", c.Host, "addrs", fmt.Sprint(addrs))
+	}
+	e.addrs, e.expiry, e.failing = addrs, now.Add(carrierDNSTTL), false
+	e.resolvedAt, e.mode, e.lastErr = now, mode, ""
+	return true
 }
 
 // Run refreshes the directory until ctx ends: once at once, then whenever

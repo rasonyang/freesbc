@@ -306,3 +306,34 @@ func TestUIAuditTab(t *testing.T) {
 		t.Error("renderAudit must build rows with textContent, not innerHTML")
 	}
 }
+
+// The Health tab and the header badge are wired: nav link, badge linking to
+// the view, the conditions and history tables, both APIs, and every string
+// from the API goes in through textContent.
+func TestUIHealthTab(t *testing.T) {
+	s := testServer(t)
+	page := uiGet(t, s, "/", true).Body.String()
+	for _, want := range []string{
+		`data-view="health"`, `id="view-health"`, `id="health-badge"`, `href="#health"`,
+		`Active conditions`, `id="conditions-body"`, `id="conditions-empty"`,
+		`id="health-history-body"`, `id="health-history-empty"`, "200",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	js := uiGet(t, s, "/assets/app.js", true).Body.String()
+	for _, want := range []string{
+		`"/api/health"`, `"/api/health/history"`, `"health"`, "function renderHealth", "function renderHealthHistory",
+		"function loadHealthHistory", "fetchJSON(HEALTH_URL)", `"destructive"`, `"warning"`, `"success"`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+	i := strings.Index(js, "// ---- health ----")
+	j := strings.Index(js, "// ---- audit ----")
+	if i < 0 || j < i || strings.Contains(js[i:j], "innerHTML") {
+		t.Error("the health code must build rows with textContent, not innerHTML")
+	}
+}

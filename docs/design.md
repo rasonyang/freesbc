@@ -566,7 +566,7 @@ Every header whose name starts with `x-freesbc-` (any case) is internal. Only Fr
 - A literal-IP entry is static: one address, the entry's port.
 - A DNS-name entry without a port resolves through SRV ordered by priority and RFC 2782 weight (`orderSRV`, `carrierdns.go:334`), then A/AAAA per target (the SRV name is `_sip._udp`, `_sip._tcp` or `_sips._tcp` for a udp, tcp or tls carrier, `srvName`); with no SRV record it falls back to A/AAAA on the carrier's default port, 5060 (5061 for tls; `Carrier.DialPort`). An entry with an explicit port skips SRV and resolves A/AAAA only (RFC 3263 §4.2; `resolve`, `carrierdns.go:258`).
 - Resolution runs on the public side only; the switch is never asked and the private leg does no DNS.
-- A good answer is cached `carrierDNSTTL` = 300 s; a failed or empty one `carrierDNSNegTTL` = 10 s; one query is bounded by `carrierLookupTimeout` = 3 s (`carrierdns.go:40-51`). A failed refresh keeps the last good set (`refresh`, `carrierdns.go:196-238`), logged at WARN once per failure run. A failure at startup is not fatal: the carrier is unresolved, its INVITEs are dropped by admission and requests for it get 503, until a lookup succeeds.
+- A good answer is cached `carrierDNSTTL` = 300 s; a failed or empty one `carrierDNSNegTTL` = 10 s; one query is bounded by `carrierLookupTimeout` = 3 s (`carrierdns.go:40-51`). A failed refresh keeps the last good set (`refresh`, `carrierdns.go:238`), logged at WARN once per failure run. A failure at startup is not fatal: the carrier is unresolved, its INVITEs are dropped by admission and requests for it get 503, until a lookup succeeds.
 - `Run` (started from `edge.Run`, `edge.go:515`) refreshes once at start and then every 5 s checks which entries have expired (`carrierdns.go:242`). Each refresh publishes an immutable `carrierSnapshot` through an atomic pointer, so admission and the shield read it without locking.
 - A request to a carrier goes to the first resolved address only (`carrierDest`, `carrierreg.go:149`). There is no failover across SRV targets or addresses inside FreeSBC; line selection and failover belong to the switch. The order of a resolved set is re-drawn at each refresh (weighted-random within a priority), so the first address can change every 300 s for a name with several equal-priority targets.
 
@@ -3067,7 +3067,7 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 |---|---|---|---|---|---|---|---|
 | **edge binding** (`Binding`) | `Location` (`edge/location.go:58`) | `recordBinding` → `Location.Put` (`register.go:305`) | active → refreshed (same token) / expired / removed | expiry always comes from the registrar's **response**; `Source` is the transport source, never the Contact host; ≤ 10 per AoR, ≤ 20000 total (`location.go:78-81`) | handler goroutines, the WS close hook, the prune ticker | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker (`edge.go:462-480`) | `Location.mu` (RWMutex) |
 | **carrier registration** (`carrierBinding`) | `carrierRegTable` (`carrierreg.go:44`) | `registerToCarrier` on a 2xx with a granted lifetime (`carrierreg.go:190`) | live → refreshed (same deterministic token) / expired / removed | keyed by token = `carrierToken(node, Contact)`; holds the registering `edge.switch` node name and the switch's original Contact; separate from `Location`, so a client token never resolves a carrier token or the reverse; a lookup treats an expired entry as absent | `registerToCarrier`, the prune ticker | granted lifetime elapsed (30 s prune), a `200` to `Expires: 0`, a wildcard un-REGISTER (`removeNode`); lost on restart, rebuilt by the switch's next refresh under the same token | `carrierRegTable.mu` |
-| **carrier directory** (`carrierSnapshot`) | `carrierDirectory` (`carrierdns.go:116`) | `newCarrierDirectory` in `edge.New`; refreshed by `Run`'s goroutine | resolved set replaced whole on each refresh; a failed refresh keeps the last good set | name → addresses (SRV or A/AAAA, `carrierDNSTTL` 300 s, failed lookup retried after 10 s, 3 s per query: `carrierdns.go:40-47`) plus the carrier source prefixes; read lock-free by every request | the refresh goroutine only | process exit | `atomic.Pointer[carrierSnapshot]` for readers; `carrierDirectory.mu` serialises refreshes and guards its cache and `rand.Rand` |
+| **carrier directory** (`carrierSnapshot`) | `carrierDirectory` (`carrierdns.go:116`) | `newCarrierDirectory` in `edge.New`; refreshed by `Run`'s goroutine | resolved set replaced whole on each refresh; a failed refresh keeps the last good set | name → addresses (SRV or A/AAAA, `carrierDNSTTL` 300 s, failed lookup retried after 10 s, 3 s per query: `carrierdns.go:40-47`) plus the carrier source prefixes; read lock-free by every request | the refresh goroutine only | process exit | `atomic.Pointer[carrierSnapshot]` for readers; `carrierDirectory.mu` guards its cache; `refresh` takes it only to read and to record an outcome (`apply`), never across a lookup, and only the refresh goroutine runs lookups, so `rand.Rand` is unshared |
 | **edge dialog** (`*edge.dialog`) | `dialogTable` (`dialog.go:322`) | `begin(req, callerPlane, limit)` (`dialog.go:380`); a second early record with the same Call-ID and caller tag is refused (482, `invite.go:239`) | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) (`dialog.go:20-36`) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record; a carrier dialog also records the carrier name (`setCarrier`, `dialog.go:682`) and its far-end address on the node's carrier port | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end did not refuse, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map, the `closed` flag **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
 | **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **switch cooldown** | one `cooldownTable` on `Server` (`cooldown.go:20`) | `edge.New` | absent ⇄ `until[name]` | keyed by the node's `IP:port` name, never by anything a client supplies; all-cooling falls back to dialling everything; `switchCooldown` = 30 s (`edge.go:126`) | handler goroutines only | `Recover` on any final response; lazy expiry otherwise | `cooldownTable.mu` |
@@ -3343,6 +3343,7 @@ permanent series per call."
 | `freesbc_media_ports_total` | Gauge | — | the same pools, summed capacity in pairs |
 | `freesbc_shield_drops_total` | Counter | `reason` ∈ {`banned`, `scanner`, `rate`} | the edge shield's drop counters (`Server.ShieldStats`, `edge.go:279`) |
 | `freesbc_build_info` | Gauge (always 1) | `version` | `Deps.Version` |
+| `freesbc_admin_health_status` | Gauge | — | overall health from `/api/health` (§13.6): 0 ok, 1 degraded, 2 critical; evaluating it on a scrape also feeds the history; absent when admin is not running |
 | `freesbc_active_registrations` | Gauge | — | edge `Location.Count()`, stored on every binding change and prune |
 | `freesbc_admin_auth_failures_total` | Counter | `reason` ∈ {`bad_credentials`, `rate_limited`} | admin `requireAuth` (§13.5): a credential that did not verify, a request answered 429 by the limiter; every reason is always exported |
 | `freesbc_edge_subscriptions` | Gauge | — | edge `subTable.total`: SUBSCRIBE dialog records, pending or active (`Metrics.SetSubscriptions`, `metrics.go:146`; read through `Metrics.Snapshot().ActiveSubscriptions`, `metrics.go:236`, `:282`, which `internal/app/app.go:133` copies into `admin.ProxyStats`; the collector is `internal/admin/metrics.go:60`, `:129`); also `active_subscriptions` in the admin status JSON |
@@ -3423,6 +3424,8 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/carriers` | GET (else 405) | Basic | array of `{"name","host","transport","mode" ("literal", "srv", "a" or "" until resolved),"addresses":[{"address","in_use"}],"resolved_at","expires_at" (RFC 3339 or null),"cache_age_seconds" (or null),"failing","last_error"}`; always an array, sorted by name (`carrierDirectory.snapshotInfo`, `carrierdns.go:474`). `in_use` marks the first address, the one the edge sends to. While `failing`, `expires_at` is the next retry and the addresses are the last good set |
 | `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
 | `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |
+| `/api/health` | GET (else 405 + `Allow: GET`) | Basic | `{"status":"ok"\|"degraded"\|"critical","conditions":[{"id","severity","message","since" (RFC 3339 UTC),"detail"?}]}` (`handleHealth`, `health.go:249`); status is the worst active severity, `ok` with none; conditions sorted severity descending then id; always an array (§13.6) |
+| `/api/health/history` | GET (else 405 + `Allow: GET`) | Basic | `{"events":[{"time","id","event":"raised"\|"cleared"\|"changed","severity","message"}]}`, newest first like `/api/audit`; always an array; the last 200 (`handleHealthHistory`, `health.go:262`) |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
 | `/api/config/validate` | POST (else 405 + `Allow: POST`) | Basic | check a candidate file, write nothing: `{"valid","errors","restart_required"}` |
@@ -3539,7 +3542,50 @@ username, password, `Authorization` value or the hash. Every `login_failed` and 
 separate from recording (`auditLog.count` / `record`) and the counters are not
 bounded by the ring.
 
-### 13.5 WebUI
+### 13.6 Health conditions
+
+`GET /api/health` and `/api/health/history` answer "is anything wrong" without
+a Prometheus rule set. The work is split so admin keeps reading the plane only
+through `admin.Deps`:
+
+- `app` (`internal/app/health.go`) builds `Deps.Health`, a closure returning the
+  raw conditions active right now (`id`, `severity` `degraded` or `critical`,
+  `message`, optional `detail`) from live edge state. It has no memory except
+  the ban-cap watch below.
+- `admin` (`internal/admin/health.go`) owns `healthTracker`. Each evaluation
+  calls the closure under one mutex and compares it with the active set: a new
+  id is `raised` and gets `since` = now, a vanished id is `cleared`, a severity
+  change on an id that stays is `changed` (its `since` is kept). A message that
+  moves without a severity change is no event. Events go into a ring of
+  `healthRingSize` = **200** (oldest dropped, lost on restart). It evaluates on
+  every `/api/health`, `/api/health/history` and `/metrics` request, and on a
+  `healthInterval` = **5 s** ticker that `Server.Run` starts and waits for on
+  shutdown, so `since` and the history are right with nobody polling.
+
+The conditions read the same snapshots the State tab does, so there is one
+accessor per fact. `carrierDirectory.refresh` holds `mu` only to read and to
+record an outcome, never across a DNS lookup, so `Server.Carriers` (and with it
+`/api/carriers` and `/api/health`) never waits on a slow resolver.
+
+| `id` | Severity | Source and rule |
+|---|---|---|
+| `switch_cooldown:<ip:port>` | `degraded`; `critical` when every `edge.switch` node is cooling | `edge.Server.SwitchNodes` (the same snapshot as `/api/switch-nodes`): a node whose state is `cooling_down` in the passive cooldown table (`cooldown.go`, 30 s after a node answered nothing) |
+| `carrier_dns:<name>` | `degraded` serving the last good set; `critical` with no address | `edge.Server.Carriers` (the same snapshot as `/api/carriers`): a carrier with `Failing` set; `detail` is its last DNS error. Literal-IP carriers never fail |
+| `config_reload_failed` | `degraded` | `config.Store.ReloadStatus` (`Deps.Reload`): `LastError` is set, so the file on disk was rejected and the previous snapshot keeps running; the message carries the error. Cleared by the next successful reload |
+| `config_restart_required` | `degraded` | `ReloadStatus.RestartRequired` is non-empty; `detail` lists the restart-only keys whose file value the running process does not use. Cleared by a restart (or by reverting the file) |
+| `rtp_ports` | `degraded` at 90 % or more of the pairs in use; `critical` at 100 % | `edge.Server.PortStats`; `portsDegradedPercent` is a constant, not a config key |
+| `shield_ban_cap` | `degraded` | `Shield.Stats().BanAddsRejected` rose since the previous evaluation; cleared when it has not risen for `banCapQuiet` = **60 s** (state in `healthSource`, which sees every evaluation) |
+| `admin_plain_remote` | `critical` | admin would serve plain HTTP on a non-loopback address; validation makes it impossible, so this is a sanity check |
+
+Absent on purpose: a listener that is not bound (every listener is bound before
+`ready`, and a serve error afterwards ends `edge.Server.Run` and so the process,
+so a running process has none to report); certificate expiry (needs #119);
+drain mode (its own gauge and endpoint). No placeholder entries stand in for them.
+
+Thresholds and notification stay in Prometheus Alertmanager. The WebUI header
+shows the status as a badge linking to the Health tab (§13.7).
+
+### 13.7 WebUI
 
 The `//go:embed`ed `webui` directory (`webui.go`): `index.html` (markup
 only) plus `assets/` — `tokens.css` (the shadcn/ui neutral theme plus FreeSBC
@@ -3554,9 +3600,9 @@ admin response carries. The page loads nothing from another origin; inline
 script, style and event handlers are blocked by the CSP and rejected by
 `TestUIHasNoInlineScriptOrStyle`.
 
-Four hash-routed views: an **Overview** polling `/api/status`, `/api/calls`
-and `/api/drain` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
-poll keeps the last data and marks the header "Connection lost"; the two
+Five hash-routed views: an **Overview** polling `/api/status`, `/api/calls`,
+`/api/drain` and `/api/health` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
+poll keeps the last data and marks the header "Connection lost"; the four
 endpoints render independently, so one failing marks only its half stale;
 polls are chained with `setTimeout` and each request times out after 4 s, so
 they never overlap; a 401 shows a persistent "session expired" banner that
@@ -3571,7 +3617,8 @@ against the candidate. A **Download config** button fetches
 says so. The Overview's **Drain mode** card shows the state, the active calls
 remaining and the time since drain began, with an enter/leave button that
 opens an in-page confirmation (no `window.confirm`) before it sends POST or
-DELETE to `/api/drain`. A **State** tab lists the five live-state tables
+DELETE to `/api/drain`. The **Overview** also lists the `listeners` of
+`/api/status`. A **State** tab lists the five live-state tables
 (`/api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`,
 `/api/switch-nodes`, `/api/carriers`), each with an empty state. It is fetched
 when the tab opens and on Reload, not polled. Registrations have a user search
@@ -3584,9 +3631,15 @@ memory and copied under the owning lock: a ban's reason and start time
 (`banEntry`, `banlist.go:37`; `BanInfo`, `shield.go:254`), a switch node's last
 penalty time (`cooldownTable.lastFail`, `cooldown.go:24`, set in `Penalize`,
 `cooldown.go:41`), and a carrier's resolution mode and last DNS error
-(`carrierEntry.mode` and `lastErr`, `carrierdns.go:134`, `:137`, set on a
-lookup at `carrierdns.go:265` and `:272`). The app adapts them to admin's own
+(`carrierEntry.mode` and `lastErr`, `carrierdns.go:134`, `:137`, set in
+`apply`, `carrierdns.go:287` and `:294`). The app adapts them to admin's own
 types in `adminDeps` (`app.go`); admin imports neither `edge` nor `shield`.
+
+The header carries a health badge (success, warning or destructive variant with
+the status spelled out) linking to the **Health** tab: the active conditions
+table (polled with the Overview) and the history (fetched when the tab opens,
+on Reload, and after each poll while the tab is visible). A **Config** and an
+**Audit** tab complete the set.
 
 ---
 
@@ -3930,6 +3983,8 @@ code constant.
 | carrier DNS cache | 300 s (`carrierDNSTTL`, `carrierdns.go:42`) | a good SRV/A/AAAA answer |
 | carrier DNS negative cache | 10 s (`carrierDNSNegTTL`, `carrierdns.go:45`) | a failed or empty lookup; the directory checks for expired entries every 5 s |
 | carrier DNS lookup | 3 s (`carrierLookupTimeout`, `carrierdns.go:47`) | one DNS query |
+| `healthInterval` | 5 s (`health.go:91`) | the admin health tracker's own evaluation tick (§13.6) |
+| `banCapQuiet` | 60 s (`app/health.go:22`) | how long `BanAddsRejected` must stand still before `shield_ban_cap` clears |
 | `shield.ban` | 1 h (config); a UDP socket ban at most 1 min (`socketBanMax`) | a scanner ban |
 | shield prune tick | 1 min (`shield.go:239`) | expired bans and idle rate-limit buckets |
 | binding / carrier-registration / subscription prune tick | 30 s (`edge.go:492`, `edge.go:517`) | expired bindings (memory only; lookups already hide them) and expired subscription records |

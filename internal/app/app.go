@@ -126,6 +126,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 		DrainState:  edgeSrv.DrainState,
 		SetDraining: edgeSrv.SetDraining,
 		Listeners:   edgeSrv.Listeners,
+		Health:      newHealthSource(edgeSrv, running, store.ReloadStatus).conditions,
 		Shield: func() admin.ShieldStats {
 			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
 		},

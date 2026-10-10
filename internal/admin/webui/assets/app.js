@@ -8,6 +8,8 @@
   var CALLS_URL = "/api/calls";
   var DRAIN_URL = "/api/drain";
   var AUDIT_URL = "/api/audit";
+  var HEALTH_URL = "/api/health";
+  var HEALTH_HISTORY_URL = "/api/health/history";
   var REGISTRATIONS_URL = "/api/registrations";
   var CARRIER_REGS_URL = "/api/carrier-registrations";
   var BANS_URL = "/api/shield/bans";
@@ -34,7 +36,7 @@
   // ---- views (hash-routed so a reload keeps the tab) ----
 
   var links = document.querySelectorAll(".nav-link[data-view]");
-  var VIEWS = ["dashboard", "config", "state", "audit"];
+  var VIEWS = ["dashboard", "config", "state", "health", "audit"];
 
   function show(name) {
     if (VIEWS.indexOf(name) < 0) name = "dashboard";
@@ -46,6 +48,8 @@
     // First time the Config tab is opened, fetch the running config
     // automatically instead of showing an empty editor.
     if (name === "config") loadConfigIfEmpty();
+    // The conditions are polled; the history is fetched on every open.
+    if (name === "health") loadHealthHistory();
     // The audit list is fetched on every open: it is cheap and not polled.
     if (name === "audit") loadAudit();
     // Live-state tables are fetched on every open, not polled.
@@ -325,19 +329,28 @@
     return Promise.allSettled([
       fetchJSON(STATUS_URL),
       fetchJSON(CALLS_URL),
-      fetchJSON(DRAIN_URL)
+      fetchJSON(DRAIN_URL),
+      fetchJSON(HEALTH_URL)
     ]).then(function (results) {
-      var st = results[0], ca = results[1], dr = results[2];
+      var st = results[0], ca = results[1], dr = results[2], he = results[3];
       if (st.status === "fulfilled") renderStatus(st.value);
       if (ca.status === "fulfilled") renderCalls(ca.value);
       if (dr.status === "fulfilled") renderDrain(dr.value);
+      if (he.status === "fulfilled") {
+        renderHealth(he.value);
+        // Keep the history current while it is on screen, without polling it
+        // from the other tabs.
+        if (!$("view-health").hidden) loadHealthHistory();
+      }
       $("status-stale").hidden = st.status === "fulfilled";
       $("calls-stale").hidden = ca.status === "fulfilled";
       $("drain-stale").hidden = dr.status === "fulfilled";
-      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected");
+      $("health-stale").hidden = he.status === "fulfilled";
+      if (he.status === "rejected") markHealthStale();
+      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected") + (he.status === "rejected");
       if (sessionExpired) return; // showSessionExpired already set the indicator
       if (failed === 0) setLive("live", "Live · " + fmtClock(new Date()));
-      else if (failed < 3) setLive("stale", "Partial update, retrying…");
+      else if (failed < 4) setLive("stale", "Partial update, retrying…");
       else setLive("stale", "Connection lost, retrying…");
     });
   }
@@ -650,6 +663,104 @@
   }
 
   btnDownload.addEventListener("click", downloadConfig);
+
+  // ---- health ----
+
+  var healthLoading = false;
+  var BADGE_VARIANT = { ok: "success", degraded: "warning", critical: "destructive" };
+  var STATUS_TEXT = { ok: "OK", degraded: "Degraded", critical: "Critical" };
+
+  function fmtDateTime(iso) {
+    var d = new Date(iso);
+    return iso && !isNaN(d) ? d : null;
+  }
+
+  // markHealthStale greys the header badge when the last refresh failed, so
+  // a green badge never outlives the data behind it.
+  function markHealthStale() {
+    var b = $("health-badge");
+    b.setAttribute("data-variant", "secondary");
+    b.textContent = "Health: unknown";
+  }
+
+  function severityBadge(sev) {
+    var b = el("span", "badge", STATUS_TEXT[sev] || sev || "—");
+    b.setAttribute("data-variant", BADGE_VARIANT[sev] || "secondary");
+    return b;
+  }
+
+  function renderHealth(data) {
+    var status = BADGE_VARIANT[data.status] ? data.status : "degraded";
+    var conds = data.conditions || [];
+    var badge = $("health-badge");
+    badge.setAttribute("data-variant", BADGE_VARIANT[status]);
+    // The state is spelled out, not carried by colour alone.
+    badge.textContent = "Health: " + STATUS_TEXT[status] + (conds.length ? " (" + conds.length + ")" : "");
+    $("health-summary").textContent = status === "ok"
+      ? "Nothing needs attention."
+      : "Overall status: " + status + ". The worst active condition decides it.";
+    $("conditions-count").textContent = fmtInt(conds.length);
+    $("conditions-empty").hidden = conds.length > 0;
+    var body = $("conditions-body");
+    body.textContent = "";
+    body.parentNode.hidden = conds.length === 0;
+    conds.forEach(function (c) {
+      var tr = document.createElement("tr");
+      var sev = el("td");
+      sev.appendChild(severityBadge(c.severity));
+      tr.appendChild(sev);
+      tr.appendChild(el("td", "mono", c.id == null ? "—" : c.id));
+      var msg = el("td", null, c.message == null ? "" : c.message);
+      if (c.detail) msg.appendChild(el("div", "muted", c.detail));
+      tr.appendChild(msg);
+      var since = el("td", "muted num", "—");
+      var d = fmtDateTime(c.since);
+      if (d) { since.textContent = fmtClock(d) + " (" + fmtDuration((Date.now() - d.getTime()) / 1000) + " ago)"; since.title = c.since; }
+      tr.appendChild(since);
+      body.appendChild(tr);
+    });
+  }
+
+  function renderHealthHistory(events) {
+    var body = $("health-history-body");
+    body.textContent = "";
+    events = events || [];
+    $("health-history-count").textContent = fmtInt(events.length);
+    $("health-history-empty").hidden = events.length > 0;
+    body.parentNode.hidden = events.length === 0;
+    events.forEach(function (e) {
+      var tr = document.createElement("tr");
+      var when = el("td", "muted num", "—");
+      var d = fmtDateTime(e.time);
+      if (d) { when.textContent = fmtClock(d); when.title = e.time; }
+      tr.appendChild(when);
+      tr.appendChild(el("td", "mono", e.event == null ? "—" : e.event));
+      var sev = el("td");
+      sev.appendChild(severityBadge(e.severity));
+      tr.appendChild(sev);
+      tr.appendChild(el("td", "mono", e.id == null ? "—" : e.id));
+      tr.appendChild(el("td", null, e.message == null ? "" : e.message));
+      body.appendChild(tr);
+    });
+  }
+
+  function loadHealthHistory() {
+    if (healthLoading) return;
+    healthLoading = true;
+    $("health-history-status").textContent = "Loading…";
+    fetchJSON(HEALTH_HISTORY_URL).then(function (data) {
+      renderHealthHistory(data.events);
+      $("health-history-status").textContent = "Loaded";
+    }).catch(function (err) {
+      if (String(err.message || err) !== "unauthorized") {
+        $("health-history-status").textContent = "Load failed";
+      }
+    }).then(function () {
+      healthLoading = false;
+    });
+  }
+
+  $("btn-health-history-load").addEventListener("click", loadHealthHistory);
 
   // ---- audit ----
 

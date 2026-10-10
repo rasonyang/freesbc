@@ -1,7 +1,7 @@
 # Admin UI
 
 How the embedded WebUI (`internal/admin/webui`) is built and the rules for
-changing it. `docs/design.md` §13.5 describes what it does; this file says how
+changing it. `docs/design.md` §13.7 describes what it does; this file says how
 to keep it consistent.
 
 ## Decisions
@@ -180,6 +180,17 @@ The data on this console is SIP state, so these rules are the core of
   response.
 - **The State tab** lists `GET /api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` as five cards, each with its own empty state and count badge. It is fetched when opened and on Reload, not polled, and the five requests fail independently (the status line says how many). Registrations have a user search (debounced) and bans show `ban_adds_rejected`; both page 50 at a time with Previous and Next. Times are local `HH:MM:SS` with the RFC 3339 original in `title`; durations use `fmtDuration`; a missing value is `—`. Node and carrier state is a badge with a word (`cooling down`, `failing`), never colour alone. The search box is the `.input` control.
 - **The Audit tab** lists `GET /api/audit` (newest first; sign-ins and drain changes) when it is opened and on Reload; it is not polled. Time is local `HH:MM:SS` with the RFC 3339 original in `title`; the result is a badge (`ok` success, anything else warning).
+- **The header health badge** shows `GET /api/health`'s status as a word
+  (`OK`, `Degraded`, `Critical`, plus the condition count) in the existing
+  `success`, `warning` and `destructive` badge variants, so no new token is
+  needed, and links to the Health tab. A failed health poll turns it grey
+  ("Health: unknown") instead of leaving a stale green.
+- **The Health tab** has the Active conditions table (severity badge, id,
+  message with optional detail, since) rendered from the Overview poll, and the
+  history from `GET /api/health/history` (newest first), fetched when the tab
+  opens, on Reload and after each poll while the tab is visible. Empty states
+  say so ("No active conditions", "No events"). All API strings go in through
+  `textContent`.
 - **Restart-only facts say so** where they are shown (listeners, the config
   hint), so nobody expects an edit to rebind a socket.
 
@@ -257,5 +268,5 @@ and leave the shadcn tokens alone:
    wide.
 5. Empty, loading, stale (API down) and error states are all designed.
 6. API strings go through `textContent`.
-7. `go test -race ./internal/admin` passes. `docs/design.md` §13.5 still
+7. `go test -race ./internal/admin` passes. `docs/design.md` §13.7 still
    describes the UI.

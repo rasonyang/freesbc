@@ -65,9 +65,11 @@
       <a class="nav-link" href="#dashboard" data-view="dashboard" aria-current="page">Overview</a>
       <a class="nav-link" href="#config" data-view="config">Config</a>
       <a class="nav-link" href="#state" data-view="state">State</a>
+      <a class="nav-link" href="#health" data-view="health">Health</a>
       <a class="nav-link" href="#audit" data-view="audit">Audit</a>
     </nav>
     <div class="header-end">
+      <a class="badge" data-variant="secondary" id="health-badge" href="#health" title="Overall health: open the active conditions">Health: …</a>
       <span class="status" id="live" data-state="pending" role="status" aria-live="polite">
         <span class="dot" aria-hidden="true"></span><span id="live-text">Connecting…</span>
       </span>
@@ -396,6 +398,70 @@
           <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg></span>
           <span class="empty-title">No carriers</span>
           <span>Entries of edge.carriers appear here with how they resolved.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-health" class="page" aria-labelledby="h-health" hidden>
+    <div class="page-header">
+      <h1 class="page-title" id="h-health">Health</h1>
+      <p class="page-description">Conditions that need attention on this node, derived from live state. Alerting and thresholds stay in Prometheus. Refreshes every 5 seconds.</p>
+      <p><span class="badge" data-variant="warning" id="health-stale" hidden>Health stale: last refresh failed</span></p>
+    </div>
+
+    <div class="card" id="conditions-card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title" id="h-conditions">Active conditions</h2>
+          <p class="card-description" id="health-summary">—</p>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="conditions-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Severity</th><th scope="col">Condition</th><th scope="col">Message</th><th scope="col">Since</th></tr>
+            </thead>
+            <tbody id="conditions-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="conditions-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg></span>
+          <span class="empty-title">No active conditions</span>
+          <span>Everything this node can check is healthy.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-heading">
+          <h2 class="card-title">History</h2>
+          <p class="card-description">Conditions raised, cleared or changed since this process started, newest first. The last 200 are kept in memory.</p>
+          <div class="toolbar">
+            <button class="btn" data-variant="outline" data-size="sm" type="button" id="btn-health-history-load">
+              <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>Reload
+            </button>
+            <span class="toolbar-status" id="health-history-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+        <div class="card-action"><span class="badge num" data-variant="secondary" id="health-history-count">0</span></div>
+      </div>
+      <div class="card-content flush">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Severity</th><th scope="col">Condition</th><th scope="col">Message</th></tr>
+            </thead>
+            <tbody id="health-history-body"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="health-history-empty">
+          <span class="empty-icon"><svg class="icon" aria-hidden="true"><use href="#i-activity"/></svg></span>
+          <span class="empty-title">No events</span>
+          <span>Raised and cleared conditions appear here.</span>
         </div>
       </div>
     </div>
