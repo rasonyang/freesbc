@@ -66,6 +66,10 @@ type Deps struct {
 	// the state changed. Nil on either makes /api/drain answer 404.
 	DrainState  func() (draining bool, since time.Time)
 	SetDraining func(on bool) (changed bool)
+	// Health returns the conditions active right now, derived from live
+	// state with no memory of its own (since and the history are the admin
+	// tracker's, health.go). Nil reports none.
+	Health func() []HealthCondition
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
@@ -155,6 +159,7 @@ type Server struct {
 	limiter  authLimiter      // per-source auth-failure rate limit
 	verified verifiedCreds    // credentials already verified by bcrypt
 	audit    auditLog         // bounded ring of auth events (audit.go)
+	health   healthTracker    // active conditions and their history (health.go)
 	now      func() time.Time // test seam for the limiter clock; nil is time.Now
 
 	metricsOnce    sync.Once
@@ -167,6 +172,8 @@ type Server struct {
 func New(cfg *config.AdminConfig, tlsCfg *config.TLSConfig, store *config.Store, deps Deps, log *slog.Logger, cfgPath string) *Server {
 	s := &Server{cfg: cfg, tls: tlsCfg, store: store, deps: deps, log: log, started: time.Now(), cfgPath: cfgPath}
 	s.audit.log = log
+	s.health.src = deps.Health
+	s.health.now = s.clock
 	s.hosts = newHostPolicy(cfg.Listen, cfg.AllowedHosts, s.useTLS())
 	return s
 }
@@ -180,6 +187,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/calls", s.requireAuth(s.handleCalls))
 	mux.HandleFunc("/api/drain", s.requireAuth(s.handleDrain))
 	mux.HandleFunc("/api/audit", s.requireAuth(s.handleAudit))
+	mux.HandleFunc("/api/health", s.requireAuth(s.handleHealth))
+	mux.HandleFunc("/api/health/history", s.requireAuth(s.handleHealthHistory))
 	mux.HandleFunc("/api/config", s.requireAuth(s.handleConfig))
 	mux.HandleFunc("/api/config/raw", s.requireAuth(s.handleConfigRaw))
 	mux.HandleFunc("/api/config/validate", s.requireAuth(s.handleConfigValidate))
@@ -197,6 +206,16 @@ func (s *Server) useTLS() bool { return s.cfg.AllowRemote && s.tls != nil }
 // otherwise it serves plain HTTP, which validation only admits on loopback.
 func (s *Server) Run(ctx context.Context) error {
 	srv := s.newHTTPServer()
+	// The tracker evaluates on a ticker too, so the history is accurate with
+	// nobody polling; Run does not return before that goroutine has.
+	hctx, hcancel := context.WithCancel(ctx)
+	var hwg sync.WaitGroup
+	hwg.Add(1)
+	go func() {
+		defer hwg.Done()
+		s.health.run(hctx, healthInterval)
+	}()
+	defer func() { hcancel(); hwg.Wait() }()
 	errc := make(chan error, 1)
 	go func() {
 		if !s.useTLS() {

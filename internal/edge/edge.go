@@ -340,6 +340,26 @@ func (s *Server) ShieldStats() shield.Stats {
 	return sh.Stats()
 }
 
+// SwitchNode is one edge.switch node as the admin health view sees it.
+type SwitchNode struct {
+	Addr    string // the node's IP:port, the name the cooldown table uses
+	Cooling bool   // inside a passive cooldown window (cooldown.go)
+}
+
+// SwitchNodes lists the switch nodes in sorted order with their passive
+// cooldown state. The set is fixed at startup; only Cooling changes.
+func (s *Server) SwitchNodes() []SwitchNode {
+	out := make([]SwitchNode, 0, len(s.topo.upstreamNames))
+	for _, name := range s.topo.upstreamNames {
+		out = append(out, SwitchNode{Addr: name, Cooling: !s.upstreamCooldown.Available(name)})
+	}
+	return out
+}
+
+// CarrierDNS is the DNS resolution state of the DNS-name carriers, for the
+// admin health view.
+func (s *Server) CarrierDNS() []CarrierDNS { return s.carriers.states() }
+
 // Listeners is the listener set Run binds, as transport://host:port, from
 // the startup snapshot (the set is restart-only).
 func (s *Server) Listeners() []string {

@@ -3328,6 +3328,7 @@ permanent series per call."
 | `freesbc_media_ports_total` | Gauge | — | the same pools, summed capacity in pairs |
 | `freesbc_shield_drops_total` | Counter | `reason` ∈ {`banned`, `scanner`, `rate`} | the edge shield's drop counters (`Server.ShieldStats`, `edge.go:279`) |
 | `freesbc_build_info` | Gauge (always 1) | `version` | `Deps.Version` |
+| `freesbc_admin_health_status` | Gauge | — | overall health from `/api/health` (§13.6): 0 ok, 1 degraded, 2 critical; evaluating it on a scrape also feeds the history; absent when admin is not running |
 | `freesbc_active_registrations` | Gauge | — | edge `Location.Count()`, stored on every binding change and prune |
 | `freesbc_admin_auth_failures_total` | Counter | `reason` ∈ {`bad_credentials`, `rate_limited`} | admin `requireAuth` (§13.5): a credential that did not verify, a request answered 429 by the limiter; every reason is always exported |
 | `freesbc_edge_subscriptions` | Gauge | — | edge `subTable.total`: SUBSCRIBE dialog records, pending or active (`Metrics.SetSubscriptions`, `metrics.go:146`; read through `Metrics.Snapshot().ActiveSubscriptions`, `metrics.go:236`, `:282`, which `internal/app/app.go:133` copies into `admin.ProxyStats`; the collector is `internal/admin/metrics.go:60`, `:129`); also `active_subscriptions` in the admin status JSON |
@@ -3401,6 +3402,8 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
 | `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`handleDrain`, `api.go:96`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
 | `/api/audit` | GET (else 405 + `Allow: GET`) | Basic | the admin audit ring (§13.5), newest first: array of `{"time" (RFC 3339 UTC),"type","source","result"}`; always an array |
+| `/api/health` | GET (else 405 + `Allow: GET`) | Basic | `{"status":"ok"\|"degraded"\|"critical","conditions":[{"id","severity","message","since" (RFC 3339 UTC),"detail"?}]}` (`handleHealth`, `health.go:249`); status is the worst active severity, `ok` with none; conditions sorted severity descending then id; always an array (§13.6) |
+| `/api/health/history` | GET (else 405 + `Allow: GET`) | Basic | `{"events":[{"time","id","event":"raised"\|"cleared"\|"changed","severity","message"}]}`, newest first like `/api/audit`; always an array; the last 200 (`handleHealthHistory`, `health.go:262`) |
 | `/api/config` | GET (else 405 + `Allow: GET`) | Basic | the **redacted** running view |
 | `/api/config/raw` | GET (else 405 + `Allow: GET`) | Basic | the on-disk file **verbatim and unredacted**, `application/x-yaml` |
 | `/api/config/validate` | POST (else 405 + `Allow: POST`) | Basic | check a candidate file, write nothing: `{"valid","errors","restart_required"}` |
@@ -3517,7 +3520,44 @@ username, password, `Authorization` value or the hash. Every `login_failed` and 
 separate from recording (`auditLog.count` / `record`) and the counters are not
 bounded by the ring.
 
-### 13.5 WebUI
+### 13.6 Health conditions
+
+`GET /api/health` and `/api/health/history` answer "is anything wrong" without
+a Prometheus rule set. The work is split so admin keeps reading the plane only
+through `admin.Deps`:
+
+- `app` (`internal/app/health.go`) builds `Deps.Health`, a closure returning the
+  raw conditions active right now (`id`, `severity` `degraded` or `critical`,
+  `message`, optional `detail`) from live edge state. It has no memory except
+  the ban-cap watch below.
+- `admin` (`internal/admin/health.go`) owns `healthTracker`. Each evaluation
+  calls the closure under one mutex and compares it with the active set: a new
+  id is `raised` and gets `since` = now, a vanished id is `cleared`, a severity
+  change on an id that stays is `changed` (its `since` is kept). A message that
+  moves without a severity change is no event. Events go into a ring of
+  `healthRingSize` = **200** (oldest dropped, lost on restart). It evaluates on
+  every `/api/health`, `/api/health/history` and `/metrics` request, and on a
+  `healthInterval` = **5 s** ticker that `Server.Run` starts and waits for on
+  shutdown, so `since` and the history are right with nobody polling.
+
+| `id` | Severity | Source and rule |
+|---|---|---|
+| `switch_cooldown:<ip:port>` | `degraded`; `critical` when every `edge.switch` node is cooling | `edge.Server.SwitchNodes`: the passive cooldown table (`cooldown.go`, 30 s after a node answered nothing) |
+| `carrier_dns:<name>` | `degraded` serving the last good set; `critical` with no address | `edge.Server.CarrierDNS`: the `failing` flag of a DNS-name carrier (`carrierdns.go`); literal-IP carriers never appear |
+| `rtp_ports` | `degraded` at 90 % or more of the pairs in use; `critical` at 100 % | `edge.Server.PortStats`; `portsDegradedPercent` is a constant, not a config key |
+| `shield_ban_cap` | `degraded` | `Shield.Stats().BanAddsRejected` rose since the previous evaluation; cleared when it has not risen for `banCapQuiet` = **60 s** (state in `healthSource`, which sees every evaluation) |
+| `admin_plain_remote` | `critical` | admin would serve plain HTTP on a non-loopback address; validation makes it impossible, so this is a sanity check |
+
+Absent on purpose: a listener that is not bound (every listener is bound before
+`ready`, and a serve error afterwards ends `edge.Server.Run` and so the process,
+so a running process has none to report); reload failure and pending
+restart-only keys (needs #115); certificate expiry (needs #119); drain mode
+(its own gauge and endpoint). No placeholder entries stand in for them.
+
+Thresholds and notification stay in Prometheus Alertmanager. The WebUI header
+shows the status as a badge linking to the Health tab (§13.7).
+
+### 13.7 WebUI
 
 The `//go:embed`ed `webui` directory (`webui.go`): `index.html` (markup
 only) plus `assets/` — `tokens.css` (the shadcn/ui neutral theme plus FreeSBC
@@ -3532,8 +3572,8 @@ admin response carries. The page loads nothing from another origin; inline
 script, style and event handlers are blocked by the CSP and rejected by
 `TestUIHasNoInlineScriptOrStyle`.
 
-Two hash-routed views: an **Overview** polling `/api/status`, `/api/calls`
-and `/api/drain` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
+Four hash-routed views: an **Overview** polling `/api/status`, `/api/calls`,
+`/api/drain` and `/api/health` every 5 s (port-pool meter warns at 80 % and 95 %; a failed
 poll keeps the last data and marks the header "Connection lost"; the two
 endpoints render independently, so one failing marks only its half stale;
 polls are chained with `setTimeout` and each request times out after 4 s, so
@@ -3549,7 +3589,12 @@ against the candidate. A **Download config** button fetches
 says so. The Overview's **Drain mode** card shows the state, the active calls
 remaining and the time since drain began, with an enter/leave button that
 opens an in-page confirmation (no `window.confirm`) before it sends POST or
-DELETE to `/api/drain`. Design rules are in `docs/admin-ui.md`.
+DELETE to `/api/drain`. The **Overview** also lists the `listeners` of
+`/api/status`. The header carries a health badge (success, warning or
+destructive variant with the status spelled out) linking to the **Health**
+tab: the active conditions table (polled with the Overview) and the history
+(fetched when the tab opens, on Reload, and after each poll while the tab is
+visible). A **Config** and an **Audit** tab complete the set. Design rules are in `docs/admin-ui.md`.
 
 ---
 
@@ -3893,6 +3938,8 @@ code constant.
 | carrier DNS cache | 300 s (`carrierDNSTTL`, `carrierdns.go:42`) | a good SRV/A/AAAA answer |
 | carrier DNS negative cache | 10 s (`carrierDNSNegTTL`, `carrierdns.go:45`) | a failed or empty lookup; the directory checks for expired entries every 5 s |
 | carrier DNS lookup | 3 s (`carrierLookupTimeout`, `carrierdns.go:47`) | one DNS query |
+| `healthInterval` | 5 s (`health.go:91`) | the admin health tracker's own evaluation tick (§13.6) |
+| `banCapQuiet` | 60 s (`app/health.go:22`) | how long `BanAddsRejected` must stand still before `shield_ban_cap` clears |
 | `shield.ban` | 1 h (config); a UDP socket ban at most 1 min (`socketBanMax`) | a scanner ban |
 | shield prune tick | 1 min (`shield.go:239`) | expired bans and idle rate-limit buckets |
 | binding / carrier-registration / subscription prune tick | 30 s (`edge.go:492`, `edge.go:517`) | expired bindings (memory only; lookups already hide them) and expired subscription records |

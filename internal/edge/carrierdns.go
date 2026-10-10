@@ -145,6 +145,11 @@ type carrierDirectory struct {
 	entries map[string]*carrierEntry
 	rnd     *rand.Rand
 
+	// state is the per-carrier view behind CarrierDNS, under its own lock
+	// so a health request never waits on a lookup that holds mu.
+	stateMu sync.Mutex
+	state   map[string]CarrierDNS
+
 	snap atomic.Pointer[carrierSnapshot]
 }
 
@@ -170,6 +175,42 @@ func newCarrierDirectory(cfg *config.Config, log *slog.Logger) *carrierDirectory
 
 // snapshot is the current published view.
 func (d *carrierDirectory) snapshot() *carrierSnapshot { return d.snap.Load() }
+
+// CarrierDNS is the resolution state of one DNS-name carrier.
+type CarrierDNS struct {
+	Name string
+	// Failing is true while the last lookup failed.
+	Failing bool
+	// Addrs is how many addresses the last good set holds (0 until a
+	// lookup has succeeded). A failing carrier with Addrs > 0 still routes
+	// on that stale set.
+	Addrs int
+}
+
+// states lists the DNS-name carriers whose resolution has been attempted,
+// sorted by name. Literal-IP carriers do no DNS and never appear. It reads
+// stateMu, not mu, so it never waits on a lookup in flight.
+func (d *carrierDirectory) states() []CarrierDNS {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	out := make([]CarrierDNS, 0, len(d.state))
+	for _, st := range d.state {
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// recordState publishes one carrier's resolution state for states. The
+// caller holds mu.
+func (d *carrierDirectory) recordState(name string, e *carrierEntry) {
+	d.stateMu.Lock()
+	if d.state == nil {
+		d.state = map[string]CarrierDNS{}
+	}
+	d.state[name] = CarrierDNS{Name: name, Failing: e.failing, Addrs: len(e.addrs)}
+	d.stateMu.Unlock()
+}
 
 // publish builds and stores a snapshot from the literal carriers, the
 // static prefixes and the cached resolutions. The caller holds mu, or is
@@ -247,12 +288,14 @@ func (d *carrierDirectory) refresh(ctx context.Context) {
 				d.log.Debug("carrier DNS lookup still failing", "carrier", c.Name, "err", err)
 			}
 			e.failing = true
+			d.recordState(c.Name, e)
 			continue
 		}
 		if e.failing || fmt.Sprint(e.addrs) != fmt.Sprint(addrs) {
 			d.log.Info("carrier resolved", "carrier", c.Name, "host", c.Host, "addrs", fmt.Sprint(addrs))
 		}
 		e.addrs, e.expiry, e.failing = addrs, now.Add(carrierDNSTTL), false
+		d.recordState(c.Name, e)
 		changed = true
 	}
 	if changed {

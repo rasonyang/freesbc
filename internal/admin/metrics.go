@@ -13,7 +13,9 @@ import (
 type collector struct {
 	deps     Deps
 	audit    *auditLog
+	health   *healthTracker
 	authFail *prometheus.Desc
+	healthSt *prometheus.Desc
 	// descriptors
 	activeCalls *prometheus.Desc
 	portsInUse  *prometheus.Desc
@@ -53,10 +55,12 @@ type collector struct {
 	proxyCarrierReg *prometheus.Desc
 }
 
-func newCollector(deps Deps, audit *auditLog) *collector {
+func newCollector(deps Deps, audit *auditLog, health *healthTracker) *collector {
 	return &collector{
 		deps:        deps,
 		audit:       audit,
+		health:      health,
+		healthSt:    prometheus.NewDesc("freesbc_admin_health_status", "Overall health from the admin conditions view: 0 ok, 1 degraded, 2 critical.", nil, nil),
 		authFail:    prometheus.NewDesc("freesbc_admin_auth_failures_total", "Admin API authentication failures, by reason (bad_credentials, rate_limited).", []string{"reason"}, nil),
 		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
 		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
@@ -106,6 +110,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dropsTotal
 	ch <- c.buildInfo
 	ch <- c.authFail
+	ch <- c.healthSt
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyReqIn, c.proxyResOut,
@@ -130,6 +135,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
 	}
 	g(c.buildInfo, 1, c.deps.Version)
+	g(c.healthSt, healthLevel(healthStatus(c.health.evaluate())))
 	fails := c.audit.failures()
 	for _, reason := range authFailureReasons {
 		ch <- prometheus.MustNewConstMetric(c.authFail, prometheus.CounterValue, float64(fails[reason]), string(reason))
@@ -212,7 +218,7 @@ func (s *Server) registry() http.Handler {
 	s.metricsOnce.Do(func() {
 		reg := prometheus.NewRegistry()
 		reg.MustRegister(collectors.NewGoCollector())
-		reg.MustRegister(newCollector(s.deps, &s.audit))
+		reg.MustRegister(newCollector(s.deps, &s.audit, &s.health))
 		s.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	})
 	return s.metricsHandler
