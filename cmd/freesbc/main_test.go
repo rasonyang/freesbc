@@ -119,3 +119,35 @@ func TestSecondSignalForcesExit(t *testing.T) {
 		}
 	}
 }
+
+// `freesbc init` takes no positional argument and rejects unknown flags,
+// like run and check, and never touches the filesystem when it does.
+func TestInitArgumentHandling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "freesbc.yaml")
+	for _, args := range [][]string{
+		{"init", "-c", path, "other.yaml"},
+		{"init", "--bogus"},
+		{"init", "-c", path, "--udp-port", "abc"},
+	} {
+		if got := run(args); got != 2 {
+			t.Errorf("run(%q) = %d, want 2", args, got)
+		}
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("init wrote %s on a usage error", path)
+	}
+	// With stdin not a terminal a missing switch is an error (exit 1), not a
+	// prompt. Pin stdin so the test never prompts when run from a terminal.
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	stdin := os.Stdin
+	os.Stdin = devnull
+	defer func() { os.Stdin = stdin }()
+	t.Setenv("FREESBC_SWITCH", "")
+	if got := run([]string{"init", "-c", path, "--no-public-lookup"}); got != 1 {
+		t.Errorf("init without a switch = %d, want 1", got)
+	}
+}

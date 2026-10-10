@@ -218,7 +218,7 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 
 ### 4.1 Entry point
 
-`cmd/freesbc/main.go` accepts exactly three subcommands and one flag:
+`cmd/freesbc/main.go` accepts exactly four subcommands (`init` adds its own flags):
 
 | Invocation | Behaviour | Exit |
 |---|---|---|
@@ -226,10 +226,11 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 | `-h` / `--help` / `help` | usage to stdout | 0 |
 | `check [-c path]` | `app.Check` → `config.Load`; prints `"<path>: config OK"`. It parses and validates only: it opens no certificate or key file, assigns no address and binds no socket, so a missing cert file, an address that is not local, or a port another process holds is found by `run` alone. Everything validation can decide from the file (literal switch addresses, socket collisions between the admin listener and WS/WSS) `check` rejects exactly as `run` would | 0 / 1 |
 | `run [-c path]` | `app.Run` under `signal.NotifyContext(SIGINT, SIGTERM)` (`withSignals`) | 0 / 1 |
+| `init [-c path] [--switch …]` | `app.Init` (`internal/app/init.go`): detects `private.ip` (UDP connect toward the switch), `public.bind` (UDP connect toward the default route) and `public.ip` (echo service, then instance metadata; announced on stderr and skippable), prompts only when stdin is a terminal, validates the bytes with `config.Parse` and creates the file `O_EXCL`, mode 0600; refuses an existing file and `private.ip == public.bind` | 0 / 1 |
 | `version` | prints `freesbc <version> <go version> <os>/<arch>` (for example `freesbc v1.2.3 go1.27.2 linux/amd64`) to stdout; handled before flag parsing | 0 |
 | `version` with any argument or flag (`freesbc version -c x`) | `unexpected argument` plus usage to stderr | 2 |
-| `check`/`run` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
-| `check`/`run` with a positional argument (`freesbc run other.yaml`) | `unexpected argument "other.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
+| `check`/`run`/`init` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
+| `check`/`run`/`init` with a positional argument (`freesbc run other.yaml`) | `unexpected argument "other.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
 | anything else | usage to stderr | 2 |
 
 `-c` defaults to `freesbc.yaml`. A positional argument is a usage error
