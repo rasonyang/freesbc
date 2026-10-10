@@ -66,3 +66,39 @@ func TestRequestInLabelsAreBounded(t *testing.T) {
 		}
 	}
 }
+
+// Live sessions count in the RTP totals, and a session moving from live to
+// finished is neither double counted nor allowed to move the totals back.
+func TestRTPTotalsIncludeLiveSessions(t *testing.T) {
+	m := NewMetrics()
+	var live media.Stats
+	live.A.RTPPacketsRx, live.B.RTPPacketsTx = 10, 4
+	live.A.RTPBytesRx, live.B.RTPBytesTx = 1000, 400
+	stats := func() media.Stats { return live }
+	key := new(int)
+
+	m.MediaStarted(false, key, stats)
+	if s := m.Snapshot(); s.RTPPacketsRx != 10 || s.RTPPacketsTx != 4 || s.RTPBytesRx != 1000 || s.RTPBytesTx != 400 {
+		t.Fatalf("live session not counted: %+v", s)
+	}
+	live.A.RTPPacketsRx = 12 // grows while live
+	if s := m.Snapshot(); s.RTPPacketsRx != 12 {
+		t.Fatalf("live growth not seen: %d", s.RTPPacketsRx)
+	}
+	before := m.Snapshot().RTPPacketsRx
+	m.MediaEnded(false, key, stats)
+	m.MediaEnded(false, key, stats) // a repeat must not fold twice
+	after := m.Snapshot()
+	if after.RTPPacketsRx != before || after.RTPPacketsTx != 4 || after.RTPBytesRx != 1000 {
+		t.Fatalf("totals moved across close: before %d after %+v", before, after)
+	}
+	// A second session adds on top of the finished total.
+	m.MediaStarted(false, new(int), func() media.Stats {
+		var st media.Stats
+		st.A.RTPPacketsRx = 5
+		return st
+	})
+	if got := m.Snapshot().RTPPacketsRx; got != 17 {
+		t.Fatalf("second session: got %d want 17", got)
+	}
+}

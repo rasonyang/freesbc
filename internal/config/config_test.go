@@ -456,3 +456,23 @@ func TestPortRangePairs(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminPprofKey(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("pw"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := "admin: { listen: 127.0.0.1:8080, password_hash: " + string(hash)
+	for _, tc := range []struct {
+		name, extra string
+		want        bool
+	}{{"default", " }\n", false}, {"on", ", pprof: true }\n", true}} {
+		cfg, err := Parse([]byte(with(adm + tc.extra)))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if cfg.Admin.Pprof != tc.want {
+			t.Errorf("%s: Pprof = %v, want %v", tc.name, cfg.Admin.Pprof, tc.want)
+		}
+	}
+}

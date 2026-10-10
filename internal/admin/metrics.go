@@ -91,10 +91,10 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		// create a permanent series per call (spec §17).
 		proxyReqIn:      prometheus.NewDesc("freesbc_sip_requests_total", "SIP requests received by the edge proxy.", []string{"method", "transport"}, nil),
 		proxyResOut:     prometheus.NewDesc("freesbc_sip_responses_total", "SIP responses sent by the edge proxy, by status class.", []string{"class"}, nil),
-		proxyRTPPktRx:   prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across finished media sessions.", nil, nil),
-		proxyRTPPktTx:   prometheus.NewDesc("freesbc_rtp_packets_tx_total", "RTP packets sent across finished media sessions.", nil, nil),
-		proxyRTPByteRx:  prometheus.NewDesc("freesbc_rtp_bytes_rx_total", "RTP bytes received across finished media sessions.", nil, nil),
-		proxyRTPByteTx:  prometheus.NewDesc("freesbc_rtp_bytes_tx_total", "RTP bytes sent across finished media sessions.", nil, nil),
+		proxyRTPPktRx:   prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across all media sessions, finished and live.", nil, nil),
+		proxyRTPPktTx:   prometheus.NewDesc("freesbc_rtp_packets_tx_total", "RTP packets sent across all media sessions, finished and live.", nil, nil),
+		proxyRTPByteRx:  prometheus.NewDesc("freesbc_rtp_bytes_rx_total", "RTP bytes received across all media sessions, finished and live.", nil, nil),
+		proxyRTPByteTx:  prometheus.NewDesc("freesbc_rtp_bytes_tx_total", "RTP bytes sent across all media sessions, finished and live.", nil, nil),
 		proxyPortFail:   prometheus.NewDesc("freesbc_media_port_allocation_failure_total", "Calls rejected because a media port pool was exhausted.", nil, nil),
 		proxyICEFail:    prometheus.NewDesc("freesbc_webrtc_ice_failure_total", "WebRTC legs that never completed ICE.", nil, nil),
 		proxyDTLSFail:   prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
@@ -245,6 +245,8 @@ func (s *Server) registry() http.Handler {
 	s.metricsOnce.Do(func() {
 		reg := prometheus.NewRegistry()
 		reg.MustRegister(collectors.NewGoCollector())
+		// Linux-only series (cpu, memory, fds) are absent elsewhere.
+		reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		reg.MustRegister(newCollector(s.deps, &s.audit, &s.health, s.tlsRecord))
 		s.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	})

@@ -39,6 +39,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 		{"allow_insecure_sdes", strings.Replace(base, "edge:\n", "edge:\n  allow_insecure_sdes: true\n", 1), []string{"edge.allow_insecure_sdes"}},
 		{"carrier srtp", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: {host: 1.2.3.4, srtp: off} }", 1), []string{"edge.carriers"}},
 		{"admin", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\" }\n", []string{"admin"}},
+		{"admin pprof", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", pprof: true }\n", []string{"admin"}},
 		{"admin allowed_hosts", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", allowed_hosts: [a.example] }\n", []string{"admin"}},
 	}
 	running := mustParse(t, base)

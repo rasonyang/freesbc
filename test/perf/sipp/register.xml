@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Registrations from many users out of ONE source socket (the generator's
+  IP:port is what admission checks later).
+
+  Each call sends one REGISTER and expects 200. Users come from users.csv
+  (-inf SEQUENTIAL, one AoR per line). FreeSBC keys a binding on AoR +
+  Call-ID, so a REFRESH must reuse the Call-ID: run.sh starts every round as
+  a new SIPp process with -cid_str '%u@%s', so call number n is always user n
+  with Call-ID "n@<ip>", and later rounds refresh the same bindings instead of
+  adding new ones (a new Call-ID per REGISTER would hit the 10-per-AoR cap).
+  The switch UAS runs with -deadcall_wait 2 so it accepts the reused Call-ID.
+  FreeSBC forwards each REGISTER to the switch UAS, which answers 200 and
+  grants 86400 s. Bindings held = users x distinct contacts; the
+  per-AoR cap is 10 and the total cap 20000.
+
+  Run:  sipp -sf register.xml -inf users.csv -key expires 3600 -m <users> -cid_str '%u@%s' ...
+-->
+
+<scenario name="register">
+  <send retrans="500">
+    <![CDATA[
+      REGISTER sip:perf.test SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field0]@perf.test>;tag=[pid]RG[call_number]
+      To: <sip:[field0]@perf.test>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      Expires: [expires]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <!-- Response-time repartition for the REGISTER round trip, in ms. -->
+  <ResponseTimeRepartition value="1, 2, 5, 10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 2000, 5000, 10000"/>
+</scenario>

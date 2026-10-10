@@ -132,6 +132,7 @@ Enable the optional `admin` block (a bcrypt `password_hash`; generate with `free
 - the Audit tab (`GET /api/audit`) lists the last 256 admin events: sign-ins (first successful login, failed login, rate-limited) and drain changes (`drain_on`, `drain_off`); `freesbc_admin_auth_failures_total` counts the failures. The source is the connecting address, so behind a reverse proxy it is the proxy's,
 - the Health tab and header badge (`GET /api/health`, `GET /api/health/history`) show whether anything needs attention: a switch node cooling down, carrier DNS failing, the RTP pool at 90 % or more, the shield ban table at its cap, the TLS certificate under 30 days from expiry or expired, plus the last 200 raise and clear events (in memory; thresholds are fixed, alerting stays in Prometheus; `freesbc_admin_health_status` exposes the status as 0, 1 or 2),
 - scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
+- set `admin.pprof: true` to also serve Go pprof under `http://<admin.listen>/debug/pprof/` behind the same Basic Auth (off by default; restart-only),
 - read live state from `/api/status` (including a `reload` object: restart-only keys pending and the last failed reload), `/api/calls`, `/api/health` (overall status and the active conditions), `/api/audit`, `/api/tls` (the loaded TLS certificate, its expiry and whether the file on disk has been renewed; also the Overview's TLS card and `freesbc_tls_cert_expiry_timestamp_seconds`) and `/api/config`, and the live tables `/api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` (read-only; the WebUI's State tab shows them), and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
 - drain the node before a restart: `POST /api/drain` refuses new calls with `503` and `Retry-After: 30` while calls and registrations in place continue, `GET /api/drain` reports `active_calls`, `DELETE /api/drain` leaves drain mode (runtime state only; see [`docs/edge.md`](docs/edge.md)).
 
@@ -159,7 +160,7 @@ Everything else stays on the switch; FreeSBC's contribution is a documented swit
 
 ## Status & limitations
 
-FreeSBC targets small and medium deployments on a single node. The repo carries no benchmarks and no load-test harness.
+FreeSBC targets small and medium deployments on a single node. Preliminary single-host numbers (Docker on an Apple M3 Max VM, FreeSBC pinned to 2 cores, generator and switch on the same physical CPU, SIPp as the switch): about 1500 call setups per second, about 450 concurrent G.711 calls and about 800 concurrent WebRTC SRTP calls under 80% of the two cores, about 400 DTLS handshakes per second, and 19000 registrations held. These are not three-host or soak results and will differ on real hardware. Method, caveats, profiles and the first bottlenecks are in [docs/performance.md](docs/performance.md); the rerunnable harness is in [test/perf/](test/perf/README.md).
 
 Non-goals: transcoding, CDR, clustering, and being a registrar in its own right. The edge proxy proxies registrations to the switch rather than owning users or credentials.
 

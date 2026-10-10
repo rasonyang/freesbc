@@ -1,0 +1,95 @@
+# perf.yaml with a wide RTP range for the concurrent-call runs: 25000 calls.
+# Only the two LIMIT lines below differ from perf.yaml. Every anchored call
+# holds 2 UDP sockets per plane (RTP+RTCP) = 4 per call, so 25000 calls need
+# ~100000 fds: docker-compose.yml sets nofile to 1048576; on a real host raise
+# LimitNOFILE / ulimit -n before starting FreeSBC.
+#
+# FreeSBC configuration for the load runs (docker-compose topology).
+#
+# One file serves every scenario in test/perf: client calls and
+# registrations (UDP/TCP), carrier inbound and outbound, and WebRTC
+# (WS/WSS). The addresses are the ones docker-compose.yml assigns; for
+# three real hosts change the marked "ADDRESS" lines (README, "Three real
+# hosts") and re-run `freesbc check -c <file>`.
+#
+#   load generator            FreeSBC                       "switch"
+#   172.28.1.20  ->  public 172.28.1.10 | private 172.28.2.10  ->  172.28.2.20
+#   172.28.1.30 (carrier UAS)
+#
+# Every knob that matters for a load test is annotated "LIMIT" below. The
+# defaults they replace are what a load test hits first (issue #109).
+
+public:
+  ip: 172.28.1.10            # ADDRESS: FreeSBC's public side (advertised)
+  # bind: 172.28.1.10        # = ip here. Set it only behind 1:1 NAT (cloud VM).
+
+private:
+  ip: 172.28.2.10            # ADDRESS: FreeSBC's private side (bind = advertised).
+                             # The private SIP socket is fixed: 172.28.2.10:5060.
+
+# LIMIT rtp: one range, two independent allocators (public bind IP, private
+# IP). Every call anchors one even/odd RTP+RTCP pair per plane, so the range
+# holds (max-min+1)/2 calls: 10000-59999 = 25000 calls (perf.yaml: 20000-29999
+# = 5000 calls, also its default shield.max_sessions). Port exhaustion
+# answers 503.
+rtp: 10000-59999
+
+# The wss listener and WebRTC need a certificate. docker/freesbc-entrypoint.sh
+# generates a self-signed pair at /etc/freesbc/{cert,key}.pem on first start;
+# the WebRTC load client does not verify it. `check` does not open the files.
+tls:
+  cert: /etc/freesbc/cert.pem
+  key: /etc/freesbc/key.pem
+
+edge:
+  # The "switch": the SIPp UAS (switch_uas.xml) on the private side, a
+  # literal IP:port. FreeSBC admits private-socket traffic only from these IPs.
+  # The SIPp "switch UAC" (carrier outbound) runs on the same host and IP,
+  # on another source port (5070), which is why it is accepted.
+  switch: [172.28.2.20:5060]   # ADDRESS
+
+  listen:                      # ports on public.bind
+    udp: 5060                  # client, carrier and registration scenarios
+    tcp: 5060                  # stream transport (separate socket from udp)
+    ws: 8080                   # plaintext WebSocket: WebRTC runs without TLS cost
+    wss: 443                   # TLS WebSocket: WebRTC runs as a browser would
+
+  # LIMIT carriers: the switch's Request-URI host[:port] must equal an entry
+  # for a request to be a carrier request. The "carrier" UAS of the
+  # carrier-outbound scenario answers on 172.28.1.30:5060.
+  carriers:
+    perfcarrier: 172.28.1.30:5060   # ADDRESS
+
+  # LIMIT carrier_sources: the carrier-inbound generator. Admission then
+  # needs no REGISTER, the per-IP early-dialog cap (64) is exempt, and its
+  # traffic is charged to shield.carrier_rate_limit instead of
+  # shield.rate_limit. It is a different address (172.28.1.25) from the
+  # client generator (172.28.1.20) so client runs take the registered-client
+  # path and carrier runs the carrier path.
+  carrier_sources: [172.28.1.25]    # ADDRESS: the carrier-inbound generator
+
+shield:
+  # LIMIT rate_limit: default 20/s per_ip counts EVERY public datagram
+  # (ACK, BYE, retransmissions, RTP-free keepalives) and drops the excess
+  # silently, so one source gets about 6 CPS. Raised far above any rate the
+  # generator can produce so the shield never interferes with capacity runs.
+  rate_limit: 1000000/s per_ip
+  # LIMIT carrier_rate_limit: same for carrier sources (default 200/s per_ip).
+  carrier_rate_limit: 1000000/s per_ip
+  ban: 1m                   # a scanner verdict never fires on a generator
+                            # sending valid SIP, but keep it short if it does
+  # LIMIT max_sessions: calls holding a session slot. 0 = the rtp pair
+  # count. Explicit here: it may not exceed the 25000 calls rtp can anchor.
+  # Set it lower to test the 503 + Retry-After path.
+  max_sessions: 25000
+  # invite_rate_limit is off (empty): a global INVITE/s cap would hide the
+  # CPS the box can really do. Use it to test the cap, e.g. 200/s.
+
+# Operator API and /metrics. run.sh scrapes /metrics with user admin and
+# password "perf" (the bcrypt hash below). Loopback only; scrape it from
+# inside the FreeSBC host or through an SSH tunnel. Throwaway credential for
+# a load rig: do not reuse this file in production.
+admin:
+  listen: 127.0.0.1:8081
+  pprof: true                # /debug/pprof/ behind the same Basic Auth, for profiling under load
+  password_hash: "$2y$10$sbCGIYv.0V/JCrqC.ZBQEuzSWlVidnXE898iuyV8L1lbOTHzqabju"

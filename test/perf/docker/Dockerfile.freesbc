@@ -1,0 +1,21 @@
+# FreeSBC for the load rig. Build context is the repository root:
+#   docker build -f test/perf/docker/Dockerfile.freesbc --build-arg VERSION=$(git describe --always --dirty) .
+FROM golang:1.27.2 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/freesbc ./cmd/freesbc
+
+FROM debian:bookworm-slim
+# curl: run.sh scrapes /metrics from inside the container (admin is loopback only).
+# openssl: the entrypoint makes a self-signed wss certificate.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl openssl ca-certificates iproute2 procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/freesbc /usr/local/bin/freesbc
+COPY test/perf/docker/freesbc-entrypoint.sh /usr/local/bin/freesbc-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/freesbc-entrypoint.sh"]
+CMD ["run", "-c", "/perf/configs/perf.yaml"]
