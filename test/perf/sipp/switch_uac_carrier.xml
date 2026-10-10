@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Carrier outbound: the "switch" sends an INVITE to FreeSBC's private
+  socket (the SIPp remote host, 172.28.2.10:5060) with the carrier as the
+  Request-URI host:port, the way FreeSWITCH/Asterisk use FreeSBC as
+  outbound proxy. FreeSBC checks the Request-URI against edge.carriers and
+  forwards to the carrier. Must run from the switch's IP (edge.switch), on a
+  port other than the UAS's 5060, e.g. -i 172.28.2.20 -p 5070.
+
+  Run:  sipp -sf switch_uac_carrier.xml -s <number> -key carrier 172.28.1.30:5060 \
+             -d 30000 -key pcap /perf/pcap/g711u_10s.pcap 172.28.2.10:5060
+-->
+
+<scenario name="switch to carrier">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:[service]@[carrier] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:+1555[call_number]@switch.test>;tag=[pid]SU[call_number]
+      To: <sip:[service]@[carrier]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:switch@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=switch 1 1 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [auto_media_port] RTP/AVP 0 101
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=ptime:20
+      a=sendrecv
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="183" optional="true"/>
+  <recv response="200" rtd="true" rrs="true" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      [routes]
+      From: <sip:+1555[call_number]@switch.test>;tag=[pid]SU[call_number]
+      To: <sip:[service]@[carrier]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <nop>
+    <action>
+      <exec play_pcap_audio="[pcap]"/>
+    </action>
+  </nop>
+
+  <pause/>
+
+  <send retrans="500">
+    <![CDATA[
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      [routes]
+      From: <sip:+1555[call_number]@switch.test>;tag=[pid]SU[call_number]
+      To: <sip:[service]@[carrier]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <ResponseTimeRepartition value="1, 2, 5, 10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000, 120000"/>
+</scenario>

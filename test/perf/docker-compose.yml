@@ -1,0 +1,92 @@
+# Single-host load rig: three roles on two bridge networks.
+#
+#   public 172.28.1.0/24                      private 172.28.2.0/24
+#   loadgen    172.28.1.20  ----+
+#   carriergen 172.28.1.25  ----+--> freesbc 172.28.1.10 | 172.28.2.10 <--> switch 172.28.2.20
+#   carrier    172.28.1.30  ----+
+#
+# The addresses match test/perf/configs/perf*.yaml. Run it through run.sh, or:
+#   docker compose -f test/perf/docker-compose.yml up -d --build
+#   docker compose -f test/perf/docker-compose.yml down
+#
+# Everything here shares the Docker VM's CPUs (Colima/Docker Desktop), so
+# absolute numbers from this rig are for method checks, not for publishing;
+# publish from three real hosts (README, "Three real hosts").
+
+name: freesbc-perf
+
+# One image for every SIPp/WebRTC role. Only loadgen carries the build section
+# (several services building the same tag collide); run.sh builds first.
+x-tools: &tools
+  image: freesbc-perf-tools
+  pull_policy: never
+  volumes:
+    - ./:/perf            # scenarios, pcap, and the out/ directory
+  ulimits:
+    nofile: 1048576
+  init: true
+
+services:
+  freesbc:
+    build:
+      context: ../..
+      dockerfile: test/perf/docker/Dockerfile.freesbc
+      args:
+        VERSION: ${FREESBC_VERSION:-perf}
+    image: freesbc-perf-freesbc
+    # Pick the config with FREESBC_CONFIG, e.g. perf-wide.yaml for >5000 calls.
+    command: ["run", "-c", "/perf/configs/${FREESBC_CONFIG:-perf.yaml}"]
+    volumes:
+      - ./:/perf:ro
+    ulimits:
+      nofile: 1048576      # 4 sockets per call + stream connections
+    networks:
+      public:
+        ipv4_address: 172.28.1.10
+      private:
+        ipv4_address: 172.28.2.10
+
+  # Public side. Client scenarios (register, uac call, WebRTC) run here.
+  loadgen:
+    <<: *tools
+    build:
+      context: ../..
+      dockerfile: test/perf/docker/Dockerfile.tools
+    networks:
+      public:
+        ipv4_address: 172.28.1.20
+
+  # Public side, listed in edge.carrier_sources: carrier-inbound scenario.
+  carriergen:
+    <<: *tools
+    networks:
+      public:
+        ipv4_address: 172.28.1.25
+
+  # Public side: the carrier that answers carrier-outbound calls
+  # (edge.carriers.perfcarrier = 172.28.1.30:5060).
+  carrier:
+    <<: *tools
+    networks:
+      public:
+        ipv4_address: 172.28.1.30
+
+  # Private side: the "switch" (UAS on :5060; the switch-side UAC for
+  # carrier-outbound runs uses :5070 from the same IP).
+  switch:
+    <<: *tools
+    networks:
+      private:
+        ipv4_address: 172.28.2.20
+
+networks:
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  private:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24

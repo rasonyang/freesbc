@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Registered-client call: INVITE with a PCMU offer, ACK, G.711 20 ms RTP from
+  a pcap while the call is held for -d ms, BYE.
+
+  Public INVITE admission requires the INVITE's source to be the exact
+  IP:port of a live registration. run.sh therefore runs register.xml first,
+  from the SAME local IP:port (-i/-p), for every user in users.csv, and only
+  then this scenario. (REGISTER and INVITE cannot share one scenario: SIPp
+  maps responses by Call-ID, and the UAS ends a Call-ID when its first
+  flow completes.) Registrations are granted 86400 s by switch_uas.xml.
+
+  Users come from users.csv (-inf); the Request-URI user is -s <service>.
+  The pcap must cover the hold: g711u_10s.pcap is 10 s, longer holds need a
+  pcap from pcap/gen_pcap.py (run.sh makes one). The switch UAS echoes RTP,
+  so media flows both ways through FreeSBC on both legs.
+
+  Run:  sipp -sf uac_call.xml -inf users.csv -s 2000 -d 30000 \
+             -key pcap /perf/pcap/g711u_10s.pcap ...
+-->
+
+<scenario name="uac call">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:[service]@perf.test SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      From: <sip:[field0]@perf.test>;tag=[pid]UC[call_number]
+      To: <sip:[service]@perf.test>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=uac 1 1 IN IP[local_ip_type] [local_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [auto_media_port] RTP/AVP 0 101
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=ptime:20
+      a=sendrecv
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="183" optional="true"/>
+  <!-- Anything but 200 (503 from a cap, 4xx) ends the call as failed. -->
+  <recv response="200" rtd="true" rrs="true" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      [routes]
+      From: <sip:[field0]@perf.test>;tag=[pid]UC[call_number]
+      To: <sip:[service]@perf.test>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <nop>
+    <action>
+      <exec play_pcap_audio="[pcap]"/>
+    </action>
+  </nop>
+
+  <!-- Hold: the call length, -d ms. -->
+  <pause/>
+
+  <send retrans="500">
+    <![CDATA[
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Max-Forwards: 70
+      [routes]
+      From: <sip:[field0]@perf.test>;tag=[pid]UC[call_number]
+      To: <sip:[service]@perf.test>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true"/>
+
+  <!-- INVITE -> 200 time (rtd): SIPp reports its p-bucket counts in the stats CSV. -->
+  <ResponseTimeRepartition value="1, 2, 5, 10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000, 120000"/>
+</scenario>

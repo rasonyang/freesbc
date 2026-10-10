@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The "switch" (private side). One UAS for every raw-capacity run, so
+  FreeSWITCH is never the bottleneck.
+
+    REGISTER  -> 200 OK echoing the Contact FreeSBC forwarded, expires 86400
+                 (no digest challenge: FreeSBC forwards it verbatim anyway)
+    INVITE    -> 100, 180, 200 with a PCMU SDP, then ACK, BYE -> 200
+                 Used by client calls and carrier-inbound calls alike.
+
+  RTP is echoed by SIPp itself: start with -rtp_echo -mp 6000. All calls
+  advertise port 6000 and are told apart by FreeSBC's per-call private port.
+  Run:  sipp -sf switch_uas.xml -i <switch ip> -p 5060 -rtp_echo -mp 6000 \
+             -nd -fd 1 -trace_stat -stat_delimiter , -trace_screen
+-->
+
+<scenario name="switch uas">
+  <!-- A new "call" is created by either method; the optional first receive
+       branches REGISTER away from the INVITE dialog. -->
+  <recv request="REGISTER" optional="true" next="reg"/>
+
+  <recv request="INVITE" crlf="true"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SW[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_Record-Route:]
+      [last_From:]
+      [last_To:];tag=[pid]SW[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[local_ip]:[local_port];transport=[transport]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=switch 1 1 IN IP4 [local_ip]
+      s=-
+      c=IN IP4 [local_ip]
+      t=0 0
+      m=audio 6000 RTP/AVP 0 101
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=ptime:20
+      a=sendrecv
+    ]]>
+  </send>
+
+  <recv request="ACK" crlf="true"/>
+
+  <!-- The call stays up until the generator hangs up. -->
+  <recv request="BYE"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <nop next="fin"/>
+
+  <label id="reg"/>
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SW[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      [last_Contact:];expires=86400
+      Expires: 86400
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <label id="fin"/>
+
+</scenario>

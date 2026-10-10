@@ -1,0 +1,18 @@
+# Load generator / "switch" / carrier image: SIPp (Debian's sip-tester build
+# has PCAP and RTP-stream support) plus the Go WebRTC load client.
+# Build context is the repository root.
+FROM golang:1.27.2 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+COPY test/perf/webrtcload ./test/perf/webrtcload
+RUN CGO_ENABLED=0 go build -trimpath -o /out/webrtcload ./test/perf/webrtcload
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sip-tester ca-certificates iproute2 procps python3-minimal \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/webrtcload /usr/local/bin/webrtcload
+CMD ["sleep", "infinity"]
