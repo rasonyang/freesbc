@@ -11,7 +11,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 
 ## Install
 
-**Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml`:
+**Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml` (linux archives add `freesbc.service`, see [Run as a service](#run-as-a-service)):
 
 ```sh
 v=v0.1.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
@@ -27,6 +27,23 @@ tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
 ```sh
 go build -o freesbc ./cmd/freesbc
 ```
+
+### Run as a service
+
+The linux archives also hold `freesbc.service`, a systemd unit that runs FreeSBC as the unprivileged `freesbc` user, with `CAP_NET_BIND_SERVICE` for listen ports below 1024 (such as `wss: 443`) and a read-only filesystem. FreeSBC writes no files: logs go to stderr, so journald needs nothing. As root, from the unpacked archive:
+
+```sh
+useradd --system --no-create-home --shell /usr/sbin/nologin freesbc
+install -m 0755 freesbc /usr/local/bin/freesbc
+install -m 0644 freesbc.service /etc/systemd/system/freesbc.service
+install -d -m 0750 -o root -g freesbc /etc/freesbc
+install -m 0640 -o root -g freesbc freesbc.example.yaml /etc/freesbc/freesbc.yaml   # then edit the addresses
+/usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml
+systemctl enable --now freesbc
+journalctl -u freesbc -f
+```
+
+The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service cannot change its own config. For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode); the unit reads it if present. There is no `ExecReload`: a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`.
 
 ## Quick start
 
