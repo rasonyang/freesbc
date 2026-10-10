@@ -7,6 +7,7 @@
   var STATUS_URL = "/api/status";
   var CALLS_URL = "/api/calls";
   var DRAIN_URL = "/api/drain";
+  var TLS_URL = "/api/tls";
   var AUDIT_URL = "/api/audit";
   var HEALTH_URL = "/api/health";
   var HEALTH_HISTORY_URL = "/api/health/history";
@@ -235,6 +236,83 @@
     });
   }
 
+  // ---- TLS certificate ----
+
+  // Rows whose long values span the grid and wrap instead of truncating.
+  var WIDE_TLS_ROWS = ["SHA-256", "Certificate", "Private key", "Disk"];
+
+  // renderTLS shows the card only when a certificate is loaded. The banner
+  // follows the server's expired / expiring_soon verdict (30 days), or a
+  // renewed certificate waiting on disk.
+  function renderTLS(t) {
+    var card = $("tls-card");
+    if (!t || !t.loaded) { card.hidden = true; return; }
+    card.hidden = false;
+    var badge = $("tls-badge");
+    var banner = $("tls-banner");
+    var pending = t.disk_differs && !t.disk_error;
+    var bad = t.expired || t.expiring_soon;
+    if (t.expired) {
+      badge.textContent = "Expired";
+      badge.setAttribute("data-variant", "destructive");
+      banner.setAttribute("data-variant", "destructive");
+      var ago = -t.days_to_expiry;
+      $("tls-banner-title").textContent = ago > 0
+        ? "Certificate expired " + fmtInt(ago) + " day(s) ago"
+        : "Certificate expired less than a day ago";
+    } else if (t.expiring_soon) {
+      badge.textContent = "Expires in " + fmtInt(t.days_to_expiry) + "d";
+      badge.setAttribute("data-variant", "warning");
+      banner.setAttribute("data-variant", "warning");
+      $("tls-banner-title").textContent = t.days_to_expiry > 0
+        ? "Certificate expires in " + fmtInt(t.days_to_expiry) + " day(s)"
+        : "Certificate expires in less than a day";
+    } else {
+      badge.textContent = pending ? "Restart to apply" : "Valid · " + fmtInt(t.days_to_expiry) + "d left";
+      badge.setAttribute("data-variant", pending ? "warning" : "success");
+      banner.setAttribute("data-variant", "warning");
+      $("tls-banner-title").textContent = "Renewed certificate on disk";
+    }
+    banner.hidden = !(bad || pending);
+    if (bad) {
+      $("tls-banner-text").textContent = pending
+        ? "A renewed certificate is already on disk at " + t.cert_file + "; a restart applies it. The running process keeps serving the old certificate until then."
+        : "Replace the files at " + t.cert_file + " and restart; the running process keeps serving the old certificate.";
+    } else {
+      $("tls-banner-text").textContent = pending
+        ? "A different certificate is now at " + t.cert_file + "; a restart applies it. The running process keeps serving the loaded certificate until then."
+        : "";
+    }
+
+    var key = t.key_type + (t.key_curve ? " " + t.key_curve : t.key_size ? " " + t.key_size : "");
+    var rows = [
+      ["Subject", t.subject],
+      ["SANs", (t.sans || []).join(", ")],
+      ["Issuer", t.issuer],
+      ["Not before", t.not_before],
+      ["Not after", t.not_after],
+      ["Key", key],
+      ["SHA-256", t.fingerprint_sha256],
+      ["Certificate", t.cert_file],
+      ["Private key", t.key_file],
+      ["Loaded", t.loaded_at],
+      ["Used by", (t.listeners || []).join(", ")]
+    ];
+    if (t.disk_error) rows.push(["Disk", "cannot read: " + t.disk_error]);
+    else if (t.disk_differs) rows.push(["Disk", "differs from loaded: renewed on disk, restart to apply"]);
+    var ul = $("tls-fields");
+    ul.textContent = "";
+    rows.forEach(function (r) {
+      var li = el("li");
+      if (WIDE_TLS_ROWS.indexOf(r[0]) >= 0) li.setAttribute("data-wide", "");
+      li.appendChild(el("span", "muted", r[0]));
+      var v = el("span", "mono", r[1] ? r[1] : "—");
+      v.title = r[1] || "";
+      li.appendChild(v);
+      ul.appendChild(li);
+    });
+  }
+
   // ---- drain mode ----
 
   var drainState = null; // last GET /api/drain body; null until the first one
@@ -330,12 +408,14 @@
       fetchJSON(STATUS_URL),
       fetchJSON(CALLS_URL),
       fetchJSON(DRAIN_URL),
-      fetchJSON(HEALTH_URL)
+      fetchJSON(HEALTH_URL),
+      fetchJSON(TLS_URL)
     ]).then(function (results) {
-      var st = results[0], ca = results[1], dr = results[2], he = results[3];
+      var st = results[0], ca = results[1], dr = results[2], he = results[3], tl = results[4];
       if (st.status === "fulfilled") renderStatus(st.value);
       if (ca.status === "fulfilled") renderCalls(ca.value);
       if (dr.status === "fulfilled") renderDrain(dr.value);
+      if (tl.status === "fulfilled") renderTLS(tl.value);
       if (he.status === "fulfilled") {
         renderHealth(he.value);
         // Keep the history current while it is on screen, without polling it
@@ -345,12 +425,13 @@
       $("status-stale").hidden = st.status === "fulfilled";
       $("calls-stale").hidden = ca.status === "fulfilled";
       $("drain-stale").hidden = dr.status === "fulfilled";
+      $("tls-stale").hidden = tl.status === "fulfilled";
       $("health-stale").hidden = he.status === "fulfilled";
       if (he.status === "rejected") markHealthStale();
-      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected") + (he.status === "rejected");
+      var failed = (st.status === "rejected") + (ca.status === "rejected") + (dr.status === "rejected") + (he.status === "rejected") + (tl.status === "rejected");
       if (sessionExpired) return; // showSessionExpired already set the indicator
       if (failed === 0) setLive("live", "Live · " + fmtClock(new Date()));
-      else if (failed < 4) setLive("stale", "Partial update, retrying…");
+      else if (failed < 5) setLive("stale", "Partial update, retrying…");
       else setLive("stale", "Connection lost, retrying…");
     });
   }

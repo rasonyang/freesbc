@@ -337,3 +337,27 @@ func TestUIHealthTab(t *testing.T) {
 		t.Error("the health code must build rows with textContent, not innerHTML")
 	}
 }
+
+// The TLS card is wired: hidden until /api/tls reports a loaded leaf, filled
+// with textContent, and the banner follows the server's verdicts.
+func TestUITLSCard(t *testing.T) {
+	read := func(name string) string {
+		b, err := webuiFS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	html := read("webui/index.html")
+	for _, want := range []string{`id="tls-card"`, `id="tls-banner"`, `id="tls-badge"`, `id="tls-fields"`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html missing %q", want)
+		}
+	}
+	js := read("webui/assets/app.js")
+	for _, want := range []string{`"/api/tls"`, "function renderTLS", "fetchJSON(TLS_URL)", "t.expiring_soon", "t.expired", `card.hidden = true`} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js missing %q", want)
+		}
+	}
+}

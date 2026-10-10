@@ -408,6 +408,10 @@ a.badge:hover { filter: brightness(0.95); }
   column-gap: calc(var(--spacing) * 6);
 }
 .list[data-layout="grid"] > li { padding-block: calc(var(--spacing) * 2); border-bottom-width: 0; }
+/* A row with a long value spans the grid and wraps instead of truncating. */
+.list[data-layout="grid"] > li[data-wide] { grid-column: 1 / -1; align-items: baseline; }
+.list[data-layout="grid"] > li[data-wide] > .muted { flex: none; }
+.list[data-layout="grid"] > li[data-wide] .mono { overflow: visible; white-space: normal; overflow-wrap: anywhere; min-width: 0; }
 
 /* ---- empty state -------------------------------------------------------- */
 .empty {
@@ -546,6 +550,17 @@ a.badge:hover { filter: brightness(0.95); }
   background: color-mix(in oklch, var(--destructive) 6%, var(--card));
 }
 .alert[data-variant="destructive"] .alert-body { color: color-mix(in oklch, var(--destructive) 85%, var(--foreground)); }
+
+.alert[data-variant="warning"] {
+  --tone: var(--warning);
+  color: light-dark(color-mix(in oklch, var(--tone) 85%, var(--foreground)), var(--tone));
+  border-color: color-mix(in oklch, var(--warning) 40%, transparent);
+  /* The light --warning step sits at hue 49 (orange); tinted onto white it
+   * reads pink, so the tint takes the amber hue (85) of the dark step. oklab, not oklch:
+   * the achromatic card has hue 0, which oklch would blend toward. */
+  background: color-mix(in oklab, var(--warning-amber) 14%, var(--card));
+}
+.alert[data-variant="warning"] .alert-body { color: color-mix(in oklch, var(--warning) 85%, var(--foreground)); }
 
 .banner {
   border-bottom-width: 1px;

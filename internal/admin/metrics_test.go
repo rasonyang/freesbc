@@ -1,8 +1,11 @@
 package admin
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/freesbc/freesbc/internal/config"
 )
@@ -87,6 +90,21 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics missing %q\n---\n%s", want, body)
 		}
+	}
+}
+
+// The certificate expiry gauge carries not-after as Unix seconds under the
+// cert file path, and is absent when no certificate is loaded.
+func TestMetricsTLSCertExpiry(t *testing.T) {
+	notAfter := time.Now().Add(40 * 24 * time.Hour).Truncate(time.Second)
+	cert, key := writeTLSPair(t, t.TempDir(), "m.example.test", notAfter, false)
+	body := string(authGET(t, tlsServer(t, cert, key), "/metrics"))
+	want := fmt.Sprintf("freesbc_tls_cert_expiry_timestamp_seconds{path=%q} %s", cert, strconv.FormatFloat(float64(notAfter.Unix()), 'g', -1, 64))
+	if !strings.Contains(body, want) {
+		t.Errorf("/metrics missing %q\n---\n%s", want, body)
+	}
+	if body := string(authGET(t, testServer(t), "/metrics")); strings.Contains(body, "freesbc_tls_cert_expiry_timestamp_seconds") {
+		t.Errorf("gauge exported with no certificate loaded")
 	}
 }
 
