@@ -37,14 +37,14 @@ useradd --system --no-create-home --shell /usr/sbin/nologin freesbc
 install -m 0755 freesbc /usr/local/bin/freesbc
 install -m 0644 freesbc.service /etc/systemd/system/freesbc.service
 install -d -m 0750 -o root -g freesbc /etc/freesbc
-/usr/local/bin/freesbc init -c /etc/freesbc/freesbc.yaml   # see Quick start
+/usr/local/bin/freesbc init -c /etc/freesbc/freesbc.yaml   # prompts on a terminal; in a script pass --switch etc. (see Quick start)
 chown root:freesbc /etc/freesbc/freesbc.yaml && chmod 0640 /etc/freesbc/freesbc.yaml
 /usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml
 systemctl enable --now freesbc
 journalctl -u freesbc -f
 ```
 
-The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service cannot change its own config; `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead, `install -m 0640 -o root -g freesbc` it in place of `init` and edit the addresses. For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode); the unit reads it if present. There is no `ExecReload`: a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`.
+The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service cannot change its own config; `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead, `install -m 0640 -o root -g freesbc` it in place of `init` and edit the addresses. For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode); the unit reads it if present. `freesbc check` does not read that file, so check such a config with `env $(grep -v '^#' /etc/freesbc/freesbc.env) /usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml` (not `. freesbc.env`, which would expand the `$` in a bcrypt hash). There is no `ExecReload`: a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`.
 
 ## Quick start
 
