@@ -384,10 +384,10 @@ func (c *Config) validateAdmin(fail failFunc) {
 	cost, cerr := bcrypt.Cost([]byte(c.Admin.PasswordHash))
 	if cerr != nil {
 		fail("admin.password_hash: must be a bcrypt hash: %v", c.envRedact.detail(c.Admin.PasswordHash, cerr))
-	} else if cost < 10 {
+	} else if cost < MinBcryptCost {
 		// Cost 4 (min) makes offline cracking ~50x cheaper; the hash
 		// travels in backups, logs and the config itself.
-		fail("admin.password_hash: bcrypt cost %d is below the minimum of 10; regenerate the hash at cost 10 or higher", cost)
+		fail("admin.password_hash: bcrypt cost %d is below the minimum of %d; regenerate the hash with `freesbc hash-password`", cost, MinBcryptCost)
 	}
 }
 

@@ -29,6 +29,8 @@ Usage:
         [--udp-port N] [--no-public-lookup]   (env: FREESBC_SWITCH, FREESBC_PRIVATE_IP,
         FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT)
   freesbc version                   print the version and exit
+  freesbc hash-password             print a bcrypt hash for admin.password_hash
+                                    (prompts on a terminal, else reads one line of stdin)
 `
 
 // version is the build version, overridable via `-ldflags "-X main.version=…"`.
@@ -65,6 +67,11 @@ func run(args []string) int {
 		}
 		fmt.Println(versionLine())
 		return 0
+	}
+	// hash-password takes no -c, and never a password argument: it would land
+	// in shell history and the process list.
+	if cmd == "hash-password" {
+		return hashPasswordCmd(args[1:])
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "freesbc.yaml", "path to config file")

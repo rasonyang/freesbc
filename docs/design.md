@@ -218,7 +218,7 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 
 ### 4.1 Entry point
 
-`cmd/freesbc/main.go` accepts exactly four subcommands (`init` adds its own flags):
+`cmd/freesbc/main.go` accepts exactly five subcommands (`check`, `run` and `init` take `-c`; `init` adds its own flags):
 
 | Invocation | Behaviour | Exit |
 |---|---|---|
@@ -229,6 +229,7 @@ gone once the handshake ends) and a `<-closed` DTLS closer
 | `init [-c path] [--switch …]` | `app.Init` (`internal/app/init.go`): detects `private.ip` (UDP connect toward the switch), `public.bind` (UDP connect toward the default route) and `public.ip` (echo service, then instance metadata; announced on stderr and skippable), prompts only when stdin is a terminal, validates the bytes with `config.Parse` and creates the file `O_EXCL`, mode 0600; refuses an existing file and `private.ip == public.bind` | 0 / 1 |
 | `version` | prints `freesbc <version> <go version> <os>/<arch>` (for example `freesbc v1.2.3 go1.27.2 linux/amd64`) to stdout; handled before flag parsing | 0 |
 | `version` with any argument or flag (`freesbc version -c x`) | `unexpected argument` plus usage to stderr | 2 |
+| `hash-password` | prints the bcrypt hash (cost `config.MinBcryptCost`) of a password to stdout, for `admin.password_hash`. On a terminal it prompts twice on stderr without echo and the entries must match; otherwise it reads one line of stdin (a trailing `\n` or `\r\n` is stripped, nothing else). An empty password, a mismatch or a password over bcrypt's 72 bytes is an error on stderr. It takes no `-c` and never the password as an argument: any argument but `-h`/`--help` is a usage error | 0 / 1 / 2 |
 | `check`/`run`/`init` with an unrecognised flag | Go's own flag usage to stderr (`flag.ContinueOnError`, mapped to exit 2 in `run`; `-h` exits 0), so `app.Run` is never reached | 2 |
 | `check`/`run`/`init` with a positional argument (`freesbc run other.yaml`) | `unexpected argument "other.yaml" (the config file is given with -c)` plus usage to stderr (audit P2-APP-007) | 2 |
 | anything else | usage to stderr | 2 |
