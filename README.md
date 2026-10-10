@@ -36,6 +36,7 @@ go build -o freesbc ./cmd/freesbc
 cp freesbc.example.yaml freesbc.yaml   # then edit the addresses
 ./freesbc check -c freesbc.yaml        # validate; errors name the line and key
 ./freesbc run   -c freesbc.yaml
+./freesbc version                      # print the build version
 ```
 
 A minimal config (every key is documented in [`docs/config.md`](docs/config.md)):

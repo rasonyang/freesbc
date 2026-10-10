@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ edge:
 		{"check", "-c", good, "other.yaml"},
 		{"check", "other.yaml"},
 		{"run", "other.yaml"},
+		{"version", "x"},
+		{"version", "-c", good},
 	} {
 		if got := run(args); got != 2 {
 			t.Errorf("run(%q) = %d, want 2 (usage error)", args, got)
@@ -41,6 +44,17 @@ edge:
 	}
 	if got := run([]string{"check", "-c", good}); got != 0 {
 		t.Errorf("check -c %s = %d, want 0", good, got)
+	}
+}
+
+// `freesbc version` prints one line starting with the build version and
+// exits 0; the plain test build carries the default "dev".
+func TestVersion(t *testing.T) {
+	if got := versionLine(); !strings.HasPrefix(got, "freesbc dev go") || strings.Contains(got, "\n") {
+		t.Errorf("versionLine() = %q, want one line starting with %q", got, "freesbc dev go")
+	}
+	if got := run([]string{"version"}); got != 0 {
+		t.Errorf("run(version) = %d, want 0", got)
 	}
 }
 

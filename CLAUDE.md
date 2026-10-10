@@ -5,12 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 - Build the only binary: `go build -o freesbc ./cmd/freesbc` (`/freesbc` is gitignored). Set the version with `-ldflags "-X main.version=<v>"` (default `dev`).
-- Release: `.github/workflows/release.yml` runs on pushed `v*` tags, or by hand with a `tag` input to backfill one. It builds `CGO_ENABLED=0 -trimpath` binaries for linux/darwin x amd64/arm64, packages `freesbc_<tag>_<os>_<arch>.tar.gz` (binary, README, LICENSE, `freesbc.example.yaml`) with `SHA256SUMS`, runs `check` on the linux/amd64 build, and uploads to the release with `gh`.
+- Release: `.github/workflows/release.yml` runs on pushed `v*` tags, or by hand with a `tag` input to backfill one. It builds `CGO_ENABLED=0 -trimpath` binaries for linux/darwin x amd64/arm64, packages `freesbc_<tag>_<os>_<arch>.tar.gz` (binary, README, LICENSE, `freesbc.example.yaml`) with `SHA256SUMS`, runs `version` (must print the tag) and `check` on the linux/amd64 build, and uploads to the release with `gh`.
 - Vet: `go vet ./...`. There is no linter config or Makefile; `gofmt -l .` and `go mod tidy -diff` are clean and CI keeps them so.
 - CI (`.github/workflows/ci.yml`, on push to main and PRs): gofmt, `go mod tidy -diff`, vet, build, `check` on `freesbc.example.yaml`, `go test -race ./...`, and govulncheck (pinned v1.8.0, `GOTOOLCHAIN=local`). `soak.yml` runs nightly and on demand: the suite under `-race -count=N` and each `Fuzz*` target for `-fuzztime`. A new fuzz target must be added to its matrix.
 - Tests (as the README runs them): `go test ./... -race`. One package: `go test -race ./internal/config`. One test: `go test ./internal/app -run '^TestCheckExamples$' -count=1 -v`.
 - No build tags. The edge suite is mostly integration tests over real loopback sockets (real sipgo transports and RTP sockets), not mocks.
-- CLI: `freesbc run|check [-c file]`. `-c` defaults to `freesbc.yaml`; a positional argument is a usage error (exit 2), so always pass `-c`.
+- CLI: `freesbc run|check [-c file]` and `freesbc version` (prints `freesbc <version> <go version> <os>/<arch>`). `-c` defaults to `freesbc.yaml`; a positional argument is a usage error (exit 2), so always pass `-c`.
 - Example config: `./freesbc check -c freesbc.example.yaml` passes (`TestCheckExamples` guards this). `check` only parses and validates: it does not test that addresses are local, open cert files or bind sockets. `run -c freesbc.example.yaml` exits 1 because `203.0.113.7` and `10.77.0.2` are not local addresses, so adapt them before `run`. The local copy `/freesbc.yaml` is gitignored.
 - Opt-in live FreeSWITCH interop. It skips unless `FREESBC_FS_INTEROP=1` and shells out to `/usr/local/freeswitch/bin/fs_cli`, so run it on the FreeSWITCH host:
   `FREESBC_FS_INTEROP=1 FREESBC_FS_ADDR=<fs-ip>:5060 FREESBC_FS_LOCAL=<this-host-ip> FREESBC_FS_USER=1000 FREESBC_FS_PASS=<pw> go test ./internal/edge/ -run TestFreeSWITCH -v`
