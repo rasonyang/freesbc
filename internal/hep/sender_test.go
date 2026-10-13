@@ -251,6 +251,16 @@ func serverTLS(cert tls.Certificate, mutual bool) *tls.Config {
 	return cfg
 }
 
+// waitSent waits for the Sent counter to reach n: the collector can read a
+// packet before the writer goroutine has counted it.
+func waitSent(t *testing.T, s *Sender, n uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Stats().Sent < n && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func checkDelivered(t *testing.T, d decoded, payload string) {
 	t.Helper()
 	if string(d.Payload) != payload || d.Type != PayloadSIP || d.Proto != 17 ||
@@ -293,6 +303,7 @@ func TestDelivery(t *testing.T) {
 				}
 				checkDelivered(t, col.recv(t), want)
 			}
+			waitSent(t, s, 3)
 			if st := s.Stats(); st.Sent != 3 || st.Dropped != 0 || st.WriteErrors != 0 {
 				t.Errorf("stats %+v", st)
 			}
@@ -362,6 +373,7 @@ func TestOversizeIsNotDropped(t *testing.T) {
 	s.Send(big)
 	s.Send(testPacket("ok"))
 	checkDelivered(t, col.recv(t), "ok")
+	waitSent(t, s, 1)
 	if st := s.Stats(); st.EncodeErrors != 1 || st.Dropped != 0 || st.Sent != 1 {
 		t.Errorf("stats %+v", st)
 	}
