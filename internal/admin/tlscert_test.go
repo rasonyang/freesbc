@@ -296,3 +296,138 @@ func TestHealthTLSCertExpiry(t *testing.T) {
 		}
 	}
 }
+
+// healthByID returns the active conditions with the given id.
+func healthByID(t *testing.T, s *Server, id string) []ActiveCondition {
+	t.Helper()
+	var out []ActiveCondition
+	for _, c := range getHealth(t, s).Conditions {
+		if c.ID == id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// differsGauge reads freesbc_tls_cert_disk_differs from /metrics.
+func differsGauge(t *testing.T, s *Server) string {
+	t.Helper()
+	for _, l := range strings.Split(string(authGET(t, s, "/metrics")), "\n") {
+		if strings.HasPrefix(l, "freesbc_tls_cert_disk_differs ") {
+			return strings.TrimPrefix(l, "freesbc_tls_cert_disk_differs ")
+		}
+	}
+	return ""
+}
+
+// The same cert on disk raises nothing and exports 0; a different one raises
+// tls_cert_renewed only after the cache refreshes, sets the gauge to 1 and
+// makes the expiry message mention the renewal.
+func TestHealthTLSCertRenewedOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeTLSPair(t, dir, "old.example.test", time.Now().Add(5*24*time.Hour), false)
+	s := tlsServer(t, cert, key)
+	s.refreshTLSDisk()
+	if got := healthByID(t, s, "tls_cert_renewed"); len(got) != 0 {
+		t.Fatalf("same cert on disk: %+v", got)
+	}
+	if g := differsGauge(t, s); g != "0" {
+		t.Fatalf("gauge = %q, want 0", g)
+	}
+	exp := healthByID(t, s, "tls_cert_expiry")
+	if len(exp) != 1 || strings.Contains(exp[0].Message, "renewed") {
+		t.Fatalf("expiry before renewal: %+v", exp)
+	}
+
+	// The file changes but nothing refreshed the cache: health and metrics
+	// must not notice (they never read the file).
+	writeTLSPair(t, dir, "new.example.test", time.Now().Add(80*24*time.Hour), false)
+	if got := healthByID(t, s, "tls_cert_renewed"); len(got) != 0 {
+		t.Fatalf("health read the file: %+v", got)
+	}
+	if g := differsGauge(t, s); g != "0" {
+		t.Fatalf("metrics read the file: gauge = %q", g)
+	}
+
+	s.refreshTLSDisk()
+	got := healthByID(t, s, "tls_cert_renewed")
+	if len(got) != 1 || got[0].Severity != HealthDegraded {
+		t.Fatalf("after refresh: %+v", got)
+	}
+	if g := differsGauge(t, s); g != "1" {
+		t.Fatalf("gauge = %q, want 1", g)
+	}
+	exp = healthByID(t, s, "tls_cert_expiry")
+	if len(exp) != 1 || !strings.Contains(exp[0].Message, "renewed on disk") {
+		t.Fatalf("expiry message lacks the renewal: %+v", exp)
+	}
+
+	// A restart loads the new file: back to quiet.
+	s2 := tlsServer(t, cert, key)
+	s2.refreshTLSDisk()
+	if got := healthByID(t, s2, "tls_cert_renewed"); len(got) != 0 {
+		t.Fatalf("after restart: %+v", got)
+	}
+}
+
+// A missing or unparsable cert file is a degraded condition once the cache
+// refreshes, and clears when a valid file is back.
+func TestHealthTLSCertDiskError(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeTLSPair(t, dir, "x.example.test", time.Now().Add(60*24*time.Hour), false)
+	s := tlsServer(t, cert, key)
+	for name, mutate := range map[string]func(){
+		"garbage": func() { _ = os.WriteFile(cert, []byte("junk"), 0o600) },
+		"missing": func() { _ = os.Remove(cert) },
+	} {
+		writeTLSPair(t, dir, "x.example.test", time.Now().Add(60*24*time.Hour), false)
+		s.refreshTLSDisk()
+		mutate()
+		if got := healthByID(t, s, "tls_cert_disk_error"); len(got) != 0 {
+			t.Fatalf("%s: raised before refresh: %+v", name, got)
+		}
+		s.refreshTLSDisk()
+		got := healthByID(t, s, "tls_cert_disk_error")
+		if len(got) != 1 || got[0].Severity != HealthDegraded {
+			t.Fatalf("%s: %+v", name, got)
+		}
+		if g := differsGauge(t, s); g != "0" {
+			t.Fatalf("%s: gauge = %q, want 0", name, g)
+		}
+	}
+}
+
+// With no certificate loaded there is no gauge and no disk condition.
+func TestHealthTLSCertDiskNotLoaded(t *testing.T) {
+	s := testServer(t)
+	s.refreshTLSDisk()
+	if g := differsGauge(t, s); g != "" {
+		t.Fatalf("gauge exported with no certificate: %q", g)
+	}
+}
+
+// Run checks once at start and then on the interval, and Run returns only
+// after the checker has stopped.
+func TestRunRefreshesTLSDisk(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeTLSPair(t, dir, "old.example.test", time.Now().Add(60*24*time.Hour), false)
+	s := tlsServer(t, cert, key)
+	s.tlsDiskEvery = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	writeTLSPair(t, dir, "new.example.test", time.Now().Add(80*24*time.Hour), false)
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.cachedTLSDisk().differs {
+		if time.Now().After(deadline) {
+			t.Fatal("timer never refreshed the cache")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+}

@@ -183,10 +183,12 @@ Created once, alive for the process lifetime:
 1. `config.Watch`: always; never fatal (`app.Run`'s wrapper logs whatever
    `Watch` returns and returns nil itself, `app.go:70-76`).
 2. `edge.Server.Run`: always; its error is fatal (`app.go:81-87`).
-3. `admin.Server.Run`: if `admin:` exists at startup; fatal. It starts two
+3. `admin.Server.Run`: if `admin:` exists at startup; fatal. It starts three
    goroutines: the health tracker's ticker (every 5 s, `healthInterval`,
-   `admin/server.go:280-285`), which `Run` cancels and waits for before it
-   returns, and the HTTP serve goroutine (`admin/server.go:288`).
+   `admin/server.go:301-305`), the TLS cert-on-disk check (once at start, then
+   every 10 min, `tlsDiskInterval`, `Server.runTLSDisk`, `admin/tlscert.go:233`),
+   both of which `Run` cancels and waits for before it returns, and the HTTP
+   serve goroutine (`admin/server.go:314`).
 
 `cmd/freesbc`'s `withSignals` adds one more, which releases signal capture
 after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
@@ -452,7 +454,7 @@ session timers or media timeouts. `defer sh.Close()` on the shield (and the
 sipgo client and user agent) fires after all of this.
 
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout
-(`admin/server.go:313-315`). In-flight HTTP requests are drained up to that
+(`admin/server.go:324-326`). In-flight HTTP requests are drained up to that
 budget.
 
 **Shield.Close**: cancel the prune loop and wait for it. Bans are in memory
@@ -3439,7 +3441,7 @@ own firewall in front of FreeSBC.
 | Surface | Certificate | Minimum version | Client auth |
 |---|---|---|---|
 | Edge `tls` and `wss` listeners | top-level `tls.cert`/`tls.key`, loaded when the listener binds (`openListener`); `check` requires `tls` whenever `edge.listen.tls` or `edge.listen.wss` is set | TLS 1.2 | — |
-| Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:289-308`); a loopback admin serves plain HTTP | TLS 1.2 | — |
+| Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:282-296`); a loopback admin serves plain HTTP | TLS 1.2 | — |
 | WebRTC DTLS | one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity, `media/dtlscert.go:36-87`), created when `edge.listen.ws` or `wss` is set | — | `RequireAnyClientCert` (`webrtcleg.go:539`), so there is always something to fingerprint |
 
 The DTLS certificate is never verified as a chain: the browser's identity
@@ -3506,6 +3508,7 @@ permanent series per call."
 | `freesbc_active_sip_dialogs` | Gauge | — | edge dialogs started and not yet ended |
 | `freesbc_edge_sessions` | Gauge | — | edge `dialogTable.sessions`: calls holding a session slot, ringing or up; the number `shield.max_sessions` caps (`Metrics.SetSessions`) |
 | `freesbc_tls_cert_expiry_timestamp_seconds` | Gauge | `path` (the `tls.cert` file) | not-after of the loaded top-level `tls` leaf, Unix seconds; absent when no listener loaded it (`collector.Collect`, `Server.tlsRecord`) |
+| `freesbc_tls_cert_disk_differs` | Gauge | none | 1 when the cert file on disk holds a different leaf than the one being served (a renewal awaiting restart), else 0 (also on a disk error); read from the cache of the 10-minute disk check, never from the file; absent when no leaf is loaded (`Server.cachedTLSDisk`) |
 | `freesbc_config_restart_required` | Gauge | — | restart-only keys changed on disk and not applied until restart (`len(Deps.Reload().RestartRequired)`, §4.4); exported only when `Deps.Reload` is wired |
 | `freesbc_config_reload_failed` | Gauge | — | 1 while the last config reload failed and the previous config is still active, else 0 (`Deps.Reload().LastError`) |
 | `freesbc_edge_draining` | Gauge | — | 1 while the edge is in drain mode, else 0 (`Metrics.SetDraining`, read through `Snapshot().Draining`; `admin.ProxyStats.Draining`) |
@@ -3583,7 +3586,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/metrics` | any | Basic | Prometheus text |
 | `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…],"listener_info":[{"transport","bind","advertised","private"}]}`; `listener_info` pairs each bound socket with the address FreeSBC advertises for it (`public.ip` on a public listener, equal to `bind` outside 1:1 NAT; `Deps.ListenerInfos`); `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
-| `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request only (never on a timer). Never the key or PEM |
+| `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request, so it is always current; the health conditions and the gauge use a separate cache refreshed every 10 minutes (`tlsDiskInterval`). Never the key or PEM |
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`handleRegistrations`, `state.go:142`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go:423`) under its read lock. No Contact, token or Call-ID |
 | `/api/carrier-registrations` | GET (else 405) | Basic | array of `{"carrier","user","token","node","expires_in"}`; always an array. The switch's live registrations at carriers (`carrierRegTable.snapshot`, `carrierreg.go:312`); `token` is the opaque `fsbc` value in the carrier Contact, `node` the registering switch node |
 | `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`handleBans`, `state.go:193`): `{"items":[{"source","kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. Both ban tables merged, newest first (`Shield.Bans`, `shield.go:290`); limit and offset as for registrations. `reason` is `scanner`, `register` or `admission`; `udp_ip` is an IP banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
@@ -3697,11 +3700,11 @@ cannot reset an exhausted attacker's budget (audit P2-ADM-003). A refund whose
 window has since rolled over is dropped. A client whose credentials were never
 verified still gets 429 while its source is over budget.
 
-`http.Server` timeouts (`newHTTPServer`, `server.go:424`): `ReadHeaderTimeout`
+`http.Server` timeouts (`newHTTPServer`, `server.go:435`): `ReadHeaderTimeout`
 5 s, `ReadTimeout` 30 s, `WriteTimeout` 30 s, `IdleTimeout` 30 s. Shutdown
 gets a 5 s drain. With `admin.allow_remote` the listener serves HTTPS (TLS 1.2
 minimum) using the top-level `tls` identity, loaded when the admin server
-starts (`server.go:308`); otherwise it serves plain HTTP, which validation
+starts (`server.go:283`); otherwise it serves plain HTTP, which validation
 admits only on a loopback address.
 
 
@@ -3797,7 +3800,9 @@ record an outcome, never across a DNS lookup, so `Server.Carriers` (and with it
 | `rtp_ports` | `degraded` at 90 % or more of the pairs in use; `critical` at 100 % | `edge.Server.PortStats`; `portsDegradedPercent` is a constant, not a config key |
 | `shield_ban_cap` | `degraded` | `Shield.Stats().BanAddsRejected` rose since the previous evaluation; cleared when it has not risen for `banCapQuiet` = **60 s** (state in `healthSource`, which sees every evaluation) |
 | `ack_missed:<plane>` (`public` or `private`) | `degraded` | `edge.Server.AckMisses`: at least `ackMissThreshold` = **3** 2xx ACK misses of that plane within `ackMissWindow` = **10 min** (`ackMissTracker` keeps the last 32 miss times per plane); the message names the advertised Contact/Record-Route URI to check for NAT/firewall reachability. Clears when the window holds fewer |
-| `tls_cert_expiry` | `degraded` under 30 days to not-after (`tlsExpiryWarn`); `critical` once expired | the top-level `tls` leaf the process loaded (the same record as `/api/tls`, `Server.tlsRecord`); added by admin itself (`Server.healthConditions`, `tlscert.go`) on top of `Deps.Health`. It never reads the cert file, so a renewal on disk is shown by `/api/tls` (`disk_differs`) only. Absent when no leaf is loaded |
+| `tls_cert_expiry` | `degraded` under 30 days to not-after (`tlsExpiryWarn`); `critical` once expired | the top-level `tls` leaf the process loaded (the same record as `/api/tls`, `Server.tlsRecord`); added by admin itself (`Server.healthConditions`, `tlscert.go`) on top of `Deps.Health`. While a renewal is pending (`tls_cert_renewed`) its message also says the certificate was renewed on disk and a restart applies it. Absent when no leaf is loaded |
+| `tls_cert_renewed` | `degraded` | the first certificate in the `tls.cert` file differs from the loaded leaf: a renewal is on disk and only a restart serves it. From the cache of the disk check (`Server.refreshTLSDisk`, once at admin start and then every `tlsDiskInterval` = **10 min**), the one timer-driven read of the cert file; `healthConditions` and `/metrics` read only the cache, so a renewal can take up to 10 min to appear (`/api/tls` re-reads per request). Absent when no leaf is loaded |
+| `tls_cert_disk_error` | `degraded` | the same check could not read or parse the `tls.cert` file (the next restart would fail); `detail` is the error |
 | `admin_plain_remote` | `critical` | admin would serve plain HTTP on a non-loopback address; validation makes it impossible, so this is a sanity check |
 
 Absent on purpose: a listener that is not bound (every listener is bound before
