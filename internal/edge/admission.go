@@ -36,10 +36,15 @@ import (
 // answered 481 (as a REFER, MESSAGE or NOTIFY naming no dialog is); a
 // non-INVITE final is never retransmitted by Timer G.
 //
-// Every drop except register_enumeration, the dialog-less BYE/INFO one
-// included, is also a strike against its source for shield.admission_ban
-// (admissionStrike); the ban scope follows the transport of the request:
-// UDP strikes ban the IP on UDP only, stream transports ban every one.
+// A REGISTER for an AoR whose refused-credential count passed
+// shield.register_ban_aor, from a source with no live binding of it, is
+// dropped the same way (register_aor_locked, regguard.go).
+//
+// Every drop except register_enumeration and register_aor_locked, the
+// dialog-less BYE/INFO one included, is also a strike against its source
+// for shield.admission_ban (admissionStrike); the ban scope follows the
+// transport of the request: UDP strikes ban the IP on UDP only, stream
+// transports ban every one.
 
 // dropReason is why a public request was dropped by admission. The set is
 // fixed, so it is a bounded metric label.
@@ -51,6 +56,7 @@ const (
 	dropSubscribeNotAdmitted
 	dropMessageNotAdmitted
 	dropDialogless
+	dropRegisterAORLocked
 	numDropReasons
 )
 
@@ -61,6 +67,7 @@ var dropReasonLabels = [numDropReasons]string{
 	dropSubscribeNotAdmitted: "subscribe_not_admitted",
 	dropMessageNotAdmitted:   "message_not_admitted",
 	dropDialogless:           "dialogless_not_admitted",
+	dropRegisterAORLocked:    "register_aor_locked",
 }
 
 func (r dropReason) String() string { return dropReasonLabels[r] }
@@ -177,7 +184,7 @@ func (s *Server) admitDialogless(req *sip.Request, src netip.AddrPort) bool {
 func (s *Server) dropSilently(reason dropReason, req *sip.Request, src netip.AddrPort, attrs ...any) {
 	s.metrics.AdmissionDropped(reason)
 	s.dropSummary.add(src.Addr())
-	if reason != dropRegisterEnumeration {
+	if reason != dropRegisterEnumeration && reason != dropRegisterAORLocked {
 		s.admissionStrike(src.Addr(), sip.NetworkToLower(req.Transport()))
 	}
 	args := append([]any{

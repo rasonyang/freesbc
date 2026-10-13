@@ -29,6 +29,7 @@ func redactConfig(cfg *config.Config) any {
 			"max_sessions":       cfg.Shield.MaxSessions,
 			"invite_rate_limit":  cfg.Shield.InviteRateLimit,
 			"register_ban":       cfg.Shield.RegisterBan,
+			"register_ban_aor":   cfg.Shield.RegisterBanAOR,
 			"admission_ban":      cfg.Shield.AdmissionBan,
 		},
 	}

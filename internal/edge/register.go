@@ -80,6 +80,14 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 		s.reject(req, tx, 400, "Bad Request")
 		return
 	}
+	if s.aorLockedFor(src.Addr(), aor) {
+		// shield.register_ban_aor (issue #187): refused credentials for
+		// this AoR passed the threshold across all sources. A source with
+		// no live binding of it gets silence, not a challenge, and nothing
+		// is sent to the switch.
+		s.dropSilently(dropRegisterAORLocked, req, src, "aor", aor)
+		return
+	}
 	clientContact, hasContact := fsip.ContactURI(req)
 	expires, unregister := requestedExpires(req)
 	wildcard := hasWildcardContact(req)

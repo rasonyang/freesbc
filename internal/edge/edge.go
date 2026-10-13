@@ -685,6 +685,7 @@ func (s *Server) Run(ctx context.Context) error {
 		"max_sessions", s.sessionLimit(s.store.Current()),
 		"invite_rate_limit", s.store.Current().Shield.InviteRateLimit,
 		"register_ban", s.store.Current().Shield.RegisterBan,
+		"register_ban_aor", s.store.Current().Shield.RegisterBanAOR,
 		"admission_ban", s.store.Current().Shield.AdmissionBan,
 		"webrtc", s.webrtcEnabled)
 

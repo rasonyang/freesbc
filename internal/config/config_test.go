@@ -509,3 +509,23 @@ func TestAdminPprofKey(t *testing.T) {
 		}
 	}
 }
+
+// shield.register_ban_aor defaults to DefaultRegisterBanAOR, takes an
+// explicit value or "off", and is validated like register_ban.
+func TestShieldRegisterBanAOR(t *testing.T) {
+	if c := mustParse(t, with("")); c.Shield.RegisterBanAOR != DefaultRegisterBanAOR {
+		t.Errorf("register_ban_aor default = %q, want %q", c.Shield.RegisterBanAOR, DefaultRegisterBanAOR)
+	}
+	if c := mustParse(t, with("shield: { register_ban_aor: 5/1m }\n")); c.Shield.RegisterBanAOR != "5/1m" {
+		t.Errorf("register_ban_aor = %q, want 5/1m", c.Shield.RegisterBanAOR)
+	}
+	if c := mustParse(t, with("shield: { register_ban_aor: \"off\" }\n")); c.Shield.RegisterBanAOR != "off" {
+		t.Errorf("register_ban_aor = %q, want off", c.Shield.RegisterBanAOR)
+	}
+	for _, y := range []string{"nope", "0/10m", "10/48h"} {
+		if _, err := Parse([]byte(with("shield: { register_ban_aor: " + y + " }\n"))); err == nil ||
+			!strings.Contains(err.Error(), "shield.register_ban_aor") {
+			t.Errorf("register_ban_aor %q: err = %v", y, err)
+		}
+	}
+}
