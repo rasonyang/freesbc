@@ -102,7 +102,7 @@ On SIGINT/SIGTERM FreeSBC drops its calls with their media released; no BYE is s
 
 - **Clients.** REGISTER is proxied to the switch verbatim (the switch is the registrar; FreeSBC holds no credential) with the Contact rewritten to carry an `fsbc=` token. Calls to clients and from clients are proxied with FreeSBC on the path.
 - **Carriers.** The switch owns carrier accounts, line selection and failover, and points each gateway at FreeSBC as outbound proxy. Requests to a host listed in `edge.carriers` are proxied to that carrier with the switch's private addresses hidden; inbound carrier requests are delivered to the switch's carrier port with an `X-FreeSBC-Carrier` header.
-- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. No SDP, Contact or Request-URI carries the switch's address to a public party, or the public party's address to the switch. Carrier legs also hide the switch in Via, Record-Route and identity headers; client legs do not yet (see [Known limitations](docs/edge.md#known-limitations)).
+- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. No SDP, Contact or Request-URI carries the switch's address to a public party, or the public party's address to the switch. Carrier legs also hide the switch in Via, Record-Route and identity headers. Client legs hide Record-Route and Route; the other headers still show the switch ([#167](https://github.com/rasonyang/freesbc/issues/167)). The Call-ID and the NOTIFY and MESSAGE bodies are the switch's own text and pass through, so set the switch to keep its name out of them: [switch-side requirements](docs/edge.md#switch-side-requirements).
 - **Shield.** Per-IP rate limiting (separate limits for carrier sources) and scanner fingerprinting with an in-memory ban; every denial is a silent drop. FreeSBC touches no kernel firewall state. The private socket is trusted and exempt, so keep it unreachable from anywhere else.
 
 Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
@@ -169,7 +169,7 @@ Non-goals: transcoding, CDR, clustering, and being a registrar in its own right.
 - All state is in memory; a restart drops every call, dialog and binding.
 - SDES-SRTP (`a=crypto`) is off unless `edge.srtp` or a carrier's `srtp` enables it, and then only over TLS/WSS signaling (or `edge.allow_insecure_sdes`); browser legs get DTLS-SRTP.
 - Switches are UDP only (carriers may be udp, tcp or tls); switches are literal `IP:port`, with no DNS.
-- Call-ID passes through the proxy unchanged.
+- Call-ID passes through the proxy unchanged, and so do the NOTIFY and MESSAGE bodies the switch writes (MWI, BLF); a switch that puts its own name in either leaks it, and the settings that decide those names are on the switch.
 - No PUBLISH, and no TURN or full ICE.
 
 See [known limitations](docs/edge.md#known-limitations) for the full list.
