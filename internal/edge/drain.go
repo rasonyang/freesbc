@@ -7,15 +7,19 @@ import (
 )
 
 // drainState is the edge's drain (maintenance) mode: while on, every new
-// out-of-dialog INVITE is refused in beginDialog with 503 + Retry-After
-// (rejectDraining), so a restart can wait for the live calls to end.
+// carrier call (carrier to switch, switch to carrier) is refused in
+// beginDialog with 503 + Retry-After (rejectDraining), and an out-of-dialog
+// OPTIONS from a carrier source, or from the switch to FreeSBC itself or to
+// a carrier host, gets the same 503 (onOptions), so a trunk's health check
+// sees the node leave and a restart can wait for the live calls to end.
+// Client calls in both directions (client to switch, switch to client) are
+// admitted.
 //
 // It is runtime state only. It is not in config, is not persisted, and a
 // restart starts not draining. Everything that belongs to a call or
 // registration already in place is unchanged: re-INVITE and every other
-// in-dialog request, REGISTER, OPTIONS, SUBSCRIBE/NOTIFY/MESSAGE/REFER and
-// RTP. The switch is not exempt: a switch-originated INVITE (a transfer
-// leg, a call to a client or carrier) is refused like any other.
+// in-dialog request, REGISTER, client OPTIONS, SUBSCRIBE/NOTIFY/MESSAGE/REFER
+// and RTP.
 type drainState struct {
 	flag  atomic.Bool // read lock-free on every new INVITE
 	mu    sync.Mutex  // serialises set and get; guards since

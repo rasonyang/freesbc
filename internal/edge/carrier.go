@@ -212,7 +212,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
-	d, ok := s.beginDialog(req, tx, planePrivate)
+	d, ok := s.beginDialog(req, tx, planePrivate, true)
 	if !ok {
 		return
 	}

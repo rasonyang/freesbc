@@ -223,8 +223,10 @@ func inviteRetryAfter(rl config.RateLimit) int {
 // the global admission control applies, once per out-of-dialog INVITE and
 // before any media is allocated:
 //
-//   - 503 + Retry-After while the edge is draining (drain.go), checked
-//     first so a refused call takes no slot and no rate token;
+//   - 503 + Retry-After while the edge is draining (drain.go) and the call
+//     is a carrier call (carrierCall: carrier to switch, or switch to
+//     carrier), checked first so a refused call takes no slot and no rate
+//     token; client calls in both directions are admitted;
 //   - 482 when the INVITE merges with one still in progress (RFC 3261
 //     §8.2.2.2: same Call-ID and From tag as a transaction the proxy is
 //     already working on);
@@ -237,11 +239,11 @@ func inviteRetryAfter(rl config.RateLimit) int {
 //
 // All four directions reach it after their cheap validation, and
 // re-INVITEs never do (they go through onReInvite).
-func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane) (*dialog, bool) {
+func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane, carrierCall bool) (*dialog, bool) {
 	cfg := s.store.Current()
-	if s.drain.on() {
-		// Before any slot, rate token or media port: drain refuses every
-		// new call, the switch's included.
+	if carrierCall && s.drain.on() {
+		// Before any slot, rate token or media port: drain refuses the
+		// carrier directions only.
 		s.rejectBusy(req, tx, drainRetryAfter, rejectDraining, "rejecting call: draining")
 		return nil, false
 	}
@@ -315,7 +317,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// One record from here to teardown: the dialog owns the media session,
 	// the CANCEL bridge and the per-fork answers, and end() is the single
 	// exit whether the call connects or not.
-	d, ok := s.beginDialog(req, tx, planePublic)
+	d, ok := s.beginDialog(req, tx, planePublic, carrier != "")
 	if !ok {
 		return
 	}
@@ -600,7 +602,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	defer cancel()
 
 	// One record from here to teardown, as in inviteToUpstream.
-	d, ok := s.beginDialog(req, tx, planePrivate)
+	d, ok := s.beginDialog(req, tx, planePrivate, false)
 	if !ok {
 		return
 	}

@@ -90,7 +90,7 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		proxySubs:       prometheus.NewDesc("freesbc_edge_subscriptions", "SUBSCRIBE dialogs the edge routes NOTIFYs for, pending or active.", nil, nil),
 		proxyDialogs:    prometheus.NewDesc("freesbc_active_sip_dialogs", "Dialogs the edge proxy is currently on the path of.", nil, nil),
 		proxySessions:   prometheus.NewDesc("freesbc_edge_sessions", "Calls holding a session slot, ringing or up; the number shield.max_sessions caps.", nil, nil),
-		proxyDraining:   prometheus.NewDesc("freesbc_edge_draining", "1 while the edge is in drain mode and refuses new INVITEs, else 0.", nil, nil),
+		proxyDraining:   prometheus.NewDesc("freesbc_edge_draining", "1 while the edge is in drain mode and refuses new carrier calls, else 0.", nil, nil),
 		proxyMedia:      prometheus.NewDesc("freesbc_active_media_sessions", "Media sessions the edge proxy is anchoring.", nil, nil),
 		proxyWebRTC:     prometheus.NewDesc("freesbc_active_webrtc_sessions", "Anchored media sessions whose public leg is WebRTC.", nil, nil),
 		proxyRegTotal:   prometheus.NewDesc("freesbc_registration_total", "Registrations accepted by the upstream registrar through the proxy.", nil, nil),

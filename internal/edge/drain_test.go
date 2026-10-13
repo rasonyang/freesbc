@@ -13,9 +13,11 @@ import (
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
-// Drain (maintenance) mode (issue #123): while draining, every new
-// out-of-dialog INVITE (public client, carrier, or the switch) is refused
-// 503 + Retry-After 30 before a slot, a rate token or a media port is taken.
+// Drain (maintenance) mode (issues #123, #149): while draining, a new
+// carrier call (carrier to switch, switch to carrier) is refused 503 +
+// Retry-After 30 before a slot, a rate token or a media port is taken, and
+// so is an out-of-dialog OPTIONS from a carrier source or from the switch to
+// FreeSBC or a carrier host. Client calls in both directions are admitted.
 // Everything that belongs to a call or registration already in place is
 // unchanged. Runtime state only.
 //
@@ -95,8 +97,7 @@ func TestDrainConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// A registered client's new INVITE is refused; nothing reaches the switch;
-// leaving drain restores normal handling without a restart.
+// A registered client's new INVITE is admitted while draining.
 func TestDrainClientToSwitch(t *testing.T) {
 	h := startHarness(t, false)
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
@@ -104,18 +105,13 @@ func TestDrainClientToSwitch(t *testing.T) {
 	auditRegisterPhone(t, h, phone, "1001")
 	h.srv.SetDraining(true)
 
-	assertBusy(t, phoneInvite(t, h, phone), "30")
-	if got := h.fs.received(sip.INVITE); len(got) != 0 {
-		t.Errorf("the switch saw %d INVITEs while draining", len(got))
-	}
-	assertNothingAllocated(t, h)
-	assertRejects(t, h, map[inviteReject]uint64{rejectDraining: 1})
-
-	h.srv.SetDraining(false)
 	if code := phoneCallStatus(t, h, phone); code != 200 {
-		t.Errorf("call after leaving drain: %d, want 200", code)
+		t.Errorf("client call while draining: %d, want 200", code)
 	}
-	assertRejects(t, h, map[inviteReject]uint64{rejectDraining: 1})
+	if got := h.fs.received(sip.INVITE); len(got) != 1 {
+		t.Errorf("the switch saw %d INVITEs while draining, want 1", len(got))
+	}
+	assertRejects(t, h, nil)
 }
 
 // An unknown public source keeps the silent drop: admission runs before
@@ -131,7 +127,7 @@ func TestDrainUnknownSourceStaysSilent(t *testing.T) {
 	}
 }
 
-// The switch is not exempt: its call to a registered client is refused.
+// The switch's call to a registered client is admitted while draining.
 func TestDrainSwitchToClient(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
@@ -144,20 +140,16 @@ func TestDrainSwitchToClient(t *testing.T) {
 	})
 	h.srv.SetDraining(true)
 
-	assertBusy(t, h.fs.call(t, ruri, h.privateSIP, phoneOfferSDP(h.fs.rtpPort)), "30")
-	if n := offered.Load(); n != 0 {
-		t.Errorf("the client saw %d INVITEs while draining", n)
-	}
-	assertNothingAllocated(t, h)
-	assertRejects(t, h, map[inviteReject]uint64{rejectDraining: 1})
-
-	h.srv.SetDraining(false)
 	if r := h.fs.call(t, ruri, h.privateSIP, phoneOfferSDP(h.fs.rtpPort)); r.StatusCode != 200 {
-		t.Errorf("call after leaving drain: %d, want 200", r.StatusCode)
+		t.Errorf("call to a client while draining: %d, want 200", r.StatusCode)
 	}
+	if n := offered.Load(); n != 1 {
+		t.Errorf("the client saw %d INVITEs while draining, want 1", n)
+	}
+	assertRejects(t, h, nil)
 }
 
-// The switch's call out through a carrier is refused too.
+// The switch's call out through a carrier is refused.
 func TestDrainSwitchToCarrier(t *testing.T) {
 	o := startOutboundRig(t)
 	answerWithTag(o.carrier)
@@ -241,5 +233,101 @@ func TestDrainEstablishedCallSurvives(t *testing.T) {
 	assertRejects(t, h, nil)
 	if on, _ := h.srv.DrainState(); !on {
 		t.Error("the last call ending left drain mode (there is no auto-exit)")
+	}
+}
+
+// buildOptions is an out-of-dialog OPTIONS from c to example.com.
+func buildOptions(c *client, callID string) *sip.Request {
+	req := sip.NewRequest(sip.OPTIONS, sip.Uri{Host: "example.com"})
+	from := &sip.FromHeader{Address: sip.Uri{User: "1001", Host: "example.com"}, Params: sip.NewParams()}
+	from.Params.Add("tag", sip.GenerateTagN(12))
+	req.AppendHeader(from)
+	req.AppendHeader(&sip.ToHeader{Address: sip.Uri{Host: "example.com"}, Params: sip.NewParams()})
+	cid := sip.CallIDHeader(callID)
+	req.AppendHeader(&cid)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.OPTIONS})
+	mf := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&mf)
+	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP", Host: "127.0.0.1", Params: sip.NewParams()}
+	via.Params.Add("branch", sip.GenerateBranchN(16))
+	req.PrependHeader(via)
+	return req
+}
+
+// While draining, an OPTIONS from a carrier source is 503 + Retry-After 30;
+// leaving drain restores the 200. It is not an INVITE reject.
+func TestDrainCarrierOptions(t *testing.T) {
+	carrier := newUDPClient(t)
+	rig := startCarrierRig(t, fmt.Sprintf("alpha: 127.0.0.1:%d", portOf(carrier.local)), "", nil)
+	rig.srv.SetDraining(true)
+
+	assertBusy(t, carrier.do(t, buildOptions(carrier, "drain-opt-c1"), rig.publicUDP), "30")
+	assertRejects(t, rig.harness, nil)
+	rig.srv.SetDraining(false)
+	if r := carrier.do(t, buildOptions(carrier, "drain-opt-c2"), rig.publicUDP); r.StatusCode != 200 {
+		t.Errorf("carrier OPTIONS after leaving drain: %d, want 200", r.StatusCode)
+	}
+}
+
+// A client's OPTIONS is answered 200 while draining.
+func TestDrainClientOptions(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	auditRegisterPhone(t, h, phone, "1001")
+	h.srv.SetDraining(true)
+	if r := phone.do(t, buildOptions(phone, "drain-opt-p1"), h.publicUDP); r.StatusCode != 200 {
+		t.Errorf("client OPTIONS while draining: %d, want 200", r.StatusCode)
+	}
+}
+
+// While draining, the switch's OPTIONS to FreeSBC itself is 503 and its
+// OPTIONS to a carrier host is 503 and not forwarded; leaving drain restores
+// the 200 and the proxying. A live client token stays 200.
+func TestDrainSwitchOptions(t *testing.T) {
+	o := startOutboundRig(t)
+	self := sip.Uri{Host: "127.0.0.1", Port: portOf(o.privateSIP)}
+	carrierURI := sip.Uri{Host: "127.0.0.1", Port: o.cport}
+	o.srv.SetDraining(true)
+
+	assertBusy(t, switchRequest(t, o.fs, sip.OPTIONS, self, o.privateSIP), "30")
+	assertBusy(t, switchRequest(t, o.fs, sip.OPTIONS, carrierURI, o.privateSIP), "30")
+	if got := o.carrier.received(sip.OPTIONS); len(got) != 0 {
+		t.Errorf("the carrier saw %d OPTIONS while draining", len(got))
+	}
+	assertRejects(t, o.harness, nil)
+
+	o.srv.SetDraining(false)
+	if r := switchRequest(t, o.fs, sip.OPTIONS, self, o.privateSIP); r.StatusCode != 200 {
+		t.Errorf("OPTIONS to FreeSBC after leaving drain: %d, want 200", r.StatusCode)
+	}
+	if r := switchRequest(t, o.fs, sip.OPTIONS, carrierURI, o.privateSIP); r.StatusCode != 200 {
+		t.Errorf("OPTIONS to the carrier after leaving drain: %d, want 200", r.StatusCode)
+	}
+	if got := o.carrier.waitFor(sip.OPTIONS, 1, 3*time.Second); len(got) != 1 {
+		t.Errorf("the carrier saw %d OPTIONS after leaving drain, want 1", len(got))
+	}
+}
+
+// A switch OPTIONS to a client token with a live binding is answered 200
+// locally (also while draining); an unknown token is 404, as an INVITE is.
+func TestSwitchOptionsToken(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	ruri := auditRegisterPhone(t, h, phone, "1001")
+	bogus := sip.NewParams()
+	bogus.Add("fsbc", "bogus-token")
+	unknown := sip.Uri{User: "1001", Host: "127.0.0.1", Port: 1234, UriParams: bogus}
+
+	for _, draining := range []bool{false, true} {
+		h.srv.SetDraining(draining)
+		if r := switchRequest(t, h.fs, sip.OPTIONS, ruri, h.privateSIP); r.StatusCode != 200 {
+			t.Errorf("draining=%v: OPTIONS to a live token: %d, want 200", draining, r.StatusCode)
+		}
+		if r := switchRequest(t, h.fs, sip.OPTIONS, unknown, h.privateSIP); r.StatusCode != 404 {
+			t.Errorf("draining=%v: OPTIONS to an unknown token: %d, want 404", draining, r.StatusCode)
+		}
+	}
+	if got := h.fs.received(sip.OPTIONS); len(got) != 0 {
+		t.Errorf("OPTIONS was forwarded to the switch %d times", len(got))
 	}
 }

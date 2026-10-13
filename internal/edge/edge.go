@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,7 +74,7 @@ type Server struct {
 	loc     *Location
 	dialogs *dialogTable
 
-	// draining refuses new out-of-dialog INVITEs (drain.go). Runtime state
+	// draining refuses new carrier calls and carrier OPTIONS (drain.go). Runtime state
 	// only: never in config, and a restart starts not draining.
 	drain drainState
 	// subs is the SUBSCRIBE dialog records (subscribe.go); subWarn spaces
@@ -1172,20 +1173,57 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 // other out-of-dialog request (classifySwitchRequest): addressed to
 // FreeSBC itself or to a registered client's token it is answered here; to
 // a carrier it is proxied to it (optionsToCarrier); to anything else, 404.
-// A public OPTIONS, a carrier's keepalive included, is answered here.
+// A token with no live binding is 404 too, as an INVITE to it is. A public
+// OPTIONS, a carrier's keepalive included, is answered here.
+//
+// While draining (drain.go) the carrier-facing answers become 503 +
+// Retry-After, so a trunk health check sees the node leave: an out-of-dialog
+// OPTIONS from a carrier source (a source that is also a live registration
+// is a client), and from the switch one naming FreeSBC itself or a carrier
+// host (the latter is not proxied). Client OPTIONS, live tokens and
+// in-dialog OPTIONS are unchanged. These are not INVITE rejects and have no
+// metric of their own; the response counters see the 503.
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inbound) {
-	if in.private() && fsip.ToTag(req) == "" {
+	outOfDialog := fsip.ToTag(req) == ""
+	draining := outOfDialog && s.drain.on()
+	if in.private() && outOfDialog {
 		switch kind, name := s.classifySwitchRequest(req); kind {
 		case targetCarrier:
+			if draining {
+				s.rejectOptionsDraining(req, tx)
+				return
+			}
 			s.optionsToCarrier(req, tx, name)
 			return
 		case targetNotFound:
 			s.reject(req, tx, 404, "Not Found")
 			return
+		case targetClient:
+			if _, ok := s.resolveTarget(req); !ok {
+				s.reject(req, tx, 404, "Not Found")
+				return
+			}
+		case targetSelf:
+			if draining {
+				s.rejectOptionsDraining(req, tx)
+				return
+			}
+		}
+	} else if draining && !in.private() {
+		if _, ok := s.carrierFallback(req); ok {
+			s.rejectOptionsDraining(req, tx)
+			return
 		}
 	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
+	s.respond(req, tx, res)
+}
+
+// rejectOptionsDraining answers an OPTIONS 503 + Retry-After while draining.
+func (s *Server) rejectOptionsDraining(req *sip.Request, tx sip.ServerTransaction) {
+	res := sip.NewResponseFromRequest(req, 503, "Service Unavailable", nil)
+	res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(drainRetryAfter)))
 	s.respond(req, tx, res)
 }
 

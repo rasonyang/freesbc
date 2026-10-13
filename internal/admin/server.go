@@ -120,7 +120,7 @@ type ProxyStats struct {
 	// ActiveSessions is the calls holding a session slot (ringing or up),
 	// the number shield.max_sessions caps.
 	ActiveSessions int64 `json:"active_sessions"`
-	// Draining is true while the edge refuses new INVITEs.
+	// Draining is true while the edge refuses new carrier calls.
 	Draining             bool  `json:"draining"`
 	ActiveMediaSessions  int64 `json:"active_media_sessions"`
 	ActiveWebRTCSessions int64 `json:"active_webrtc_sessions"`

@@ -338,7 +338,7 @@ type Snapshot struct {
 	ActiveMediaSessions  int64
 	ActiveWebRTCSessions int64
 
-	// Draining is true while the edge refuses new INVITEs (drain.go).
+	// Draining is true while the edge refuses new carrier calls (drain.go).
 	Draining bool
 
 	RegistrationTotal   uint64
