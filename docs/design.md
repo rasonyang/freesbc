@@ -113,10 +113,11 @@ graph TD
     shield --> config
 ```
 
-`internal/config`, `internal/media`, `internal/sip` and `internal/sip/sdp`
-import nothing from this module. `internal/sip` does not import the rest of
-the module either (its package doc, `internal/sip/doc.go:1-12`): it holds
-protocol primitives with no policy.
+`internal/config`, `internal/hep`, `internal/media`, `internal/sip` and
+`internal/sip/sdp` import nothing from this module (`hep` is a library not yet
+wired into the process, so it has no node in the graph). `internal/sip` does
+not import the rest of the module either (its package doc,
+`internal/sip/doc.go:1-12`): it holds protocol primitives with no policy.
 
 Consequences that hold by construction:
 
@@ -4436,6 +4437,7 @@ Stated because the code establishes them, not as future work.
 | `internal/sip` | reusable SIP primitives only: safe header accessors, transport-source parsing with `Unmap`, default ports, listener matching, branch/token generation, REGISTER expiry parsing (`DeltaSeconds`, `GrantedExpires`), `BuildCancel`/`TeardownRequest`, the read-filter wrapper | policy, workflow, or state: "a transcription of RFC 3261/3264 with no policy of its own" |
 | `internal/sip/sdp` | the bounded typed parse, codec intersection, and body construction from scratch | copying anything from another leg's body; deciding SDES policy (the package parses and builds `a=crypto`, the edge decides); DNS |
 | `internal/media` | port pools, latching, the payload-agnostic relay, the silence watchdog, the ICE-lite/DTLS-SRTP browser leg, the per-process DTLS identity, packet/byte counters | SIP, SDP, or any protocol above UDP. Its doc: "It knows nothing about SIP" |
+| `internal/hep` | HEPv3 encoding, the bounded queue and single writer goroutine, UDP/TCP/TLS transports with reconnect and backoff | SIP or RTCP knowledge, config, deciding what to mirror; it imports nothing from this module and is not wired into the process yet |
 | `internal/shield` | the in-memory ban table, per-source token buckets, scanner signatures, the carrier-source predicate hook | kernel firewall state; being a hard dependency of anything |
 | `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the client binding table, the carrier directory (DNS) and carrier registration table, switch-node routing with cooldown, switch-request classification, topology hiding on carrier legs, admission, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | carrier accounts, routing or credentials; any B2BUA call state |
 | `internal/admin` | HTTP routing, Basic auth, cookie sessions (login, logout) and their shared limiter, the Prometheus registry and collector, the redacted config view, the raw config round-trip, the embedded WebUI | reading edge state directly — everything arrives through `admin.Deps` closures built in `internal/app` |
