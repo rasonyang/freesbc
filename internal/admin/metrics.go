@@ -24,6 +24,8 @@ type collector struct {
 	dropsTotal  *prometheus.Desc
 	buildInfo   *prometheus.Desc
 	tlsExpiry   *prometheus.Desc
+	udpRcvbuf   *prometheus.Desc
+	udpInErrors *prometheus.Desc
 
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
 	// source is wired, and Collect skips the whole block then).
@@ -77,6 +79,8 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
+		udpRcvbuf:   prometheus.NewDesc("freesbc_udp_receive_buffer_errors_total", "Kernel UDP datagrams dropped on a full socket receive buffer (RcvbufErrors, IPv4 + IPv6), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
+		udpInErrors: prometheus.NewDesc("freesbc_udp_in_errors_total", "Kernel UDP receive errors (InErrors, IPv4 + IPv6; includes the receive buffer drops), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
 		restartRequired: prometheus.NewDesc("freesbc_config_restart_required", "Restart-only config keys changed on disk and not applied until restart.", nil, nil),
@@ -132,6 +136,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.restartRequired
 	ch <- c.reloadFailed
 	ch <- c.healthSt
+	ch <- c.udpRcvbuf
+	ch <- c.udpInErrors
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyRegAuth, c.proxyRegUnans, c.proxyRegBrk, c.proxyReqIn, c.proxyResOut,
@@ -156,6 +162,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
 	}
 	g(c.buildInfo, 1, c.deps.Version)
+	if u, ok := readUDPStats(); ok {
+		ch <- prometheus.MustNewConstMetric(c.udpRcvbuf, prometheus.CounterValue, float64(u.RcvbufErrors))
+		ch <- prometheus.MustNewConstMetric(c.udpInErrors, prometheus.CounterValue, float64(u.InErrors))
+	}
 	g(c.healthSt, healthLevel(healthStatus(c.health.evaluate())))
 	fails := c.audit.failures()
 	for _, reason := range authFailureReasons {
