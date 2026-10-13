@@ -48,7 +48,7 @@ pcap and the UAS echoes it, but SIPp does not analyse what returns. Use:
 * the `webrtc` scenario, which measures echoed-packet ratio, sequence-gap loss,
   RFC 3550 jitter and RTT per call;
 * FreeSBC's own `freesbc_rtp_packets_rx_total` vs `..._tx_total` (summary
-  line `tx_over_rx`; below 1.0 means FreeSBC dropped packets). On builds where
+  line `tx_over_rx`; below 1.0 means FreeSBC dropped packets; 1.0 does not exclude kernel drops on a full UDP receive buffer, which `freesbc_udp_receive_buffer_errors_total` and `udp_rcvbuf_errors` in `metrics.csv` show). On builds where
   these count finished sessions only, they move when calls end; the summary
   window includes the teardown, so they still add up for runs that finish.
 

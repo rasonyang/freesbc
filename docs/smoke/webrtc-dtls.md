@@ -107,6 +107,7 @@ Check the file, then run it:
 | `freesbc_webrtc_ice_failure_total` | browser legs that never completed ICE, including legs closed before they were established (CANCEL, tab closed) |
 | `freesbc_webrtc_dtls_failure_total` | browser legs whose DTLS handshake failed, **including a fingerprint mismatch** |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | packets relayed, folded in when a session ends |
+| `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Linux only: kernel UDP receive drops for the whole network namespace; rx/tx 1.0 does not exclude them |
 | `freesbc_media_ports_in_use` | RTP port pairs held across all pools: +2 per browser call |
 
 `freesbc_media_ports_in_use` / `_total` count RTP port pairs across every
