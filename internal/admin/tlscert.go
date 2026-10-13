@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
@@ -18,6 +19,17 @@ import (
 // tlsExpiryWarn is how far ahead of not-after the certificate counts as
 // expiring soon (the WebUI banner and expiring_soon).
 const tlsExpiryWarn = 30 * 24 * time.Hour
+
+// tlsDiskInterval is how often the background check re-reads the cert file
+// to compare it with the loaded leaf. It is the only timer-driven read of
+// that file; the health tracker and /metrics read the cached result only.
+const tlsDiskInterval = 10 * time.Minute
+
+// tlsDisk is the cached outcome of the last disk check.
+type tlsDisk struct {
+	differs bool   // the first cert in the file is not the loaded leaf
+	err     string // the file could not be read or parsed; differs is false
+}
 
 // tlsRecord is the one top-level tls leaf the process loaded, shared by
 // every listener that uses it. Only the parsed leaf is kept, never the key
@@ -191,9 +203,56 @@ func (s *Server) handleTLS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rec.body(s.clock()))
 }
 
+// refreshTLSDisk re-reads the cert file once and caches whether it differs
+// from the loaded leaf (or why it cannot be read). With no leaf loaded it
+// clears the cache.
+func (s *Server) refreshTLSDisk() {
+	var d tlsDisk
+	if rec := s.tlsRecord(); rec != nil {
+		if c, err := firstCertOnDisk(rec.certFile); err != nil {
+			d.err = err.Error()
+		} else {
+			d.differs = fingerprint(c) != fingerprint(rec.leaf)
+		}
+	}
+	s.tlsMu.Lock()
+	s.tlsDisk = d
+	s.tlsMu.Unlock()
+}
+
+// cachedTLSDisk returns the last refreshTLSDisk result without touching the
+// file. Zero before the first check.
+func (s *Server) cachedTLSDisk() tlsDisk {
+	s.tlsMu.Lock()
+	defer s.tlsMu.Unlock()
+	return s.tlsDisk
+}
+
+// runTLSDisk checks once at start and then every tlsDiskInterval until ctx
+// is done.
+func (s *Server) runTLSDisk(ctx context.Context) {
+	every := s.tlsDiskEvery
+	if every <= 0 {
+		every = tlsDiskInterval
+	}
+	s.refreshTLSDisk()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.refreshTLSDisk()
+		}
+	}
+}
+
 // healthConditions is the health tracker's source: Deps.Health plus the
-// certificate expiry condition. It reads no file (the tracker also runs on a
-// timer), so a renewal on disk is /api/tls's to report, not a condition.
+// certificate conditions. It reads no file (the tracker runs every few
+// seconds and on every scrape): the disk conditions come from the cache
+// runTLSDisk keeps, so a renewal can take up to tlsDiskInterval to appear.
+// /api/tls re-reads the file per request and is always current.
 func (s *Server) healthConditions() []HealthCondition {
 	var out []HealthCondition
 	if s.deps.Health != nil {
@@ -203,22 +262,47 @@ func (s *Server) healthConditions() []HealthCondition {
 	if rec == nil {
 		return out
 	}
+	disk := s.cachedTLSDisk()
 	days, expired, soon := expiry(rec.leaf, s.clock())
 	notAfter := rec.leaf.NotAfter.UTC().Format(time.RFC3339)
 	switch {
 	case expired:
+		msg := "the loaded TLS certificate has expired"
+		if disk.differs {
+			msg += "; a renewed certificate is on disk, restart to apply it"
+		}
 		out = append(out, HealthCondition{
 			ID:       "tls_cert_expiry",
 			Severity: HealthCritical,
-			Message:  "the loaded TLS certificate has expired",
+			Message:  msg,
 			Detail:   "not after " + notAfter,
 		})
 	case soon:
+		msg := fmt.Sprintf("the loaded TLS certificate expires in %d day(s)", days)
+		if disk.differs {
+			msg = fmt.Sprintf("the loaded TLS certificate expires in %d day(s); it was renewed on disk, restart to apply it", days)
+		}
 		out = append(out, HealthCondition{
 			ID:       "tls_cert_expiry",
 			Severity: HealthDegraded,
-			Message:  fmt.Sprintf("the loaded TLS certificate expires in %d day(s)", days),
+			Message:  msg,
 			Detail:   "not after " + notAfter,
+		})
+	}
+	if disk.differs {
+		out = append(out, HealthCondition{
+			ID:       "tls_cert_renewed",
+			Severity: HealthDegraded,
+			Message:  "a renewed certificate is on disk; restart to apply",
+			Detail:   rec.certFile,
+		})
+	}
+	if disk.err != "" {
+		out = append(out, HealthCondition{
+			ID:       "tls_cert_disk_error",
+			Severity: HealthDegraded,
+			Message:  "the TLS certificate file cannot be read; the next restart would fail",
+			Detail:   disk.err,
 		})
 	}
 	return out

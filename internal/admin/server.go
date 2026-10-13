@@ -212,6 +212,9 @@ type Server struct {
 	tlsMu     sync.Mutex
 	tlsLeaf   *x509.Certificate
 	tlsLoaded time.Time
+	tlsDisk   tlsDisk // last disk check, guarded by tlsMu
+
+	tlsDiskEvery time.Duration // test seam for tlsDiskInterval; 0 is the default
 
 	metricsOnce    sync.Once
 	metricsHandler http.Handler
@@ -274,6 +277,23 @@ func (s *Server) useTLS() bool { return s.cfg.AllowRemote && s.tls != nil }
 // otherwise it serves plain HTTP, which validation only admits on loopback.
 func (s *Server) Run(ctx context.Context) error {
 	srv := s.newHTTPServer()
+	// The pair is loaded before the cert-on-disk check starts, so its first
+	// run already sees the leaf.
+	if s.useTLS() {
+		cert, err := tls.LoadX509KeyPair(s.tls.Cert, s.tls.Key)
+		if err != nil {
+			return fmt.Errorf("admin tls cert/key: %w", err)
+		}
+		if cert.Leaf == nil {
+			if cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+				return fmt.Errorf("admin tls cert/key: %w", err)
+			}
+		}
+		s.tlsMu.Lock()
+		s.tlsLeaf, s.tlsLoaded = cert.Leaf, time.Now()
+		s.tlsMu.Unlock()
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	}
 	// The tracker evaluates on a ticker too, so the history is accurate with
 	// nobody polling; Run does not return before that goroutine has.
 	hctx, hcancel := context.WithCancel(ctx)
@@ -283,6 +303,12 @@ func (s *Server) Run(ctx context.Context) error {
 		defer hwg.Done()
 		s.health.run(hctx, healthInterval)
 	}()
+	// The cert-on-disk check shares the tracker's lifetime.
+	hwg.Add(1)
+	go func() {
+		defer hwg.Done()
+		s.runTLSDisk(hctx)
+	}()
 	defer func() { hcancel(); hwg.Wait() }()
 	errc := make(chan error, 1)
 	go func() {
@@ -290,21 +316,6 @@ func (s *Server) Run(ctx context.Context) error {
 			errc <- srv.ListenAndServe()
 			return
 		}
-		cert, err := tls.LoadX509KeyPair(s.tls.Cert, s.tls.Key)
-		if err != nil {
-			errc <- fmt.Errorf("admin tls cert/key: %w", err)
-			return
-		}
-		if cert.Leaf == nil {
-			if cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
-				errc <- fmt.Errorf("admin tls cert/key: %w", err)
-				return
-			}
-		}
-		s.tlsMu.Lock()
-		s.tlsLeaf, s.tlsLoaded = cert.Leaf, time.Now()
-		s.tlsMu.Unlock()
-		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
 		errc <- srv.ListenAndServeTLS("", "")
 	}()
 	s.log.Info("admin server listening", "addr", s.cfg.Listen, "tls", s.useTLS())

@@ -14,6 +14,7 @@ type collector struct {
 	deps     Deps
 	audit    *auditLog
 	tlsRec   func() *tlsRecord // nil result: no certificate loaded
+	tlsDisk  func() tlsDisk    // cached disk check; never reads the file
 	health   *healthTracker
 	authFail *prometheus.Desc
 	healthSt *prometheus.Desc
@@ -26,6 +27,7 @@ type collector struct {
 	tlsExpiry   *prometheus.Desc
 	udpRcvbuf   *prometheus.Desc
 	udpInErrors *prometheus.Desc
+	tlsDiffers  *prometheus.Desc
 
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
 	// source is wired, and Collect skips the whole block then).
@@ -66,13 +68,15 @@ type collector struct {
 	reloadFailed    *prometheus.Desc
 }
 
-func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func() *tlsRecord) *collector {
+func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func() *tlsRecord, tlsDisk func() tlsDisk) *collector {
 	return &collector{
 		deps:        deps,
 		audit:       audit,
 		health:      health,
 		tlsRec:      tlsRec,
+		tlsDisk:     tlsDisk,
 		healthSt:    prometheus.NewDesc("freesbc_admin_health_status", "Overall health from the admin conditions view: 0 ok, 1 degraded, 2 critical.", nil, nil),
+		tlsDiffers:  prometheus.NewDesc("freesbc_tls_cert_disk_differs", "1 when the cert file on disk (checked every 10 minutes) holds a different leaf than the one being served, so a restart applies a renewal; 0 otherwise, also when the file cannot be read; absent when no certificate is loaded.", nil, nil),
 		tlsExpiry:   prometheus.NewDesc("freesbc_tls_cert_expiry_timestamp_seconds", "Not-after of the loaded top-level tls leaf certificate as Unix seconds; absent when none is loaded.", []string{"path"}, nil),
 		authFail:    prometheus.NewDesc("freesbc_admin_auth_failures_total", "Admin API authentication failures, by reason (bad_credentials, rate_limited).", []string{"reason"}, nil),
 		activeCalls: prometheus.NewDesc("freesbc_active_calls", "Currently active bridged calls.", nil, nil),
@@ -133,6 +137,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.buildInfo
 	ch <- c.authFail
 	ch <- c.tlsExpiry
+	ch <- c.tlsDiffers
 	ch <- c.restartRequired
 	ch <- c.reloadFailed
 	ch <- c.healthSt
@@ -174,6 +179,11 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 
 	if rec := c.tlsRec(); rec != nil {
 		g(c.tlsExpiry, float64(rec.leaf.NotAfter.Unix()), rec.certFile)
+		differs := 0.0
+		if c.tlsDisk().differs {
+			differs = 1
+		}
+		g(c.tlsDiffers, differs)
 	}
 
 	if c.deps.Reload != nil {
@@ -271,7 +281,7 @@ func (s *Server) registry() http.Handler {
 		reg.MustRegister(collectors.NewGoCollector())
 		// Linux-only series (cpu, memory, fds) are absent elsewhere.
 		reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-		reg.MustRegister(newCollector(s.deps, &s.audit, &s.health, s.tlsRecord))
+		reg.MustRegister(newCollector(s.deps, &s.audit, &s.health, s.tlsRecord, s.cachedTLSDisk))
 		s.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 	})
 	return s.metricsHandler
