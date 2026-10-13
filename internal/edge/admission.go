@@ -214,6 +214,30 @@ func (s *Server) admissionStrike(ip netip.Addr, transport string) {
 	sh.StrikeOn(ip, shield.StrikeAdmission, transport)
 }
 
+// malformedStrike counts one malformed public read (a UDP datagram or a
+// WS/WSS frame fsip.Malformed flagged) against its source in the shield. It
+// shares shield.admission_ban with admissionStrike, so a source alternating
+// both kinds hits one budget, and it has the same exemptions (a carrier
+// source, an IP holding a registration) and the same ban scope (UDP: that IP
+// on UDP only; WS/WSS: every transport). A tcp or tls read never reaches it:
+// a chunk of a byte stream is not a message. The read is already past the
+// ban check and the rate token, so the cost is one shield call.
+func (s *Server) malformedStrike(info sip.TransportReadProps) {
+	sh := s.currentShield()
+	if sh == nil {
+		return
+	}
+	ap, err := netip.ParseAddrPort(info.RemoteAddr.String())
+	if err != nil {
+		return
+	}
+	ip := ap.Addr().Unmap()
+	if s.carriers.snapshot().isSource(ip) || s.loc.HasIP(ip) {
+		return
+	}
+	sh.StrikeOn(ip, shield.StrikeMalformed, info.Transport)
+}
+
 // admissionSummaryEvery is the period of the admission-drop summary WARN.
 // An interval with no drops logs nothing.
 const admissionSummaryEvery = time.Minute

@@ -23,6 +23,15 @@ const (
 	// StrikeAdmissionUDP is the offender-table reason of admission strikes
 	// from UDP, counted apart from stream ones (see StrikeOn).
 	StrikeAdmissionUDP = StrikeAdmission + "_udp"
+	// StrikeMalformed is a public datagram the read filter's scan found
+	// malformed (issue #190). It shares shield.admission_ban with
+	// StrikeAdmission: one budget per source and scope, so a source that
+	// alternates both kinds is counted once. The offender view keeps the
+	// two reasons apart (StrikeMalformed, StrikeMalformedUDP).
+	StrikeMalformed = BanReasonMalformed
+	// StrikeMalformedUDP is the offender-table reason of malformed strikes
+	// from UDP.
+	StrikeMalformedUDP = StrikeMalformed + "_udp"
 )
 
 // offenderCap bounds the offender table. A flood of distinct sources only
@@ -30,6 +39,9 @@ const (
 // source that keeps failing stays tracked (it is always the most recent).
 const offenderCap = 16384
 
+// offenderKey names one budget: the source and the budget's reason. A
+// budget shared by several strike reasons (admission_ban) is keyed by its
+// primary reason (StrikeAdmission, with "_udp" for the UDP scope).
 type offenderKey struct {
 	src    netip.Addr // bucketKey: an IPv4 address, an IPv6 /64
 	reason string
@@ -41,8 +53,13 @@ type offender struct {
 	key    offenderKey
 	start  time.Time
 	window time.Duration
-	count  int
+	count  int  // all strikes of the budget in this window
 	over   bool // the threshold was crossed in this window (WARN once)
+	// parts breaks count down by the reason each strike was reported
+	// under. It is nil until a strike names a part, so a single-reason
+	// budget (register) allocates nothing. At most one entry per reason
+	// sharing the budget, so it stays tiny.
+	parts map[string]int
 }
 
 // offenderTable is an LRU-capped table of per-source strike counters.
@@ -60,7 +77,10 @@ func newOffenderTable() *offenderTable {
 
 // strike adds one strike under lim and returns the window's count, whether
 // it is over lim.N, and whether this strike is the one that crossed it.
-func (t *offenderTable) strike(key offenderKey, lim config.StrikeLimit) (count int, over, crossed bool) {
+//
+// part is the reason the strike is tallied under in the offender view when
+// it must be told apart from the rest of the budget, else "".
+func (t *offenderTable) strike(key offenderKey, part string, lim config.StrikeLimit) (count int, over, crossed bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
@@ -69,7 +89,7 @@ func (t *offenderTable) strike(key offenderKey, lim config.StrikeLimit) (count i
 		o = el.Value.(*offender)
 		t.lru.MoveToFront(el)
 		if now.Sub(o.start) >= lim.Window {
-			o.start, o.count, o.over = now, 0, false
+			o.start, o.count, o.over, o.parts = now, 0, false, nil
 		}
 	} else {
 		if t.lru.Len() >= t.max {
@@ -82,6 +102,12 @@ func (t *offenderTable) strike(key offenderKey, lim config.StrikeLimit) (count i
 	}
 	o.window = lim.Window
 	o.count++
+	if part != "" {
+		if o.parts == nil {
+			o.parts = map[string]int{}
+		}
+		o.parts[part]++
+	}
 	if o.count <= lim.N {
 		return o.count, false, false
 	}
@@ -119,15 +145,28 @@ func (t *offenderTable) size() int {
 	return len(t.entries)
 }
 
-// live copies the entries whose window is still open.
+// live copies the entries whose window is still open, one row per reason a
+// budget was struck under (a single-reason budget is one row).
 func (t *offenderTable) live() []offender {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
 	out := make([]offender, 0, len(t.entries))
 	for _, el := range t.entries {
-		if o := el.Value.(*offender); now.Sub(o.start) < o.window {
-			out = append(out, *o)
+		o := el.Value.(*offender)
+		if now.Sub(o.start) >= o.window {
+			continue
+		}
+		if len(o.parts) == 0 {
+			row := *o
+			row.parts = nil
+			out = append(out, row)
+			continue
+		}
+		for reason, n := range o.parts {
+			row := *o
+			row.key.reason, row.count, row.parts = reason, n, nil
+			out = append(out, row)
 		}
 	}
 	return out
@@ -170,11 +209,24 @@ func (s *Shield) strike(src netip.Addr, reason string, udp bool) bool {
 	if lim.Off || lim.N <= 0 || lim.Window <= 0 {
 		return false
 	}
-	table, key := s.bans, offenderKey{bucketKey(src), reason}
-	if udp {
-		table, key.reason = s.udpBans, reason+"_udp"
+	// A reason that shares another's threshold shares its budget too: the
+	// entry is keyed by the budget's reason and the strike is also tallied
+	// under its own reason, which is what the offender view lists.
+	budget := reason
+	if reason == StrikeMalformed {
+		budget = StrikeAdmission
 	}
-	count, over, crossed := s.offenders.strike(key, lim)
+	table, key, part := s.bans, offenderKey{bucketKey(src), budget}, ""
+	if udp {
+		table, key.reason = s.udpBans, budget+"_udp"
+	}
+	if budget == StrikeAdmission {
+		part = reason
+		if udp {
+			part += "_udp"
+		}
+	}
+	count, over, crossed := s.offenders.strike(key, part, lim)
 	if !over {
 		return false
 	}
@@ -193,6 +245,8 @@ func (s *Shield) strike(src netip.Addr, reason string, udp bool) bool {
 
 // ClearStrikes forgets src's strikes of reason: the plane saw src succeed
 // (a 2xx registration), so its earlier failures were not an attack.
+// Clearing StrikeAdmission clears the whole admission_ban budget, malformed
+// strikes included, in both scopes.
 func (s *Shield) ClearStrikes(src netip.Addr, reason string) {
 	s.offenders.clear(offenderKey{bucketKey(src), reason})
 	if reason == StrikeAdmission {
@@ -207,8 +261,9 @@ func (s *Shield) strikeLimit(cfg *config.Config, reason string) config.StrikeLim
 	switch reason {
 	case StrikeRegister:
 		str = cfg.Shield.RegisterBan
-	case StrikeAdmission:
+	case StrikeAdmission, StrikeMalformed:
 		str = cfg.Shield.AdmissionBan
+		reason = StrikeAdmission
 	default:
 		return config.StrikeLimit{Off: true}
 	}
@@ -233,7 +288,10 @@ func (s *Shield) strikeLimit(cfg *config.Config, reason string) config.StrikeLim
 type OffenderInfo struct {
 	// Source is the struck IPv4 address, or an IPv6 /64 prefix.
 	Source string
-	// Reason is the strike reason (StrikeRegister).
+	// Reason is the strike reason (StrikeRegister, StrikeAdmission,
+	// StrikeAdmissionUDP, StrikeMalformed, StrikeMalformedUDP). Strikes is
+	// that reason's own count, though reasons sharing a budget (admission
+	// and malformed) are banned on their sum.
 	Reason string
 	// Strikes is the count in the current window, which opened at Since
 	// and closes at Until.

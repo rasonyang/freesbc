@@ -30,6 +30,9 @@ const (
 	// BanReasonAdmission is a source whose requests admission kept
 	// dropping (shield.admission_ban).
 	BanReasonAdmission = "admission"
+	// BanReasonMalformed is a source whose malformed datagrams crossed
+	// shield.admission_ban (a budget shared with BanReasonAdmission).
+	BanReasonMalformed = "malformed"
 )
 
 // Ban kinds: which of the two tables an entry lives in.
