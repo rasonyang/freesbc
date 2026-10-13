@@ -1004,6 +1004,12 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		if a := trusted(info); a != arrPublic {
 			return s.marker.stamp(a, out), nil
 		}
+		// A datagram or frame sipgo's parser is certain to reject strikes its
+		// source (issue #190). It still goes on to sipgo, whose parse failure
+		// log and metric stay the record of the failure.
+		if !fsip.IsByteStream(info.Transport) && info.RemoteAddr != nil && fsip.Malformed(out) {
+			s.malformedStrike(info)
+		}
 		// A REGISTER whose credential retry reuses a challenged branch is
 		// answered by sipgo from its transaction, never by a handler, so
 		// it is counted here (regguard.go).
