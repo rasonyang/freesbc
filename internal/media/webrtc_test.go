@@ -196,6 +196,15 @@ func TestWebRTCLegOnWildcardBind(t *testing.T) {
 		ice.WithNetworkTypes([]ice.NetworkType{ice.NetworkTypeUDP4}),
 		ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeHost}),
 		ice.WithIncludeLoopback(),
+		// Loopback only. The leg is reached at 127.0.0.1:<port> alone,
+		// and on a multi-homed host a wildcard socket sources its replies
+		// from the address of the route back to the check, so a check
+		// from a non-loopback browser candidate is answered from that
+		// address, which is not the remote candidate the browser sent it
+		// to, and pion discards the response. Gathering only on loopback
+		// keeps every check and its response on one 5-tuple, whatever
+		// interfaces the host has.
+		ice.WithIPFilter(func(ip net.IP) bool { return ip.IsLoopback() }),
 		ice.WithLoggerFactory(lf),
 	)
 	if err != nil {
