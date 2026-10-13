@@ -123,7 +123,7 @@
         <div class="card-header">
           <div class="card-heading">
             <h2 class="card-title">Drain mode</h2>
-            <p class="card-description">While draining, new calls are refused with 503 (public, carrier and switch alike); calls and registrations in place continue. Runtime only: a restart starts not draining.</p>
+            <p class="card-description">While draining, new carrier calls (carrier to switch and switch to carrier) are refused with 503; client calls are still admitted, and calls and registrations in place continue. Runtime only: a restart starts not draining.</p>
           </div>
           <div class="card-action"><span class="badge" data-variant="warning" id="drain-stale" hidden>Stale</span><span class="badge" data-variant="secondary" id="drain-badge">—</span></div>
         </div>

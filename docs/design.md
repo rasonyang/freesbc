@@ -503,7 +503,7 @@ Code lives in `internal/edge`: `carrier.go` (classification, `inviteToCarrier`, 
 
 ### 6.1 Classification of switch-originated requests
 
-A request that arrives on the private socket without a To tag is classified by its Request-URI alone, never by registration state (`classifySwitchRequest`, `internal/edge/carrier.go:91`). In order:
+A request that arrives on the private socket without a To tag is classified by its Request-URI alone, never by registration state (`classifySwitchRequest`, `internal/edge/carrier.go:103`). In order:
 
 1. The Request-URI, or the topmost Route that does not name FreeSBC (`firstForeignRoute`, `carrier.go:113`), carries an `fsbc` URI parameter: `targetClient`. Whether the token is live is the client path's business (an unknown token is a 404 there).
 2. The Request-URI host[:port] equals an `edge.carriers` entry: `targetCarrier`, with the carrier's name. The match key is `carrierKey` (`carrier.go:42`): host lower-cased without a trailing dot, literal IPs in canonical form, port defaulting to 5060. The map is built once from the boot config (`carrierURIsOf`, `carrier.go:54`).
@@ -518,13 +518,13 @@ What each handler does with the result:
 |---|---|---|---|---|
 | INVITE | `inviteToClient` | `inviteToCarrier` (`carrier.go:185`) | 404 | 404 (`invitePrivate`, `carrier.go:167`) |
 | REGISTER | 404 | `registerToCarrier` (`carrierreg.go:190`) | 404 | 404 (`onRegister`, `register.go:29-41`) |
-| OPTIONS | 200 locally | `optionsToCarrier` (`carrier.go:292`) | 200 locally | 404 (`onOptions`, `edge.go:1176`) |
+| OPTIONS | 200 locally (an unknown token → 404) | `optionsToCarrier` (`carrier.go:305`); 503 while draining | 200 locally; 503 while draining | 404 (`onOptions`, `edge.go:1186`) |
 | SUBSCRIBE | `subscribeToClient` (`subscribe.go:438`); a token naming no binding → 404 | 405 | 404 | 404 |
 | BYE, INFO, NOTIFY, MESSAGE | `directionFor` by token (no binding → **481**; a MESSAGE → **404**, `indialog.go:488-493`) | 405 | 404 | 404 (`onInDialog`, `indialog.go:450-463`) |
 | REFER | 481 (no To-tag) | 481 | 481 | 481 (`indialog.go:465-470`) |
 | any other method (PUBLISH) | 405 (`onNoRoute`, `edge.go:1198`) | 405 | 405 | 405 |
 
-An OPTIONS with a To tag is answered locally without classification (`edge.go:1176-1190`). A switch request that has a To tag takes the in-dialog path (§6.7), where the dialog record, not the Request-URI, decides the direction.
+An OPTIONS with a To tag is answered locally without classification or drain check (`onOptions`, `edge.go:1186`). A switch request that has a To tag takes the in-dialog path (§6.7), where the dialog record, not the Request-URI, decides the direction.
 
 ### 6.2 Inbound path: carrier to switch
 
@@ -545,7 +545,7 @@ The carrier source set for the shield (`carrierSnapshot.isSource`, IP only, so a
 - Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:35`, `invite.go:280-291`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:152-153`). The predicate is the live directory snapshot (`edge.go:594`).
 - A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:844-851`; `restoreCarrierRURI`, `hide.go:314`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
 
-A public OPTIONS, including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1176`).
+A public OPTIONS, including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1186`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
 
 ```mermaid
 sequenceDiagram
@@ -592,7 +592,7 @@ The switch uses FreeSBC as its outbound proxy and addresses the carrier in the R
 
 **REGISTER** (`registerToCarrier`, `carrierreg.go:190`): see §6.8. The Request-URI, Authorization and Call-ID are untouched; the digest the switch computed covers them. `401`/`407` challenges and the retried REGISTER pass through untouched (`carrierreg.go:236-239`): the switch holds the account and FreeSBC holds no credential.
 
-**OPTIONS** (`optionsToCarrier`, `carrier.go:292`): proxied to the carrier with hiding, the answer relayed back; 503 when unresolved, 504 on timeout (32 s).
+**OPTIONS** (`optionsToCarrier`, `carrier.go:305`): while draining (§7.1) answered **503** + `Retry-After: 30` locally and not forwarded; otherwise proxied to the carrier with hiding, the answer relayed back; 503 when unresolved, 504 on timeout (32 s).
 
 Every other out-of-dialog method gets 405 (table in §6.1). The send address of every forwarded request is the carrier's resolved address and the sending socket is the public UDP listener.
 
@@ -857,28 +857,37 @@ logger adds. The wrapper also refuses to forward any `data` attribute added
 through `With`. Matching on the message is a sipgo v1.4.3 workaround
 (`TestSipgoParseFailureLogContract` fails if the string changes).
 
-**Drain mode.** `Server.SetDraining` (`edge.go:342`) flips a `drainState`
-(`drain.go:19`: an atomic flag read lock-free on every INVITE, plus a mutex
+**Drain mode.** `Server.SetDraining` (`edge.go:343`) flips a `drainState`
+(`drain.go:23`: an atomic flag read lock-free on every INVITE, plus a mutex
 that guards the `since` time) and the gauge `freesbc_edge_draining`
-(`Metrics.SetDraining`). `beginDialog` checks it first (`invite.go:243`),
-before `dialogTable.begin`, the rate token and any media: while draining, every
-new out-of-dialog INVITE is answered **503** with `Retry-After: 30`
-(`drainRetryAfter`, `invite.go:156`) through `rejectBusy` and counted as
-`freesbc_edge_invite_rejects_total{reason="draining"}` (`rejectDraining`). That
-covers all four entry paths because they all go through `beginDialog`
-(`dialogTable.begin` has no other caller), and the switch is **not** exempt: a
-switch-originated INVITE (a call to a client, a call out through a carrier, a
-transfer leg) is refused like a public one. A public INVITE that admission
-(§7.5) drops silently is still dropped silently, since admission runs first.
+(`Metrics.SetDraining`). `beginDialog` takes a `carrierCall` flag and checks
+drain first (`invite.go:244`), before `dialogTable.begin`, the rate token and
+any media: while draining, a new carrier call is answered **503** with
+`Retry-After: 30` (`drainRetryAfter`, `invite.go:156`) through `rejectBusy` and
+counted as `freesbc_edge_invite_rejects_total{reason="draining"}`
+(`rejectDraining`). Carrier calls are carrier to switch (`inviteToUpstream`
+with a carrier caller) and switch to carrier (`inviteToCarrier`); client to
+switch (a registered source, which wins over a carrier source as in
+admission) and switch to client (`inviteToClient`) pass `carrierCall=false`
+and are admitted. A public INVITE that admission (§7.5) drops silently is
+still dropped silently, since admission runs first. `onOptions` (`edge.go:1186`)
+reports drain too, for an out-of-dialog OPTIONS only: **503** +
+`Retry-After: 30` to a carrier source (not also a live registration), to a
+switch OPTIONS naming FreeSBC itself and to a switch OPTIONS naming a carrier
+host (answered locally, not proxied). Client OPTIONS, a live client token and
+in-dialog OPTIONS are unchanged. These are not INVITE rejects and have no
+counter of their own (`freesbc_edge_responses_total` sees the 503). The
+INVITE 503 is the guarantee; the OPTIONS 503 only lets a trunk or the switch
+see the node leave.
 Nothing else changes: re-INVITE and every other in-dialog request, BYE,
-CANCEL, ACK, PRACK/UPDATE, REGISTER, OPTIONS, SUBSCRIBE/NOTIFY/MESSAGE/REFER
+CANCEL, ACK, PRACK/UPDATE, REGISTER, client OPTIONS, SUBSCRIBE/NOTIFY/MESSAGE/REFER
 and RTP are handled as usual, so existing calls and bindings live on and end
 normally. The state is runtime only (never in config, not persisted, a
 restart starts not draining) and there is no automatic exit when the calls
 reach zero: the operator polls `GET /api/drain` (§13.3) and restarts. The edge
 logs each actual change at Info (`edge drain entered` / `edge drain left`).
 
-**Global call admission control.** `beginDialog` (`invite.go:240`) is the one
+**Global call admission control.** `beginDialog` (`invite.go:242`) is the one
 place every out-of-dialog INVITE passes after its cheap validation and before
 any media is allocated: `inviteToUpstream` (client and carrier to switch,
 `invite.go`), `inviteToClient` (switch to client) and `inviteToCarrier`
@@ -1036,7 +1045,7 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | CANCEL | only orphan CANCELs reach the handler (§7.8) |
 | PRACK, UPDATE | `onPrackUpdate` (`prack.go:30`): **481** with no To-tag or no dialog the tags name (early forks included); a PRACK with SDP that answers no owed offer → **488**; otherwise `onInDialog` (§7.8, §7.9a) |
 | BYE, INFO, NOTIFY | `onInDialog` (§7.8); NOTIFY whatever its `Event`, matched against the subscription table first (§7.8a). A NOTIFY with no To-tag from a public client → **481**; so is a public NOTIFY, REFER or MESSAGE that names no dialog or subscription (never hashed upstream, `indialog.go:505`). An out-of-dialog one from the switch is classified like an out-of-dialog INVITE (§7.5): a client token goes on, a carrier destination → **405**, anything else → **404**. A NOTIFY with a To-tag from the switch that `directionFor` cannot route is forwarded by Call-ID alone to that dialog's client, tags unchecked (`relaxedNotifyDirection`, §7.8); **481** only when no dialog with a public route has the Call-ID |
-| OPTIONS | answered locally with **200 OK** + `Allow`; never forwarded to the switch, because relaying every phone's keepalive would multiply its load. From the private socket an out-of-dialog OPTIONS is classified first: a carrier destination is proxied to the carrier (§6), an unknown destination → **404**; FreeSBC itself or a client token → 200 |
+| OPTIONS | answered locally with **200 OK** + `Allow`; never forwarded to the switch, because relaying every phone's keepalive would multiply its load. From the private socket an out-of-dialog OPTIONS is classified first: a carrier destination is proxied to the carrier (§6), an unknown destination or a client token with no live binding → **404**; FreeSBC itself or a live client token → 200. While draining (§7.1) an out-of-dialog OPTIONS from a carrier source, to FreeSBC itself or to a carrier host (not proxied) is **503** + `Retry-After: 30` |
 | SUBSCRIBE | `onSubscribe` (`subscribe.go:379`, §7.8a) |
 | REFER | `onInDialog`: **481** with no To-tag or no dialog, **603** on a carrier dialog (never forwarded), else forwarded unchanged (§7.8a) |
 | MESSAGE | `onMessage` (`message.go:33`, §7.8a) |
@@ -1275,7 +1284,7 @@ deliver.
 2. To-tag present → `onReInvite` (§7.9).
 3. Arrival on the **private socket** → `invitePrivate`
    (`internal/edge/carrier.go:167`), which classifies by Request-URI alone
-   (`classifySwitchRequest`, `carrier.go:91`; details in §6):
+   (`classifySwitchRequest`, `carrier.go:103`; details in §6):
    1. the Request-URI, or the topmost remaining Route, carries an `fsbc`
       token → `inviteToClient` (`invite.go:552`): the binding is found by
       the token (`resolveTarget`; there is no address-of-record fallback,
@@ -1291,7 +1300,7 @@ deliver.
    user (or pinned by a carrier registration token) at the node's carrier
    port, stamped `X-FreeSBC-Carrier` (§6).
 
-Every path opens its record with `beginDialog` (`invite.go:240`), which
+Every path opens its record with `beginDialog` (`invite.go:242`), which
 answers **503** while draining (§7.1), **482** for a merged request and **503**
 once shutdown has begun (the dialog table is closed).
 
@@ -1573,7 +1582,7 @@ fixed and every label is exported from the start:
 | Reason | Response | Where |
 |---|---|---|
 | `early_cap` | 503 | `maxEarlyPerSource` reached for a client source (§7.5) |
-| `draining` | 503 + `Retry-After: 30` | `beginDialog`: drain mode is on (§7.1); sent by `rejectBusy`, before a slot, a rate token or a port is taken |
+| `draining` | 503 + `Retry-After: 30` | `beginDialog`: drain mode is on and the call is a carrier call (§7.1); sent by `rejectBusy`, before a slot, a rate token or a port is taken |
 | `shutting_down` | 503 | `beginDialog` once the table is closed; `rejectMedia` for `errShuttingDown` |
 | `loop_detected` | 482 | `beginDialog`, the INVITE merges with a call in progress |
 | `no_public_side` | 488, 480, 503 | no listener for the INVITE's transport, or for the client's or carrier's leg |
@@ -1776,7 +1785,7 @@ that match no dialog is still forwarded — the endpoint answers 481 — but
 tears nothing down, and a 401/407 challenge leaves the call up.
 
 An out-of-dialog request (no To tag) from the switch is classified first,
-by Request-URI alone (`classifySwitchRequest`, `carrier.go:91`; §6): an
+by Request-URI alone (`classifySwitchRequest`, `carrier.go:103`; §6): an
 `fsbc` token goes on to `directionFor`; a request addressed to a carrier is
 answered **405** here (REGISTER, INVITE and OPTIONS have their own
 handlers); anything else is **404**.
@@ -3925,7 +3934,7 @@ carry the same caps, framing, deadlines and rate token as accepted ones.
 
 **The switch is never an open relay.** A request from the switch is delivered
 only to a registered client (a valid `fsbc` token) or to an `edge.carriers`
-destination, chosen by Request-URI (`classifySwitchRequest`, `carrier.go:91`);
+destination, chosen by Request-URI (`classifySwitchRequest`, `carrier.go:103`);
 anything else is answered 404. There is no AoR fallback. A carrier request to
 the switch always goes to `<node IP>:switch_carrier_port`, never to the client
 port, so unauthenticated carrier traffic cannot reach the switch's

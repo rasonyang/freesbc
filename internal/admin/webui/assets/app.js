@@ -367,7 +367,7 @@
     drainConfirm.setAttribute("data-for", enter ? "enter" : "leave");
     $("drain-confirm-title").textContent = enter ? "Enter drain mode?" : "Leave drain mode?";
     $("drain-confirm-text").textContent = enter
-      ? "New calls will be refused with 503 Service Unavailable, including calls from carriers and from the switch, until you leave drain mode or restart. " +
+      ? "New carrier calls (from and to carriers) will be refused with 503 Service Unavailable; client calls are still admitted. Carrier-facing OPTIONS answer 503 too. This lasts until you leave drain mode or restart. " +
         fmtInt(drainState.active_calls) + " active call(s) continue."
       : "New calls will be accepted again.";
     drainConfirm.hidden = false;
