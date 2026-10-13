@@ -264,6 +264,8 @@ func (s *Shield) strikeLimit(cfg *config.Config, reason string) config.StrikeLim
 	case StrikeAdmission, StrikeMalformed:
 		str = cfg.Shield.AdmissionBan
 		reason = StrikeAdmission
+	case StrikeRegisterAOR:
+		str = cfg.Shield.RegisterBanAOR
 	default:
 		return config.StrikeLimit{Off: true}
 	}
@@ -286,12 +288,13 @@ func (s *Shield) strikeLimit(cfg *config.Config, reason string) config.StrikeLim
 
 // OffenderInfo is one source with strikes in an open window.
 type OffenderInfo struct {
-	// Source is the struck IPv4 address, or an IPv6 /64 prefix.
+	// Source is the struck IPv4 address, or an IPv6 /64 prefix; for reason
+	// StrikeRegisterAOR it is the AoR.
 	Source string
 	// Reason is the strike reason (StrikeRegister, StrikeAdmission,
-	// StrikeAdmissionUDP, StrikeMalformed, StrikeMalformedUDP). Strikes is
-	// that reason's own count, though reasons sharing a budget (admission
-	// and malformed) are banned on their sum.
+	// StrikeAdmissionUDP, StrikeMalformed, StrikeMalformedUDP,
+	// StrikeRegisterAOR). Strikes is that reason's own count, though reasons
+	// sharing a budget (admission and malformed) are banned on their sum.
 	Reason string
 	// Strikes is the count in the current window, which opened at Since
 	// and closes at Until.
@@ -308,6 +311,7 @@ const maxOffenders = 1000
 func (s *Shield) Offenders(limit int) (top []OffenderInfo, total int) {
 	limit = min(max(limit, 1), maxOffenders)
 	live := s.offenders.live()
+	aors := s.aors.live()
 	sort.Slice(live, func(i, j int) bool {
 		if live[i].count != live[j].count {
 			return live[i].count > live[j].count
@@ -317,15 +321,27 @@ func (s *Shield) Offenders(limit int) (top []OffenderInfo, total int) {
 		}
 		return live[i].key.src.Less(live[j].key.src)
 	})
-	total = len(live)
+	total = len(live) + len(aors)
 	top = make([]OffenderInfo, 0, min(limit, total))
-	for _, o := range live[:min(limit, total)] {
+	for _, o := range live {
 		src := o.key.src.String()
 		if o.key.src.Is6() {
 			src = netip.PrefixFrom(o.key.src, 64).String()
 		}
 		top = append(top, OffenderInfo{Source: src, Reason: o.key.reason, Strikes: o.count,
 			Since: o.start, Until: o.start.Add(o.window)})
+	}
+	for _, e := range aors {
+		until := e.start.Add(e.window)
+		if !e.locked.IsZero() {
+			until = e.locked
+		}
+		top = append(top, OffenderInfo{Source: e.key, Reason: StrikeRegisterAOR, Strikes: e.count,
+			Since: e.start, Until: until})
+	}
+	sort.SliceStable(top, func(i, j int) bool { return top[i].Strikes > top[j].Strikes })
+	if len(top) > limit {
+		top = top[:limit]
 	}
 	return top, total
 }

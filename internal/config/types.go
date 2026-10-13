@@ -137,6 +137,9 @@ type StrikeLimit struct {
 // DefaultRegisterBan is shield.register_ban when the key is unset.
 const DefaultRegisterBan = "10/10m"
 
+// DefaultRegisterBanAOR is shield.register_ban_aor when the key is unset.
+const DefaultRegisterBanAOR = "10/10m"
+
 // DefaultAdmissionBan is shield.admission_ban when the key is unset.
 const DefaultAdmissionBan = "50/5m"
 

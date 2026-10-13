@@ -357,6 +357,9 @@ func (c *Config) validateShield(fail failFunc) {
 	if _, err := ParseStrikeLimit(c.Shield.RegisterBan); err != nil {
 		fail("shield.register_ban: %v", c.envRedact.detail(c.Shield.RegisterBan, err))
 	}
+	if _, err := ParseStrikeLimit(c.Shield.RegisterBanAOR); err != nil {
+		fail("shield.register_ban_aor: %v", c.envRedact.detail(c.Shield.RegisterBanAOR, err))
+	}
 	if _, err := ParseStrikeLimit(c.Shield.AdmissionBan); err != nil {
 		fail("shield.admission_ban: %v", c.envRedact.detail(c.Shield.AdmissionBan, err))
 	}

@@ -249,7 +249,33 @@ func (s *Server) registerStrike(src netip.AddrPort, head fsip.RegisterHead, repl
 		return false
 	}
 	s.metrics.RegisterAuthFailed()
+	// The same refused attempt is also a strike against the AoR, whatever
+	// the source (issue #187): a distributed brute force keeps each source
+	// under register_ban but not the AoR it all aims at.
+	sh.StrikeAOR(head.AOR)
 	return sh.Strike(ip, shield.StrikeRegister)
+}
+
+// aorLockedFor reports whether a REGISTER for aor from src is to be dropped
+// because the AoR's limit is open (shield.register_ban_aor): src is neither
+// a carrier source nor the holder of a live binding of aor (matched by
+// source key, any port, so a phone that moved ports still refreshes).
+func (s *Server) aorLockedFor(src netip.Addr, aor string) bool {
+	sh := s.currentShield()
+	if sh == nil || !sh.AORLocked(aor) {
+		return false
+	}
+	src = src.Unmap()
+	if s.carriers.snapshot().isSource(src) {
+		return false
+	}
+	key := enumKey(src)
+	for _, b := range s.loc.ByAOR(aor) {
+		if enumKey(b.Source.Addr()) == key {
+			return false
+		}
+	}
+	return true
 }
 
 // refreshesBinding reports whether ip's source key holds a live binding of
@@ -278,6 +304,7 @@ func (s *Server) registerOutcome(in bindingInput, res *sip.Response) {
 		if sh := s.currentShield(); sh != nil {
 			sh.ClearStrikes(in.source.Addr(), shield.StrikeRegister)
 			sh.ClearStrikes(in.source.Addr(), shield.StrikeAdmission)
+			sh.ClearAOR(in.aor)
 		}
 		return
 	}

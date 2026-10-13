@@ -212,6 +212,11 @@ type ShieldConfig struct {
 	// attempts pass a threshold ("<n>/<window>", e.g. "10/10m"), or "off".
 	// Default "10/10m". Hot.
 	RegisterBan string `yaml:"register_ban"`
+	// RegisterBanAOR counts the same refused attempts per AoR across all
+	// sources ("<n>/<window>", e.g. "10/10m"), or "off". Over it, REGISTERs
+	// for that AoR from a source with no live binding of it are dropped
+	// silently for shield.ban. Default "10/10m". Hot.
+	RegisterBanAOR string `yaml:"register_ban_aor"`
 	// AdmissionBan bans a public source whose requests admission keeps
 	// dropping (out-of-dialog INVITE, SUBSCRIBE or MESSAGE from a source that
 	// is neither a carrier nor registered) past a threshold ("<n>/<window>",
@@ -270,6 +275,9 @@ func withDefaults(c *Config) {
 	}
 	if c.Shield.RegisterBan == "" {
 		c.Shield.RegisterBan = DefaultRegisterBan
+	}
+	if c.Shield.RegisterBanAOR == "" {
+		c.Shield.RegisterBanAOR = DefaultRegisterBanAOR
 	}
 	if c.Shield.AdmissionBan == "" {
 		c.Shield.AdmissionBan = DefaultAdmissionBan

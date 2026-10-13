@@ -33,6 +33,7 @@ type Shield struct {
 	socketBans *banList[netip.AddrPort] // UDP source sockets (see CheckFrom)
 	udpBans    *banList[netip.Addr]     // source IPs banned on UDP only (see StrikeOn)
 	offenders  *offenderTable           // per-source strike counters (Strike)
+	aors       *aorTable                // per-AoR REGISTER strikes (StrikeAOR)
 
 	// Cumulative drop counters by reason, for the admin API's metrics
 	// snapshot (Stats). Incremented in Check at each of its three drop
@@ -74,6 +75,7 @@ func New(store *config.Store, log *slog.Logger, isCarrier func(netip.Addr) bool)
 		socketBans: newBanTable[netip.AddrPort](),
 		udpBans:    newBanList(),
 		offenders:  newOffenderTable(),
+		aors:       newAORTable(),
 		stop:       cancel,
 		done:       make(chan struct{}),
 	}
@@ -258,6 +260,7 @@ func (s *Shield) pruneLoop(ctx context.Context) {
 			s.socketBans.prune()
 			s.udpBans.prune()
 			s.offenders.prune()
+			s.aors.prune()
 		}
 	}
 }
