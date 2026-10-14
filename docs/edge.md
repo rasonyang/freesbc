@@ -172,6 +172,19 @@ On Linux the private socket installs a BPF receive filter: a datagram is deliver
 - **The interface is resolved once at startup.** Recreating the interface that owns `private.ip` (a new VLAN/bond/bridge ifindex) drops wire traffic until FreeSBC restarts.
 - **The filter is Linux-only.** Elsewhere the private socket is unfiltered and strict `rp_filter=1` or a firewall rule dropping traffic to `private.ip` on the public interface remains the mitigation; loose `rp_filter=2` is not sufficient when the spoofed source is routable.
 
+## UDP socket buffers
+
+FreeSBC asks the kernel for a 4 MiB receive buffer and a 1 MiB send buffer on every UDP SIP socket (the public `edge.listen.udp` socket and the private `private.ip:5060` socket). The sizes are fixed, not configurable, and `rmem_default` need not be raised because the size is set explicitly. RTP sockets are not resized. The kernel caps the request at `net.core.rmem_max` and `net.core.wmem_max` (Linux) or `kern.ipc.maxsockbuf` (macOS), so raise them to at least 4 MiB and 1 MiB:
+
+```sh
+sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+# persistent: /etc/sysctl.d/90-freesbc.conf
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+```
+
+Apply it before FreeSBC starts (a running socket keeps the size it got). If the grant falls short FreeSBC still starts and logs one warning per socket, `udp socket receive buffer below request; datagrams may drop under bursts` (or `... send buffer below request`), with the address, `requested` and `effective` bytes. Without the larger buffer a burst or a GC pause overflows the socket and the kernel drops datagrams silently; the signal is the `RcvbufErrors` counter, `nstat -az UdpRcvbufErrors`, `freesbc_udp_receive_buffer_errors_total` on `/metrics` (Linux), or the `RcvbufErrors` column of the `Udp:` lines in `/proc/net/snmp`.
+
 ## Multiple switches (`edge.switch`)
 
 `edge.switch` with one entry is a single upstream. With more than one it is a pool: the proxy picks a node per user. This is the OpenSIPS dispatcher's `hash-user` algorithm (alg 10), applied at the edge.

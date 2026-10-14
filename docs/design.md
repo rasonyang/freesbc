@@ -315,6 +315,19 @@ There are no wildcard binds: validation rejects `0.0.0.0` and `::` for
 `public.ip`, `public.bind` and `private.ip`. Public and private are separate
 sockets on separate addresses, so they have separate port namespaces.
 
+Both UDP SIP sockets (`udp` and `udp-private`) are opened in `openListener`
+(`edge.go:875`) and sized right after the bind (`sizeUDPSocket`,
+`sockbuf.go`): receive buffer `udpSIPReadBuffer` 4 MiB and send buffer
+`udpSIPWriteBuffer` 1 MiB (`sockbuf.go:16-17`), fixed constants rather than
+config (issue #171; the OS default overflowed under bursts and the kernel
+dropped datagrams, `UdpRcvbufErrors`). The effective sizes are read back with
+`getsockopt` (`sockbuf_unix.go`, halved on Linux, which reports double the
+grant; unknown elsewhere). A read-back below the
+request, or a `SetReadBuffer`/`SetWriteBuffer` error, logs one Warn per socket
+and startup continues: the kernel caps the request at `net.core.rmem_max` /
+`wmem_max` (Linux) or `kern.ipc.maxsockbuf` (macOS). RTP sockets are not
+resized: each carries one stream of about 50 packets per second.
+
 `Run` first checks that `public.bind` and `private.ip` are assigned to a local
 interface (`checkLocalAddr`, `edge.go:534`); `check`
 cannot do that. It then binds **every socket synchronously before serving
@@ -4363,6 +4376,7 @@ code constant.
 |---|---|---|
 | `rtpSilenceTimeout` | 5 min (`edge.go:161`) | media silence; the only automatic reclaim for a confirmed call whose BYE was lost |
 | `switchCooldown` | 30 s (`edge.go:165`) | a switch node that answered nothing is skipped while alternatives exist |
+| `udpSIPReadBuffer` / `udpSIPWriteBuffer` | 4 MiB / 1 MiB (`sockbuf.go:16-17`) | requested kernel receive and send buffer of each UDP SIP socket (§4.3); capped by the host's sysctl |
 | `udpServingTimeout` | 5 s (`edge.go:771`) | startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
 | `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, a ws/wss connection's HTTP upgrade request (§7.1a), and the dial plus handshake of a connection FreeSBC opens to a tcp/tls carrier (§6.10) |
 | `streamIdleTimeout` | 60 s | a stream connection silent this long and in no use (no binding, dialog or carrier source) is closed; an in-use one is re-armed |
