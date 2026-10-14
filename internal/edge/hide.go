@@ -3,46 +3,59 @@ package edge
 import (
 	"net/netip"
 	"regexp"
+	"strings"
 
 	"github.com/emiago/sipgo/sip"
 
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
 
-// This file holds topology hiding on carrier legs (issue #96). On a client
-// call the proxy keeps every Via below its own. Record-Route is hidden on
-// every public leg (issue #166): a client sees FreeSBC's public entry only
-// and the private one lives on the switch side alone. A carrier is also
-// different: it is on
-// the public internet and the switch behind FreeSBC is on a private LAN, so
-// nothing toward the carrier may name a private address.
+// This file holds topology hiding on every public leg: carriers (issue
+// #96) and registered clients (issues #166, #167). The switch behind
+// FreeSBC is on a private LAN, so nothing toward a public party may name a
+// private address or identify the switch. On a call the proxy keeps every
+// Via below its own; the rules below are what a public party is shown
+// instead. A carrier and a client differ in one way only: a client leg also
+// gets the header allowlist (filterToClient), because a client has no use
+// for a header the switch added, whereas a carrier legitimately receives
+// the switch's dialplan headers (P-Charge-Info, X-Account...).
 //
 // The rules, per message:
 //
-// Request toward a carrier (out-of-dialog REGISTER, INVITE, OPTIONS and
-// every in-dialog request of a carrier call that goes public):
+// Request toward a public party (a carrier's out-of-dialog REGISTER,
+// INVITE and OPTIONS and every in-dialog request of a carrier call; a
+// switch-originated INVITE, SUBSCRIBE, NOTIFY, MESSAGE and every in-dialog
+// request toward a client), hideToPublic:
 //   - Via: every Via the switch added is removed; the one Via is FreeSBC's
-//     public one (hideToCarrier).
+//     public one. The switch's own Vias are restored on the response.
 //   - Record-Route: only FreeSBC's public entry, and only when the request
 //     opens a dialog. Nothing the switch sent survives.
 //   - Route: FreeSBC's own entries were stripped as the request was
 //     prepared. On an out-of-dialog request every remaining Route is
 //     removed (switch-preloaded routes may be private). On an in-dialog
-//     request the remaining Routes are the route set learned from the
-//     carrier's own Record-Routes (a multi-hop carrier proxy chain needs
-//     them) and are kept: the only private entry in the switch's route set
-//     is FreeSBC's, already stripped. The send-to address is unchanged.
+//     request the remaining Routes are the route set learned from the far
+//     end's own Record-Routes (a multi-hop carrier proxy chain needs them)
+//     and are kept: the only private entry in the switch's route set is
+//     FreeSBC's, already stripped. The send-to address is unchanged.
 //   - Identity: the host of From, To, P-Asserted-Identity,
-//     P-Preferred-Identity, Remote-Party-ID, Diversion, Call-Info and
-//     Alert-Info is rewritten to public.ip (port dropped) when it is
-//     private.ip or the IP of an edge.switch node (Asterisk and FreeSWITCH
-//     default to their own IP).
-//     User, parameters and tags are kept. Any other host (a carrier
+//     P-Preferred-Identity, Remote-Party-ID, Diversion, History-Info,
+//     Referred-By, Refer-To, Call-Info, Alert-Info and Error-Info is
+//     rewritten to public.ip (port dropped) when it is private.ip or the IP
+//     of an edge.switch node (Asterisk and FreeSWITCH default to their own
+//     IP). User, parameters and tags are kept. Any other host (a carrier
 //     domain) is left alone. Call-ID is the switch's and passes through
-//     unchanged.
-//   - Contact: FreeSBC's public address (REGISTER carries the rewritten
-//     binding instead, carrierreg.go).
+//     unchanged (its host, if any, is the switch's business, #168).
+//   - Contact: FreeSBC's public address (a carrier REGISTER carries the
+//     rewritten binding instead, carrierreg.go).
 //   - X-FreeSBC-*: removed, as for every forwarded request.
+//   - Client legs only: every header outside clientHeaderAllowlist is
+//     removed (Server, User-Agent, Warning, X-*, P-* other than the
+//     identity ones).
+//
+// Request from a public party toward the switch (a client's, or a carrier's
+// in-dialog request): From and To are restored to the switch's own URIs
+// where the dialog or subscription record knows them (restoreIdentity),
+// since the far end echoes the masked form in its in-dialog requests.
 //
 // Response to the switch (respToSwitch): our public Via is popped, then the
 // switch's original Vias are restored, so its transaction matches, and the
@@ -57,50 +70,75 @@ import (
 // removed, and a Contact, if present, is FreeSBC's public one, so no
 // private address leaves in a response either.
 //
-// ACK, CANCEL, BYE, re-INVITE, PRACK, UPDATE, INFO and NOTIFY in a carrier dialog
+// Response to a client (respToClient, the switch's answer to a
+// client-originated request): Record-Routes naming the private socket or
+// the switch are removed (a client sees FreeSBC's public entry alone),
+// the identity rule above is applied, a Contact is FreeSBC's public one
+// (except in a REGISTER response, whose Contact list is the client's own
+// bindings, restored by register.go), and the allowlist is applied. That
+// drops Path, Service-Route and P-Associated-URI from a REGISTER 200. A
+// digest challenge passes verbatim: its realm may name the switch's
+// domain, but the client's digest is computed over it, so rewriting it would
+// break the credential.
+//
+// ACK, CANCEL, BYE, re-INVITE, PRACK, UPDATE, INFO and NOTIFY in a dialog
 // all take the same rules because they all leave through
-// prepareForwardHidden / relayResponseHide. SDP is rebuilt from scratch on
+// prepareForwardFor / relayResponseHide. SDP is rebuilt from scratch on
 // every leg already, so no body carries a foreign address.
 
 // respHide selects the topology-hiding rewrite a relayed response gets.
 type respHide int
 
 const (
-	respPlain     respHide = iota // client legs: nothing hidden
-	respToSwitch                  // carrier leg's response, going to the switch
+	respPlain     respHide = iota // nothing hidden
+	respToSwitch                  // a public party's response, going to the switch
 	respToCarrier                 // switch's response to a carrier's request
+	respToClient                  // switch's response to a client's request
 )
 
-// prepareForwardFor is prepareForward, hidden when the request goes to a
-// carrier (carrierLeg says so).
-func (s *Server) prepareForwardFor(req *sip.Request, from, to side, dest string, recordRoute, hide bool) (*sip.Request, error) {
-	if hide {
-		return s.prepareForwardHidden(req, from, to, dest, recordRoute)
+// hideKind selects the topology-hiding rewrite a request going to a public
+// party gets (hideToPublic).
+type hideKind int
+
+const (
+	hideNone    hideKind = iota // toward the switch: nothing hidden
+	hideCarrier                 // toward a carrier
+	hideClient                  // toward a client: also the header allowlist
+)
+
+// prepareForwardFor is prepareForward, hidden per kind.
+func (s *Server) prepareForwardFor(req *sip.Request, from, to side, dest string, recordRoute bool, kind hideKind) (*sip.Request, error) {
+	out, err := s.prepareForward(req, from, to, dest, recordRoute)
+	if err != nil || kind == hideNone {
+		return out, err
 	}
-	return s.prepareForward(req, from, to, dest, recordRoute)
+	s.hideToPublic(out, to, recordRoute, fsip.ToTag(req) != "", kind)
+	return out, nil
 }
 
 // prepareForwardHidden is prepareForward for a request going to a carrier.
 func (s *Server) prepareForwardHidden(req *sip.Request, from, to side, dest string, recordRoute bool) (*sip.Request, error) {
-	out, err := s.prepareForward(req, from, to, dest, recordRoute)
-	if err != nil {
-		return nil, err
-	}
-	s.hideToCarrier(out, to, recordRoute, fsip.ToTag(req) != "")
-	return out, nil
+	return s.prepareForwardFor(req, from, to, dest, recordRoute, hideCarrier)
 }
 
 // identityHeaders are the generic headers whose URI hosts are masked.
 // Call-Info and Alert-Info carry switch-generated SIP URIs such as
-// FreeSWITCH's intercom hint `Call-Info: <sip:10.77.0.10>;answer-after=0`.
-var identityHeaders = []string{"P-Asserted-Identity", "P-Preferred-Identity", "Remote-Party-ID", "Diversion", "Call-Info", "Alert-Info"}
+// FreeSWITCH's intercom hint `Call-Info: <sip:10.77.0.10>;answer-after=0`;
+// History-Info, Referred-By and Refer-To name the switch in a redirect or a
+// transfer. A Replaces header carries only a Call-ID and tags, and the
+// Replaces escaped inside a Refer-To URI stays behind the host, which is
+// the only part rewritten.
+var identityHeaders = []string{"P-Asserted-Identity", "P-Preferred-Identity", "Remote-Party-ID", "Diversion",
+	"History-Info", "Referred-By", "Refer-To", "Call-Info", "Alert-Info", "Error-Info"}
 
-var uriHostRe = regexp.MustCompile(`(sips?:(?:[^@\s>;,]*@)?)([^\s:>;,]+)(:\d+)?`)
+// The host is a bracketed IPv6 literal or anything up to a port, parameter,
+// header or delimiter; the brackets stay in group 2.
+var uriHostRe = regexp.MustCompile(`(sips?:(?:[^@\s>;,]*@)?)(\[[0-9a-fA-F:.]+\]|[^\s:>;,?\[\]]+)(:\d+)?`)
 
 // isSwitchHost reports whether host is the private socket's IP or the IP of
 // an edge.switch node.
 func (s *Server) isSwitchHost(host string) bool {
-	ip, err := netip.ParseAddr(host)
+	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
 	if err != nil {
 		return false
 	}
@@ -123,9 +161,17 @@ func (s *Server) maskURI(u *sip.Uri, pub netip.Addr) {
 	}
 }
 
-// maskIdentity applies the identity rule of the file comment to a request
-// going to a carrier.
-func (s *Server) maskIdentity(out *sip.Request, pub netip.Addr) {
+// identityMsg is a request or a response whose identity headers can be
+// masked.
+type identityMsg interface {
+	fsip.Editable
+	From() *sip.FromHeader
+	To() *sip.ToHeader
+}
+
+// maskIdentity applies the identity rule of the file comment to a message
+// going to a public party.
+func (s *Server) maskIdentity(out identityMsg, pub netip.Addr) {
 	if f := out.From(); f != nil {
 		s.maskURI(&f.Address, pub)
 	}
@@ -146,6 +192,9 @@ func (s *Server) maskIdentity(out *sip.Request, pub netip.Addr) {
 					return m
 				}
 				changed = true
+				if pub.Is6() {
+					return g[1] + "[" + pub.String() + "]"
+				}
 				return g[1] + pub.String()
 			})
 		}
@@ -159,11 +208,84 @@ func (s *Server) maskIdentity(out *sip.Request, pub netip.Addr) {
 	}
 }
 
-// hideToCarrier strips everything private from a prepared request: all Vias
-// but the top one (ours, public), every Record-Route and Route, and
-// whatever internal headers remain. recordRoute adds back FreeSBC's public
-// Record-Route alone.
-func (s *Server) hideToCarrier(out *sip.Request, to side, recordRoute, inDialog bool) {
+// restoreURI undoes maskURI for a URI a public party echoed back: when real
+// is a switch address and cur is the masked form of it (same user, host
+// public.ip), cur becomes real again.
+func (s *Server) restoreURI(cur *sip.Uri, real sip.Uri, pub netip.Addr) {
+	if s.isSwitchHost(real.Host) && cur.Host == pub.String() && cur.User == real.User {
+		cur.Host, cur.Port = real.Host, real.Port
+	}
+}
+
+// restoreIdentity puts the switch's own From and To addresses back on an
+// in-dialog request going to the switch from a public party, which echoes
+// the masked form it was given. uriOf maps a From/To tag to the real
+// address the record kept for it; pub is the public address masked to.
+func (s *Server) restoreIdentity(out *sip.Request, pub netip.Addr, uriOf func(tag string) (sip.Uri, bool)) {
+	if f, tag := out.From(), fsip.FromTag(out); f != nil && tag != "" {
+		if real, ok := uriOf(tag); ok {
+			s.restoreURI(&f.Address, real, pub)
+		}
+	}
+	if t, tag := out.To(), fsip.ToTag(out); t != nil && tag != "" {
+		if real, ok := uriOf(tag); ok {
+			s.restoreURI(&t.Address, real, pub)
+		}
+	}
+}
+
+// clientHeaderAllowlist is every header (lower case) a client leg may
+// carry toward a client (responses and switch-originated requests; a
+// client's own User-Agent and X-* reach the switch). It is an allowlist because the switch adds
+// headers FreeSBC cannot enumerate (Server, User-Agent, Warning, X-*, P-*)
+// and each names or fingerprints it. What stays is the RFC 3261 core and
+// the headers a client acts on; the identity ones have their hosts masked
+// (identityHeaders). Organization is dropped with Server and User-Agent;
+// Path, Service-Route and P-Associated-URI (a REGISTER 200) name the
+// switch. The compact forms are listed for headers sipgo does not
+// canonicalise.
+var clientHeaderAllowlist = func() map[string]bool {
+	m := map[string]bool{}
+	for _, n := range []string{
+		"via", "from", "to", "call-id", "cseq", "contact", "record-route", "route", "max-forwards",
+		"content-length", "content-type", "content-disposition", "content-encoding", "content-language",
+		"mime-version", "expires", "min-expires", "allow", "supported", "require", "proxy-require", "unsupported",
+		"rseq", "rack", "www-authenticate", "proxy-authenticate", "authorization", "proxy-authorization",
+		"authentication-info", "event", "allow-events", "subscription-state", "refer-to", "referred-by",
+		"refer-sub", "replaces", "join", "target-dialog", "session-expires", "min-se", "retry-after", "reason",
+		"privacy", "accept", "accept-encoding", "accept-language", "accept-contact", "reject-contact",
+		"request-disposition", "date", "timestamp", "subject", "priority", "call-info", "alert-info",
+		"error-info", "diversion", "history-info", "p-asserted-identity", "p-preferred-identity",
+		"remote-party-id", "recv-info", "info-package", "reply-to", "in-reply-to", "identity", "identity-info",
+		"flow-timer",
+		"v", "f", "t", "i", "m", "l", "c", "e", "k", "s", "o", "u", "b", "r", "x", "a", "j", "y", "n",
+	} {
+		m[n] = true
+	}
+	return m
+}()
+
+// filterToClient removes every header outside clientHeaderAllowlist.
+// sipgo's RemoveHeader is exact-name and removes one header per call, so
+// the names are collected first, one per occurrence.
+func filterToClient(m headerSet) {
+	var drop []string
+	for _, h := range m.Headers() {
+		if !clientHeaderAllowlist[strings.ToLower(h.Name())] {
+			drop = append(drop, h.Name())
+		}
+	}
+	for _, n := range drop {
+		m.RemoveHeader(n)
+	}
+}
+
+// hideToPublic strips everything private from a prepared request going to a
+// carrier or a client: all Vias but the top one (ours, public), every
+// Record-Route and Route, the switch's identity, and whatever internal
+// headers remain. recordRoute adds back FreeSBC's public Record-Route
+// alone. kind hideClient also applies the header allowlist.
+func (s *Server) hideToPublic(out *sip.Request, to side, recordRoute, inDialog bool, kind hideKind) {
 	if top := out.Via(); top != nil {
 		fsip.RemoveHeaders(out, "Via")
 		out.PrependHeader(top)
@@ -181,6 +303,9 @@ func (s *Server) hideToCarrier(out *sip.Request, to side, recordRoute, inDialog 
 		fsip.SetContact(out, to.uri())
 	}
 	stripInternalHeaders(out)
+	if kind == hideClient {
+		filterToClient(out)
+	}
 }
 
 // hideResponse applies mode's rewrite to a response clone whose own Via has
@@ -220,21 +345,20 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 				fsip.RemoveHeaders(res, "Contact")
 			}
 		}
+	case respToClient:
+		// A 3xx Contact is FreeSBC's too: the issue asks for every client-bound
+		// Contact, so a switch redirect is not usable as a redirect target.
+		s.hideRecordRoutesToClient(res)
+		if pub, ok := s.publicSideFor(orig); ok {
+			s.maskIdentity(res, pub.advIP)
+			// A REGISTER response lists the client's own bindings, which
+			// register.go restores; every other Contact is the switch's.
+			if orig.Method != sip.REGISTER && len(res.GetHeaders("Contact")) > 0 {
+				fsip.SetContact(res, pub.uri())
+			}
+		}
+		filterToClient(res)
 	}
-}
-
-// hideRoutesToClient is the Record-Route/Route rule for an out-of-dialog
-// request the switch sends to a public client (issue #166): the only
-// Record-Route the client sees is FreeSBC's public entry for the side it is
-// on, and no Route the switch preloaded survives (FreeSBC's own were
-// stripped as the request was prepared). The switch's own route set is
-// completed on the way back by addPrivateRecordRoute.
-func (s *Server) hideRoutesToClient(out *sip.Request, to side, recordRoute bool) {
-	fsip.RemoveHeaders(out, "Record-Route")
-	if recordRoute {
-		out.PrependHeader(to.recordRoute())
-	}
-	fsip.RemoveHeaders(out, "Route")
 }
 
 // hideRecordRoutesToClient removes every Record-Route naming the private
@@ -312,12 +436,13 @@ func sideMatches(sd side, u sip.Uri) bool {
 	return sd.advIP == ip.Unmap() && sd.advPort == port
 }
 
-// carrierLeg names the carrier a request of an in-dialog exchange belongs
-// to, and which hiding applies: reqHide says the request is going to a
-// carrier (public side) and must be hidden, resp is the rewrite its
-// response gets. A request on a client dialog, or one with no carrier at
-// all, gets neither.
-func (s *Server) carrierLeg(req *sip.Request, d *dialog, from, to side) (reqHide bool, resp respHide) {
+// hideLeg decides which topology hiding a request of an in-dialog exchange
+// gets and what its response gets: kind says how the request is hidden when
+// it goes to a public party (carrier or client), resp is the rewrite its
+// response gets. A request toward the switch is never hidden. A carrier
+// dialog (or a request from a carrier's source) takes the carrier rules, any
+// other the client rules.
+func (s *Server) hideLeg(req *sip.Request, d *dialog, from, to side) (kind hideKind, resp respHide) {
 	name := ""
 	if d != nil {
 		name = d.carrierName()
@@ -325,19 +450,21 @@ func (s *Server) carrierLeg(req *sip.Request, d *dialog, from, to side) (reqHide
 		name, _ = s.carrierFallback(req)
 	}
 	switch {
-	case name == "":
-		return false, respPlain
+	case to.plane == planePublic && name != "":
+		return hideCarrier, respToSwitch
 	case to.plane == planePublic:
-		return true, respToSwitch
+		return hideClient, respToSwitch
+	case from.plane == planePublic && name != "":
+		return hideNone, respToCarrier
 	case from.plane == planePublic:
-		return false, respToCarrier
+		return hideNone, respToClient
 	}
-	return false, respPlain
+	return hideNone, respPlain
 }
 
 // noteOutbound counts a request of a carrier dialog going to the carrier.
-func (s *Server) noteOutbound(req *sip.Request, d *dialog, hide bool) {
-	if hide && d != nil {
+func (s *Server) noteOutbound(req *sip.Request, d *dialog, kind hideKind) {
+	if kind == hideCarrier && d != nil {
 		s.metrics.CarrierRequest(d.carrierName(), dirOutbound, req.Method.String())
 	}
 }

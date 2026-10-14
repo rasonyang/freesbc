@@ -586,7 +586,7 @@ func TestSubscribeRecordsFollowTheBinding(t *testing.T) {
 func TestSubTableDeadlines(t *testing.T) {
 	tab := newSubTable(NewMetrics())
 	now := time.Now()
-	sub, res := tab.begin("c1", "st", "dialog", "tok", planePublic, dialogRoute{}, now)
+	sub, res := tab.begin("c1", "st", "dialog", "tok", planePublic, dialogRoute{}, sip.Uri{}, sip.Uri{}, now)
 	if res != subBeginOK {
 		t.Fatalf("begin = %v", res)
 	}
@@ -682,7 +682,7 @@ func TestSubscribeShutdownLeaksNothing(t *testing.T) {
 	if s := h.srv.metrics.Snapshot().ActiveSubscriptions; s != 0 {
 		t.Errorf("gauge after stop = %d", s)
 	}
-	if _, res := h.srv.subs.begin("late", "t", "dialog", "tok", planePublic, dialogRoute{}, time.Now()); res != subBeginClosed {
+	if _, res := h.srv.subs.begin("late", "t", "dialog", "tok", planePublic, dialogRoute{}, sip.Uri{}, sip.Uri{}, time.Now()); res != subBeginClosed {
 		t.Errorf("begin after stop = %v, want closed", res)
 	}
 	auditWaitOwnedGoroutines(t, "after stop", baseline, 5*time.Second)

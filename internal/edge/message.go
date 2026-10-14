@@ -74,7 +74,7 @@ func (s *Server) onMessage(req *sip.Request, tx sip.ServerTransaction, in inboun
 		}
 		return nil
 	}
-	if _, err := s.forwardAndRelay(ctx, req, tx, out, respPlain, adapt); err != nil {
+	if _, err := s.forwardAndRelay(ctx, req, tx, out, respToClient, adapt); err != nil {
 		s.log.Debug("forward MESSAGE", "err", err, "upstream", name, "sip_call_id", fsip.CallID(req))
 		if ctx.Err() != nil {
 			s.reject(req, tx, 504, "Server Time-out")
