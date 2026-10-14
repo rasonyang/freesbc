@@ -20,8 +20,13 @@ const StrikeRegisterAOR = "register_aor"
 
 const (
 	// aorCap bounds the AoR table. AoRs are attacker-chosen strings, so a
-	// flood of distinct ones only evicts the least recently struck.
+	// flood of distinct ones only evicts the least recently struck, and
+	// not a locked one while an unlocked one is near the back.
 	aorCap = 16384
+	// aorEvictScan is how many entries from the back of the LRU a full
+	// table looks through for one that is not locked before it gives up
+	// and evicts the back entry.
+	aorEvictScan = 64
 	// aorKeyMax caps a key's length. A longer AoR (the edge never admits one:
 	// fsip.NormalizeAOR allows 128+1+255 bytes at most) is cut to it.
 	aorKeyMax = 384
@@ -75,9 +80,9 @@ func (t *aorTable) strike(aor string, lim config.StrikeLimit, ban time.Duration)
 		}
 	} else {
 		if t.lru.Len() >= t.max {
-			oldest := t.lru.Back()
-			delete(t.entries, oldest.Value.(*aorEntry).key)
-			t.lru.Remove(oldest)
+			victim := t.evictable(now)
+			delete(t.entries, victim.Value.(*aorEntry).key)
+			t.lru.Remove(victim)
 		}
 		e = &aorEntry{key: key, start: now}
 		t.entries[key] = t.lru.PushFront(e)
@@ -92,6 +97,20 @@ func (t *aorTable) strike(aor string, lim config.StrikeLimit, ban time.Duration)
 		return e.count, true, true
 	}
 	return e.count, false, false
+}
+
+// evictable picks the entry a full table drops: the least recently struck
+// one that is not locked at now among the last aorEvictScan, else the back
+// entry, so the cap always holds. A locked AoR is no longer struck, so it
+// drifts to the back and would otherwise be the first to go.
+func (t *aorTable) evictable(now time.Time) *list.Element {
+	el := t.lru.Back()
+	for i := 0; el != nil && i < aorEvictScan; i, el = i+1, el.Prev() {
+		if e := el.Value.(*aorEntry); e.locked.IsZero() || !now.Before(e.locked) {
+			return el
+		}
+	}
+	return t.lru.Back()
 }
 
 func (t *aorTable) isLocked(aor string) bool {
