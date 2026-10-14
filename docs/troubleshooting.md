@@ -81,6 +81,10 @@ Asterisk (`pjsip set logger on`, or `sip set debug on` for chan_sip):
 - Media timeouts: `rtp_timeout` and `rtp_timeout_hold` on the PJSIP endpoint (chan_sip: `rtptimeout`, `rtpholdtimeout`); a channel with no media for that long gets a BYE.
 - `external_media_address` and `external_signaling_address` on the transport must not be set to an address that is not FreeSBC's: media and signaling are anchored on FreeSBC either way.
 
+## SIP datagrams lost under bursts
+
+Symptom: calls or REGISTERs fail at high rates with no FreeSBC log line, and `nstat -az UdpRcvbufErrors` (or `RcvbufErrors` in `/proc/net/snmp`) keeps rising. Check the startup log for `udp socket receive buffer below request`: the kernel capped the 4 MiB request FreeSBC makes on its UDP SIP sockets. Raise `net.core.rmem_max` and `net.core.wmem_max` and restart FreeSBC; see [UDP socket buffers](edge.md#udp-socket-buffers).
+
 ### Order of checks
 
 1. `reason` and `terminated_by` on the `call ended` line, then the matching section.

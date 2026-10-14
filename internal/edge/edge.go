@@ -910,6 +910,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if err != nil {
 			return l, err
 		}
+		sizeUDPSocket(s.log, pc)
 		l.packet = pc
 		return l, nil
 	case "tcp", "ws":
