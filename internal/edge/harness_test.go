@@ -556,6 +556,12 @@ type fakeSwitch struct {
 	// prackHook, if set, overrides the default PRACK behaviour (200).
 	// Guarded by mu.
 	prackHook func(req *sip.Request, tx sip.ServerTransaction) bool
+	// byeHook, if set, overrides the default BYE behaviour (200). Guarded
+	// by mu.
+	byeHook func(req *sip.Request, tx sip.ServerTransaction) bool
+	// registerExtra are headers added to every REGISTER response the
+	// switch sends (Server, Path...). Guarded by mu.
+	registerExtra []sip.Header
 
 	conn   *net.UDPConn
 	cancel context.CancelFunc
@@ -587,6 +593,12 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) { f.record(req) })
 	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
 		f.record(req)
+		f.mu.Lock()
+		hook := f.byeHook
+		f.mu.Unlock()
+		if hook != nil && hook(req, tx) {
+			return
+		}
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 	srv.OnUpdate(f.onUpdate)
@@ -744,6 +756,30 @@ func (f *fakeSwitch) setNoRouteHook(hook func(req *sip.Request, tx sip.ServerTra
 	f.mu.Unlock()
 }
 
+func (f *fakeSwitch) setByeHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
+	f.mu.Lock()
+	f.byeHook = hook
+	f.mu.Unlock()
+}
+
+// setRegisterExtra makes every REGISTER response carry hs.
+func (f *fakeSwitch) setRegisterExtra(hs ...sip.Header) {
+	f.mu.Lock()
+	f.registerExtra = hs
+	f.mu.Unlock()
+}
+
+// respondRegister adds the registerExtra headers and sends res.
+func (f *fakeSwitch) respondRegister(tx sip.ServerTransaction, res *sip.Response) {
+	f.mu.Lock()
+	extra := f.registerExtra
+	f.mu.Unlock()
+	for _, h := range extra {
+		res.AppendHeader(sip.NewHeader(h.Name(), h.Value()))
+	}
+	_ = tx.Respond(res)
+}
+
 func (f *fakeSwitch) setPrackHook(hook func(req *sip.Request, tx sip.ServerTransaction) bool) {
 	f.mu.Lock()
 	f.prackHook = hook
@@ -865,18 +901,18 @@ func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 			res.AppendHeader(sip.NewHeader("WWW-Authenticate",
 				`Digest realm="example.com", nonce="abc123nonce", algorithm=MD5, qop="auth"`))
 		}
-		_ = tx.Respond(res)
+		f.respondRegister(tx, res)
 		return
 	}
 	if status != 0 {
-		_ = tx.Respond(sip.NewResponseFromRequest(req, status, "", nil))
+		f.respondRegister(tx, sip.NewResponseFromRequest(req, status, "", nil))
 		return
 	}
 	if challenge {
 		res := sip.NewResponseFromRequest(req, 401, "Unauthorized", nil)
 		res.AppendHeader(sip.NewHeader("WWW-Authenticate",
 			`Digest realm="example.com", nonce="abc123nonce", algorithm=MD5, qop="auth"`))
-		_ = tx.Respond(res)
+		f.respondRegister(tx, res)
 		return
 	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -897,7 +933,7 @@ func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 		res.AppendHeader(echo)
 	}
 	res.AppendHeader(sip.NewHeader("Expires", granted))
-	_ = tx.Respond(res)
+	f.respondRegister(tx, res)
 }
 
 func (f *fakeSwitch) onInvite(req *sip.Request, tx sip.ServerTransaction) {
@@ -1159,7 +1195,7 @@ func (f *fakeSwitch) sendAckTo2xx(t *testing.T, res *sip.Response) {
 // Request-URI and headers copied from the final response, Route = the
 // Record-Route set in reverse (RFC 3261 §12.1.2) — as a method so a switch
 // on any loopback address sources the request from its own socket.
-func (f *fakeSwitch) uacBye(t *testing.T, res *sip.Response) *sip.Response {
+func (f *fakeSwitch) uacBye(t *testing.T, res *sip.Response, extra ...sip.Header) *sip.Response {
 	t.Helper()
 	req := sip.NewRequest(sip.BYE, res.To().Address)
 	sip.CopyHeaders("From", res, req)
@@ -1178,6 +1214,9 @@ func (f *fakeSwitch) uacBye(t *testing.T, res *sip.Response) *sip.Response {
 		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
+	for _, h := range extra {
+		req.AppendHeader(h)
+	}
 
 	req.SetTransport("UDP")
 	req.SetDestination(f.inDialogDest(t, req, res))

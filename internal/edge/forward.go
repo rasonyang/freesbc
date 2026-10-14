@@ -190,32 +190,24 @@ func (s *Server) popOwnVia(res *sip.Response, allowEmpty bool) (ok bool) {
 // than each loop's own bool.
 var errResponseDropped = errors.New("proxy: response cannot be routed back")
 
-// relayResponse forwards one response of a forwarded request back through
-// the server transaction, toward whoever sent the original.
+// relayResponseHide forwards one response of a forwarded request back
+// through the server transaction, toward whoever sent the original.
 //
 // This is the whole of the mechanics every relay loop shares: clone (the
 // far end's response must stay intact for the transaction layer), pop our
-// own Via, let the caller rewrite what it owns, then send it to the
-// request's transport SOURCE (symmetric response routing, RFC 3581) and
-// count it. Everything else in the response is the far end's and is left
-// alone, except the Allow and Supported values the proxy cannot carry
-// (sanitizeExtensions).
+// own Via, apply the topology-hiding rewrite mode selects (hide.go), let the
+// caller rewrite what it owns, then send it to the request's transport
+// SOURCE (symmetric response routing, RFC 3581) and count it. Everything
+// else in the response is the far end's and is left alone, except the Allow
+// and Supported values the proxy cannot carry (sanitizeExtensions).
 //
-// adapt runs on the clone after the Via is popped and before anything is
-// sent. It is where each loop rewrites the Contact and the SDP body; the
-// error it returns is the caller's own (a failed media negotiation), and
-// aborts the relay without sending or counting anything.
+// adapt runs on the clone after the Via is popped and the rewrite applied,
+// before anything is sent. It is where each loop rewrites the Contact and
+// the SDP body; the error it returns is the caller's own (a failed media
+// negotiation), and aborts the relay without sending or counting anything.
 //
 // A failure to send is logged, not returned: the transaction layer owns
 // retransmission, and there is nothing a relay loop can do about it.
-func (s *Server) relayResponse(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response,
-	adapt func(out *sip.Response) error) error {
-	return s.relayResponseHide(orig, tx, res, respPlain, adapt)
-}
-
-// relayResponseHide is relayResponse for a response on a carrier leg: mode
-// says which topology-hiding rewrite (hide.go) the response gets after our
-// Via is popped and before adapt runs.
 func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response,
 	mode respHide, adapt func(out *sip.Response) error) error {
 
@@ -250,9 +242,9 @@ func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, 
 // request on its own goroutine, and the transaction layer, not this loop,
 // owns retransmission.
 //
-// mode and adapt are for a carrier leg or a request whose final response
-// needs rewriting (the carrier REGISTER's Contact); plain callers pass
-// respPlain and nil.
+// mode is the topology-hiding rewrite of the responses (hide.go) and adapt
+// is for a request whose final response needs more (the carrier REGISTER's
+// Contact).
 func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
 	mode respHide, adapt func(out *sip.Response) error) (*sip.Response, error) {
 	clTx, err := s.clientTx(ctx, out)

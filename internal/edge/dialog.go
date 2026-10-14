@@ -228,6 +228,12 @@ type earlyFork struct {
 	route  dialogRoute
 	routed bool
 
+	// to is the To address the switch used on this fork's responses, for
+	// restoreIdentity in the early dialog (setForkTo); toSet says it was
+	// recorded.
+	to    sip.Uri
+	toSet bool
+
 	// sdes is what this fork's answer decided for the public leg, applied
 	// when the media follows the fork (followFork); the zero plan changes
 	// nothing.
@@ -900,6 +906,22 @@ func (d *dialog) setForkRoute(tag string, r dialogRoute) {
 	f.route, f.routed = r, true
 }
 
+// setForkTo records the To address the switch put on a tagged response of
+// the early dialog tagged tag.
+func (d *dialog) setForkTo(tag string, u sip.Uri) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	if d.state != dialogEarly || d.forks == nil {
+		return
+	}
+	f, ok := d.forks[tag]
+	if !ok {
+		f = &earlyFork{origin: newSDPOrigin()}
+		d.forks[tag] = f
+	}
+	f.to, f.toSet = u, true
+}
+
 // forkAnswer is the answer already built for a fork, or nil.
 func (d *dialog) forkAnswer(f *earlyFork) []byte {
 	d.tab.mu.Lock()
@@ -1124,7 +1146,36 @@ type byeInfo struct {
 	remote    string
 	contact   sip.Uri
 	transport string
-	carrier   bool // the dialog is a carrier's: masking applies toward the public side
+}
+
+// setCalleeURI records the To address the switch answered with, which is
+// the callee's identity as the switch knows it (it normally echoes the
+// INVITE's, but may fill in its own address). The client echoes the masked
+// form (respToClient), and restoreIdentity maps it back to this one.
+func (d *dialog) setCalleeURI(u sip.Uri) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	d.calleeURI = u
+}
+
+// uriForTag is the real From/To address the record kept for the dialog
+// party that owns tag (the caller's or the callee's), as the caller's
+// INVITE named it: what restoreIdentity puts back on a request the far end
+// echoed in masked form.
+func (d *dialog) uriForTag(tag string) (sip.Uri, bool) {
+	d.tab.mu.Lock()
+	defer d.tab.mu.Unlock()
+	switch {
+	case tag == "":
+		return sip.Uri{}, false
+	case tag == d.callerTag:
+		return d.callerURI, true
+	case d.forks[tag] != nil && d.forks[tag].toSet:
+		return d.forks[tag].to, true
+	case tag == d.calleeTag:
+		return d.calleeURI, true
+	}
+	return sip.Uri{}, false
 }
 
 // byes describes the two BYEs that end this dialog from the middle: one to
@@ -1145,10 +1196,10 @@ func (d *dialog) byes() [2]byeInfo {
 	return [2]byeInfo{
 		{callID: d.callID, toward: d.callerPlane,
 			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
-			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport},
 		{callID: d.callID, toward: calleePlane,
 			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
-			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport},
 	}
 }
 

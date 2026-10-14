@@ -285,7 +285,7 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 			if final {
 				s.registerOutcome(in, res)
 			}
-			err := s.relayResponse(req, tx, res, func(relayed *sip.Response) error {
+			err := s.relayResponseHide(req, tx, res, respToClient, func(relayed *sip.Response) error {
 				if final && res.StatusCode/100 == 2 {
 					granted := s.recordBinding(res, in)
 					// The client compares the Contact in the 200 OK

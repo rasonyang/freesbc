@@ -63,13 +63,14 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			return
 		}
 	}
-	hide, resp := s.carrierLeg(req, d, from, to)
+	hide, resp := s.hideLeg(req, d, from, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
 	s.noteOutbound(req, d, hide)
+	s.restoreToSwitch(req, out, from, to, d)
 	s.retargetInDialog(req, out, to, d)
 	fsip.SetContact(out, to.uri())
 	if offerless {
@@ -315,12 +316,13 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	if !ok {
 		return // nothing to forward it to; an ACK gets no response
 	}
-	hide, _ := s.carrierLeg(req, d, from, to)
+	hide, _ := s.hideLeg(req, d, from, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		return
 	}
 	s.noteOutbound(req, d, hide)
+	s.restoreToSwitch(req, out, from, to, d)
 	s.retargetInDialog(req, out, to, d)
 	if d == nil && !in.private() {
 		s.restoreCarrierRURI(req, out)
@@ -558,13 +560,14 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 			return
 		}
 	}
-	hide, resp := s.carrierLeg(req, d, from, to)
+	hide, resp := s.hideLeg(req, d, from, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
 	}
 	s.noteOutbound(req, d, hide)
+	s.restoreToSwitch(req, out, from, to, d)
 	s.retargetInDialog(req, out, to, d)
 	if d == nil && !in.private() {
 		s.restoreCarrierRURI(req, out)
@@ -900,6 +903,15 @@ func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
 	}
 }
 
+// restoreToSwitch puts the switch's own From and To addresses back on a
+// request a public party sent into a dialog, before it goes to the switch.
+func (s *Server) restoreToSwitch(req, out *sip.Request, from, to side, d *dialog) {
+	if d == nil || to.plane != planePrivate || from.plane != planePublic {
+		return
+	}
+	s.restoreIdentity(out, from.advIP, d.uriForTag)
+}
+
 // byeBothEnds tells both endpoints of a confirmed dialog that the call is
 // over, when FreeSBC ended it on its own (the silence watchdog, a WebRTC
 // peer whose certificate did not match its fingerprint, an answer it could
@@ -944,8 +956,9 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	req.AppendHeader(toward.via(fsip.NewBranch()))
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	if b.carrier && toward.plane == planePublic {
-		// Identity toward a carrier never names the switch (hide.go).
+	if toward.plane == planePublic {
+		// Identity toward a carrier or a client never names the switch
+		// (hide.go).
 		s.maskURI(&b.fromURI, toward.advIP)
 		s.maskURI(&b.toURI, toward.advIP)
 	}

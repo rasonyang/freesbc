@@ -76,6 +76,10 @@ type subscription struct {
 	// tag of the 2xx). notTag is empty while the record is pending.
 	subTag, notTag string
 	event          string
+	// subURI and notURI are the From and To addresses of the SUBSCRIBE, as
+	// its sender wrote them: what restoreIdentity puts back on a request
+	// the other end echoed in masked form.
+	subURI, notURI sip.Uri
 	// token is the registration binding the subscription is charged to.
 	token string
 	// subscriberPlane is the plane the SUBSCRIBE came from: public for a
@@ -126,7 +130,7 @@ const (
 
 // begin adds a pending record, enforcing both caps atomically with the
 // insertion.
-func (t *subTable) begin(callID, subTag, event, token string, subscriber plane, route dialogRoute, now time.Time) (*subscription, subBegin) {
+func (t *subTable) begin(callID, subTag, event, token string, subscriber plane, route dialogRoute, subURI, notURI sip.Uri, now time.Time) (*subscription, subBegin) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	switch {
@@ -139,7 +143,7 @@ func (t *subTable) begin(callID, subTag, event, token string, subscriber plane, 
 	}
 	sub := &subscription{
 		callID: callID, subTag: subTag, event: event, token: token,
-		subscriberPlane: subscriber, route: route,
+		subscriberPlane: subscriber, route: route, subURI: subURI, notURI: notURI,
 		deadline: now.Add(2 * subExpiryMargin),
 		state:    subPending,
 	}
@@ -468,7 +472,7 @@ func (s *Server) subscribeToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if !ok {
 		return
 	}
-	out, err := s.prepareForward(req, s.topo.private, to, b.Source.String(), true)
+	out, err := s.prepareForwardFor(req, s.topo.private, to, b.Source.String(), true, hideClient)
 	if err != nil {
 		s.subs.end(sub)
 		s.reject(req, tx, 483, "Too Many Hops")
@@ -476,7 +480,6 @@ func (s *Server) subscribeToClient(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	// The Request-URI the switch used names FreeSBC's own contact for the
 	// client; the client must see one addressed to itself.
-	s.hideRoutesToClient(out, to, true)
 	out.Recipient = clientRequestURI(b)
 	fsip.SetContact(out, to.uri())
 	s.log.Debug("proxying SUBSCRIBE to client", "sip_call_id", fsip.CallID(req),
@@ -497,7 +500,14 @@ func (s *Server) subscribeToClient(req *sip.Request, tx sip.ServerTransaction) {
 // (480 to a public subscriber whose registration lapsed, 404 to the switch,
 // whose Request-URI token no longer names anyone).
 func (s *Server) beginSubscription(req *sip.Request, tx sip.ServerTransaction, event, token string, subscriber plane, route dialogRoute, goneCode int, goneText string) (*subscription, bool) {
-	sub, res := s.subs.begin(fsip.CallID(req), fsip.FromTag(req), event, token, subscriber, route, time.Now())
+	var subURI, notURI sip.Uri
+	if f := req.From(); f != nil {
+		subURI = f.Address
+	}
+	if t := req.To(); t != nil {
+		notURI = t.Address
+	}
+	sub, res := s.subs.begin(fsip.CallID(req), fsip.FromTag(req), event, token, subscriber, route, subURI, notURI, time.Now())
 	switch res {
 	case subBeginOK:
 		if f := s.afterSubBegin.Load(); f != nil {
@@ -549,11 +559,8 @@ func (s *Server) relaySubscribe(req *sip.Request, tx sip.ServerTransaction, out 
 		if isSDPBody(res) {
 			stripBody(res)
 		}
-		switch {
-		case requester.plane == planePrivate && res.StatusCode/100 == 2:
+		if requester.plane == planePrivate && res.StatusCode/100 == 2 {
 			s.addPrivateRecordRoute(res)
-		case requester.plane == planePublic:
-			s.hideRecordRoutesToClient(res)
 		}
 		if res.StatusCode/100 == 2 && !confirmed {
 			u, _ := fsip.ContactURI(res)
@@ -573,7 +580,11 @@ func (s *Server) relaySubscribe(req *sip.Request, tx sip.ServerTransaction, out 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	if _, err := s.forwardAndRelay(ctx, req, tx, out, respPlain, adapt); err != nil {
+	mode := respToClient
+	if requester.plane == planePrivate {
+		mode = respToSwitch
+	}
+	if _, err := s.forwardAndRelay(ctx, req, tx, out, mode, adapt); err != nil {
 		s.log.Debug("forward SUBSCRIBE", "err", err, "sip_call_id", fsip.CallID(req))
 		if ctx.Err() != nil {
 			s.reject(req, tx, 504, "Server Time-out")
@@ -634,10 +645,28 @@ func (s *Server) forwardInSubscription(req *sip.Request, tx sip.ServerTransactio
 			s.subs.learnContact(sub, u)
 		}
 	}
-	out, err := s.prepareForward(req, from, to, dest, false)
+	// A request from the switch is hidden like any toward a client, and its
+	// answer gets the switch's Vias back; one from the public end has the
+	// switch's own From and To restored and its answer is the switch's.
+	kind, mode := hideNone, respToClient
+	if !senderPublic {
+		kind, mode = hideClient, respToSwitch
+	}
+	out, err := s.prepareForwardFor(req, from, to, dest, false, kind)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
 		return
+	}
+	if senderPublic {
+		s.restoreIdentity(out, from.advIP, func(tag string) (sip.Uri, bool) {
+			switch tag {
+			case v.subTag:
+				return v.subURI, true
+			case v.notTag:
+				return v.notURI, true
+			}
+			return sip.Uri{}, false
+		})
 	}
 	if contact.Host != "" {
 		out.Recipient = contact
@@ -656,7 +685,7 @@ func (s *Server) forwardInSubscription(req *sip.Request, tx sip.ServerTransactio
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	final, err := s.forwardAndRelay(ctx, req, tx, out, respPlain, adapt)
+	final, err := s.forwardAndRelay(ctx, req, tx, out, mode, adapt)
 	if err != nil {
 		s.log.Debug("forward in-subscription request", "err", err,
 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))

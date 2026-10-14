@@ -70,7 +70,8 @@ type inviteLeg struct {
 
 	// resp is the topology-hiding rewrite the caller's responses get
 	// (hide.go): respToSwitch for a call to a carrier, respToCarrier for a
-	// carrier's call to the switch, respPlain otherwise.
+	// carrier's call to the switch, respToSwitch for a call to a client and
+	// respToClient for a client's call to the switch.
 	resp respHide
 }
 
@@ -158,15 +159,22 @@ func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 			// the caller sends the moment it sees this 18x finds its route.
 			l.dialog().setForkRoute(tag, s.legRoute(l, res))
 		}
+		if l.callee == calleeUpstream {
+			if t := res.To(); t != nil {
+				if tag := fsip.ToTag(res); tag != "" && res.StatusCode < 300 {
+					// The early dialog's identity, for a PRACK or UPDATE.
+					l.dialog().setForkTo(tag, t.Address)
+				}
+				if is2xx {
+					l.dialog().setCalleeURI(t.Address)
+				}
+			}
+		}
 		fsip.SetContact(out, l.near.uri())
-		switch {
-		case l.fromPrivate && res.StatusCode < 300:
+		if l.fromPrivate && res.StatusCode < 300 {
 			// The switch's route set must start at the private socket, and
 			// neither a carrier nor a client echoes that entry.
 			s.addPrivateRecordRoute(out)
-		case !l.fromPrivate && l.resp == respPlain:
-			// A client never sees the private entry or the switch's own.
-			s.hideRecordRoutesToClient(out)
 		}
 		if len(res.Body()) > 0 || is2xx {
 			body, err := s.forkAnswer(l, res)

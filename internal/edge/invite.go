@@ -379,7 +379,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// only, with that Contact as the Request-URI (carrierreg.go).
 	var pinned carrierBinding
 	isPinned := false
-	resp := respPlain
+	resp := respToClient
 	if carrier != "" {
 		pinned, isPinned = s.carrierRURI(req, carrier)
 		resp = respToCarrier
@@ -625,14 +625,15 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		offerless = func(b []byte) (*offerResult, error) { return s.buildUpstreamOffer(ctx, d, b, src) }
 	}
 
-	out, err := s.prepareForward(req, s.topo.private, to, dest, true)
+	// The switch's Vias, identity, routes and headers never reach the
+	// client (hideToPublic), and its answers get them back (respToSwitch).
+	out, err := s.prepareForwardFor(req, s.topo.private, to, dest, true, hideClient)
 	if err != nil {
 		s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
 		return
 	}
 	// The Request-URI FreeSWITCH used names FreeSBC's own contact; the
 	// client must see one addressed to itself.
-	s.hideRoutesToClient(out, to, true)
 	out.Recipient = clientRequestURI(binding)
 	fsip.SetContact(out, to.uri())
 	if offer != nil {
@@ -677,7 +678,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 
 	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeClient,
-		calleeRemote: dest, transport: binding.Transport, fromPrivate: true}
+		calleeRemote: dest, transport: binding.Transport, fromPrivate: true, resp: respToSwitch}
 	if r := s.pumpInvite(ctx, l); !r.finalised {
 		// The client never gave a final response: its INVITE timed out
 		// (Timer B), its transport failed, or the backstop expired. The
