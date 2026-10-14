@@ -183,7 +183,7 @@ func (s *Server) admitDialogless(req *sip.Request, src netip.AddrPort) bool {
 // onInvite).
 func (s *Server) dropSilently(reason dropReason, req *sip.Request, src netip.AddrPort, attrs ...any) {
 	s.metrics.AdmissionDropped(reason)
-	s.dropSummary.add(src.Addr())
+	s.dropSummary.addAdmission(src.Addr())
 	if reason != dropRegisterEnumeration && reason != dropRegisterAORLocked {
 		s.admissionStrike(src.Addr(), sip.NetworkToLower(req.Transport()))
 	}
@@ -227,8 +227,10 @@ func (s *Server) admissionStrike(ip netip.Addr, transport string) {
 // both kinds hits one budget, and it has the same exemptions (a carrier
 // source, an IP holding a registration) and the same ban scope (UDP: that IP
 // on UDP only; WS/WSS: every transport). A tcp or tls read never reaches it:
-// a chunk of a byte stream is not a message. The read is already past the
-// ban check and the rate token, so the cost is one shield call.
+// a chunk of a byte stream is not a message. Each read it strikes is also
+// counted, by kind, in the once-a-minute drop summary (dropSummary). The
+// read is already past the ban check and the rate token, so the cost is one
+// shield call.
 func (s *Server) malformedStrike(info sip.TransportReadProps) {
 	sh := s.currentShield()
 	if sh == nil {
@@ -242,65 +244,87 @@ func (s *Server) malformedStrike(info sip.TransportReadProps) {
 	if s.carriers.snapshot().isSource(ip) || s.loc.HasIP(ip) {
 		return
 	}
+	s.dropSummary.addMalformed(ip)
 	sh.StrikeOn(ip, shield.StrikeMalformed, info.Transport)
 }
 
-// admissionSummaryEvery is the period of the admission-drop summary WARN.
-// An interval with no drops logs nothing.
+// admissionSummaryEvery is the period of the admission-drop summary WARN,
+// which covers admission drops and the malformed public reads that strike
+// (malformedStrike), kept apart by kind. An interval with neither logs
+// nothing.
 const admissionSummaryEvery = time.Minute
 
 // maxSummarySources bounds the per-source counts kept for one summary
-// interval. Sources past it still count in the total, only their per-source
+// interval. Sources past it still count in the totals, only their per-source
 // count is lost, so memory is bounded however many sources are dropped.
 const maxSummarySources = 1024
 
-// dropSummary counts the admission drops of one interval: the total and a
-// bounded per-source tally, from which the WARN names the top source.
+// summaryCount is one source's tally for an interval, by kind.
+type summaryCount struct{ admission, malformed int }
+
+// dropSummary counts the admission drops and struck malformed reads of one
+// interval: a total per kind and a bounded per-source tally, from which the
+// WARN names the top source by its combined count.
 type dropSummary struct {
-	mu       sync.Mutex
-	total    int
-	bySrc    map[netip.Addr]int
-	overflow bool // some source was not tracked (cap reached)
+	mu        sync.Mutex
+	admission int
+	malformed int
+	bySrc     map[netip.Addr]summaryCount
+	overflow  bool // some source was not tracked (cap reached)
 }
 
-func (d *dropSummary) add(ip netip.Addr) {
+func (d *dropSummary) addAdmission(ip netip.Addr) { d.add(ip, false) }
+func (d *dropSummary) addMalformed(ip netip.Addr) { d.add(ip, true) }
+
+func (d *dropSummary) add(ip netip.Addr, malformed bool) {
 	ip = ip.Unmap().WithZone("")
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.total++
-	if d.bySrc == nil {
-		d.bySrc = map[netip.Addr]int{}
+	if malformed {
+		d.malformed++
+	} else {
+		d.admission++
 	}
-	if _, ok := d.bySrc[ip]; !ok && len(d.bySrc) >= maxSummarySources {
+	if d.bySrc == nil {
+		d.bySrc = map[netip.Addr]summaryCount{}
+	}
+	c, ok := d.bySrc[ip]
+	if !ok && len(d.bySrc) >= maxSummarySources {
 		d.overflow = true
 		return
 	}
-	d.bySrc[ip]++
+	if malformed {
+		c.malformed++
+	} else {
+		c.admission++
+	}
+	d.bySrc[ip] = c
 }
 
 // take returns the summary line for the interval just ended and starts a
-// new one; ok is false when there were no drops.
+// new one; ok is false when there was nothing to report.
 func (d *dropSummary) take(interval time.Duration) (msg string, ok bool) {
 	d.mu.Lock()
-	total, by, overflow := d.total, d.bySrc, d.overflow
-	d.total, d.bySrc, d.overflow = 0, nil, false
+	adm, mal, by, overflow := d.admission, d.malformed, d.bySrc, d.overflow
+	d.admission, d.malformed, d.bySrc, d.overflow = 0, 0, nil, false
 	d.mu.Unlock()
-	if total == 0 {
+	if adm+mal == 0 {
 		return "", false
 	}
 	var top netip.Addr
+	var topC summaryCount
 	topN := 0
-	for ip, n := range by {
-		if n > topN || (n == topN && ip.Less(top)) {
-			top, topN = ip, n
+	for ip, c := range by {
+		if n := c.admission + c.malformed; n > topN || (n == topN && ip.Less(top)) {
+			top, topC, topN = ip, c, n
 		}
 	}
 	more := ""
 	if overflow {
 		more = "+"
 	}
-	return fmt.Sprintf("admission drops: %d in %s from %d%s sources, top=%s (%d)",
-		total, interval, len(by), more, top, topN), true
+	return fmt.Sprintf("admission drops: %d in %s (%d admission, %d malformed) from %d%s sources, top=%s (%d admission, %d malformed)",
+		adm+mal, interval, adm, mal, len(by), more, top, topC.admission, topC.malformed), true
 }
 
 // maxWarnedSources bounds the set of sources already warned about. When
