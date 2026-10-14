@@ -28,6 +28,7 @@ var restartOnly = []struct {
 	{"edge.allow_insecure_sdes", func(c *Config) any { return c.Edge.AllowInsecureSDES }},
 	{"edge.carrier_sources", func(c *Config) any { return c.Edge.CarrierSources }},
 	{"admin", func(c *Config) any { return c.Admin }},
+	{"hep", func(c *Config) any { return c.HEP }},
 }
 
 // RestartOnlyChanges reports which restart-only settings differ between the

@@ -64,6 +64,10 @@ type collector struct {
 	proxyCarrierReq *prometheus.Desc
 	proxyCarrierReg *prometheus.Desc
 
+	hepSent    *prometheus.Desc
+	hepDropped *prometheus.Desc
+	hepErrors  *prometheus.Desc
+
 	restartRequired *prometheus.Desc
 	reloadFailed    *prometheus.Desc
 }
@@ -86,6 +90,10 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		udpRcvbuf:   prometheus.NewDesc("freesbc_udp_receive_buffer_errors_total", "Kernel UDP datagrams dropped on a full socket receive buffer (RcvbufErrors, IPv4 + IPv6), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		udpInErrors: prometheus.NewDesc("freesbc_udp_in_errors_total", "Kernel UDP receive errors (InErrors, IPv4 + IPv6; includes the receive buffer drops), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
+
+		hepSent:    prometheus.NewDesc("freesbc_hep_packets_sent_total", "SIP messages written to the HOMER collector as HEP packets; absent when the hep section is off.", nil, nil),
+		hepDropped: prometheus.NewDesc("freesbc_hep_packets_dropped_total", "SIP messages not mirrored because the HEP send queue was full or closed.", nil, nil),
+		hepErrors:  prometheus.NewDesc("freesbc_hep_errors_total", "HEP packets lost, by kind (write: dial or write failure; encode: refused as oversize or unaddressable).", []string{"kind"}, nil),
 
 		restartRequired: prometheus.NewDesc("freesbc_config_restart_required", "Restart-only config keys changed on disk and not applied until restart.", nil, nil),
 		reloadFailed:    prometheus.NewDesc("freesbc_config_reload_failed", "1 while the last config reload failed and the previous config is still active, else 0.", nil, nil),
@@ -143,6 +151,9 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.healthSt
 	ch <- c.udpRcvbuf
 	ch <- c.udpInErrors
+	ch <- c.hepSent
+	ch <- c.hepDropped
+	ch <- c.hepErrors
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyRegAuth, c.proxyRegUnans, c.proxyRegBrk, c.proxyReqIn, c.proxyResOut,
@@ -194,6 +205,15 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		g(c.restartRequired, float64(len(rs.RestartRequired)))
 		g(c.reloadFailed, failed)
+	}
+
+	if c.deps.HEP != nil {
+		if h := c.deps.HEP(); h != nil {
+			ch <- prometheus.MustNewConstMetric(c.hepSent, prometheus.CounterValue, float64(h.Sent))
+			ch <- prometheus.MustNewConstMetric(c.hepDropped, prometheus.CounterValue, float64(h.Dropped))
+			ch <- prometheus.MustNewConstMetric(c.hepErrors, prometheus.CounterValue, float64(h.WriteErrors), "write")
+			ch <- prometheus.MustNewConstMetric(c.hepErrors, prometheus.CounterValue, float64(h.EncodeErrors), "encode")
+		}
 	}
 
 	if c.deps.Proxy == nil {

@@ -397,6 +397,10 @@ type streamConn struct {
 	// carrier is whether the connection is to or from a carrier, which
 	// decides the connection cap it was counted against.
 	carrier bool
+	// unroute removes a dialed connection's local address from the HEP
+	// routes (hepmirror.go); nil on an accepted connection, whose local
+	// address is its listener's.
+	unroute func()
 
 	// pending is data already read from the connection that sipgo has yet
 	// to see: the WebSocket upgrade request, received during prepare.
@@ -553,6 +557,9 @@ func (c *streamConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
+		if c.unroute != nil {
+			c.unroute()
+		}
 		s := c.l.s
 		s.streams.release(c.ap.Addr(), c.carrier)
 		s.metrics.StreamConnClosed(c.l.transport)

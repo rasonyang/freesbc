@@ -293,14 +293,14 @@ rtp: "%d-%d"
 
 // newHarness parses the config, builds the proxy with the private socket on
 // 127.0.0.1:priv and starts it; the caller attaches the fake switches.
-func newHarness(t *testing.T, yaml string, priv int) *harness {
+func newHarness(t *testing.T, yaml string, priv int, opts ...Option) *harness {
 	t.Helper()
-	return newHarnessLog(t, yaml, priv, slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return newHarnessLog(t, yaml, priv, slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}), opts...)
 }
 
 // newHarnessLog is newHarness with the proxy's log handler chosen by the
 // caller, so a test can inspect what the proxy logs.
-func newHarnessLog(t *testing.T, yaml string, priv int, handler slog.Handler) *harness {
+func newHarnessLog(t *testing.T, yaml string, priv int, handler slog.Handler, opts ...Option) *harness {
 	t.Helper()
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
@@ -308,7 +308,7 @@ func newHarnessLog(t *testing.T, yaml string, priv int, handler slog.Handler) *h
 	}
 	store := config.NewStore(cfg)
 	log := slog.New(handler)
-	srv, err := New(store, log, WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", priv))))
+	srv, err := New(store, log, append([]Option{WithPrivateAddr(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", priv)))}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}

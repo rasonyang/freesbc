@@ -34,6 +34,9 @@ type Config struct {
 	Edge    EdgeConfig    `yaml:"edge"`
 	Shield  ShieldConfig  `yaml:"shield"`
 	Admin   *AdminConfig  `yaml:"admin"`
+	// HEP mirrors the edge's SIP signaling to a HOMER collector. Nil (the
+	// section is absent) means off.
+	HEP *HEPConfig `yaml:"hep"`
 
 	// envRedact is set by expandEnv: what ${VAR} expansion substituted, so
 	// validate can keep expanded values out of its error messages.
@@ -240,6 +243,43 @@ type AdminConfig struct {
 	Pprof bool `yaml:"pprof"`
 }
 
+// HEP transports.
+const (
+	HEPUDP = "udp"
+	HEPTCP = "tcp"
+	HEPTLS = "tls"
+)
+
+// HEPConfig is the hep section: where and how the edge ships a copy of every
+// SIP message to HOMER over HEPv3. There is no password: HOMER 11 ignores the
+// HEP auth key chunk.
+type HEPConfig struct {
+	// Address is the collector as a literal IP:port (HOMER 11: 9060 for
+	// udp and tcp, 9061 for tls).
+	Address string `yaml:"address"`
+	// Transport is udp (the default), tcp or tls.
+	Transport string `yaml:"transport"`
+	// TLS holds the client settings; transport: tls only.
+	TLS *HEPTLSConfig `yaml:"tls"`
+	// CaptureID is the capture agent ID (HEP chunk 0x0c).
+	CaptureID uint32 `yaml:"capture_id"`
+	// NodeName is the capture node name (HEP chunk 0x13); optional.
+	NodeName string `yaml:"node_name"`
+	// RedactAuth masks the value of Authorization and Proxy-Authorization
+	// in the mirrored copy. Nil means the default, true (see withDefaults).
+	RedactAuth *bool `yaml:"redact_auth"`
+}
+
+// HEPTLSConfig is the TLS client side of the hep section.
+type HEPTLSConfig struct {
+	// CA replaces the system roots for the collector's certificate.
+	CA string `yaml:"ca"`
+	// Cert and Key are the PEM pair presented for HOMER's mutual TLS:
+	// both or neither.
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+}
+
 // AdminUser is the only admin user name.
 const AdminUser = "admin"
 
@@ -282,6 +322,21 @@ func withDefaults(c *Config) {
 	if c.Shield.AdmissionBan == "" {
 		c.Shield.AdmissionBan = DefaultAdmissionBan
 	}
+	if h := c.HEP; h != nil {
+		if h.Transport == "" {
+			h.Transport = HEPUDP
+		}
+		if h.RedactAuth == nil {
+			on := true
+			h.RedactAuth = &on
+		}
+	}
+}
+
+// HEPRedact reports whether the hep mirror masks Authorization headers. True
+// when hep is off, so a caller never has to special-case the default.
+func (c *Config) HEPRedact() bool {
+	return c.HEP == nil || c.HEP.RedactAuth == nil || *c.HEP.RedactAuth
 }
 
 // PublicIP is the address advertised to public peers. Only meaningful on a

@@ -51,6 +51,7 @@ jobs:
           - { pkg: ./internal/edge, target: FuzzReadFilter }
           - { pkg: ./internal/edge, target: FuzzMalformedScan }
           - { pkg: ./internal/edge, target: FuzzStreamFramer }
+          - { pkg: ./internal/edge, target: FuzzHEPCapture }
           - { pkg: ./internal/hep, target: FuzzEncodeDecode }
           - { pkg: ./internal/media, target: FuzzAuditClassify }
           - { pkg: ./internal/media, target: FuzzAuditDemux }

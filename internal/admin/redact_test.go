@@ -63,3 +63,22 @@ func TestRedactConfigCarriers(t *testing.T) {
 		}
 	}
 }
+
+// The hep section is part of the redacted view; it holds only file paths and
+// no secret.
+func TestRedactConfigHEP(t *testing.T) {
+	cfg := mustCfg(t)
+	if b, _ := json.Marshal(redactConfig(cfg)); strings.Contains(string(b), `"hep"`) {
+		t.Errorf("hep shown while off: %s", b)
+	}
+	f := false
+	cfg.HEP = &config.HEPConfig{Address: "10.77.0.50:9061", Transport: "tls", CaptureID: 2001, NodeName: "edge1",
+		RedactAuth: &f, TLS: &config.HEPTLSConfig{CA: "/etc/ca.pem", Cert: "/etc/c.pem", Key: "/etc/c.key"}}
+	b, _ := json.Marshal(redactConfig(cfg))
+	for _, want := range []string{`"address":"10.77.0.50:9061"`, `"capture_id":2001`, `"node_name":"edge1"`,
+		`"redact_auth":false`, `"ca":"/etc/ca.pem"`, `"key":"/etc/c.key"`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("%s missing from %s", want, b)
+		}
+	}
+}

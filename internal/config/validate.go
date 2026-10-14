@@ -40,6 +40,7 @@ func (c *Config) validate() error {
 	c.validateCarriers(fail)
 	c.validateShield(fail)
 	c.validateAdmin(fail)
+	c.validateHEP(fail)
 	c.validateSockets(fail)
 
 	if len(errs) > 0 {
@@ -397,6 +398,39 @@ func (c *Config) validateAdmin(fail failFunc) {
 		// Cost 4 (min) makes offline cracking ~50x cheaper; the hash
 		// travels in backups, logs and the config itself.
 		fail("admin.password_hash: bcrypt cost %d is below the minimum of %d; regenerate the hash with `freesbc hash-password`", cost, MinBcryptCost)
+	}
+}
+
+// maxHEPNodeName keeps the node name chunk well inside one HEP packet.
+const maxHEPNodeName = 255
+
+// validateHEP checks the optional hep section. It opens no files and dials
+// nothing: a missing CA file shows up when the sender is built.
+func (c *Config) validateHEP(fail failFunc) {
+	h := c.HEP
+	if h == nil {
+		return
+	}
+	if ap, err := netip.ParseAddrPort(h.Address); err != nil {
+		fail("hep.address: %q is not a literal IP:port", h.Address)
+	} else if ap.Addr().IsUnspecified() || ap.Port() == 0 {
+		fail("hep.address: %q needs a specific IP and a port", h.Address)
+	}
+	switch h.Transport {
+	case HEPUDP, HEPTCP, HEPTLS:
+	default:
+		fail("hep.transport: must be udp, tcp or tls, got %q", h.Transport)
+	}
+	if h.TLS != nil {
+		if h.Transport != HEPTLS {
+			fail("hep.tls: only valid with transport: tls")
+		}
+		if (h.TLS.Cert == "") != (h.TLS.Key == "") {
+			fail("hep.tls: cert and key must be set together")
+		}
+	}
+	if len(h.NodeName) > maxHEPNodeName {
+		fail("hep.node_name: longer than %d bytes", maxHEPNodeName)
 	}
 }
 

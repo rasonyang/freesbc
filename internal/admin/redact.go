@@ -36,6 +36,15 @@ func redactConfig(cfg *config.Config) any {
 	if cfg.TLS != nil {
 		view["tls"] = map[string]any{"cert": cfg.TLS.Cert, "key": cfg.TLS.Key}
 	}
+	if h := cfg.HEP; h != nil {
+		v := map[string]any{"address": h.Address, "transport": h.Transport, "capture_id": h.CaptureID,
+			"node_name": h.NodeName, "redact_auth": cfg.HEPRedact()}
+		if h.TLS != nil {
+			// File paths, not key material.
+			v["tls"] = map[string]any{"ca": h.TLS.CA, "cert": h.TLS.Cert, "key": h.TLS.Key}
+		}
+		view["hep"] = v
+	}
 	if cfg.Admin != nil {
 		a := map[string]any{"listen": cfg.Admin.Listen, "allow_remote": cfg.Admin.AllowRemote}
 		if cfg.Admin.PasswordHash != "" {
