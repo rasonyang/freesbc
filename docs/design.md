@@ -1139,7 +1139,11 @@ Per REGISTER:
    source key, no refresh of a live binding, no carrier source, never an
    unanswered exchange). The table (`aorTable`, `shield/aorstrikes.go`) is an
    LRU of at most 16384 AoRs (`aorCap`), keys cut at 384 bytes, fixed
-   window from the first strike, pruned on the shield tick. The strike that
+   window from the first strike, pruned on the shield tick. When it is
+   full, a new AoR evicts the least recently struck unlocked entry among
+   the last 64 (`aorEvictScan`), so a flood of distinct AoRs cannot push
+   a lock out early, and falls back to the least recently struck entry
+   when all of those are locked, so the cap always holds. The strike that
    crosses the threshold locks the AoR for `shield.ban` (one WARN
    `shield locked AoR ...` naming the AoR and the count); a lock is not
    extended by later strikes and ends by itself. While locked,

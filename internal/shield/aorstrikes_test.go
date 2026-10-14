@@ -105,6 +105,80 @@ func TestAORTableCapped(t *testing.T) {
 	}
 }
 
+func TestAORFullTableKeepsLockedEntry(t *testing.T) {
+	s, _ := aorShield(t, "1/10m")
+	now := time.Unix(1_700_000_000, 0)
+	s.aors.now = func() time.Time { return now }
+	s.aors.max = 256
+	s.StrikeAOR("victim@x")
+	if !s.StrikeAOR("victim@x") {
+		t.Fatal("victim not locked")
+	}
+	// Distinct single strikes stay under the threshold, so they are unlocked.
+	for i := 0; i < 5000; i++ {
+		s.StrikeAOR(fmt.Sprintf("flood%d@x", i))
+	}
+	if !s.AORLocked("victim@x") {
+		t.Error("a flood of distinct AoRs evicted a locked AoR")
+	}
+	if n := s.aors.size(); n != 256 {
+		t.Errorf("table holds %d AoRs, want the cap 256", n)
+	}
+}
+
+func TestAORFullOfLockedEntriesStaysCapped(t *testing.T) {
+	s, _ := aorShield(t, "1/10m")
+	now := time.Unix(1_700_000_000, 0)
+	s.aors.now = func() time.Time { return now }
+	s.aors.max = 8
+	for i := 0; i < 8; i++ {
+		k := fmt.Sprintf("locked%d@x", i)
+		s.StrikeAOR(k)
+		s.StrikeAOR(k)
+	}
+	s.StrikeAOR("new@x")
+	if n := s.aors.size(); n != 8 {
+		t.Errorf("table holds %d AoRs, want the cap 8", n)
+	}
+	if s.AORLocked("locked0@x") {
+		t.Error("the back entry was not the fallback victim")
+	}
+	if !s.AORLocked("locked1@x") {
+		t.Error("fallback evicted more than the back entry")
+	}
+}
+
+func TestAORExpiredLockIsEvictable(t *testing.T) {
+	s, _ := aorShield(t, "1/10m")
+	now := time.Unix(1_700_000_000, 0)
+	s.aors.now = func() time.Time { return now }
+	s.aors.max = 4
+	s.StrikeAOR("old@x")
+	s.StrikeAOR("old@x")
+	now = now.Add(30 * time.Minute)
+	for i := 0; i < 3; i++ {
+		k := fmt.Sprintf("locked%d@x", i)
+		s.StrikeAOR(k)
+		s.StrikeAOR(k)
+	}
+	// A later strike moves old@x to the front without extending its lock,
+	// so the still-locked entries sit behind it.
+	s.StrikeAOR("old@x")
+	now = now.Add(30*time.Minute + time.Second)
+	if s.AORLocked("old@x") {
+		t.Fatal("old@x still locked")
+	}
+	s.StrikeAOR("new@x")
+	for i := 0; i < 3; i++ {
+		if !s.AORLocked(fmt.Sprintf("locked%d@x", i)) {
+			t.Errorf("locked%d@x lost its lock", i)
+		}
+	}
+	if n := s.aors.size(); n != 4 {
+		t.Errorf("table holds %d AoRs, want 4", n)
+	}
+}
+
 func TestAOROffendersListed(t *testing.T) {
 	s, _ := aorShield(t, "5/10m")
 	for i := 0; i < 3; i++ {
