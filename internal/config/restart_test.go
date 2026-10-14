@@ -41,6 +41,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 		{"admin", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\" }\n", []string{"admin"}},
 		{"admin pprof", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", pprof: true }\n", []string{"admin"}},
 		{"admin allowed_hosts", base + "admin: { listen: 127.0.0.1:8080, password_hash: \"" + testHash + "\", allowed_hosts: [a.example] }\n", []string{"admin"}},
+		{"hep on", base + "hep: { address: 10.77.0.50:9060 }\n", []string{"hep"}},
 	}
 	running := mustParse(t, base)
 	for _, tc := range cases {
@@ -49,6 +50,28 @@ func TestRestartOnlyChanges(t *testing.T) {
 				t.Errorf("RestartOnlyChanges = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// Every hep key is restart-only, including the ones that only change the
+// mirrored copy.
+func TestRestartOnlyChangesHEP(t *testing.T) {
+	base := minimalYAML + "hep: { address: 10.77.0.50:9060, capture_id: 1 }\n"
+	running := mustParse(t, base)
+	for name, next := range map[string]string{
+		"address":     strings.Replace(base, "9060", "9061", 1),
+		"capture_id":  strings.Replace(base, "capture_id: 1", "capture_id: 2", 1),
+		"redact_auth": strings.Replace(base, "capture_id: 1", "capture_id: 1, redact_auth: false", 1),
+		"removed":     minimalYAML,
+	} {
+		if got := RestartOnlyChanges(running, mustParse(t, next)); !slices.Equal(got, []string{"hep"}) {
+			t.Errorf("%s: RestartOnlyChanges = %q, want [hep]", name, got)
+		}
+	}
+	// Spelling the defaults out is not a change.
+	same := strings.Replace(base, "capture_id: 1", "capture_id: 1, transport: udp, redact_auth: true", 1)
+	if got := RestartOnlyChanges(running, mustParse(t, same)); got != nil {
+		t.Errorf("explicit defaults reported as a change: %q", got)
 	}
 }
 

@@ -69,3 +69,16 @@ edge:
 #   listen: 127.0.0.1:8080
 #   password_hash: "REPLACE-WITH-BCRYPT-HASH"   # freesbc hash-password
 #   allowed_hosts: [sbc.example.net]            # extra Host names (no port); loopback and listen are implied
+
+# --- Mirror SIP signaling to HOMER over HEP (docs/homer.md) -------------------
+
+# hep:
+#   address: 10.77.0.50:9060   # literal IP:port; HOMER 11: 9060 udp/tcp, 9061 tls
+#   transport: udp             # udp | tcp | tls
+#   # tls:                     # only with transport: tls
+#   #   ca: /etc/freesbc/homer-ca.pem
+#   #   cert: /etc/freesbc/hep-client.pem   # optional, for HOMER mutual_tls
+#   #   key:  /etc/freesbc/hep-client.key
+#   capture_id: 2001
+#   node_name: freesbc-edge1
+#   redact_auth: true          # mask Authorization / Proxy-Authorization in the copy (default)

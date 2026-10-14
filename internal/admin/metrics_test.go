@@ -220,3 +220,24 @@ func TestPprofOnNeedsAuth(t *testing.T) {
 		t.Error("pprof heap empty")
 	}
 }
+
+// The HEP counters render only when the mirror is configured.
+func TestMetricsHEP(t *testing.T) {
+	deps := emptyDeps()
+	if body := string(authGET(t, newTestServer(t, deps), "/metrics")); strings.Contains(body, "freesbc_hep_") {
+		t.Errorf("hep series exported with no hep wired")
+	}
+	deps = emptyDeps()
+	deps.HEP = func() *HEPStats { return &HEPStats{Sent: 7, Dropped: 2, WriteErrors: 3, EncodeErrors: 1} }
+	body := string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{
+		"freesbc_hep_packets_sent_total 7",
+		"freesbc_hep_packets_dropped_total 2",
+		`freesbc_hep_errors_total{kind="write"} 3`,
+		`freesbc_hep_errors_total{kind="encode"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q\n---\n%s", want, body)
+		}
+	}
+}

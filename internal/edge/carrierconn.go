@@ -223,6 +223,11 @@ func (cc *carrierConns) dial(ctx context.Context, name, network, dest string) er
 		return fmt.Errorf("connection cap reached (%s)", streamRefusalLabels[why])
 	}
 	c := &streamConn{Conn: raw, l: l, ap: ap, remote: dest, lim: lim, fr: &sipFramer{max: lim.maxMessage}, carrier: true}
+	// The connection leaves from an ephemeral port, which the HEP tracer
+	// cannot know otherwise (hepmirror.go).
+	if la, ok := addrPortOf(raw.LocalAddr()); ok {
+		c.unroute = s.hep.route(la)
+	}
 	s.metrics.StreamConnOpened(network)
 	if network == config.CarrierTLS {
 		tc := tls.Client(raw, cc.tls[name])

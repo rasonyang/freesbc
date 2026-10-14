@@ -19,6 +19,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 
 	"github.com/freesbc/freesbc/internal/config"
+	"github.com/freesbc/freesbc/internal/hep"
 	"github.com/freesbc/freesbc/internal/media"
 	"github.com/freesbc/freesbc/internal/shield"
 	fsip "github.com/freesbc/freesbc/internal/sip"
@@ -101,6 +102,10 @@ type Server struct {
 	// arrival.go. Created in New, never replaced.
 	marker *arrivalMarker
 
+	// hep mirrors SIP signaling to HOMER; nil when the hep section is off
+	// (hepmirror.go). Written once in New.
+	hep *hepMirror
+
 	webrtcEnabled bool
 
 	// rtpTimeout is the media silence timeout in nanoseconds: the
@@ -171,6 +176,7 @@ type Option func(*options)
 
 type options struct {
 	privateAddr netip.AddrPort
+	hep         *hep.Sender
 }
 
 // WithPrivateAddr overrides the private SIP socket, which is otherwise the
@@ -234,7 +240,13 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		return nil, err
 	}
 	raiseUDPSendLimit()
+	var mirror *hepMirror
+	if o.hep != nil {
+		mirror = &hepMirror{sender: o.hep, redact: cfg.HEPRedact(), bind: cfg.PublicBind(), pub: cfg.PublicIP()}
+		installHEPTracer()
+	}
 	s := &Server{
+		hep:              mirror,
 		store:            store,
 		boot:             cfg,
 		privAddr:         priv,
@@ -617,6 +629,16 @@ func (s *Server) Run(ctx context.Context) error {
 	defer listenCancel()
 
 	listeners := append(s.publicListeners(), bound{"udp-private", s.privAddr.String()})
+
+	// The tracer finds this server's outbound sockets by local address. Every
+	// bound socket is registered before it can send, and removed when Run
+	// returns. The private socket reports its own address; public ones are
+	// mapped to public.ip behind 1:1 NAT inside capture.
+	for _, l := range listeners {
+		if ap, err := netip.ParseAddrPort(l.addr); err == nil {
+			defer s.hep.route(ap)()
+		}
+	}
 
 	// Bind every socket SYNCHRONOUSLY before serving any of them. Binding
 	// inside the serving goroutines would make a bind failure racy to
@@ -1002,6 +1024,9 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		if len(out) == 0 || err != nil {
 			return out, err
 		}
+		// Mirror to HOMER what the shield accepted, before the arrival
+		// stamp: the per-process secret must never leave the process.
+		s.hep.inbound(info, out, fsip.IsByteStream(info.Transport))
 		if a := trusted(info); a != arrPublic {
 			return s.marker.stamp(a, out), nil
 		}

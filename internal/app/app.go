@@ -9,12 +9,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/freesbc/freesbc/internal/admin"
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/edge"
+	"github.com/freesbc/freesbc/internal/hep"
 )
 
 // Options are Run's inputs. Log and Version are optional; ConfigPath is not.
@@ -72,7 +75,21 @@ func Run(ctx context.Context, opts Options) error {
 
 	// The edge: public SIP/UDP + WS/WSS toward phones, browsers and
 	// carriers, the switch behind it, media anchored through the SBC.
-	edgeSrv, err := edge.New(store, log, testHookEdgeOptions...)
+	edgeOpts := append([]edge.Option(nil), testHookEdgeOptions...)
+	var hepSender *hep.Sender
+	if cfg.HEP != nil {
+		hepSender, err = newHEPSender(cfg.HEP, log)
+		if err != nil {
+			return fmt.Errorf("hep: %w", err)
+		}
+		// Closed after every component has stopped (g.Wait below runs
+		// before this), so the queue is flushed after the last message.
+		defer closeHEPSender(hepSender, log)
+		edgeOpts = append(edgeOpts, edge.WithHEP(hepSender))
+		log.Info("HEP mirror enabled", "address", cfg.HEP.Address, "transport", cfg.HEP.Transport,
+			"capture_id", cfg.HEP.CaptureID, "redact_auth", cfg.HEPRedact())
+	}
+	edgeSrv, err := edge.New(store, log, edgeOpts...)
 	if err != nil {
 		return fmt.Errorf("edge: %w", err)
 	}
@@ -105,6 +122,9 @@ func Run(ctx context.Context, opts Options) error {
 
 	if adminCfg := cfg.Admin; adminCfg != nil {
 		deps := adminDeps(edgeSrv, opts.Version, cfg, store)
+		if hepSender != nil {
+			deps.HEP = hepStats(hepSender)
+		}
 		adminSrv := admin.New(adminCfg, cfg.TLS, store, deps, log, opts.ConfigPath)
 		g.Go(func() error {
 			if err := adminSrv.Run(gctx); err != nil && gctx.Err() == nil {
@@ -120,6 +140,50 @@ func Run(ctx context.Context, opts Options) error {
 	<-gctx.Done()
 	log.Info("shutting down")
 	return g.Wait()
+}
+
+// newHEPSender builds the HEP sender from the hep section. It dials nothing:
+// the sender connects on its first packet, so a collector that is down at
+// startup is not fatal.
+func newHEPSender(h *config.HEPConfig, log *slog.Logger) (*hep.Sender, error) {
+	opts := hep.Options{
+		Network:   h.Transport,
+		Addr:      h.Address,
+		CaptureID: h.CaptureID,
+		NodeName:  h.NodeName,
+		Logger:    log.With("component", "hep"),
+	}
+	if h.Transport == config.HEPTLS {
+		host, _, err := net.SplitHostPort(h.Address)
+		if err != nil {
+			return nil, err
+		}
+		var ca, cert, key string
+		if h.TLS != nil {
+			ca, cert, key = h.TLS.CA, h.TLS.Cert, h.TLS.Key
+		}
+		if opts.TLS, err = hep.TLSConfig(ca, cert, key, host); err != nil {
+			return nil, err
+		}
+	}
+	return hep.New(opts)
+}
+
+// closeHEPSender flushes the queue, bounded, at shutdown.
+func closeHEPSender(s *hep.Sender, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.Close(ctx); err != nil {
+		log.Warn("HEP sender closed with packets unsent", "err", err)
+	}
+}
+
+// hepStats adapts the sender's counters for /metrics.
+func hepStats(s *hep.Sender) func() *admin.HEPStats {
+	return func() *admin.HEPStats {
+		st := s.Stats()
+		return &admin.HEPStats{Sent: st.Sent, Dropped: st.Dropped, WriteErrors: st.WriteErrors, EncodeErrors: st.EncodeErrors}
+	}
 }
 
 // adminDeps assembles the admin API's view of the running edge plane.

@@ -33,6 +33,7 @@ Principles of the schema:
 | `edge` | yes | restart (every key) |
 | `shield` | no | hot |
 | `admin` | no | restart |
+| `hep` | no (off when absent) | restart |
 
 ### `public`
 
@@ -253,6 +254,29 @@ The config API is read-only. There is no write endpoint: edit the file, run `fre
 
 The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the candidate text) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
 
+### `hep`
+
+Optional, off when absent. Mirrors every SIP message the edge receives or sends, on every socket, to a HOMER collector over HEPv3. What is mirrored, the HOMER ports and the security notes are in [`homer.md`](homer.md).
+
+```yaml
+hep:
+  address: 10.77.0.50:9060
+  transport: udp
+  capture_id: 2001
+  node_name: freesbc-edge1
+```
+
+| Key | Default | Rules |
+|---|---|---|
+| `address` | required | Literal `IP:port` of the collector (HOMER 11: 9060 for `udp` and `tcp`, 9061 for `tls`). No DNS, no wildcard. |
+| `transport` | `udp` | `udp`, `tcp` or `tls`. |
+| `tls` | none | Only with `transport: tls`; without it the system roots are used. Keys: `ca` (replaces the system roots), `cert` and `key` (client pair for HOMER's mutual TLS, both or neither). The server certificate is verified against the host of `address`, so for a literal IP it must carry that IP as a SAN; there is no option to skip verification. `check` does not open these files; `run` fails at startup on a missing or malformed one. |
+| `capture_id` | `0` | Capture agent ID (HEP chunk `0x0c`), an unsigned 32-bit integer. |
+| `node_name` | empty | Capture node name (HEP chunk `0x13`), at most 255 bytes. |
+| `redact_auth` | `true` | Masks the value of `Authorization` and `Proxy-Authorization` in the mirrored copy; the forwarded message is unchanged. |
+
+There is no password key: HOMER 11 ignores the HEP auth key. The sender dials on the first packet, so a collector that is down at startup does not stop FreeSBC; copies are dropped, never queued without bound (`freesbc_hep_packets_dropped_total`, `freesbc_hep_errors_total`). Every `hep` key is restart-only.
+
 ## Reload classes
 
 `config.Watch` watches the file's parent directory (200 ms debounce, symlink-aware) and publishes each valid file as an immutable snapshot. An invalid file is logged and the previous snapshot stays. FreeSBC never writes the file: the operator edits it (run `freesbc check` first) and the watcher does the reload.
@@ -263,6 +287,7 @@ The WebUI's Config tab has a **Download config** button that fetches `/api/confi
 | `public`, `private`, `rtp`, `tls` | restart-only |
 | `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
 | `admin` (every key, including `allowed_hosts` and `pprof`, and whether the section exists) | restart-only |
+| `hep` (every key, and whether the section exists) | restart-only |
 
 A reload that edits a restart-only setting is still published, so its hot settings apply, and logs a warning listing the changed keys (`config.RestartOnlyChanges`). The running process keeps its startup values for the restart-only settings until it restarts. The table in `restartOnly` (`internal/config/restart.go`) and `docs/design.md` §4.4 are the same list.
 

@@ -104,8 +104,10 @@ graph TD
     app --> admin["internal/admin"]
     app --> config["internal/config"]
     app --> edge["internal/edge"]
+    app --> hep["internal/hep"]
     admin --> config
     edge --> config
+    edge --> hep
     edge --> media["internal/media"]
     edge --> shield["internal/shield"]
     edge --> sip["internal/sip"]
@@ -114,8 +116,9 @@ graph TD
 ```
 
 `internal/config`, `internal/hep`, `internal/media`, `internal/sip` and
-`internal/sip/sdp` import nothing from this module (`hep` is a library not yet
-wired into the process, so it has no node in the graph). `internal/sip` does
+`internal/sip/sdp` import nothing from this module (`hep` is the HEPv3 sender
+library; `app` builds its `Sender` and `edge` is handed it as a `*hep.Sender`,
+§7.1b). `internal/sip` does
 not import the rest of the module either (its package doc,
 `internal/sip/doc.go:1-12`): it holds protocol primitives with no policy.
 
@@ -207,6 +210,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:911`) | its 5 s BYE context |
 | per request: sipgo handler goroutine | sipgo | handler return (after the final response; `dialogTable` owns the dialog from then on) |
 | shield prune loop | `shield.New` (`shield.go:64`) | `Shield.Close` |
+| HEP writer (one per process, owned by `hep.Sender`, not by the edge) | `hep.New` from `app.Run` when `hep:` is set | `closeHEPSender` after `g.Wait()` |
 
 **Media**
 
@@ -260,7 +264,12 @@ fsnotify-driven exclusively.
    logs one WARN with the advertised address and the forwards the router
    needs (`Config.NATForwards`, `internal/config/nat.go`; the same text
    `check` and `init` print as `NATChecklist`).
-3. `edge.New(store, log, testHookEdgeOptions...)` (`app.go:58`). Keeps
+3. When `cfg.HEP` is set, build the `hep.Sender` (`newHEPSender`,
+   `app.go:145`; it dials nothing, so a collector that is down is not fatal;
+   a bad `hep.tls` file is) and defer its close (`closeHEPSender`), then pass
+   it to the edge as `edge.WithHEP`. The deferred close runs after `g.Wait()`,
+   so the queue is flushed after the last message (§4.5, §7.1b).
+   `edge.New(store, log, edgeOpts...)` (`app.go:58`). Keeps
    `store.Current()` as its startup snapshot (`boot`), builds the topology
    from it, raises the process-wide UDP MTU, builds the carrier directory,
    the carrier registration table, `Location`, `Metrics`, the cooldown table,
@@ -325,7 +334,8 @@ the happens-before edge the test harness uses.
 
 The edge installs a transport read filter on the sipgo user agent
 (`edge.go:568`, `readFilter` at `:942`) before any socket exists; §14 covers
-what it enforces.
+what it enforces. When `hep:` is set it is also where inbound messages are
+mirrored to HOMER (§7.1b).
 
 The edge deliberately bypasses sipgo's `ListenAndServe*` helpers and calls
 `tl.ServeUDP` / `ServeTCP` / `ServeTLS` / `ln.Serve` directly, because in
@@ -400,6 +410,7 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.allow_insecure_sdes` |
 | | `edge.carrier_sources` |
 | | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, `pprof`, and whether the section exists) |
+| | `hep` (every key, and whether the section exists: the sender and the process-wide sipgo tracer are set up once at startup, §7.1b) |
 
 Which plane code runs is not a setting: the edge always runs, and the admin
 server runs when an `admin:` section existed at startup.
@@ -456,6 +467,11 @@ sipgo client and user agent) fires after all of this.
 **Admin**: on `ctx.Done()`, `srv.Shutdown` under a fresh **5 s** timeout
 (`admin/server.go:324-326`). In-flight HTTP requests are drained up to that
 budget.
+
+**HEP sender**: when the mirror is on, `closeHEPSender` runs after `g.Wait()`
+(a `defer` in `app.Run`), so every component has stopped sending first. It
+flushes the queue for at most 3 s and then drops what is left
+(`hep.Sender.Close`, counted in `freesbc_hep_packets_dropped_total`).
 
 **Shield.Close**: cancel the prune loop and wait for it. Bans are in memory
 only, so none survive the process.
@@ -1010,6 +1026,65 @@ own listener (`streamListener`) and bounds every stream transport the same way.
 Known sipgo behaviour: the pool also keys an accepted connection by the
 listener's own address, and a policy close followed by sipgo's own close logs
 sipgo's `TCP ref went negative` at Warn (harmless, as for UDP).
+
+### 7.1b HEP mirror to HOMER
+
+With a `hep:` section the edge ships a copy of every SIP message it receives
+or sends, on every socket, to a HOMER collector (`docs/homer.md`). Call-ID
+passes through the proxy, so the client, switch and carrier legs of a call land
+in one HOMER call flow. The mirror is `hepMirror` (`internal/edge/hepmirror.go`),
+built in `New` from the `hep.Sender` that `app` passes in with `edge.WithHEP`
+(`edge.go:244-247`); on a server without one `s.hep` is nil and every call is a
+no-op. Capture never blocks and never fails a message: `hep.Sender.Send` only
+queues, and a full queue drops the copy (`freesbc_hep_packets_dropped_total`).
+
+- **Inbound** is taken in the read filter (`edge.go:1029`), right after the
+  size cap, the private-source check, the ban and the rate token have accepted
+  the bytes (`base`) and BEFORE `marker.stamp`. A flood the shield drops is
+  therefore not mirrored, and the per-process `X-FreeSBC-Arrival` secret never
+  leaves the process. It sees the private socket too (the switch's requests).
+  `hepMirror.inbound` (`hepmirror.go:113`) copies what it keeps, because the
+  filter's `data` is sipgo's read buffer. A tcp or tls read is a chunk, so it
+  is split into complete messages by Content-Length (`nextStreamMessage`,
+  `hepmirror.go:285`); a message split over two reads is not mirrored. A UDP
+  datagram or WS/WSS frame is one message.
+- **Outbound** has no hook in sipgo v1.4.3. The only tap is the package-level
+  `sip.SIPDebugTracer`, called from the UDP, TCP and WS connection writes and
+  only while `sip.SIPDebug` is true. `New` installs it once per process
+  (`installHEPTracer`, `hepmirror.go:59`, `sync.Once`, only when a sender was
+  passed); both globals are unsynchronised, so they are written before any
+  server runs. `SIPTraceWrite` (`hepmirror.go:74`) sees every send:
+  retransmissions, stateless replies, relayed responses and the CANCEL/BYE the
+  edge generates. `SIPTraceRead` is a no-op: it fires before the read filter,
+  so it would mirror what the shield is about to drop, unstamped. `SIPDebug`
+  also turns on a few extra Debug logs in sipgo's WS transport.
+- **Routing by local address.** The tracer is process-wide and carries no
+  server identity, so it finds the mirror through `hepRoutes`, a `sync.Map`
+  keyed by the local `netip.AddrPort` of the socket that wrote. `Run` registers
+  every public listener's bind address and the private socket before it can
+  send (`edge.go:639`) and removes them when it returns; a dialed carrier
+  connection registers its ephemeral local address in `carrierConns.dial` and
+  removes it when the `streamConn` closes (`stream.go`, `unroute`). Several
+  servers in one process (tests) therefore never see each other's traffic.
+  sipgo reports a TLS connection as "TCP" and WSS as "WS"; the HEP protocol
+  field is only 17 (UDP) or 6 (everything else), and the local port tells the
+  sockets apart.
+- **Fields.** Source and destination are the two ends of the socket that
+  carried the message; the local end equal to `public.bind` is reported as
+  `public.ip` (they differ only behind 1:1 NAT, and the ladder should match
+  the SIP headers). The correlation ID (0x11) is the Call-ID, found by a small
+  allocation-free scan of the header section (`callIDOf`, long and compact
+  form); a message with no Call-ID is not mirrored, since HOMER cannot place
+  it and a malformed flood must not become collector load. Capture ID and node
+  name come from the `Sender`.
+- **`hep.redact_auth`** (default on) masks the value of `Authorization` and
+  `Proxy-Authorization`, folded lines included, in the mirrored copy only
+  (`redactAuthHeaders`, `hepmirror.go:253`); the forwarded message is never
+  touched.
+
+The sender's own behaviour (bounded queue of 4096, one writer goroutine,
+reconnect with backoff for tcp and tls, no auth key because HOMER 11 ignores
+it) is in `internal/hep`'s package doc.
 
 ### 7.2 Topology snapshot
 
@@ -3499,7 +3574,7 @@ All metrics live on a **private** registry built lazily on the first
 collector, the process collector (`collectors.NewProcessCollector`; the
 `process_*` series other than `process_start_time_seconds` exist on Linux only)
 plus one `collector` that samples `admin.Deps` on every scrape — no
-duplicated state. `Describe` advertises all 38 descriptors of the freesbc collector; the whole edge
+duplicated state. `Describe` advertises all 41 descriptors of the freesbc collector; the whole edge
 block is skipped at `Collect` time when `Deps.Proxy` is nil (it is never nil in
 a running process).
 
@@ -3548,6 +3623,9 @@ permanent series per call."
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go:1144`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_ack_missed_total` | Counter | `plane` ∈ {`public`, `private`}: the side that failed to ACK a 2xx | edge `noteAckMiss` (`ack.go`), once per missed ACK (§7.7); both planes are always exported |
 | `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `rejectInvite` / `rejectBusy` (`invite.go:148`, `invite.go:187`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
+| `freesbc_hep_packets_sent_total` | Counter | — | `hep.Stats.Sent` through `Deps.HEP` (`hepStats`, `app.go:182`): SIP messages written to the collector. Exported only when `hep:` is set |
+| `freesbc_hep_packets_dropped_total` | Counter | — | `hep.Stats.Dropped`: copies refused because the send queue was full or closed, and queued ones given up at shutdown |
+| `freesbc_hep_errors_total` | Counter | `kind` ∈ {`write`, `encode`} | `hep.Stats.WriteErrors` (dial or write failure) and `EncodeErrors` (oversize or unaddressable); both kinds always exported while the mirror is on |
 | `freesbc_edge_carrier_requests_total` | Counter | `carrier` (an `edge.carriers` name or `unknown`), `direction` ∈ {`inbound` (carrier to switch), `outbound` (switch to carrier)}, `method` (folded like `sip_requests_total`) | edge `Metrics.CarrierRequest` (§6) |
 | `freesbc_edge_carrier_registrations` | Gauge | `carrier` | live carrier registrations per `edge.carriers` name, republished from the carrier registration table on every change and every prune tick (`carrierreg.go:126`) |
 
@@ -4217,6 +4295,12 @@ be used to read an environment variable.
   front of public UDP) and on the switch (route carrier calls only to inbound
   dialplans; never trust FreeSBC's private IP on the client port, docs/edge.md).
   The code enforces none of this.
+- **The HEP mirror carries what topology hiding removes.** A mirrored copy is
+  the message as it crossed each socket, so it holds the switch addresses, the
+  switch Via and Contact and the `fsbc=` tokens that never reach a carrier. HOMER
+  11 does not authenticate HEP senders: put the collector on the private network
+  or use `hep.transport: tls` with mutual TLS. Without `hep.redact_auth`, REGISTER
+  digests and nonces are shipped (`docs/homer.md`).
 - **Carrier sources follow DNS.** The addresses of a DNS-name `edge.carriers`
   entry are carrier sources for as long as they stay in the directory. There is
   no DNSSEC and no pinning, so whoever controls that answer can add a carrier
@@ -4500,7 +4584,7 @@ Stated because the code establishes them, not as future work.
 | `internal/sip` | reusable SIP primitives only: safe header accessors, transport-source parsing with `Unmap`, default ports, listener matching, branch/token generation, REGISTER expiry parsing (`DeltaSeconds`, `GrantedExpires`), `BuildCancel`/`TeardownRequest`, the read-filter wrapper | policy, workflow, or state: "a transcription of RFC 3261/3264 with no policy of its own" |
 | `internal/sip/sdp` | the bounded typed parse, codec intersection, and body construction from scratch | copying anything from another leg's body; deciding SDES policy (the package parses and builds `a=crypto`, the edge decides); DNS |
 | `internal/media` | port pools, latching, the payload-agnostic relay, the silence watchdog, the ICE-lite/DTLS-SRTP browser leg, the per-process DTLS identity, packet/byte counters | SIP, SDP, or any protocol above UDP. Its doc: "It knows nothing about SIP" |
-| `internal/hep` | HEPv3 encoding, the bounded queue and single writer goroutine, UDP/TCP/TLS transports with reconnect and backoff | SIP or RTCP knowledge, config, deciding what to mirror; it imports nothing from this module and is not wired into the process yet |
+| `internal/hep` | HEPv3 encoding, the bounded queue and single writer goroutine, UDP/TCP/TLS transports with reconnect and backoff | SIP or RTCP knowledge, config, deciding what to mirror; it imports nothing from this module. `app` builds the `Sender` from `hep:`; `edge` decides what to hand it (§7.1b) |
 | `internal/shield` | the in-memory ban table, per-source token buckets, scanner signatures, the carrier-source predicate hook | kernel firewall state; being a hard dependency of anything |
-| `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the client binding table, the carrier directory (DNS) and carrier registration table, switch-node routing with cooldown, switch-request classification, topology hiding on every public leg, admission, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction | carrier accounts, routing or credentials; any B2BUA call state |
+| `internal/edge` | proxy dialogs keyed by Call-ID and both tags, the client binding table, the carrier directory (DNS) and carrier registration table, switch-node routing with cooldown, switch-request classification, topology hiding on every public leg, admission, RFC 3261 §16 forwarding mechanics, media anchoring and SDP construction, and the HEP mirror's capture points (`hepmirror.go`: Call-ID, addresses, Authorization masking) | carrier accounts, routing or credentials; any B2BUA call state |
 | `internal/admin` | HTTP routing, Basic auth, cookie sessions (login, logout) and their shared limiter, the Prometheus registry and collector, the redacted config view, the raw config round-trip, the embedded WebUI | reading edge state directly — everything arrives through `admin.Deps` closures built in `internal/app` |

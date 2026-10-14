@@ -120,6 +120,7 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
 - [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, non-goals, known limitations
+- [`docs/homer.md`](docs/homer.md): mirror SIP signaling to a HOMER collector over HEP (setup, what is mirrored, security notes)
 - [`docs/troubleshooting.md`](docs/troubleshooting.md): calls that connect and then drop (`call ended` reasons, lost ACK, RTP silence, session timers)
 - [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
 - [`examples/switch/`](examples/switch/README.md): verified FreeSWITCH and Asterisk configurations for the reference topology

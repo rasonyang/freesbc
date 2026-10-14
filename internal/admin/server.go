@@ -66,6 +66,9 @@ type Deps struct {
 	Running func() *config.Config
 	// Proxy reports the edge plane's counters; nil reports none.
 	Proxy func() ProxyStats
+	// HEP reports the HEP mirror's counters; nil, or a nil result (the hep
+	// section is absent), exports no freesbc_hep_* series.
+	HEP func() *HEPStats
 	// DrainState reports whether the edge is draining and since when.
 	// SetDraining enters (true) or leaves (false) drain and reports whether
 	// the state changed. Nil on either makes /api/drain answer 404.
@@ -102,6 +105,11 @@ type Deps struct {
 	// state with no memory of its own (since and the history are the admin
 	// tracker's, health.go). Nil reports none.
 	Health func() []HealthCondition
+}
+
+// HEPStats are the cumulative counters of the HEP sender.
+type HEPStats struct {
+	Sent, Dropped, WriteErrors, EncodeErrors uint64
 }
 
 // ProxyStats is the edge proxy's operator-visible state: registrations,
