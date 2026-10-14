@@ -4047,10 +4047,14 @@ source and any IP holding a registration binding on any port (`Location.HasIP`,
 `location.go:233`, a per-IP binding count) are never struck, and a 2xx
 REGISTER clears the source's admission strikes. A WARN once a minute
 (`dropSummary`, `admission.go`, `admissionSummaryEvery`) summarises the
-drops of that minute (total, number of sources, the top source); the tally
-holds at most `maxSummarySources` (1024) sources, the rest only count in the
-total (a `+` after the source count marks that), and an interval with no
-drops logs nothing. A public NOTIFY, REFER or MESSAGE that names no dialog or
+drops of that minute: admission drops and the malformed public reads that
+`malformedStrike` struck, kept apart by kind (total with its two parts,
+number of sources, the top source by combined count with its two parts). A
+read the read filter dropped before the scan (banned, rate-limited) and an
+exempt source (carrier, registered IP) are in neither count. The tally holds
+at most `maxSummarySources` (1024) sources, the rest only count in the totals
+(a `+` after the source count marks that), and an interval with nothing to
+report logs nothing. A public NOTIFY, REFER or MESSAGE that names no dialog or
 subscription is answered 481 and never reaches the switch, so a made-up
 To-tag cannot carry it past admission (`indialog.go:505`). Subscription
 records are bounded per registration and in all (§15.1) and a SUBSCRIBE over

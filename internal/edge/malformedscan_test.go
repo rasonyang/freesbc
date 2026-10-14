@@ -288,3 +288,38 @@ func TestMalformedFilterScopes(t *testing.T) {
 		t.Errorf("offenders = %+v, want malformed 2 (ws, wss) and malformed_udp 1", top)
 	}
 }
+
+// Struck malformed datagrams reach the once-a-minute summary with their
+// count; a registered IP's do not.
+func TestMalformedInDropSummary(t *testing.T) {
+	h := startHarnessStrict(t, false, false)
+	for i := 0; i < 3; i++ {
+		sendMalformedProbe(t, h, garbage(i))
+	}
+	waitOffenderStrikes(t, h, shield.StrikeMalformedUDP, 3)
+	msg, ok := h.srv.dropSummary.take(time.Minute)
+	want := "admission drops: 3 in 1m0s (0 admission, 3 malformed) from 1 sources, top=127.0.0.1 (0 admission, 3 malformed)"
+	if !ok || msg != want {
+		t.Fatalf("summary = %q, %v; want %q", msg, ok, want)
+	}
+}
+
+func TestMalformedRegisteredIPNotInDropSummary(t *testing.T) {
+	h := startHarnessStrict(t, false, false)
+	phone := newUDPClient(t)
+	auditRegisterPhone(t, h, phone, "1001")
+	h.srv.dropSummary.take(time.Minute)
+	for i := 0; i < 3; i++ {
+		sendMalformedProbe(t, h, garbage(i))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.parseFailures("UDP") < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := h.parseFailures("UDP"); n < 3 {
+		t.Fatalf("parse failures = %d, want 3: the probes never reached the filter", n)
+	}
+	if msg, ok := h.srv.dropSummary.take(time.Minute); ok {
+		t.Fatalf("registered IP appeared in summary: %q", msg)
+	}
+}

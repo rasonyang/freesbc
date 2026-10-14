@@ -146,8 +146,8 @@ type Server struct {
 	// dropWarned limits admission-drop WARNs to one per source IP and
 	// reason; enumLimit is the REGISTER enumeration limit (admission.go).
 	dropWarned *warnOnce
-	// dropSummary accumulates admission drops between two summary WARNs
-	// (admissionSummaryEvery).
+	// dropSummary accumulates admission drops and struck malformed reads
+	// between two summary WARNs (admissionSummaryEvery).
 	dropSummary *dropSummary
 	enumLimit   *enumLimiter
 	// regGuard remembers the challenges relayed to public REGISTER
