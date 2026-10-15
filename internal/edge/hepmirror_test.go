@@ -231,7 +231,9 @@ func TestHEPMirrorsUDPCall(t *testing.T) {
 
 	// The switch rings, then answers only once the phone has seen the 180, so
 	// the 180 is never superseded by the 200 and its mirror is deterministic.
-	// A 180 sent right before the 200 can be lost inside sipgo (#213).
+	// The edge relays a 180 sent right before the 200 (#213, prov.go), but
+	// this phone is a sipgo client whose own transaction layer has the same
+	// race and may drop it, so the wait stays.
 	rang := make(chan struct{})
 	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 100, "Trying", nil))
