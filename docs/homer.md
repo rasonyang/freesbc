@@ -46,7 +46,7 @@ Not mirrored:
 - Anything the pre-parse read filter drops: oversized reads, reads from shield-banned sources, rate-limited reads, and private-socket reads from a non-switch address. A flood the shield absorbs therefore does not reach the collector. The datagram that earns a ban is mirrored, the ones after it are not.
 - A message with no Call-ID (HOMER cannot place it).
 - On tcp and tls, a message split over two reads of the connection (each complete message in a read is mirrored; WS and WSS frames and UDP datagrams are always whole messages).
-- RTP and RTCP. Media is not part of this feature.
+- RTP and RTCP. Media is not part of this feature: FreeSBC sends SIP only (HEP type 1) and never HEP type 5. To get RTCP quality reports into HOMER, report them from the switch, which receives the relayed RTCP in plain form; see [RTCP and call quality in HOMER](edge.md#rtcp-and-call-quality-in-homer).
 
 ### HEP fields
 
