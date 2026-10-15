@@ -1,0 +1,31 @@
+<include>
+  <!-- NODE B: delete this file for a single node. -->
+  <!-- Carrier line "carrier-a", registered, through FreeSBC node B. In freesbc.yaml
+       (identical on both nodes):
+         edge.carriers: { carrier-a: "203.0.113.60:5060" }
+       One gateway per node (carrier-a-n1 = node A, carrier-a-n2 = node B), each with
+       its own carrier account: a carrier registration names one node in its Contact.
+       Replace username, password and the carrier address (proxy). -->
+  <gateway name="carrier-a-n2">
+    <param name="username" value="acct-a2"/>
+    <param name="password" value="CHANGE-ME"/>
+
+    <!-- Request-URI host[:port] of every REGISTER and INVITE, and the host of
+         From/To. It must equal the edge.carriers entry exactly. The same on the
+         gateway of every node. -->
+    <param name="proxy" value="203.0.113.60:5060"/>
+
+    <!-- Where the datagram goes: node B's private socket, always UDP.
+         Set BOTH. outbound-proxy alone sends REGISTER straight to the carrier,
+         around FreeSBC, from the switch's private address. -->
+    <param name="outbound-proxy" value="$${freesbc_b_ip}:5060"/>
+    <param name="register-proxy" value="$${freesbc_b_ip}:5060"/>
+
+    <param name="register" value="true"/>
+    <param name="expire-seconds" value="300"/>
+    <param name="retry-seconds" value="30"/>
+
+    <!-- OPTIONS health check of the path through this node. -->
+    <param name="ping" value="15"/>
+  </gateway>
+</include>

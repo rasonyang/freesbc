@@ -21,6 +21,14 @@
   <X-PRE-PROCESS cmd="set" data="external_rtp_ip=10.77.0.10"/>
   <X-PRE-PROCESS cmd="set" data="external_sip_ip=10.77.0.10"/>
 
+  <!-- FreeSBC nodes (docs/two-node.md). The private.ip of each node: the switch talks
+       to a node on private.ip:5060 and the node talks to the switch from there.
+       Used by acl.conf.xml and the gateways in sip_profiles/external/. Single node: see
+       README.md, "Two FreeSBC nodes", for every node B line to delete. -->
+  <X-PRE-PROCESS cmd="set" data="freesbc_a_ip=10.77.0.2"/>
+  <!-- NODE B (second FreeSBC node): remove this line, the node B line in acl.conf.xml and the *-n2 files for one node. -->
+  <X-PRE-PROCESS cmd="set" data="freesbc_b_ip=10.77.0.3"/>
+
   <!-- Stock values, repeated so the intent is explicit. -->
   <X-PRE-PROCESS cmd="set" data="internal_sip_port=5060"/>
   <X-PRE-PROCESS cmd="set" data="internal_auth_calls=true"/>

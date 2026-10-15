@@ -1,7 +1,7 @@
 <include>
   <!-- Reached only by an authenticated user (user_context=default). Allows a
        destination allowlist to users whose directory variable toll_allow contains
-       "domestic", and tries carrier-a, then carrier-b. Narrow the pattern to what
+       "domestic", and tries carrier-a, then carrier-b, each through node A, then node B. Narrow the pattern to what
        you sell. A number that fails either condition falls through to the rest of
        the context, which has no gateway route once 01_example.com.xml is removed. -->
   <extension name="outbound-carrier">
@@ -10,8 +10,12 @@
       <action application="log" data="INFO outbound user=${accountcode} to=$1"/>
       <action application="set" data="hangup_after_bridge=true"/>
       <action application="set" data="continue_on_fail=true"/>
-      <!-- Failover: next gateway only on a failure, not on answer. -->
-      <action application="bridge" data="sofia/gateway/carrier-a/$1|sofia/gateway/carrier-b/$1"/>
+      <!-- Failover: next gateway only on a failure, not on answer. Two gateways per
+           carrier, one per FreeSBC node: a node that answers 503 (draining, or at
+           shield.max_sessions) or does not answer at all (down; the INVITE times out
+           after about 32 s, or the gateway is skipped at once once its ping marked it
+           DOWN) makes the bridge try the next one. Single node: keep only the -n1 legs. -->
+      <action application="bridge" data="sofia/gateway/carrier-a-n1/$1|sofia/gateway/carrier-a-n2/$1|sofia/gateway/carrier-b-n1/$1|sofia/gateway/carrier-b-n2/$1"/>
       <action application="hangup" data="${originate_disposition}"/>
     </condition>
   </extension>
