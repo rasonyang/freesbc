@@ -1888,15 +1888,20 @@ cancel, and relaying it would let any source that knows a Call-ID inject
 CANCELs toward the switch.
 
 Once the series context is cancelled, `pumpInvite` does not simply return: it
-calls `abandonAttempt` (`invite_leg.go:487`), which CANCELs the branch if no
+calls `abandonAttempt` (`invite_leg.go:560`), which CANCELs the branch if no
 CANCEL was sent yet and then runs `drainCancelledInvite`
-(`invite_leg.go:314`) for `cancelDrain` (300 ms) so the far end's 487 is
+(`invite_leg.go:368`) for `cancelDrain` (300 ms) so the far end's 487 is
 still matched by the live client transaction and ACKed by the transaction
-layer (RFC 3261 §17.1.1.3). The same helper serves all three INVITE paths
-(to the switch, to a client, to a carrier). A 2xx that arrives after the
+layer (RFC 3261 §17.1.1.3). When no final has come by then the pump still
+returns, but the transaction is not terminated: a goroutine keeps waiting
+for up to `cancelLinger` (32 s, at most `maxCancelLingers` = 4096 at once,
+over which the transaction is terminated after the 300 ms as before), so a
+2xx that crossed the CANCEL on a slow far end is still matched and ACKed and
+BYEd, and any final ends the wait early. The same helper serves all three
+INVITE paths (to the switch, to a client, to a carrier). A 2xx that arrives after the
 caller cancelled is never relayed or confirmed: it is ACKed and BYEd.
 
-**FreeSBC's own ACK/BYE.** `ackThenBye` (`invite_leg.go:358`) builds both with
+**FreeSBC's own ACK/BYE.** `ackThenBye` (`invite_leg.go:431`) builds both with
 `fsip.TeardownRequest` (`sip/request.go:85`), which follows the dialog's
 route set: the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
 `OwnRecordRoute(topo.isSelf)` at FreeSBC's own entries, since the INVITE
@@ -1907,7 +1912,7 @@ request is sent to the first route when it names an IP literal, else to the
 2xx's transport source (the nearest hop): a hostname route is never
 resolved, keeping the edge free of DNS on dialog traffic. `FromListener(side.laddr)`
 pins the socket it leaves by, as `forward` pins a relayed request
-(`teardownOpts`, `invite_leg.go:392`).
+(`teardownOpts`, `invite_leg.go:465`).
 
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
@@ -4417,8 +4422,9 @@ code constant.
 | `drainRetryAfter` | 30 s (`invite.go:156`) | `Retry-After` of a 503 refused because the edge is draining |
 | `capWarnEvery` | 10 s per reason (`invite.go`) | spacing of the session-cap / invite-rate WARN lines |
 | `inviteTimeout` | 5 min (`invite.go:24`) | one whole call setup (client, carrier and switch-originated paths, and re-INVITE) |
-| `cancelDrain` | 300 ms (`invite_leg.go:297`) | post-CANCEL drain of the far end's final response |
-| CANCEL / `ackThenBye` BYE / BYE after media end | 5 s each (`invite_leg.go:363`, `invite_leg.go:468`, `indialog.go:971`) | one transaction |
+| `cancelDrain` | 300 ms (`invite_leg.go:335`) | inline wait of the pump for the far end's final response after a CANCEL |
+| `cancelLinger` | 32 s (`invite_leg.go:345`; `maxCancelLingers` 4096) | how long a cancelled INVITE's client transaction is kept in the background to match a late final (a 2xx is ACKed and BYEd); a final ends it early |
+| CANCEL / `ackThenBye` BYE / BYE after media end | 5 s each (`invite_leg.go:541`, `invite_leg.go:436`, `indialog.go:971`) | one transaction |
 | INVITE client transaction after a 2xx | Timer M, 64·T1 (32 s; sipgo; `invite_leg.go:84`) | relaying 2xx retransmissions; a later fork's 2xx is ACKed and BYEd |
 | in-dialog (BYE/INFO/NOTIFY/REFER/MESSAGE/PRACK/UPDATE), SUBSCRIBE, out-of-dialog MESSAGE and carrier OPTIONS | 32 s (`indialog.go:646`, `subscribe.go:567`, `subscribe.go:650`, `message.go:67`, `carrier.go:305`) | `forwardAndRelay` |
 | `subExpiryMargin` | 32 s (`subscribe.go:46`) | how long a subscription record outlives its granted expiry; a pending record lives twice that |
@@ -4522,7 +4528,7 @@ case (audit P2-MED-009).
 `freesbc_media_port_allocation_failure_total`.
 
 **An answered call that cannot be anchored.** The edge completes the SIP
-dialog and immediately tears it down with `ackThenBye` (`invite_leg.go:358`),
+dialog and immediately tears it down with `ackThenBye` (`invite_leg.go:431`),
 then answers the near side 488.
 
 ---

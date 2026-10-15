@@ -328,15 +328,29 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 	}
 }
 
-// cancelDrain is how long drainCancelledInvite waits for the final response
-// a CANCEL provokes. Long enough for a local far end's 487 (a few RTTs),
-// short enough that a dead one cannot stall teardown: a 2xx that raced the
-// CANCEL must be ACKed and BYEd, or the far end retransmits its 200 for up
-// to Timer H.
+// cancelDrain is how long drainCancelledInvite waits inline for the final
+// response a CANCEL provokes. Long enough for a local far end's 487 (a few
+// RTTs); a slower one is waited for in the background (cancelLinger), so the
+// pump never stalls on it.
 const cancelDrain = 300 * time.Millisecond
 
+// cancelLinger bounds how long a cancelled INVITE's client transaction is
+// kept to match a final that has not come yet (64*T1, RFC 3261 Timer B).
+// A final leaves the transaction to its own timers (D, or M after a 2xx).
+// A 2xx that crosses the CANCEL on a loaded or distant far end can arrive
+// well after cancelDrain; once the transaction is gone it matches nothing,
+// is never ACKed or BYEd, and the far end's dialog lingers until its own
+// timers expire. Any final ends the wait early, so the usual 487 releases
+// it at once; only a far end that goes silent holds it for the full bound.
+const cancelLinger = 32 * time.Second
+
+// maxCancelLingers caps the transactions held in the background by
+// drainCancelledInvite. Over it a cancelled INVITE is terminated after the
+// inline drain, as before.
+const maxCancelLingers = 4096
+
 // drainCancelledInvite reads whatever the far end still has to say after the
-// call has been cancelled, briefly and without relaying any of it.
+// call has been cancelled, without relaying any of it.
 //
 // The CANCEL for the forwarded INVITE is already on the wire (sendCancel
 // sent it before cancelling the series context), but the final it provokes
@@ -349,9 +363,30 @@ const cancelDrain = 300 * time.Millisecond
 // Nothing read here may be relayed — the caller's server transaction is
 // already terminated. A 2xx is the one response with work left in it: the
 // far end believes it has a live dialog, so it is completed and torn down.
-// When nothing final arrives in time the transaction is terminated here.
+// When nothing final arrives within cancelDrain the wait continues in the
+// background for up to cancelLinger and the pump returns.
 func (s *Server) drainCancelledInvite(l *inviteLeg) {
-	drain := time.NewTimer(cancelDrain)
+	if s.awaitCancelledFinal(l, cancelDrain) {
+		return
+	}
+	if s.cancelLingers.Add(1) > maxCancelLingers {
+		s.cancelLingers.Add(-1)
+		l.clTx.Terminate()
+		return
+	}
+	go func() {
+		defer s.cancelLingers.Add(-1)
+		if !s.awaitCancelledFinal(l, cancelLinger-cancelDrain) {
+			l.clTx.Terminate()
+		}
+	}()
+}
+
+// awaitCancelledFinal reads the cancelled INVITE's transaction for up to
+// wait and reports whether it ended: a final arrived (a 2xx is ACKed and
+// BYEd) or the transaction died. false means the time ran out.
+func (s *Server) awaitCancelledFinal(l *inviteLeg, wait time.Duration) bool {
+	drain := time.NewTimer(wait)
 	defer drain.Stop()
 	responses := l.clTx.Responses()
 	for {
@@ -376,16 +411,15 @@ func (s *Server) drainCancelledInvite(l *inviteLeg) {
 				// The final: a non-2xx was ACKed by the transaction layer on
 				// its way in, a 2xx is being torn down. Nothing left to wait
 				// for.
-				return
+				return true
 			}
 		case <-l.clTx.Done():
 			// The transaction died under us (a transport error, or a
 			// Terminate from another path): no response can be matched any
 			// more, so there is nothing left to drain for.
-			return
+			return true
 		case <-drain.C:
-			l.clTx.Terminate()
-			return
+			return false
 		}
 	}
 }
