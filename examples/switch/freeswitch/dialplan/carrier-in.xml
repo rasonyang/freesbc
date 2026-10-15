@@ -14,12 +14,13 @@
       </condition>
     </extension>
 
-    <!-- A call to the Contact this switch registered for gateway "carrier-a".
-         FreeSBC delivers it with the Request-URI restored to sip:gw+carrier-a@10.77.0.10:5080,
-         so sofia sets ${sip_gateway}=carrier-a (the dialplan destination_number is the
+    <!-- A call to the Contact this switch registered for gateway "carrier-a-n1" (through
+         node A) or "carrier-a-n2" (through node B).
+         FreeSBC delivers it with the Request-URI restored to sip:gw+carrier-a-n1@10.77.0.10:5080 (or -n2),
+         so sofia sets ${sip_gateway}=carrier-a-n1 (or -n2) (the dialplan destination_number is the
          gateway's "extension" param, by default its username). -->
     <extension name="registered-line-a">
-      <condition field="${sip_gateway}" expression="^carrier-a$">
+      <condition field="${sip_gateway}" expression="^carrier-a-n[12]$">
         <action application="set" data="line=carrier-a"/>
         <action application="bridge" data="user/1000@$${domain}"/>
       </condition>

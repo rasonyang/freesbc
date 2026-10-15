@@ -31,7 +31,10 @@
     <param name="rtp-timer-name" value="soft"/>
     <param name="rfc2833-pt" value="101"/>
     <param name="dtmf-type" value="rfc2833"/>
-    <param name="rtp-timeout-sec" value="300"/>
+    <!-- Media timeout: a channel whose FreeSBC node died stops receiving RTP and is
+         hung up (MEDIA_TIMEOUT) after this many seconds. Do not set it above the
+         time you can accept a dead call to hold its channel and licence. -->
+    <param name="rtp-timeout-sec" value="60"/>
     <param name="rtp-hold-timeout-sec" value="1800"/>
   </settings>
 </profile>

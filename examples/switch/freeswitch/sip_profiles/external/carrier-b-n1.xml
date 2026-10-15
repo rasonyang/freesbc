@@ -1,0 +1,16 @@
+<include>
+  <!-- Second carrier line, IP-authenticated (no registration), through FreeSBC
+       node A; used for failover. The carrier allowlists the public.ip of every node.
+         edge.carriers: { carrier-b: "203.0.113.60:5061" } -->
+  <gateway name="carrier-b-n1">
+    <param name="proxy" value="203.0.113.60:5061"/>
+    <param name="outbound-proxy" value="$${freesbc_a_ip}:5060"/>
+    <!-- The gateway ping (OPTIONS) goes to register-proxy, not to outbound-proxy; with
+         no register-proxy it goes straight to the carrier, around FreeSBC. Set it to the
+         same node even though register is false. -->
+    <param name="register-proxy" value="$${freesbc_a_ip}:5060"/>
+    <param name="register" value="false"/>
+    <!-- OPTIONS health check of the path through this node. -->
+    <param name="ping" value="15"/>
+  </gateway>
+</include>

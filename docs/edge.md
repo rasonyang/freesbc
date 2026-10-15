@@ -74,7 +74,7 @@ See [`freesbc.example.yaml`](../freesbc.example.yaml) for a complete annotated c
   systemctl restart freesbc
   ```
 
-  Add a deadline to the loop if a stuck call must not block the restart. The Overview page of the WebUI has the same controls.
+  Add a deadline to the loop if a stuck call must not block the restart. The Overview page of the WebUI has the same controls. With two FreeSBC nodes, drain one at a time while the other carries the new carrier calls: see [`two-node.md`](two-node.md).
 - **Header hygiene.** Every `X-FreeSBC-*` header arriving on a public socket is removed before anything else; only FreeSBC adds them, and only on the private side.
 - A handler panic is contained, counted (`freesbc_sip_handler_panics_total`), and answered 500 only if no final response went out.
 
