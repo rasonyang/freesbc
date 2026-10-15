@@ -576,7 +576,7 @@ The carrier source set for the shield (`carrierSnapshot.isSource`, IP only, so a
 - Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:35`, `invite.go:280-291`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:154-155`). The predicate is the live directory snapshot (`edge.go:594`).
 - A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:844-851`; `restoreCarrierRURI`, `hide.go:475`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
 
-A public OPTIONS, including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1193`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
+A public OPTIONS from an admitted source (live registration, carrier source or a live dialog's To tag; otherwise dropped silently as `options_not_admitted`), including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1193`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
 
 ```mermaid
 sequenceDiagram
@@ -908,7 +908,7 @@ admission) and switch to client (`inviteToClient`) pass `carrierCall=false`
 and are admitted. A public INVITE that admission (§7.5) drops silently is
 still dropped silently, since admission runs first. `onOptions` (`edge.go:1193`)
 reports drain too, for an out-of-dialog OPTIONS only: **503** +
-`Retry-After: 30` to a carrier source (not also a live registration), to a
+`Retry-After: 30` to a carrier source (not also a live registration; a source admission drops gets silence first), to a
 switch OPTIONS naming FreeSBC itself and to a switch OPTIONS naming a carrier
 host (answered locally, not proxied). Client OPTIONS, a live client token and
 in-dialog OPTIONS are unchanged. These are not INVITE rejects and have no
@@ -1140,7 +1140,7 @@ Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 | CANCEL | only orphan CANCELs reach the handler (§7.8) |
 | PRACK, UPDATE | `onPrackUpdate` (`prack.go:30`): **481** with no To-tag or no dialog the tags name (early forks included); a PRACK with SDP that answers no owed offer → **488**; otherwise `onInDialog` (§7.8, §7.9a) |
 | BYE, INFO, NOTIFY | `onInDialog` (§7.8); NOTIFY whatever its `Event`, matched against the subscription table first (§7.8a). A NOTIFY with no To-tag from a public client → **481**; so is a public NOTIFY, REFER or MESSAGE that names no dialog or subscription (never hashed upstream, `indialog.go:505`). An out-of-dialog one from the switch is classified like an out-of-dialog INVITE (§7.5): a client token goes on, a carrier destination → **405**, anything else → **404**. A NOTIFY with a To-tag from the switch that `directionFor` cannot route is forwarded by Call-ID alone to that dialog's client, tags unchecked (`relaxedNotifyDirection`, §7.8); **481** only when no dialog with a public route has the Call-ID |
-| OPTIONS | answered locally with **200 OK** + `Allow`; never forwarded to the switch, because relaying every phone's keepalive would multiply its load. From the private socket an out-of-dialog OPTIONS is classified first: a carrier destination is proxied to the carrier (§6), an unknown destination or a client token with no live binding → **404**; FreeSBC itself or a live client token → 200. While draining (§7.1) an out-of-dialog OPTIONS from a carrier source, to FreeSBC itself or to a carrier host (not proxied) is **503** + `Retry-After: 30` |
+| OPTIONS | public: answered only for an admitted source (live registration, carrier source or a To tag naming a live dialog), anything else dropped silently as `options_not_admitted`; an admitted one is answered locally with **200 OK** + `Allow`; never forwarded to the switch, because relaying every phone's keepalive would multiply its load. From the private socket an out-of-dialog OPTIONS is classified first: a carrier destination is proxied to the carrier (§6), an unknown destination or a client token with no live binding → **404**; FreeSBC itself or a live client token → 200. While draining (§7.1) an out-of-dialog OPTIONS from a carrier source, to FreeSBC itself or to a carrier host (not proxied) is **503** + `Retry-After: 30` |
 | SUBSCRIBE | `onSubscribe` (`subscribe.go:379`, §7.8a) |
 | REFER | `onInDialog`: **481** with no To-tag or no dialog, **603** on a carrier dialog (never forwarded), else forwarded unchanged (§7.8a) |
 | MESSAGE | `onMessage` (`message.go:33`, §7.8a) |
@@ -2121,6 +2121,8 @@ whose dialog record is gone, e.g. after a restart), but only when
 transport address of a live registration or a carrier source
 (`admitPublicInvite`). Any other public source is answered **481** and counted
 as `dialogless_not_admitted`; nothing is sent upstream (`indialog.go:512`).
+
+A public **OPTIONS** is answered only for an admitted source (`admitPublicOptions`, `edge.go`, called first in `onOptions`): a live registration or carrier source (`admitPublicInvite`), or a To tag that matches a live dialog (`dialogs.lookup`, confirmed dialogs only). Anyone else is dropped silently as `options_not_admitted` (`dropSilently`, a strike like any non-enumeration drop), before the drain check, so a stranger gets no answer while draining either. Trade-off: a phone with an expired binding, or one probing before its first REGISTER, gets silence. The private socket is unchanged.
 
 **MESSAGE** (RFC 3428, `onMessage`, `message.go:33`) is proxied with its body
 untouched. In-dialog MESSAGE and any MESSAGE from the switch take
@@ -3632,7 +3634,7 @@ permanent series per call."
 | `freesbc_edge_register_unanswered_total` | Counter | — | edge `registerUnanswered` (`register.go:25`): one per REGISTER attempt a switch node answered with nothing (a silent node or a transport error); no node label |
 | `freesbc_edge_register_breaker_rejects_total` | Counter | — | edge `RegisterBreakerRejected`: one per client REGISTER answered 503 + `Retry-After: 30` without dialing because every node's REGISTER breaker was open (§7.4) |
 | `freesbc_edge_register_auth_failures_total` | Counter | — | edge `registerStrike` (`regguard.go`): one per failed REGISTER credential attempt struck against its source (§7.4), replays counted in the read filter included. No `source` label: the sources are in `GET /api/shield/offenders` |
-| `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`, `dialogless_not_admitted`, `register_aor_locked`} | edge `dropSilently` (`admission.go:184`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a), a BYE or INFO naming no dialog from a source that is neither a live registration nor a carrier (answered 481, §7.8a); every reason is always exported |
+| `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`, `dialogless_not_admitted`, `options_not_admitted`, `register_aor_locked`} | edge `dropSilently` (`admission.go:184`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a), a BYE or INFO naming no dialog from a source that is neither a live registration nor a carrier (answered 481, §7.8a); every reason is always exported |
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go:1144`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_ack_missed_total` | Counter | `plane` ∈ {`public`, `private`}: the side that failed to ACK a 2xx | edge `noteAckMiss` (`ack.go`), once per missed ACK (§7.7); both planes are always exported |
 | `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `rejectInvite` / `rejectBusy` (`invite.go:148`, `invite.go:187`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
@@ -4564,7 +4566,7 @@ Stated because the code establishes them, not as future work.
   interpret `Refer-To` and declines REFER on carrier dialogs (603).
 - **No active qualification.** There is no outbound OPTIONS keepalive;
   switch-node health is entirely passive, and an OPTIONS from the public side
-  is answered locally.
+  is answered locally, and only for an admitted source.
 - **No TCP or SIP-over-TLS toward the switch.** The private socket is UDP
   only. A carrier may be udp, tcp or tls (§6.10). Public tcp/tls serve
   registered phones and ws/wss serve browsers.
