@@ -202,12 +202,46 @@ What the pool requires of the switch: a **shared registration database**. Regist
 
 Failover is passive and transport-driven. A node that fails to accept the datagram (an unreachable route, a closed port that resets) is penalised for 30 s and retried only when no healthy alternative remains, never hard-blocked. On UDP a silent node is indistinguishable from a slow one, so a whole REGISTER attempt with zero responses is also penalised; the phone's own retry then skips that node. A node that leaves 3 REGISTER attempts in a row unanswered is not dialed for REGISTER at all for 30 s (then 1 m, then 5 m while it keeps failing); the phone gets `503` with `Retry-After: 30` from FreeSBC instead of waiting out the 32 s budget, and a pool still tries the other nodes first. After the window the next REGISTER is sent as a probe, and any response, a 401 included, closes the breaker. Watch `freesbc_edge_register_unanswered_total`, `freesbc_edge_register_breaker_rejects_total` and `/api/switch-nodes` (`cooling_down` while open). The breaker covers REGISTER only; INVITE keeps the 30 s reorder-only cooldown. Any final response, including a 401 challenge, is a real judgement and ends the attempt series; it is relayed, never retried on another node. Because the pool is modulo-hashed, a change in the node set reshuffles users between nodes; with a shared database that is a re-registration, not an outage.
 
+## RTCP and call quality in HOMER
+
+FreeSBC mirrors SIP to HOMER ([`homer.md`](homer.md)) but does not report RTCP (HEP type 5). The switch already sees the RTCP of every call in plain form, so a reporter on the switch covers both legs, and reporting it is not something only the edge can do (issue #134 is the scope rule; issue #129 was closed as won't-do).
+
+**What reaches the switch.** FreeSBC anchors every stream and relays RTCP in both directions on the RTP+1 port of each leg. A browser (DTLS-SRTP) leg and an SDES-SRTP leg are decrypted from SRTCP before the switch leg and re-protected in the other direction, so the switch always receives plain RTCP. Compounds are relayed uninterpreted: no SSRC or report-block rewriting. The RTCP the switch reports comes from FreeSBC's `private.ip`, not from the public endpoint, and it is only as informative as the far end's own reports.
+
+**Asterisk.** `res_hep` with `res_hep_rtcp` sends RTCP statistics to HOMER as HEP type 5. Set `uuid_type = call-id` in `hep.conf` so the RTCP correlates with the SIP mirrored from FreeSBC:
+
+```ini
+; hep.conf
+[general]
+enabled = yes
+capture_address = 10.77.0.50:9060
+uuid_type = call-id
+```
+
+Check the option names against the sample `hep.conf` of your Asterisk version.
+
+**FreeSWITCH.** FreeSWITCH has no native HEP RTCP reporter. Run [heplify](https://github.com/sipcapture/heplify) on the switch host, on the interface facing FreeSBC (`any` also works, including in a container sharing the switch's network namespace). It reads the SDP in the private SIP and reports the RTCP on the announced ports, rtcp-mux or RTP+1, as HEP type 5 tagged with the Call-ID. FreeSWITCH sends no RTCP by default: turn it on per profile with the sofia parameter `rtcp-audio-interval-msec`, or per call with the `rtcp_audio_interval_msec` channel variable:
+
+```xml
+<!-- sofia profile -->
+<param name="rtcp-audio-interval-msec" value="5000"/>
+```
+
+```
+heplify -i <private-interface> -m SIPRTCP -hs 10.77.0.50:9060 -hi 42 -hn fs1
+```
+
+`-m SIPRTCP` (heplify's default mode) sends SIP and RTCP; `SIPRTP` reports the same RTCP. `-hi` and `-hn` name the node in HOMER; add `-nt tcp` if the collector takes HEP over TCP only. In SIPRTCP mode heplify's periodic stats may show `rtcp_fail` counts for rtcp-mux calls while the reports still arrive. The SIP heplify captures on the private side duplicates what FreeSBC already mirrors, so HOMER shows the private-side messages twice, once from each source.
+
+Checked with FreeSWITCH 1.11.3, heplify 2.0.28 and HOMER 11: an SR from each end, in both directions, under the call's Call-ID, with rtcp-mux and with RTCP on RTP+1.
+
 ## Non-goals
 
 - Business routing, dial plans, least-cost routing and number transformation: the switch's job.
 - Holding credentials, registering to carriers on its own, or terminating digest authentication.
 - A B2BUA: no leg-splitting, no Call-ID rewriting, no transcoding.
 - SRV failover across targets, NAPTR, or carrier OPTIONS keep-alive of its own.
+- RTCP reporting to HOMER: the switch does it, see [RTCP and call quality in HOMER](#rtcp-and-call-quality-in-homer).
 - A kernel firewall integration, persistence, or clustering. State is in memory and lost on restart.
 - PUBLISH, and any use of the proxy as a presence server: SUBSCRIBE is carried, but the presence logic stays on the switch.
 - TURN and full ICE.

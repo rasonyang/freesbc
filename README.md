@@ -156,7 +156,7 @@ Everything else stays on the switch; FreeSBC's contribution is a documented swit
 - Toll-fraud protection: switch authentication plus dialplan rules.
 - Call history and CDR: the switch's CDR and CEL.
 - Call lifecycle events: the switch's event system.
-- RTCP reporting to HOMER: the switch receives the relayed RTCP and can report it.
+- RTCP reporting to HOMER: the switch receives the relayed RTCP and can report it ([setup](docs/edge.md#rtcp-and-call-quality-in-homer)).
 - Config version history: the operator's VCS.
 - Editing the config through the admin API: edit the file, run `freesbc check`, and the watcher reloads it. Like nginx, there is no write API.
 
