@@ -220,7 +220,7 @@ uuid_type = call-id
 
 Check the option names against the sample `hep.conf` of your Asterisk version.
 
-**FreeSWITCH.** FreeSWITCH has no native HEP RTCP reporter. Run [heplify](https://github.com/sipcapture/heplify) on the switch host in a mode that captures both SIP and RTCP, on the interface facing FreeSBC. It correlates RTCP to the Call-ID from the SDP it sees in the private SIP. FreeSWITCH must also be told to send RTCP, for example with the `rtcp_audio_interval_msec` channel variable or the sofia profile parameter `rtcp-audio-interval-msec`:
+**FreeSWITCH.** FreeSWITCH has no native HEP RTCP reporter. Run [heplify](https://github.com/sipcapture/heplify) on the switch host, on the interface facing FreeSBC (`any` also works, including in a container sharing the switch's network namespace). It reads the SDP in the private SIP and reports the RTCP on the announced ports, rtcp-mux or RTP+1, as HEP type 5 tagged with the Call-ID. FreeSWITCH sends no RTCP by default: turn it on per profile with the sofia parameter `rtcp-audio-interval-msec`, or per call with the `rtcp_audio_interval_msec` channel variable:
 
 ```xml
 <!-- sofia profile -->
@@ -228,10 +228,12 @@ Check the option names against the sample `hep.conf` of your Asterisk version.
 ```
 
 ```
-heplify -i <private-interface> -m SIPRTCP -hs 10.77.0.50:9060
+heplify -i <private-interface> -m SIPRTCP -hs 10.77.0.50:9060 -hi 42 -hn fs1
 ```
 
-Flag names vary between heplify versions; check `heplify -h`. The SIP heplify captures on the private side duplicates what FreeSBC already mirrors, so HOMER may show those messages twice.
+`-m SIPRTCP` (heplify's default mode) sends SIP and RTCP; `SIPRTP` reports the same RTCP. `-hi` and `-hn` name the node in HOMER; add `-nt tcp` if the collector takes HEP over TCP only. In SIPRTCP mode heplify's periodic stats may show `rtcp_fail` counts for rtcp-mux calls while the reports still arrive. The SIP heplify captures on the private side duplicates what FreeSBC already mirrors, so HOMER shows the private-side messages twice, once from each source.
+
+Checked with FreeSWITCH 1.11.3, heplify 2.0.28 and HOMER 11: an SR from each end, in both directions, under the call's Call-ID, with rtcp-mux and with RTCP on RTP+1.
 
 ## Non-goals
 
