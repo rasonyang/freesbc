@@ -221,7 +221,10 @@ func TestMalformedFloodIsRateLimitedBeforeParse(t *testing.T) {
 }
 
 // A parsable request costs exactly one token end to end: a bucket of 10
-// answers 10 OPTIONS and drops the 11th. A double charge would stop at 5.
+// admits 10 OPTIONS past the rate limit and drops the 11th. A double charge
+// would stop at 5. The source is unregistered, so since #188 the 10 are
+// dropped by admission (no response) instead of answered; the rate drop
+// count is what proves the single charge.
 func TestParsableRequestCostsOneToken(t *testing.T) {
 	h := startShieldHarness(t, "10/m per_ip", "10/m per_ip", "", false, false, newLogRecorder())
 	c := dialUDP(t, h.publicUDP)
@@ -230,11 +233,14 @@ func TestParsableRequestCostsOneToken(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := udpResponses(c, 500*time.Millisecond); n != 10 {
-		t.Errorf("responses = %d, want 10 (one token per request)", n)
+	if n := udpResponses(c, 500*time.Millisecond); n != 0 {
+		t.Errorf("responses = %d, want 0 (unregistered OPTIONS is dropped silently)", n)
 	}
 	if got := h.rateDrops(); got != 1 {
-		t.Errorf("rate drops = %d, want 1", got)
+		t.Errorf("rate drops = %d, want 1 (one token per request)", got)
+	}
+	if got := admissionDrops(h, dropOptions); got != 10 {
+		t.Errorf("options_not_admitted drops = %d, want 10", got)
 	}
 }
 

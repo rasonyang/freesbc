@@ -1207,7 +1207,12 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 // FreeSBC itself or to a registered client's token it is answered here; to
 // a carrier it is proxied to it (optionsToCarrier); to anything else, 404.
 // A token with no live binding is 404 too, as an INVITE to it is. A public
-// OPTIONS, a carrier's keepalive included, is answered here.
+// OPTIONS is answered here only when admitted (issue #188): its source is a
+// live registration or a carrier source (admitPublicInvite), or it carries a
+// To tag naming a live dialog. Any other source is dropped silently
+// (options_not_admitted, a strike like any non-enumeration drop), so a
+// scanner learns neither liveness nor the method list. Admission is decided
+// before drain, so a stranger gets silence while draining too.
 //
 // While draining (drain.go) the carrier-facing answers become 503 +
 // Retry-After, so a trunk health check sees the node leave: an out-of-dialog
@@ -1219,6 +1224,9 @@ type handler func(*sip.Request, sip.ServerTransaction, inbound)
 func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 	outOfDialog := fsip.ToTag(req) == ""
 	draining := outOfDialog && s.drain.on()
+	if !in.private() && !s.admitPublicOptions(req, in.src) {
+		return
+	}
 	if in.private() && outOfDialog {
 		switch kind, name := s.classifySwitchRequest(req); kind {
 		case targetCarrier:
@@ -1251,6 +1259,23 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inboun
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	res.AppendHeader(sip.NewHeader("Allow", strings.Join(allowedMethods, ", ")))
 	s.respond(req, tx, res)
+}
+
+// admitPublicOptions reports whether a public OPTIONS may be answered. An
+// OPTIONS naming a live dialog (Call-ID plus both tags) always may; any
+// other needs a live registration or carrier source. A refusal is counted
+// and struck by dropSilently and the handler sends nothing.
+func (s *Server) admitPublicOptions(req *sip.Request, src netip.AddrPort) bool {
+	if fsip.ToTag(req) != "" {
+		if _, _, found := s.dialogs.lookup(fsip.CallID(req), fsip.FromTag(req), fsip.ToTag(req)); found {
+			return true
+		}
+	}
+	if kind, _ := s.admitPublicInvite(req, src); kind != srcDrop {
+		return true
+	}
+	s.dropSilently(dropOptions, req, src)
+	return false
 }
 
 // rejectOptionsDraining answers an OPTIONS 503 + Retry-After while draining.

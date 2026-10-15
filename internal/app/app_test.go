@@ -55,7 +55,7 @@ func TestCheckExamples(t *testing.T) {
 }
 
 // TestRunStartsAndStopsOnCancel starts the edge plane on a real port,
-// proves it is actually serving (an OPTIONS to the public listener is answered), and checks
+// proves it is actually serving (a dialog-less BYE to the public listener is answered 481), and checks
 // that cancelling the context is a clean shutdown (nil error) that releases
 // the listener.
 //
@@ -121,7 +121,9 @@ func startRun(t *testing.T, sipPort, upPort int) (<-chan error, context.CancelFu
 	return done, cancel
 }
 
-// waitServing polls the public listener with OPTIONS from 127.0.0.1 until it answers 200. It fails fast if Run returns
+// waitServing polls the public listener from 127.0.0.1 until it answers (a BYE naming no
+// dialog gets 481 from the edge itself; a public OPTIONS from an unregistered
+// source is dropped silently since #188). It fails fast if Run returns
 // first — which is how a bind error surfaces.
 func waitServing(sipPort int, done <-chan error) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -143,12 +145,12 @@ func waitServing(sipPort int, done <-chan error) error {
 		default:
 		}
 		req := strings.Join([]string{
-			fmt.Sprintf("OPTIONS sip:sbc@127.0.0.1:%d SIP/2.0", sipPort),
+			fmt.Sprintf("BYE sip:sbc@127.0.0.1:%d SIP/2.0", sipPort),
 			fmt.Sprintf("Via: SIP/2.0/UDP %s;branch=z9hG4bK-app-ready-%d", local, i),
 			"From: <sip:probe@127.0.0.1>;tag=probe",
-			"To: <sip:sbc@127.0.0.1>",
+			"To: <sip:sbc@127.0.0.1>;tag=probe-to",
 			fmt.Sprintf("Call-ID: app-ready-%d", i),
-			"CSeq: 1 OPTIONS",
+			"CSeq: 1 BYE",
 			"Max-Forwards: 70",
 			"Content-Length: 0",
 			"", "",
@@ -158,11 +160,11 @@ func waitServing(sipPort int, done <-chan error) error {
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		n, _, err := conn.ReadFromUDP(buf)
-		if err == nil && strings.HasPrefix(string(buf[:n]), "SIP/2.0 200") {
+		if err == nil && strings.HasPrefix(string(buf[:n]), "SIP/2.0 481") {
 			return nil
 		}
 	}
-	return errors.New("no 200 to OPTIONS within 10s")
+	return errors.New("no 481 to BYE within 10s")
 }
 
 // isAddrInUse reports a bind collision. The string check covers a layer

@@ -208,6 +208,10 @@ func TestMalformedAndAdmissionShareBudget(t *testing.T) {
 func TestMalformedScanSparesValidTraffic(t *testing.T) {
 	h := startHarnessStrict(t, false, false)
 	setAdmissionBan(h, "1/5m")
+	// A registration on this IP exempts it from admission strikes, so only
+	// a malformed strike could show up (a public OPTIONS from a socket with
+	// no binding is an admission drop since #188).
+	auditRegisterPhone(t, h, newUDPClient(t), "1001")
 	for i := 0; i < 5; i++ {
 		sendMalformedProbe(t, h, rawOptions(auditUDP(t).LocalAddr(), i))
 		sendMalformedProbe(t, h, []byte("\r\n\r\n"))

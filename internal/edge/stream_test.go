@@ -165,16 +165,19 @@ func dialRawHandshake(t *testing.T, transport, addr string, handshake bool) *raw
 	return &rawConn{Conn: c, br: bufio.NewReader(c)}
 }
 
-// optionsMsg is a complete OPTIONS request with a body of bodyLen bytes.
-func optionsMsg(transport string, n, bodyLen int) string {
+// probeMsg is a complete PUBLISH request with a body of bodyLen bytes. PUBLISH
+// is answered 405 by onNoRoute whatever the source, so an unregistered raw
+// connection gets a response to prove the stream is served (a public OPTIONS
+// from such a source is dropped by admission, issue #188).
+func probeMsg(transport string, n, bodyLen int) string {
 	body := strings.Repeat("x", bodyLen)
-	return fmt.Sprintf("OPTIONS sip:127.0.0.1 SIP/2.0\r\n"+
+	return fmt.Sprintf("PUBLISH sip:127.0.0.1 SIP/2.0\r\n"+
 		"Via: SIP/2.0/%s 127.0.0.1;branch=z9hG4bK-raw%d\r\n"+
 		"Max-Forwards: 70\r\n"+
 		"From: <sip:probe@example.com>;tag=t%d\r\n"+
 		"To: <sip:127.0.0.1>\r\n"+
 		"Call-ID: raw-%d-%d\r\n"+
-		"CSeq: 1 OPTIONS\r\n"+
+		"CSeq: 1 PUBLISH\r\n"+
 		"Content-Length: %d\r\n\r\n%s",
 		strings.ToUpper(transport), n, n, n, time.Now().UnixNano(), bodyLen, body)
 }
@@ -220,15 +223,15 @@ func (c *rawConn) expectClosed(t *testing.T, d time.Duration, what string) {
 	}
 }
 
-// expectOpenAndServing sends an OPTIONS and expects a 200.
+// expectServing sends a probe and expects its 405.
 func (c *rawConn) expectServing(t *testing.T, transport string, n int) {
 	t.Helper()
-	if _, err := io.WriteString(c, optionsMsg(transport, n, 0)); err != nil {
+	if _, err := io.WriteString(c, probeMsg(transport, n, 0)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	st, err := c.readStatus(3 * time.Second)
-	if err != nil || !strings.Contains(st, "200") {
-		t.Fatalf("OPTIONS: status %q err %v, want 200", st, err)
+	if err != nil || !strings.Contains(st, "405") {
+		t.Fatalf("probe: status %q err %v, want 405", st, err)
 	}
 }
 
@@ -495,7 +498,7 @@ func TestStreamTCPOnPrivatePortNeverGetsPrivateTrust(t *testing.T) {
 	// The filter, asked directly with the private socket as the local
 	// address: nothing is stamped on a TCP read.
 	filter := h.srv.readFilter()
-	req := []byte(optionsMsg("tcp", 1, 0))
+	req := []byte(probeMsg("tcp", 1, 0))
 	out, err := filter(sip.TransportReadProps{
 		Transport:  "TCP",
 		LocalAddr:  net.TCPAddrFromAddrPort(h.srv.privAddr),
@@ -570,7 +573,7 @@ func TestStreamSplitAndCoalescedMessages(t *testing.T) {
 
 			// One request, with a body, in four writes cut in the start
 			// line, the headers, the blank line and the body.
-			msg := optionsMsg(tr, 1, 600)
+			msg := probeMsg(tr, 1, 600)
 			cuts := []int{7, strings.Index(msg, "Call-ID") + 3, strings.Index(msg, "\r\n\r\n") + 2, len(msg) - 100, len(msg)}
 			prev := 0
 			for _, cut := range cuts {
@@ -580,12 +583,12 @@ func TestStreamSplitAndCoalescedMessages(t *testing.T) {
 				prev = cut
 				time.Sleep(40 * time.Millisecond)
 			}
-			if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+			if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "405") {
 				t.Fatalf("split request: status %q err %v", st, err)
 			}
 
 			// Three requests in one write, with a keep-alive between.
-			batch := optionsMsg(tr, 2, 0) + "\r\n\r\n" + optionsMsg(tr, 3, 50) + optionsMsg(tr, 4, 0)
+			batch := probeMsg(tr, 2, 0) + "\r\n\r\n" + probeMsg(tr, 3, 50) + probeMsg(tr, 4, 0)
 			if _, err := io.WriteString(c, batch); err != nil {
 				t.Fatal(err)
 			}
@@ -600,7 +603,7 @@ func TestStreamSplitAndCoalescedMessages(t *testing.T) {
 					_, _ = c.br.Discard(2)
 					continue
 				}
-				if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+				if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "405") {
 					t.Fatalf("coalesced request %d: status %q err %v", got, st, err)
 				}
 				got++
@@ -619,15 +622,15 @@ func TestStreamOversizedMessageRefused(t *testing.T) {
 			limit := h.srv.streamLim.maxMessage
 
 			c := dialRaw(t, tr, h.streamAddr(tr))
-			if _, err := io.WriteString(c, optionsMsg(tr, 1, limit-1024)); err != nil {
+			if _, err := io.WriteString(c, probeMsg(tr, 1, limit-1024)); err != nil {
 				t.Fatal(err)
 			}
-			if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+			if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "405") {
 				t.Fatalf("message just under the bound: status %q err %v", st, err)
 			}
 
 			// Declared too large: refused before the body is read.
-			if _, err := io.WriteString(c, strings.Replace(optionsMsg(tr, 2, 0), "Content-Length: 0", fmt.Sprintf("Content-Length: %d", limit), 1)); err != nil {
+			if _, err := io.WriteString(c, strings.Replace(probeMsg(tr, 2, 0), "Content-Length: 0", fmt.Sprintf("Content-Length: %d", limit), 1)); err != nil {
 				t.Fatal(err)
 			}
 			c.expectClosed(t, 3*time.Second, "declared oversize")
@@ -860,7 +863,7 @@ func TestStreamConnectionRate(t *testing.T) {
 func TestStreamBannedSource(t *testing.T) {
 	h := startStreamHarness(t, streamOpts{tcp: true})
 	c := dialRaw(t, "tcp", h.publicTCP)
-	msg := strings.Replace(optionsMsg("tcp", 1, 0), "CSeq: 1 OPTIONS\r\n", "CSeq: 1 OPTIONS\r\nUser-Agent: friendly-scanner\r\n", 1)
+	msg := strings.Replace(probeMsg("tcp", 1, 0), "CSeq: 1 PUBLISH\r\n", "CSeq: 1 PUBLISH\r\nUser-Agent: friendly-scanner\r\n", 1)
 	if _, err := io.WriteString(c, msg); err != nil {
 		t.Fatal(err)
 	}
@@ -1076,7 +1079,7 @@ func TestStreamSlowLorisTimerRestartsPerMessage(t *testing.T) {
 			n := 0
 			for len(stream) < 6000 {
 				n++
-				stream = append(stream, optionsMsg(tr, n, 0)...)
+				stream = append(stream, probeMsg(tr, n, 0)...)
 				bounds[len(stream)] = true
 			}
 			begin := time.Now()
@@ -1095,7 +1098,7 @@ func TestStreamSlowLorisTimerRestartsPerMessage(t *testing.T) {
 				t.Fatalf("the stream took %v, too short to prove anything against %v", took, h.srv.streamLim.message)
 			}
 			for i := 0; i < n; i++ {
-				if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "200") {
+				if st, err := c.readStatus(3 * time.Second); err != nil || !strings.Contains(st, "405") {
 					t.Fatalf("response %d of %d: status %q err %v (the connection was closed mid-stream?)", i+1, n, st, err)
 				}
 			}
@@ -1104,7 +1107,7 @@ func TestStreamSlowLorisTimerRestartsPerMessage(t *testing.T) {
 			}
 
 			// A message that starts and then stalls is still closed.
-			if _, err := io.WriteString(c, optionsMsg(tr, 9999, 0)[:40]); err != nil {
+			if _, err := io.WriteString(c, probeMsg(tr, 9999, 0)[:40]); err != nil {
 				t.Fatal(err)
 			}
 			c.expectClosed(t, 3*time.Second, "a stalled message after pipelined traffic")
@@ -1257,7 +1260,7 @@ func TestStreamWSFragmentsChargedPerFrame(t *testing.T) {
 	c := dialRaw(t, "ws", h.publicWS)
 	wsUpgrade(t, c)
 	auditReplaceConfig(h, func(c *config.Config) { c.Shield.RateLimit = "6/h per_ip" })
-	msg := optionsMsg("ws", 1, 0)
+	msg := probeMsg("ws", 1, 0)
 	go func() {
 		_, _ = c.Write(wsFrame(false, 0x1, msg[:1]))
 		for i := 1; i < len(msg)-1; i++ {

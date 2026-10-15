@@ -57,6 +57,7 @@ const (
 	dropMessageNotAdmitted
 	dropDialogless
 	dropRegisterAORLocked
+	dropOptions
 	numDropReasons
 )
 
@@ -68,6 +69,7 @@ var dropReasonLabels = [numDropReasons]string{
 	dropMessageNotAdmitted:   "message_not_admitted",
 	dropDialogless:           "dialogless_not_admitted",
 	dropRegisterAORLocked:    "register_aor_locked",
+	dropOptions:              "options_not_admitted",
 }
 
 func (r dropReason) String() string { return dropReasonLabels[r] }
