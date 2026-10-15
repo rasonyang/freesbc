@@ -227,11 +227,63 @@ type pumpResult struct {
 
 // pumpInvite relays every response of a forwarded INVITE until the final
 // one.
+//
+// Before a final response goes out, any provisional the wire delivered
+// ahead of it that sipgo's transaction layer dropped (prov.go) is relayed
+// first, in wire order, through the same path as a channel response. Once
+// the final has been relayed the pump returns, so a 1xx read after it is
+// never relayed (RFC 6026 §7.2).
 func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 	s.watch2xx(l)
 	d := l.dialog()
 	responded := false
+	seen := make(map[*sip.Response]struct{}) // responses already read from the channel
 	responses := l.clTx.Responses()
+
+	// step relays one response; done says the pump ends with the result.
+	step := func(res *sip.Response) (r pumpResult, done bool) {
+		responded = true
+		if ctx.Err() != nil || d.wasCancelled() {
+			// The caller cancelled (or the backstop fired) while this
+			// response was in flight: nothing may be relayed or
+			// confirmed. A 2xx believes the call is up — complete and
+			// tear it down; anything else is drained below.
+			if res.StatusCode/100 == 2 {
+				s.refuse2xx(l, res)
+				return pumpResult{responded: true, finalised: d.callerCancelled()}, true
+			}
+			s.abandonAttempt(l)
+			return pumpResult{responded: true, finalised: d.callerCancelled()}, true
+		}
+		err := s.relayInviteResponse(l, res)
+		switch {
+		case errors.Is(err, errResponseDropped):
+			return pumpResult{}, false
+		case err != nil && d.wasCancelled():
+			// The caller's CANCEL won the race with this 2xx (confirm
+			// refused it); relayInviteResponse has ACKed and BYEd it.
+			return pumpResult{responded: true, finalised: d.callerCancelled()}, true
+		case err != nil:
+			s.log.Warn("media negotiation failed", "err", err, "sip_call_id", fsip.CallID(l.req))
+			// Relaying an answer we cannot anchor would set up a call
+			// with no audio, so refuse the requesting side — once: this
+			// 488 is its final. A 2xx has already been ACKed and BYEd by
+			// relayInviteResponse; a provisional leaves the far side
+			// ringing, so its INVITE is CANCELled (RFC 3261 §16.7 step
+			// 10: a proxy that finalises the caller cancels the pending
+			// branches).
+			s.rejectInvite(l.req, l.tx, 488, "Not Acceptable Here", rejectMediaFailed)
+			if res.StatusCode/100 != 2 {
+				s.abandonAttempt(l)
+			}
+			return pumpResult{responded: true, finalised: true}, true
+		}
+		if res.StatusCode >= 200 {
+			return pumpResult{final: res, responded: true, finalised: true}, true
+		}
+		return pumpResult{}, false
+	}
+
 	for {
 		select {
 		case res, ok := <-responses:
@@ -244,47 +296,19 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 				responses = nil
 				continue
 			}
+			seen[res] = struct{}{}
 			if !fsip.Forwardable(res) {
 				continue // a 100 Trying is hop-by-hop; ours already went out
 			}
-			responded = true
-			if ctx.Err() != nil || d.wasCancelled() {
-				// The caller cancelled (or the backstop fired) while this
-				// response was in flight: nothing may be relayed or
-				// confirmed. A 2xx believes the call is up — complete and
-				// tear it down; anything else is drained below.
-				if res.StatusCode/100 == 2 {
-					s.refuse2xx(l, res)
-					return pumpResult{responded: true, finalised: d.callerCancelled()}
-				}
-				s.abandonAttempt(l)
-				return pumpResult{responded: true, finalised: d.callerCancelled()}
-			}
-			err := s.relayInviteResponse(l, res)
-			switch {
-			case errors.Is(err, errResponseDropped):
-				continue
-			case err != nil && d.wasCancelled():
-				// The caller's CANCEL won the race with this 2xx (confirm
-				// refused it); relayInviteResponse has ACKed and BYEd it.
-				return pumpResult{responded: true, finalised: d.callerCancelled()}
-			case err != nil:
-				s.log.Warn("media negotiation failed", "err", err, "sip_call_id", fsip.CallID(l.req))
-				// Relaying an answer we cannot anchor would set up a call
-				// with no audio, so refuse the requesting side — once: this
-				// 488 is its final. A 2xx has already been ACKed and BYEd by
-				// relayInviteResponse; a provisional leaves the far side
-				// ringing, so its INVITE is CANCELled (RFC 3261 §16.7 step
-				// 10: a proxy that finalises the caller cancels the pending
-				// branches).
-				s.rejectInvite(l.req, l.tx, 488, "Not Acceptable Here", rejectMediaFailed)
-				if res.StatusCode/100 != 2 {
-					s.abandonAttempt(l)
-				}
-				return pumpResult{responded: true, finalised: true}
-			}
 			if res.StatusCode >= 200 {
-				return pumpResult{final: res, responded: true, finalised: true}
+				for _, p := range s.prov.before(l.out, res, seen) {
+					if r, done := step(p); done {
+						return r
+					}
+				}
+			}
+			if r, done := step(res); done {
+				return r
 			}
 		case <-l.clTx.Done():
 			if err := l.clTx.Err(); err != nil {

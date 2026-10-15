@@ -277,6 +277,8 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.untrack()
 
+	releaseProv := s.prov.register(out)
+	defer releaseProv()
 	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)

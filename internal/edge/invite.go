@@ -449,8 +449,10 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// Started on ctx, the series context: the client transaction must
 		// outlive the attempt so its CANCEL and its retransmissions are
 		// still matched.
+		releaseProv := s.prov.register(out)
 		clTx, err := s.clientTx(ctx, out)
 		if err != nil {
+			releaseProv()
 			s.log.Warn("forward INVITE upstream", "err", err, "sip_call_id", fsip.CallID(req),
 				"upstream", name, "attempt", attempt+1)
 			if ctx.Err() != nil {
@@ -475,6 +477,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 			near: from, far: s.topo.private, callee: calleeUpstream,
 			calleeRemote: dest, transport: from.transport, resp: resp}
 		r := s.pumpInvite(ctx, l)
+		releaseProv()
 
 		if r.final != nil {
 			// ANY final response ends the series — pumpInvite has already
@@ -666,6 +669,8 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	defer d.untrack()
 
+	releaseProv := s.prov.register(out)
+	defer releaseProv()
 	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)

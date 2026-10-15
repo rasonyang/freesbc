@@ -1607,6 +1607,28 @@ the session reports (`endReasonOf` over `Session.Cause()`, below), and
 `onMediaEnd` when that `end` was the one that ended the dialog (see below). That goroutine's
 only exit is the session's `Done` channel, so it cannot outlive the call.
 
+**Provisionals a final overtakes (sipgo workaround, #213).** sipgo starts one
+goroutine per response, so a 180 or 183 read just before a 200 can reach the
+INVITE client transaction after it, which is then Accepted (or Completed) and
+drops the 1xx (RFC 6026 §7.2); `Responses()` never carries it. The transport
+layer's `OnMessage` handler `provTable.observe` (`prov.go:74`, installed after
+`sipgo.NewUA` in `Run`, `edge.go:600`) runs in the read goroutine in wire
+order (after the transaction layer has started each response's goroutine, so it may not have recorded a final yet) and sees the same `*sip.Response` the transaction later hands over. For
+each INVITE client transaction registered before its request is sent
+(`provTable.register`; `invite.go` upstream and client legs, `carrier.go`) it
+keeps up to 32 responses. When `pumpInvite` reads a final response
+(`invite_leg.go:236`) it first relays, through the same path as a channel
+response, every recorded provisional with a lower sequence (all of them, when the final is not recorded yet: nothing read after it can be) that it has not
+already read from the channel (`provTable.before`, `prov.go:106`), so 180 then 200, 183 with
+SDP then 200 and 180 then 486 reach the caller in order, and a 183's fork
+answer is recorded before the 2xx. A 1xx that arrived after the final has a
+higher sequence and is never replayed. sipgo sends on `Responses()` under the
+transaction's FSM lock, so a 1xx it accepted always precedes the final on the
+channel; the pump returns after a final, so no 1xx is relayed after one.
+Re-INVITE relays and forked 2xx after the first (`watch2xx`) are not covered.
+Remove it when sipgo delivers responses to one transaction in arrival order
+(upstream: emiago/sipgo#306, fixes proposed in #307 and #354, not merged).
+
 **2xx retransmissions and late forks (Timer M).** The INVITE client
 transaction is **not** terminated after a 2xx: sipgo keeps it in the RFC 6026
 Accepted state until Timer M (64·T1) and passes every later 2xx to the

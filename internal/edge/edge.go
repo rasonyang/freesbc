@@ -106,6 +106,10 @@ type Server struct {
 	// (hepmirror.go). Written once in New.
 	hep *hepMirror
 
+	// prov records INVITE responses in wire order, to replay provisionals
+	// sipgo's per-response goroutines let a 200 overtake (prov.go).
+	prov provTable
+
 	webrtcEnabled bool
 
 	// rtpTimeout is the media silence timeout in nanoseconds: the
@@ -591,6 +595,9 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("proxy: sipgo ua: %w", err)
 	}
 	defer ua.Close()
+	// After the transaction layer's own handler, in the read goroutine: see
+	// provTable.
+	ua.TransportLayer().OnMessage(s.prov.observe)
 
 	srv, err := sipgo.NewServer(ua, sipgo.WithServerLogger(sipgoLog))
 	if err != nil {
