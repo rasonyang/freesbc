@@ -52,6 +52,10 @@ type Server struct {
 
 	topo *topology
 
+	// cancelLingers counts cancelled INVITE transactions held in the
+	// background for a late final (drainCancelledInvite, maxCancelLingers).
+	cancelLingers atomic.Int64
+
 	// carriers is the carrier directory: what edge.carriers resolves to and
 	// the carrier source set (carrierdns.go). carrierURIs maps the
 	// "host:port" a carrier is addressed by in a Request-URI to its name.

@@ -149,6 +149,16 @@ func TestAuditBalanceNormalBye(t *testing.T) {
 // must ACK and BYE that 200 and release the call's resources; the caller is
 // gone and will never ACK.
 func TestAuditBalanceCancelRaces200(t *testing.T) {
+	// The 200 follows the CANCEL after a fixed delay, so what is asserted
+	// does not depend on how fast the host happens to be: once inside the
+	// post-CANCEL drain (cancelDrain) and once well past it.
+	t.Run("inside drain window", func(t *testing.T) { auditCancelRaces200(t, 0) })
+	t.Run("after drain window", func(t *testing.T) { auditCancelRaces200(t, cancelDrain+700*time.Millisecond) })
+}
+
+// auditCancelRaces200 runs three rounds of the CANCEL/200 race with the 200
+// sent delay after the CANCEL reached FreeSWITCH.
+func auditCancelRaces200(t *testing.T, delay time.Duration) {
 	h := startHarness(t, false)
 	pending := make(chan *sip.Response, 1)
 	h.fs.setInviteHook(func(req *sip.Request, tx sip.ServerTransaction) bool {
@@ -209,6 +219,7 @@ func TestAuditBalanceCancelRaces200(t *testing.T) {
 		h.fs.waitFor(sip.CANCEL, cancelsBefore+1, 3*time.Second)
 		acksBefore := len(h.fs.received(sip.ACK))
 		byesBefore := len(h.fs.received(sip.BYE))
+		time.Sleep(delay)
 		h.fs.sendResponse(t, ok) // the 200 that crossed the CANCEL
 		<-done
 
