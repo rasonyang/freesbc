@@ -9,6 +9,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/hep"
 )
 
@@ -24,9 +25,38 @@ type hepMirror struct {
 	sender *hep.Sender
 	redact bool
 	// bind and pub are public.bind and public.ip. A local address equal to
-	// bind is reported as pub, so behind 1:1 NAT the HOMER ladder shows the
-	// address the SIP headers carry.
+	// bind is reported as pub, and a listener's port as its advertised one
+	// (advPorts), so behind NAT the HOMER ladder shows the address the SIP
+	// headers carry.
 	bind, pub netip.Addr
+	// advPorts maps a public listener's bound port to its edge.advertise
+	// port, for the listeners where the two differ. tcp, tls, ws and wss
+	// share one key space (protocol 6), where validation keeps their ports
+	// distinct.
+	advPorts map[hepPort]uint16
+}
+
+// hepPort is a local port under one HEP protocol (17 UDP, 6 TCP).
+type hepPort struct {
+	proto uint8
+	port  uint16
+}
+
+// hepAdvPorts is the advPorts table of a config: every public listener whose
+// advertised port differs from the one it binds. Nil when none does.
+func hepAdvPorts(cfg *config.Config) map[hepPort]uint16 {
+	var out map[hepPort]uint16
+	for _, tr := range config.Transports {
+		listen, adv := cfg.Edge.Listen.Port(tr), cfg.AdvertisedPort(tr)
+		if listen == 0 || listen == adv {
+			continue
+		}
+		if out == nil {
+			out = map[hepPort]uint16{}
+		}
+		out[hepPort{hepProto(tr), uint16(listen)}] = uint16(adv)
+	}
+	return out
 }
 
 // WithHEP mirrors the edge's SIP signaling to sender. The server does not
@@ -149,7 +179,11 @@ func (m *hepMirror) capture(proto uint8, local, remote netip.AddrPort, inbound b
 		return
 	}
 	if local.Addr().Unmap() == m.bind {
-		local = netip.AddrPortFrom(m.pub, local.Port())
+		port := local.Port()
+		if adv, ok := m.advPorts[hepPort{proto, port}]; ok {
+			port = adv
+		}
+		local = netip.AddrPortFrom(m.pub, port)
 	}
 	p := hep.Packet{Proto: proto, Type: hep.PayloadSIP, CorrelationID: callID}
 	if inbound {

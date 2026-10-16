@@ -418,6 +418,7 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.switch` |
 | | `edge.switch_carrier_port` |
 | | `edge.listen` |
+| | `edge.advertise` (read by `buildTopology` into each public side's `advPort`) |
 | | `edge.carriers` (including each carrier's `srtp`) |
 | | `edge.srtp` |
 | | `edge.allow_insecure_sdes` |
@@ -1084,11 +1085,13 @@ queues, and a full queue drops the copy (`freesbc_hep_packets_dropped_total`).
   sockets apart.
 - **Fields.** Source and destination are the two ends of the socket that
   carried the message; the local end equal to `public.bind` is reported as
-  `public.ip` (they differ only behind 1:1 NAT, and the ladder should match
-  the SIP headers). The correlation ID (0x11) is the Call-ID, found by a small
-  allocation-free scan of the header section (`callIDOf`, long and compact
-  form); a message with no Call-ID is not mirrored, since HOMER cannot place
-  it and a malformed flood must not become collector load. Capture ID and node
+  `public.ip`, with a listener's `edge.advertise` port in place of the
+  port it binds (`hepAdvPorts`, keyed by protocol and port), since they
+  differ only behind NAT and the ladder should match the SIP headers. The
+  correlation ID (0x11) is the Call-ID, found by a small allocation-free
+  scan of the header section (`callIDOf`, long and compact form); a
+  message with no Call-ID is not mirrored, since HOMER cannot place it and a
+  malformed flood must not become collector load. Capture ID and node
   name come from the `Sender`.
 - **`hep.redact_auth`** (default on) masks the value of `Authorization` and
   `Proxy-Authorization`, folded lines included, in the mirrored copy only
@@ -1104,7 +1107,9 @@ it) is in `internal/hep`'s package doc.
 `topology` is built once in `edge.New` (`buildTopology`,
 `internal/edge/topology.go`) and never written again; every handler reads it
 without a lock. It holds the public sides keyed by transport (one per
-non-zero `edge.listen` port, advertising `public.ip`), the private side
+non-zero `edge.listen` port, advertising `public.ip` and the
+`edge.advertise` port, else the listen port; the UDP side's outbound pin
+`laddr` stays the bound socket), the private side
 (`private.ip:5060`), the switch endpoint map with a **sorted** name list
 (map iteration order must never leak into routing), and the two advertised
 media addresses (`public.ip` and `private.ip`). Each endpoint records the
@@ -3493,8 +3498,14 @@ The topology is two addresses, each written once (`docs/config.md`).
   local address). Listeners are `udp`, `tcp`, `tls`, `ws` and `wss` on the ports of
   `edge.listen` (`edge.go:486-501`). Everything advertised to phones,
   browsers and carriers (Via, Contact, Record-Route, SDP `c=`) names
-  `public.ip` and the port the listener bound: there is deliberately no
-  port-translation field.
+  `public.ip` and, for signaling, the listener's advertised port:
+  `edge.advertise.<transport>` when set (a NAT that translates the port,
+  issue #164), else the port it bound (`Config.AdvertisedPort`). A carrier
+  REGISTER's rewritten Contact uses it too. `isSelf`, `isSelfVia` and
+  `isPublicURI` match a public side on that advertised pair only: it is the
+  only one FreeSBC writes, and `public.ip` with the listen port belongs to
+  the router behind NAT. Media gets no offset: SDP names the real `rtp`
+  ports, so the range must be forwarded 1:1.
 - **Private side.** One fixed UDP socket, `private.ip:5060`
   (`config.PrivateSIPPort`), is both the bind and the advertised address.
   Via, Contact and Record-Route toward the switch name it
@@ -3542,7 +3553,8 @@ The topology is two addresses, each written once (`docs/config.md`).
 ### 12.3 Firewall and port-range assumptions
 
 - Open on the public address: the `edge.listen` ports (UDP for `udp`, TCP for
-  `ws`/`wss`) and the `rtp` range. Nothing checks reachability; validation
+  `ws`/`wss`), or their `edge.advertise` ports forwarded to them, and the
+  `rtp` range with unchanged numbers. Nothing checks reachability; validation
   checks only range sanity (`≥ 1024`, `min < max`, at least one RTP/RTCP
   pair).
 - Open on the private LAN: `private.ip:5060` toward the switch, the `rtp`
@@ -3716,7 +3728,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/login` | POST (else 405 + `Allow: POST`) | **none** (it is the sign-in) | JSON `{"password"}`, at most 4 KiB; the user is always `admin`. Behind `guardMW` (Host and Origin), not `requireAuth` (`handleLogin`, `session.go:154`). Success is **204** with `Set-Cookie: freesbc_session` (§13.4); a wrong password is a generic 401 with no `WWW-Authenticate`; over the limiter's budget is 429; a malformed or oversized body is 400 and is not counted as a failure |
 | `/api/logout` | POST (else 405 + `Allow: POST`) | **none** (idempotent) | behind `guardMW`; deletes the session the cookie names, if any, and always clears the cookie (`Max-Age=0`); always **204** (`handleLogout`, `session.go:193`). A live session dropped is a `logout` event (§13.5) |
 | `/metrics` | any | Basic | Prometheus text |
-| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…],"listener_info":[{"transport","bind","advertised","private"}]}`; `listener_info` pairs each bound socket with the address FreeSBC advertises for it (`public.ip` on a public listener, equal to `bind` outside 1:1 NAT; `Deps.ListenerInfos`); `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
+| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…],"listener_info":[{"transport","bind","advertised","private"}]}`; `listener_info` pairs each bound socket with the address FreeSBC advertises for it (`public.ip` and the `edge.advertise` port, else the bound port, on a public listener, equal to `bind` outside NAT; `Deps.ListenerInfos`); `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go:544`) |
 | `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request, so it is always current; the health conditions and the gauge use a separate cache refreshed every 10 minutes (`tlsDiskInterval`). Never the key or PEM |
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`handleRegistrations`, `state.go:142`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go:423`) under its read lock. No Contact, token or Call-ID |
