@@ -52,8 +52,8 @@ type Server struct {
 
 	topo *topology
 
-	// cancelLingers counts cancelled INVITE transactions held in the
-	// background for a late final (drainCancelledInvite, maxCancelLingers).
+	// cancelLingers counts INVITE and re-INVITE transactions held in the
+	// background for a late final (lingerForFinal, maxCancelLingers).
 	cancelLingers atomic.Int64
 
 	// carriers is the carrier directory: what edge.carriers resolves to and
