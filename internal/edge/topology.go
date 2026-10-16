@@ -196,26 +196,26 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 		privateMediaIP: priv.Addr(),
 	}
 	pubIP, bind := cfg.PublicIP(), cfg.PublicBind()
-	for _, l := range []struct {
-		transport string
-		port      int
-	}{{"udp", cfg.Edge.Listen.UDP}, {"tcp", cfg.Edge.Listen.TCP}, {"tls", cfg.Edge.Listen.TLS},
-		{"ws", cfg.Edge.Listen.WS}, {"wss", cfg.Edge.Listen.WSS}} {
-		if l.port == 0 {
+	for _, tr := range config.Transports {
+		port := cfg.Edge.Listen.Port(tr)
+		if port == 0 {
 			continue
 		}
-		// Public listeners advertise the port they bind. A port
-		// translation in front of FreeSBC would need its own config field;
-		// there is deliberately none rather than a guess.
-		s := side{plane: planePublic, transport: l.transport, advIP: pubIP, advPort: l.port}
-		if l.transport == "udp" {
-			s.laddr = sipAddr(bind, l.port)
+		// A public listener binds its edge.listen port and advertises
+		// edge.advertise's, which defaults to the same number: behind a NAT
+		// that translates the port, peers must be told the external one.
+		// The outbound pin (laddr) is the bound socket, never the advertised
+		// port, which is not local.
+		s := side{plane: planePublic, transport: tr, advIP: pubIP, advPort: cfg.AdvertisedPort(tr)}
+		if tr == "udp" {
+			s.laddr = sipAddr(bind, port)
 		}
-		t.public[l.transport] = s
+		t.public[tr] = s
 	}
 	// A tcp or tls carrier is dialed by FreeSBC, so it needs no listener. It
 	// still needs a side to name in Via, Record-Route and Contact; one
-	// without a listener advertises the transport's default port.
+	// without a listener advertises the transport's default port
+	// (edge.advertise cannot apply: it is valid only beside a listener).
 	for _, c := range cfg.CarrierList() {
 		if _, ok := t.public[c.Transport]; ok || c.Transport == config.CarrierUDP {
 			continue
@@ -253,6 +253,13 @@ func (t *topology) publicSide(transport string) (side, bool) {
 //
 // Only the host and port are compared; parameters are not, because a
 // downstream element may legitimately add or reorder them.
+//
+// A public side matches on its advertised address alone (public.ip and the
+// edge.advertise port), never on the port it binds. The advertised pair is
+// the only one FreeSBC ever writes, so it is the only one that can come back;
+// behind a port-translating NAT, public.ip with the listen port names
+// whatever the router maps there, which need not be FreeSBC, and claiming it
+// would swallow a Route meant for another host.
 func (t *topology) isSelf(u sip.Uri) bool {
 	ip, err := netip.ParseAddr(u.Host)
 	if err != nil {

@@ -69,7 +69,7 @@ func Run(ctx context.Context, opts Options) error {
 		for i, f := range fw {
 			ports[i] = f.String()
 		}
-		log.Warn("1:1 NAT: the router must forward these ports to public.bind, same numbers; in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via",
+		log.Warn("NAT: the router must forward these ports to public.bind, same numbers unless shown external->internal (edge.advertise; never the rtp range); in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via",
 			"advertised", cfg.Public.IP, "forward_to", cfg.Public.Bind, "ports", ports)
 	}
 

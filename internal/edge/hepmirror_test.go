@@ -14,6 +14,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/hep"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 )
@@ -459,6 +460,38 @@ func TestHEPReportsPublicIPBehindNAT(t *testing.T) {
 	col.await(t, "inbound", "nat-1", "OPTIONS", "198.51.100.4:5070", "203.0.113.7:5060")
 	col.await(t, "outbound", "nat-1", "OPTIONS", "203.0.113.7:5060", "198.51.100.4:5070")
 	col.await(t, "private", "nat-1", "OPTIONS", "10.77.0.2:5060", "10.77.0.10:5060")
+}
+
+// With edge.advertise the local end of a translated listener is reported
+// with its advertised port too; another protocol on the same number, and a
+// listener that is not translated, keep theirs.
+func TestHEPReportsAdvertisedPort(t *testing.T) {
+	cfg, err := config.Parse([]byte(advTopoYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := startHEPCollector(t)
+	sender, err := hep.New(hep.Options{Network: "udp", Addr: col.addr, CaptureID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close(t.Context())
+	m := &hepMirror{sender: sender, bind: cfg.PublicBind(), pub: cfg.PublicIP(), advPorts: hepAdvPorts(cfg)}
+	remote := netip.MustParseAddrPort("198.51.100.4:5070")
+	for _, c := range []struct {
+		id    string
+		proto uint8
+		local string
+		want  string
+	}{
+		{"adv-udp", 17, "172.31.5.10:5060", "203.0.113.7:16060"},
+		{"adv-tcp", 6, "172.31.5.10:5060", "203.0.113.7:5060"},
+		{"adv-ws", 6, "172.31.5.10:18080", "203.0.113.7:18080"},
+	} {
+		msg := []byte("OPTIONS sip:x SIP/2.0\r\nCall-ID: " + c.id + "\r\n\r\n")
+		m.capture(c.proto, netip.MustParseAddrPort(c.local), remote, true, msg)
+		col.await(t, c.id, c.id, "OPTIONS", "198.51.100.4:5070", c.want)
+	}
 }
 
 func TestHEPCallIDOf(t *testing.T) {

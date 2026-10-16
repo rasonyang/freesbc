@@ -33,6 +33,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 		{"switch", strings.Replace(base, "10.77.0.10:5060", "10.77.0.11:5060", 1), []string{"edge.switch"}},
 		{"switch_carrier_port", strings.Replace(base, "edge:\n", "edge:\n  switch_carrier_port: 5080\n", 1), []string{"edge.switch_carrier_port"}},
 		{"listen", strings.Replace(base, "udp: 5060", "udp: 5070", 1), []string{"edge.listen"}},
+		{"advertise", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  advertise: { udp: 16060 }", 1), []string{"edge.advertise"}},
 		{"carriers", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carriers: { a: 1.2.3.4 }", 1), []string{"edge.carriers"}},
 		{"carrier_sources", strings.Replace(base, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  carrier_sources: [1.2.3.4]", 1), []string{"edge.carrier_sources"}},
 		{"srtp", strings.Replace(base, "edge:\n", "edge:\n  srtp: optional\n", 1), []string{"edge.srtp"}},

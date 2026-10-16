@@ -74,6 +74,28 @@ type ListenPorts struct {
 	WSS int `yaml:"wss"`
 }
 
+// Transports are the edge.listen (and edge.advertise) keys, in the order
+// listeners are opened and listed.
+var Transports = [...]string{"udp", "tcp", "tls", "ws", "wss"}
+
+// Port is the port set for transport ("udp", "tcp", "tls", "ws" or "wss"); 0
+// when it is not set or the transport is unknown.
+func (l ListenPorts) Port(transport string) int {
+	switch transport {
+	case "udp":
+		return l.UDP
+	case "tcp":
+		return l.TCP
+	case "tls":
+		return l.TLS
+	case "ws":
+		return l.WS
+	case "wss":
+		return l.WSS
+	}
+	return 0
+}
+
 // EdgeConfig is the SIP/RTP/WebRTC edge proxy.
 type EdgeConfig struct {
 	// Switch lists the switch nodes as literal "IP:port" (UDP). One entry
@@ -83,6 +105,12 @@ type EdgeConfig struct {
 	// carrier traffic; 0 (the default) means the node's own switch port.
 	SwitchCarrierPort int         `yaml:"switch_carrier_port"`
 	Listen            ListenPorts `yaml:"listen"`
+	// Advertise is the public port FreeSBC names in Via, Contact and
+	// Record-Route for each listener, when a NAT in front translates the
+	// port (external 16060 to the listen port 5060). A transport left at 0
+	// advertises its listen port. Signaling only: the rtp range is never
+	// offset.
+	Advertise ListenPorts `yaml:"advertise"`
 	// Carriers maps a carrier name to its destination: "host[:port]", or a
 	// mapping that adds the transport and its TLS settings (CarrierConfig).
 	Carriers map[string]CarrierConfig `yaml:"carriers"`
@@ -345,6 +373,31 @@ func (c *Config) PublicIP() netip.Addr { return mustAddr(c.Public.IP) }
 
 // PublicBind is the local address every public socket binds.
 func (c *Config) PublicBind() netip.Addr { return mustAddr(c.Public.Bind) }
+
+// AdvertisedPort is the public port FreeSBC advertises for a listener:
+// edge.advertise.<transport> when set, else edge.listen.<transport>. It is 0
+// when the transport has no listener.
+func (c *Config) AdvertisedPort(transport string) int {
+	listen := c.Edge.Listen.Port(transport)
+	if listen == 0 {
+		return 0
+	}
+	if adv := c.Edge.Advertise.Port(transport); adv != 0 {
+		return adv
+	}
+	return listen
+}
+
+// PortTranslated reports whether any listener advertises a port other than
+// the one it binds (edge.advertise).
+func (c *Config) PortTranslated() bool {
+	for _, tr := range Transports {
+		if c.AdvertisedPort(tr) != c.Edge.Listen.Port(tr) {
+			return true
+		}
+	}
+	return false
+}
 
 // PrivateIP is the private bind and advertised address.
 func (c *Config) PrivateIP() netip.Addr { return mustAddr(c.Private.IP) }
