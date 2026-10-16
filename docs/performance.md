@@ -61,6 +61,16 @@ Single-host Docker on Colima: one Apple M3 Max laptop, one Colima VM, five conta
 | `sdp.Parse` plain / sdes / webrtc | 2619 / 3204 / 5476 | 2265 / 2842 / 4773 | 32 / 39 / 43 |
 | `sdp.Build`+marshal plain / sdes / webrtc | 1250 / 1360 / 2043 | 1344 / 1617 / 2273 | 31 / 34 / 41 |
 
+The benchmarks below were added for the batched RTP I/O prototype (issue #172; analysis and full tables in [notes/172-rtp-batch-io.md](notes/172-rtp-batch-io.md)). They are Linux only (`BenchmarkRelayLoad` runs on any platform, in plain mode only where batching is unavailable). They were measured on a linux/amd64 VM with 4 vCPUs (Xeon 2.1 GHz), `-cpu 2`, median of 3 runs. `BenchmarkRelayLoad` spawns a load generator, takes about a minute, and runs only with `FREESBC_BENCH_RELAY_LOAD=1`.
+
+| Benchmark | plain | batched (`recvmmsg`/`sendmmsg`, off by default) |
+|---|---:|---:|
+| `BenchmarkRelayLoad`, CPU ns per forwarded packet, 100 / 500 calls at 50 pps | 19610 / 11101 | 20693 / 12518 |
+| `BenchmarkRelayLoad`, 500 calls, packets arriving 4 back to back | 7563 | 7649 |
+| `BenchmarkRelayLoad`, allocs per packet | 1 | 0 |
+| `BenchmarkSessionForwardBurst`, ns/packet, burst 1 / 4 / 16 | 6787 / 6067 / 5340 | 6604 / 5507 / 4620 |
+| `BenchmarkUDPSendPath`, ns per send: `sendto` / `sendmmsg` x8 / connected `Write` | 3382 | 2728 (connected 3031) |
+
 Reading them: the parallel variants are slower per operation than the serial ones for `dialogTable.begin`, `lookup` and the shield, the contention the issue predicted (one global mutex each), but at 0.2 to 1 microsecond per call they are far below the per-packet and per-transaction costs below, and did not appear among the top entries of either profile. SRTP is cheap next to the syscalls around it. Port allocation costs 48 to 172 microseconds near exhaustion, which is paid once per call leg.
 
 ## Results
