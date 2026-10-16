@@ -106,8 +106,9 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		ok, again := okOut, refused
 		mu.Unlock()
 		if again {
-			// A 2xx FreeSBC could not anchor, retransmitted: its ACK was
-			// lost, so send it again.
+			// A 2xx FreeSBC ACKed itself and did not relay (one it could
+			// not anchor, or one to an abandoned re-INVITE), retransmitted:
+			// its ACK was lost, so send it again.
 			go s.ack2xx(res, to)
 			return
 		}
@@ -237,8 +238,15 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			// CANCEL it (RFC 3261 §16.8, as giveUp does for an initial
 			// INVITE) and answer the requester 408, or it waits out its own
 			// timer and the far end keeps an open INVITE transaction that
-			// 491s every later re-INVITE (§14.1).
-			s.abandonReInvite(req, tx, out, clTx, to)
+			// 491s every later re-INVITE (§14.1). The transaction is
+			// abandonReInvite's from here: the deferred Terminate must not
+			// cut short its wait for a 2xx that crossed the CANCEL.
+			finalised = true
+			s.abandonReInvite(req, tx, out, clTx, to, func() {
+				mu.Lock()
+				refused = true
+				mu.Unlock()
+			})
 			return
 		}
 	}
@@ -248,35 +256,21 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 // answered 408 and the forwarded re-INVITE is CANCELled. CANCEL is built
 // from out, the request as it went on the wire, so a carrier leg's CANCEL
 // carries the same hidden identity as the re-INVITE (hide.go). The
-// transaction is then drained for the final the CANCEL provokes, so a 487
-// is ACKed by the transaction layer and a 2xx that crossed the CANCEL is
-// ACKed here rather than retransmitted.
+// transaction is then kept for the final the CANCEL provokes, as for a
+// cancelled INVITE (lingerForFinal: cancelDrain inline, then up to
+// cancelLinger in the background), so a 487 is ACKed by the transaction
+// layer and a 2xx that crossed the CANCEL, however late, is ACKed here
+// rather than retransmitted until the far end gives up on the dialog. The
+// dialog itself is live, so that 2xx is only ACKed, never BYEd; acked runs
+// first, so the relay's retransmission hook re-ACKs it too.
 func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
-	clTx sip.ClientTransaction, to side) {
+	clTx sip.ClientTransaction, to side, acked func()) {
 	s.reject(req, tx, 408, "Request Timeout")
 	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}})
-	drain := time.NewTimer(cancelDrain)
-	defer drain.Stop()
-	responses := clTx.Responses()
-	for {
-		select {
-		case res, ok := <-responses:
-			if !ok {
-				responses = nil
-				continue
-			}
-			if res.StatusCode/100 == 2 {
-				s.ack2xx(res, to)
-			}
-			if res.StatusCode >= 200 {
-				return
-			}
-		case <-clTx.Done():
-			return
-		case <-drain.C:
-			return
-		}
-	}
+	s.lingerForFinal(clTx, func(res *sip.Response) {
+		acked()
+		s.ack2xx(res, to)
+	})
 }
 
 // applyReInvite points the anchored media at whatever a completed
