@@ -208,7 +208,8 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:123-128`); `ack2xx` also from the re-INVITE relay (`indialog.go:110`) | its 5 s BYE context / after one write |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:450,489`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:911`) | its 5 s BYE context |
-| per request: sipgo handler goroutine | sipgo | handler return (after the final response; `dialogTable` owns the dialog from then on) |
+| per request: sipgo transaction-layer goroutine running `serveTx` and the handler | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); `serveTx` does not wait for the transaction's timers (#170) |
+| per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | the transaction's `Done` (Timer L, H or I on UDP; at once on a reliable transport) |
 | shield prune loop | `shield.New` (`shield.go:64`) | `Shield.Close` |
 | HEP writer (one per process, owned by `hep.Sender`, not by the edge) | `hep.New` from `app.Run` when `hep:` is set | `closeHEPSender` after `g.Wait()` |
 
@@ -1128,7 +1129,14 @@ RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 
 Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 `NOTIFY`, `SUBSCRIBE`, `REFER`, `MESSAGE`, `PRACK`, `UPDATE`, `OPTIONS`, and
-`OnNoRoute` (`edge.go:600-613`).
+a no-route handler for any other method (`s.routes`, `edge.go`). They are
+dispatched by `serveTx` (`txserve.go`), which `Run` installs on sipgo's
+transaction layer in place of sipgo's `Server.handleRequest` (issue #170):
+after the handler returns it leaves a UDP transaction that has sent a final
+response to sipgo's own timers (J, L, H/I) instead of waiting in
+`TerminateGracefully` for up to 32 s, and otherwise calls
+`TerminateGracefully` as sipgo does (`Terminate` when there is no final or
+the transport is reliable).
 
 | Method | Handling |
 |---|---|
@@ -1398,7 +1406,7 @@ deliver.
      `edge.carrier_sources`, held by the carrier directory, §6) → a
      **carrier** call, with the carrier's name;
    - anything else → dropped **silently** (`dropSilently`): the handler
-     returns without responding, and sipgo's `Server.handleRequest` then
+     returns without responding, and `serveTx` (`txserve.go`) then
      calls `TerminateGracefully`, which for a transaction with no final
      response is `Terminate` — it stops `Timer_1xx` (the 200 ms automatic
      "100 Trying"), removes the transaction and sends nothing, so there is

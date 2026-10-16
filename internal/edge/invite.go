@@ -55,9 +55,9 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 			// INVITE from a source that is neither a carrier source nor a
 			// registered transport address is dropped before anything
 			// answers it, so a scanner learns nothing. Returning without a
-			// response is the whole mechanism: sipgo's Server.handleRequest
-			// calls TerminateGracefully when the handler returns, which, for
-			// a transaction with no final response, is Terminate — it stops
+			// response is the whole mechanism: serveTx (txserve.go) calls
+			// TerminateGracefully when the handler returns, which, for a
+			// transaction with no final response, is Terminate — it stops
 			// the Timer_1xx that would otherwise send "100 Trying" at 200
 			// ms, removes the transaction and sends nothing. A
 			// retransmission of the INVITE opens a fresh transaction and is

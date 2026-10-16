@@ -71,11 +71,13 @@ func TestCaseE_NoLeaksAfterCalls(t *testing.T) {
 		t.Errorf("gauges did not return to zero: %+v", snap)
 	}
 
-	// Goroutines. Counting them all would measure the wrong thing: sipgo
-	// parks a goroutine per server transaction in TerminateGracefully for
-	// the RFC 3261 Timer J period (32s on UDP), so a run of calls leaves
-	// dozens of perfectly correct goroutines behind that simply have not
-	// aged out yet. Waiting them out would make this a 30-second test.
+	// Goroutines. Counting them all would measure the wrong thing: the
+	// fake switch (a plain sipgo server) parks a goroutine per server
+	// transaction in TerminateGracefully for the RFC 3261 Timer J period
+	// (32s on UDP), and the edge's drainAcks keeps one per INVITE
+	// transaction until sipgo's Timer L, so a run of calls leaves dozens
+	// of perfectly correct goroutines behind that simply have not aged out
+	// yet. Waiting them out would make this a 30-second test.
 	//
 	// What must be zero is the media plane's own goroutines: each session
 	// starts four relay loops and a watchdog, and those are exactly the
