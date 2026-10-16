@@ -204,12 +204,14 @@ CPU profiles are 30 s `/debug/pprof/profile` samples taken from inside the conta
 
 1. A goroutine dump at 2500 CPS (carrier-in): 189159 goroutines, **159195 of them (84%) in one stack**: `sipgo.(*Server).handleRequest` (`server.go:267`) blocked in `sip.(*ServerTx).TerminateGracefully` (`transaction_server_tx.go:181`), which waits on `<-tx.Done()` until the transaction's timers expire (Timer J, 32 s, for non-INVITE over UDP, and Timer H/I for INVITE). A further 19932 are the media UDP readers. Goroutines scale at about 76 per CPS (75961 at 1000 CPS, 114k at 1500, 155k at 2000) and are flat in time at a given rate.
 2. Memory follows: about 2.3 MB of RSS per CPS (2.3 GB at 1000, 3.3 GB at 1500, 7.2 GB at 3000). At 3500 CPS the 8 GiB limit killed the process. Live-heap profile at 2500 CPS (2.0 GB in use): sipgo `NewRequest`, `NewResponse`, `ParseHeader` and header clones, `NewServerTx`, plus `dialogTable.begin` and port allocation. These are the lingering per-transaction objects.
+
+   **Since #170** the edge no longer parks that goroutine: `serveTx` (`internal/edge/txserve.go`) returns once a final has gone out and leaves the transaction to sipgo's timers. The request, response and transaction objects still live for the 32 s, as RFC 3261 retransmission handling requires. In the in-process harness this removed 64 goroutines and about 0.5 MB of stack per CPS for calls, and halved RSS per request/s for transactions the edge answers itself. The rig numbers in this section predate it and have not been re-measured; see [the research note](notes/170-sipgo-tx-linger.md).
 3. CPU profile at 2500 CPS (31.9 s of CPU in 30 s, one core of two): `syscall` 21.6% flat (`sendto` 10.1% and `recvfrom` 8.5% cumulative), GC 22% (`gcBgMarkWorker` 9% plus `gcAssistAlloc` 12.8%), goroutine stack growth `runtime.copystack` 11.7% (every request starts a new goroutine that grows its stack), `mallocgc` 16%. FreeSBC's own handlers (`onInvite`, `relayResponseHide`, `onInDialog`) are under 25% each cumulative and mostly time inside `sendto`.
 4. Failure mode: before calls fail, the kernel drops datagrams on the SIP sockets (`RcvbufErrors` 406 at 1500 CPS, 22552 at 2000, 155315 at 3000; none below 1500). The receive buffer is the Linux default (212992 bytes on this VM; `rmem_max` is the same) and FreeSBC does not call `SetReadBuffer`; each UDP socket has one reader loop. Bursts plus GC pauses fill it, SIPp retransmits (T1 500 ms), and above ~1500 to 1600 CPS retransmissions no longer rescue the calls. Issue #171 now sets 4 MiB receive and 1 MiB send buffers on the UDP SIP sockets; these numbers predate it and were not re-measured.
 
 **Media: the first limit is the per-packet `sendto` syscall.** CPU profile at 509 concurrent calls (51k pps in, 51k out, process at 163%): **93.7% of all samples are in `syscall.Syscall6`; 88.5% are under `net.(*UDPConn).WriteTo` / `syscall.sendto`, 5.5% under `recvfrom`**, called from `media.(*Session).forward`. SRTP, mutexes, the scheduler and GC together are under 6%. There is one `recvfrom` and one `sendto` per packet. On this topology the send cost is inflated because the veth/bridge delivery to the next container is charged to the sender, so on a real NIC the share will be lower but the syscall will probably still lead; that is untested.
 
-**Goroutines after REGISTER bursts: transaction timers, not a leak.** A burst of 2000 REGISTERs from 500 users (`run.sh -u 500 -r 200 -t 10 register`, i.e. four rounds) left **2027 goroutines, 2000 of them in the same `ServerTx.TerminateGracefully` stack**. Counted every 10 s after the last REGISTER: 2030, 1531, 530, 30, 30, 30, 30. They drain to the 30-goroutine baseline within about 40 s, which matches the 32 s Timer J. The report of about 1360 goroutines still present after a minute did **not** reproduce in this setup (UDP, instant 200 from the switch, no digest challenge). If it recurs, collect `/debug/pprof/goroutine?debug=1` at that moment: stacks other than `TerminateGracefully` would indicate something else (a TCP/WS connection per user, for example, holds goroutines for as long as the connection lives).
+**Goroutines after REGISTER bursts: transaction timers, not a leak (before #170).** A burst of 2000 REGISTERs from 500 users (`run.sh -u 500 -r 200 -t 10 register`, i.e. four rounds) left **2027 goroutines, 2000 of them in the same `ServerTx.TerminateGracefully` stack**. Counted every 10 s after the last REGISTER: 2030, 1531, 530, 30, 30, 30, 30. They drain to the 30-goroutine baseline within about 40 s, which matches the 32 s Timer J. The report of about 1360 goroutines still present after a minute did **not** reproduce in this setup (UDP, instant 200 from the switch, no digest challenge). If it recurs, collect `/debug/pprof/goroutine?debug=1` at that moment: stacks other than `TerminateGracefully` would indicate something else (a TCP/WS connection per user, for example, holds goroutines for as long as the connection lives).
 
 ## Sizing guidance
 
@@ -217,15 +219,36 @@ From this single-host, two-core, Docker-on-Colima topology only. Treat as a floo
 
 | Dimension | Figure measured | Per core (derived) | Notes |
 |---|---|---|---|
-| Client call setup | 1500 CPS (fails at 1600), 0.75 core used | not CPU-bound | memory about 2.3 MB per CPS |
+| Client call setup | 1500 CPS (fails at 1600), 0.75 core used | not CPU-bound | memory about 2.3 MB per CPS before #170 (see [below](#memory-cps-and-gomemlimit)) |
 | Carrier call setup | in: 1500 clean, 3000 burst; out: 1250 clean | | in at 3000 needs >7 GB |
 | Concurrent UDP G.711 calls | about 450 under 80% of 2 cores | about 225 | 27 us CPU per forwarded packet; ~0.13 MB per call |
 | Concurrent WebRTC SRTP calls | about 800 under 80% of 2 cores | about 400 | end-to-end loss 0.0018% at 816 |
 | DTLS handshakes | about 400/s | about 200/s | |
 | Registrations | 19000 held (cap 20000); 6000 REGISTER/s refresh | | live heap about 2.8 KB per binding |
-| RAM | signaling at high CPS: about 430 CPS per GB; media calls: about 7000 per GB (derived from RSS) | | the high-CPS figure is dominated by lingering transactions |
+| RAM | signaling at high CPS: about 430 CPS per GB (before #170); media calls: about 7000 per GB (derived from RSS) | | the high-CPS figure is dominated by lingering transactions; see [below](#memory-cps-and-gomemlimit) |
 
 Practical reading, with the caveats above: a pair of cores handles on the order of 1000 calls per second of setup or a few hundred concurrent media calls; the media path is syscall-bound, so more cores help roughly linearly only if the network path scales, which was not measured here (two cores only). Provision RAM for CPS, not for concurrent calls. The rtp range (5000 calls per plane with the default `20000-29999`) is well above the 450 to 800 calls two cores sustained here. Use `perf-wide.yaml` or a wider `rtp` for larger tests.
+
+### Memory, CPS and GOMEMLIMIT
+
+Memory at a sustained call rate is set by state that outlives each call by a fixed time, not by concurrent calls. Every UDP transaction is kept for 64*T1 = 32 s after its final response (RFC 3261 Timer J for non-INVITE, Timer L after an INVITE 2xx, Timer H otherwise), so that a retransmitted request is answered again rather than handled twice. The parsed request, the response and the transaction object live that long, and so do the dialog and its media objects, which the INVITE's transactions still reach. The amount in memory is therefore proportional to CPS × 32 s. Stream transports (tcp, tls, ws, wss) end their server transactions at once.
+
+| Figure | Before #170 (perf rig, carrier-in) | After #170 |
+|---|---|---|
+| goroutines per sustained CPS | about 76, 64 of them parked handler goroutines (INVITE and BYE) | the 64 are gone. `drainAcks` (added after the rig run) keeps one small goroutine per INVITE for 32 s, so expect about 44 (harness: 160 → 96, of which 64 are the in-process fake switch's own) |
+| RSS per sustained CPS | about 2.3 MB (unset GOMEMLIMIT, GOGC 100) | not re-measured on the rig; the harness shows 20% less for calls (with the fake switch's lingering state in both) and 55% less per request/s the edge answers itself |
+| live heap per sustained CPS | about 0.8 MB (2.0 GB at 2500 CPS) | unchanged by #170: the lingering objects are still needed |
+
+Until the rig is re-run, plan with the measured **2.3 MB per sustained CPS** as an upper bound. Add about 0.13 MB per concurrent media call and a 50 MB base. At 1500 CPS that is about 3.5 GB.
+
+**GOMEMLIMIT.** Without it the Go runtime lets the heap grow to about twice the live heap (GOGC=100) before collecting, which is where most of the 2.3 MB/CPS comes from. Setting a memory limit makes the GC collect harder as the process approaches it. That trades CPU for memory, and signaling at high CPS was not CPU-bound here (below 2 cores even at 3000 CPS):
+
+- Set it to about 80 to 90% of the memory the process may use: the container or cgroup limit (`MemoryMax=`, `--memory`), or the host's RAM minus what else runs there. Leave GOGC at its default.
+- It is a soft limit. It counts goroutine stacks, which the GC cannot reclaim, and the live heap (about 0.8 MB per sustained CPS) cannot be freed either. When live heap plus stacks approach the limit, the GC runs nearly continuously: in the harness, a limit just above the live heap spent about 80% of the process's CPU in GC. Past the limit the process keeps growing and the OOM killer still ends it. So a limit lowers RSS at a given CPS and raises the ceiling before OOM, but does not remove it: keep at least 30 to 50% headroom over the expected live heap.
+- Watch `process_resident_memory_bytes`, `go_memstats_heap_inuse_bytes`, `go_goroutines` and the GC CPU share (`go_gc_*` series) on `/metrics` under load.
+- systemd: `Environment=GOMEMLIMIT=3600MiB` next to `MemoryMax=4G` (commented example in `packaging/freesbc.service`). Docker: `--memory 8g -e GOMEMLIMIT=7GiB`.
+
+In the in-process harness at 300 calls/s (`TestMeasureTxLingerSustained`, research note), a limit of 650MiB took RSS from 860 to 624 MiB at 22% → 38% GC CPU after #170, while before #170 the same limit needed 63% GC CPU, because 178 MiB of parked stacks counted against it.
 
 ## Limits a load test hits first
 
