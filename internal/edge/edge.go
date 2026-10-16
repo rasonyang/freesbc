@@ -251,7 +251,8 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 	raiseUDPSendLimit()
 	var mirror *hepMirror
 	if o.hep != nil {
-		mirror = &hepMirror{sender: o.hep, redact: cfg.HEPRedact(), bind: cfg.PublicBind(), pub: cfg.PublicIP()}
+		mirror = &hepMirror{sender: o.hep, redact: cfg.HEPRedact(), bind: cfg.PublicBind(), pub: cfg.PublicIP(),
+			advPorts: hepAdvPorts(cfg)}
 		installHEPTracer()
 	}
 	s := &Server{
@@ -472,8 +473,9 @@ func (s *Server) TLSCert() (leaf *x509.Certificate, loadedAt time.Time, users []
 }
 
 // ListenerInfo is one bound socket and the address FreeSBC advertises for
-// it. They differ on a public listener behind 1:1 NAT (public.bind against
-// public.ip); the private socket advertises its bind.
+// it. They differ on a public listener behind NAT (public.bind against
+// public.ip, the edge.listen port against edge.advertise's); the private
+// socket advertises its bind.
 type ListenerInfo struct {
 	Transport  string
 	Bind       string
@@ -491,13 +493,9 @@ func (s *Server) ListenerInfos() []ListenerInfo {
 	return append(out, ListenerInfo{Transport: "udp", Bind: s.privAddr.String(), Advertised: s.privAddr.String(), Private: true})
 }
 
-// advertisedAddr is public.ip with the listener's port.
+// advertisedAddr is public.ip with the listener's advertised port.
 func (s *Server) advertisedAddr(l bound) string {
-	ap, err := netip.ParseAddrPort(l.addr)
-	if err != nil {
-		return l.addr // unreachable: publicListeners built it from an AddrPort
-	}
-	return netip.AddrPortFrom(s.boot.PublicIP(), ap.Port()).String()
+	return netip.AddrPortFrom(s.boot.PublicIP(), uint16(s.boot.AdvertisedPort(l.transport))).String()
 }
 
 type bound struct {
@@ -510,13 +508,9 @@ type bound struct {
 func (s *Server) publicListeners() []bound {
 	bind := s.boot.PublicBind()
 	var out []bound
-	for _, l := range []struct {
-		transport string
-		port      int
-	}{{"udp", s.boot.Edge.Listen.UDP}, {"tcp", s.boot.Edge.Listen.TCP}, {"tls", s.boot.Edge.Listen.TLS},
-		{"ws", s.boot.Edge.Listen.WS}, {"wss", s.boot.Edge.Listen.WSS}} {
-		if l.port != 0 {
-			out = append(out, bound{l.transport, netip.AddrPortFrom(bind, uint16(l.port)).String()})
+	for _, tr := range config.Transports {
+		if port := s.boot.Edge.Listen.Port(tr); port != 0 {
+			out = append(out, bound{tr, netip.AddrPortFrom(bind, uint16(port)).String()})
 		}
 	}
 	return out
@@ -713,8 +707,8 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.log.Info("edge proxy listening",
 		"public_listeners", len(s.publicListeners()),
-		// Equal outside 1:1 NAT. Behind it clients are told advertised, and
-		// the router must forward each to its bind.
+		// Equal outside NAT. Behind it clients are told advertised, and the
+		// router must forward each to its bind.
 		"advertised", advertised,
 		"bind", binds,
 		"private", s.privAddr.String(),

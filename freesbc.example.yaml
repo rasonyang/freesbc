@@ -50,6 +50,10 @@ edge:
     # wss: 443               # enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux); needs tls
     # ws: 8080               # plaintext WebSocket, development only
 
+  # advertise:               # only when the NAT translates a port: Via/Contact/
+  #   udp: 16060             # Record-Route name 16060, the socket binds 5060;
+  #   tcp: 16060             # signaling only, forward the rtp range 1:1
+
   carriers:                  # where the switch may send requests (allowlist);
     carrier-a: sip.carrier-a.com      # must equal the switch gateway's host[:port]
     mobile:    223.76.90.4:16060      # name is stamped as X-FreeSBC-Carrier

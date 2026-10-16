@@ -17,6 +17,8 @@ func redactConfig(cfg *config.Config) any {
 			"switch_carrier_port": cfg.Edge.SwitchCarrierPort,
 			"listen": map[string]any{"udp": cfg.Edge.Listen.UDP, "tcp": cfg.Edge.Listen.TCP, "tls": cfg.Edge.Listen.TLS,
 				"ws": cfg.Edge.Listen.WS, "wss": cfg.Edge.Listen.WSS},
+			"advertise": map[string]any{"udp": cfg.Edge.Advertise.UDP, "tcp": cfg.Edge.Advertise.TCP, "tls": cfg.Edge.Advertise.TLS,
+				"ws": cfg.Edge.Advertise.WS, "wss": cfg.Edge.Advertise.WSS},
 			"carriers":            redactCarriers(cfg.Edge.Carriers),
 			"carrier_sources":     cfg.Edge.CarrierSources,
 			"srtp":                cfg.Edge.SRTP,

@@ -53,7 +53,7 @@ Not mirrored:
 | Chunk | Value |
 |---|---|
 | `0x02` IP protocol | 17 for UDP, 6 for tcp, tls, ws and wss |
-| `0x03`/`0x04`, `0x05`/`0x06`, `0x07`, `0x08` | The two ends of the socket that actually carried the message. The local end is reported as `public.ip` when the socket is bound to `public.bind` (they differ only behind 1:1 NAT), so the ladder matches the addresses in the SIP headers |
+| `0x03`/`0x04`, `0x05`/`0x06`, `0x07`, `0x08` | The two ends of the socket that actually carried the message. The local end is reported as `public.ip` when the socket is bound to `public.bind`, with a listener's `edge.advertise` port in place of its bound one (they differ only behind NAT), so the ladder matches the addresses in the SIP headers |
 | `0x0b` payload type | 1 (SIP) |
 | `0x0c` capture agent ID | `hep.capture_id` |
 | `0x11` correlation ID | the SIP Call-ID (long or compact form) |

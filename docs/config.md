@@ -56,13 +56,26 @@ The private SIP socket is fixed at `private.ip:5060` (`config.PrivateSIPPort`) a
 
 #### 1:1 NAT checklist
 
-When `public.bind` differs from `public.ip`, `freesbc check` prints, `freesbc init` prints after writing the file, and `freesbc run` logs at WARN (`1:1 NAT: the router must forward ...`) the advertised endpoint and the ports the router must forward to `public.bind`, with the same port numbers on both sides: every configured `edge.listen` port (`udp` over UDP; `tcp`, `tls`, `ws`, `wss` over TCP) and the whole `rtp` range over UDP. Nothing else binds `public.bind` (the admin API has its own `admin.listen`, the private socket is `private.ip`). Responses follow Via/rport and work without a forward, but in-dialog requests (the 2xx ACK, BYE) follow Contact and Record-Route to `public.ip:<port>`; a missing forward therefore shows as every call ending at 32 s with `reason=ack_timeout` and the WARN `2xx ACK never arrived` (see [Troubleshooting](troubleshooting.md#lost-ack-reasonack_timeout)). `check` exit codes are unchanged. The `edge proxy listening` line shows `advertised=[...]` and `bind=[...]` side by side, and `GET /api/status` gives each listener's `advertised` address in `listener_info`.
+When `public.bind` differs from `public.ip`, or `edge.advertise` gives a listener a port other than its own (NAT mode either way), `freesbc check` prints, `freesbc init` prints after writing the file, and `freesbc run` logs at WARN (`NAT: the router must forward ...`) the advertised endpoint and the ports the router must forward to `public.bind`: every configured `edge.listen` port (`udp` over UDP; `tcp`, `tls`, `ws`, `wss` over TCP) and the whole `rtp` range over UDP. Each has the same number on both sides, except a listener with an `edge.advertise` port, which is shown `external->internal` (`udp/16060->5060`). The `rtp` range is never translated: it must be forwarded 1:1, with the same numbers. Nothing else binds `public.bind` (the admin API has its own `admin.listen`, the private socket is `private.ip`). Responses follow Via/rport and work without a forward, but in-dialog requests (the 2xx ACK, BYE) follow Contact and Record-Route to `public.ip:<port>`; a missing forward therefore shows as every call ending at 32 s with `reason=ack_timeout` and the WARN `2xx ACK never arrived` (see [Troubleshooting](troubleshooting.md#lost-ack-reasonack_timeout)). `check` exit codes are unchanged. The `edge proxy listening` line shows `advertised=[...]` and `bind=[...]` side by side, and `GET /api/status` gives each listener's `advertised` address in `listener_info`.
 
 ```
 NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060 tcp/16060 tcp/7443 (wss) udp/16800-16900 (rtp))
 REQUIRED forwards -> 172.20.0.4 (same port numbers):
   udp/16060
   tcp/16060
+  tcp/7443 (wss)
+  udp/16800-16900 (rtp)
+in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:
+these ports MUST be reachable from clients.
+```
+
+With `edge.listen: { udp: 5060, tcp: 5060, wss: 7443 }` and `edge.advertise: { udp: 16060, tcp: 16060 }` the same router needs:
+
+```
+NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060->5060 tcp/16060->5060 tcp/7443 (wss) udp/16800-16900 (rtp))
+REQUIRED forwards -> 172.20.0.4 (external->internal where shown, else the same port number; the rtp range is never translated):
+  udp/16060->5060
+  tcp/16060->5060
   tcp/7443 (wss)
   udp/16800-16900 (rtp)
 in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:
@@ -103,6 +116,7 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 | `switch` | required | List of literal `IP:port` (UDP), at least one. |
 | `switch_carrier_port` | `0` (the node's own `switch` port) | `0` or 1-65535. |
 | `listen` | required | At least one of `udp`, `tcp`, `tls`, `ws`, `wss`. |
+| `advertise` | none (each listener advertises its `listen` port) | Map of `udp`, `tcp`, `tls`, `ws`, `wss` to the port named in Via, Contact and Record-Route, 1-65535, only for a transport `listen` sets. |
 | `carriers` | none | Map of name to `host[:port]`, or to a mapping `{host, transport, ca_file, client_cert, client_key, srtp}`. |
 | `srtp` | `off` | SDES-SRTP policy for registered clients: `off`, `optional` or `required`. |
 | `allow_insecure_sdes` | `false` | Allow SDES on a leg whose signaling is not TLS or WSS. |
@@ -138,6 +152,27 @@ A client on a stream transport is reachable only through the connection it opene
 
 Every stream transport (`tcp`, `tls`, `ws`, `wss`) is bounded by constants, not keys (design.md §15.2): at most 256 open connections per source IP (an IPv6 source by its /64) and 10000 in all (connections to and from carriers have their own 1024 pool), a 10 s TLS handshake and WebSocket upgrade, a 15 s bound on one message once its first byte has arrived, a 60 s idle timeout (CRLF keep-alives and WebSocket ping/pong frames do not defer it), and 24 KiB per SIP message. The idle timeout does not apply to a connection with a live registration binding, a dialog or a carrier source. Each new connection costs the source one `shield.rate_limit` token. Open connections and refusals are in `freesbc_edge_stream_connections{transport}`, `freesbc_edge_stream_refused_total{reason}` and `freesbc_edge_stream_closed_total{reason}`. Each connection takes a file descriptor, so raise the process limit (`LimitNOFILE`) above the 10000 cap plus the media ports.
 
+#### `edge.advertise`
+
+The public port FreeSBC names for a listener, when a NAT in front of it translates the port: the router forwards external `16060` to the `5060` FreeSBC binds, so peers must be told `16060`. Keys are the `edge.listen` keys; a transport left out (or `0`) advertises its `listen` port.
+
+```yaml
+edge:
+  listen:
+    udp: 5060
+    tls: 5061
+  advertise:
+    udp: 16060
+    tls: 16061
+```
+
+- Each value is 1-65535, and only a transport set in `edge.listen` may have one.
+- `tcp`, `tls`, `ws` and `wss` are TCP ports on `public.ip` once advertised, so no two of them may advertise the same port (counting a transport left out at its `listen` port). `udp` may share a number with `tcp`.
+- Signaling only. The advertised port is what goes into Via sent-by, Contact (including the rewritten Contact of a carrier REGISTER) and Record-Route toward public parties, and what `/api/status` `listener_info` and the `edge proxy listening` line show as `advertised`; the socket still binds `public.bind` with the `listen` port. The `rtp` range gets no offset: SDP names the real media ports, so the router must forward the whole range 1:1 with the same numbers.
+- FreeSBC recognises its own Route, Record-Route, Via and Request-URI on the public side by `public.ip` and the advertised port only, since that is the only pair it ever writes. `public.ip` with the `listen` port is not taken as FreeSBC's (behind the NAT it is the router's), and a carrier may be configured there unless `public.bind` equals `public.ip`.
+- A `tcp` or `tls` carrier with no matching listener still names the transport's default port (`edge.advertise` needs a listener).
+- `check` prints the forwards with the translation (see "1:1 NAT checklist").
+
 #### `edge.carriers`
 
 An allowlist of the destinations the switch may send carrier traffic to. Each key is a name; each value is `host[:port]` (a UDP carrier) or a mapping:
@@ -161,7 +196,7 @@ An unknown key in the mapping is an error. `host` is required. Rules for the map
 - The port written in `host` is the port the switch's Request-URI must carry and the port FreeSBC dials. Without one, the Request-URI port is taken as 5060 and the dial port is 5060 (5061 for `tls`) unless SRV says otherwise. An IPv6 literal with a port needs brackets: `[2001:db8::1]:5060`.
 - A DNS name without a port is resolved through SRV (`_sip._udp`, `_sip._tcp` or `_sips._tcp` for `transport` udp, tcp, tls), then A/AAAA. A DNS name with a port is resolved through A/AAAA only (RFC 3263 §4.2). Resolution happens on the public side only and is cached for 300 s.
 - No two entries may share the same `host:port` (default port applied).
-- A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` or `public.ip` with that `edge.listen` port), nor an `edge.switch` node.
+- A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` with that `edge.listen` port, or `public.ip` with its advertised port, `edge.advertise` or else the `edge.listen` port), nor an `edge.switch` node.
 - `transport` is `udp` (default), `tcp` or `tls`. A `udp` carrier requires `edge.listen.udp`. A `tcp` or `tls` carrier needs no listener to be called, because FreeSBC opens the connection; its own requests to FreeSBC (inbound calls, in-dialog requests) need the matching `edge.listen.tcp` or `edge.listen.tls`, or they can only use the connection FreeSBC opened. A `tls` carrier does not need the top-level `tls`, which is FreeSBC's server identity.
 - `srtp` is `off` (default), `optional` or `required`, the SDES-SRTP policy toward that carrier. The string form means `off`. A non-`off` value needs `transport: tls`, unless `edge.allow_insecure_sdes` is `true`; `check` fails otherwise. Unlike a client, a carrier's transport is fixed, so the rule is checked at load. Restart-only, with the rest of `edge.carriers`.
 - `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. `check` does not open these files; startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
@@ -285,7 +320,7 @@ There is no password key: HOMER 11 ignores the HEP auth key. The sender dials on
 |---|---|
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`, `shield.max_sessions`, `shield.invite_rate_limit`, `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban` | hot |
 | `public`, `private`, `rtp`, `tls` | restart-only |
-| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
+| `edge.switch`, `edge.switch_carrier_port`, `edge.listen`, `edge.advertise`, `edge.carriers` (including each carrier's `srtp`), `edge.carrier_sources`, `edge.srtp`, `edge.allow_insecure_sdes` | restart-only |
 | `admin` (every key, including `allowed_hosts` and `pprof`, and whether the section exists) | restart-only |
 | `hep` (every key, and whether the section exists) | restart-only |
 

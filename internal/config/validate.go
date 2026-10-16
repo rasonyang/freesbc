@@ -37,6 +37,7 @@ func (c *Config) validate() error {
 	c.validateRTP(fail)
 	c.validateTLS(fail)
 	c.validateEdge(fail)
+	c.validateAdvertise(fail)
 	c.validateCarriers(fail)
 	c.validateShield(fail)
 	c.validateAdmin(fail)
@@ -179,6 +180,44 @@ func (c *Config) validateEdge(fail failFunc) {
 	}
 }
 
+// validateAdvertise checks edge.advertise: each port in range and set only
+// for a transport edge.listen enables. tcp, tls, ws and wss are all TCP ports
+// on public.ip once advertised, so no two of them may advertise one port,
+// just as no two may listen on one.
+func (c *Config) validateAdvertise(fail failFunc) {
+	e := &c.Edge
+	for _, tr := range Transports {
+		p := e.Advertise.Port(tr)
+		if p == 0 {
+			continue
+		}
+		key := "edge.advertise." + tr
+		checkPort(fail, key, p)
+		if e.Listen.Port(tr) == 0 {
+			fail("%s: edge.listen.%s is not set (only a listening transport can advertise a port)", key, tr)
+		}
+	}
+	label := func(tr string) string {
+		if e.Advertise.Port(tr) != 0 {
+			return "edge.advertise." + tr
+		}
+		return "edge.listen." + tr
+	}
+	streams := [...]string{"tcp", "tls", "ws", "wss"}
+	for i, a := range streams {
+		for _, b := range streams[:i] {
+			pa := c.AdvertisedPort(a)
+			// Two equal listen ports with no advertise are validateEdge's
+			// error already.
+			if pa == 0 || pa != c.AdvertisedPort(b) || (e.Advertise.Port(a) == 0 && e.Advertise.Port(b) == 0) {
+				continue
+			}
+			fail("%s: port %d is already advertised by %s", label(a), pa, label(b))
+			break
+		}
+	}
+}
+
 // dnsLabel is one DNS label: letters, digits and interior hyphens.
 var dnsLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
@@ -314,7 +353,7 @@ func (c *Config) validateCarriers(fail failFunc) {
 		if addr.IsValid() {
 			ap := netip.AddrPortFrom(addr, uint16(port))
 			if lp := listen[tr]; lp != 0 && (ap == netip.AddrPortFrom(c.PublicBind(), uint16(lp)) ||
-				ap == netip.AddrPortFrom(c.PublicIP(), uint16(lp))) {
+				ap == netip.AddrPortFrom(c.PublicIP(), uint16(c.AdvertisedPort(tr)))) {
 				fail("%s: %s is FreeSBC's own public %s socket", label, key, strings.ToUpper(tr))
 				continue
 			}

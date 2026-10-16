@@ -23,6 +23,7 @@ var restartOnly = []struct {
 	{"edge.switch", func(c *Config) any { return c.Edge.Switch }},
 	{"edge.switch_carrier_port", func(c *Config) any { return c.Edge.SwitchCarrierPort }},
 	{"edge.listen", func(c *Config) any { return c.Edge.Listen }},
+	{"edge.advertise", func(c *Config) any { return c.Edge.Advertise }},
 	{"edge.carriers", func(c *Config) any { return c.Edge.Carriers }},
 	{"edge.srtp", func(c *Config) any { return c.Edge.SRTP }},
 	{"edge.allow_insecure_sdes", func(c *Config) any { return c.Edge.AllowInsecureSDES }},
