@@ -22,6 +22,13 @@ RestartSec=5s
 # Up to 10000 stream connections plus the RTP sockets. Go raises its soft
 # limit to this hard limit at start.
 LimitNOFILE=65536
+# Memory grows with the sustained call rate (every UDP transaction is kept
+# 32 s after its final response). To cap it, set a cgroup limit and a Go
+# soft limit about 10 to 20% below it; the GC then works harder (more CPU)
+# as memory nears the limit. See docs/performance.md, "Memory, CPS and
+# GOMEMLIMIT".
+#MemoryMax=4G
+#Environment=GOMEMLIMIT=3600MiB
 
 # Only needed when a listen port is below 1024 (for example wss: 443). Delete
 # both lines to run with no capabilities.

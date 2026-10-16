@@ -209,7 +209,8 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | background wait for a CANCELled INVITE's or abandoned re-INVITE's final (`lingerForFinal`; at most `maxCancelLingers`) | `drainCancelledInvite` and `abandonReInvite` after the inline `cancelDrain` (`invite_leg.go:378`) | a final, the transaction's `Done`, or `cancelLinger` (then `Terminate`) |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:460,499`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:905`) | its 5 s BYE context |
-| per request: sipgo handler goroutine | sipgo | handler return (after the final response; `dialogTable` owns the dialog from then on) |
+| per request: sipgo transaction-layer goroutine running `serveTx` and the handler | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); `serveTx` does not wait for the transaction's timers (#170) |
+| per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | the transaction's `Done` (Timer L, H or I on UDP; at once on a reliable transport) |
 | shield prune loop | `shield.New` (`shield.go:64`) | `Shield.Close` |
 | HEP writer (one per process, owned by `hep.Sender`, not by the edge) | `hep.New` from `app.Run` when `hep:` is set | `closeHEPSender` after `g.Wait()` |
 
@@ -1134,7 +1135,14 @@ RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 
 Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 `NOTIFY`, `SUBSCRIBE`, `REFER`, `MESSAGE`, `PRACK`, `UPDATE`, `OPTIONS`, and
-`OnNoRoute` (`edge.go:600-613`).
+a no-route handler for any other method (`s.routes`, `edge.go`). They are
+dispatched by `serveTx` (`txserve.go`), which `Run` installs on sipgo's
+transaction layer in place of sipgo's `Server.handleRequest` (issue #170):
+after the handler returns it leaves a UDP transaction that has sent a final
+response to sipgo's own timers (J, L, H/I) instead of waiting in
+`TerminateGracefully` for up to 32 s, and otherwise calls
+`TerminateGracefully` as sipgo does (`Terminate` when there is no final or
+the transport is reliable).
 
 | Method | Handling |
 |---|---|
@@ -1404,7 +1412,7 @@ deliver.
      `edge.carrier_sources`, held by the carrier directory, §6) → a
      **carrier** call, with the carrier's name;
    - anything else → dropped **silently** (`dropSilently`): the handler
-     returns without responding, and sipgo's `Server.handleRequest` then
+     returns without responding, and `serveTx` (`txserve.go`) then
      calls `TerminateGracefully`, which for a transaction with no final
      response is `Terminate` — it stops `Timer_1xx` (the 200 ms automatic
      "100 Trying"), removes the transaction and sends nothing, so there is
@@ -1666,7 +1674,7 @@ reclamation of a confirmed dialog is the media silence watchdog, surfaced
 through `sess.Done()`. When it is the media that ends the dialog (the
 watchdog, or a WebRTC peer whose certificate does not match its
 fingerprint), `end()` reports it and the watcher calls the table's
-`onMediaEnd` — `byeBothEnds` (`indialog.go:917`, wired at `edge.go:274`) —
+`onMediaEnd` — `byeBothEnds` (`indialog.go:917`, wired at `edge.go:297`) —
 which sends **each endpoint a BYE on behalf of the other** (RFC 3261 §15):
 From/To and tags from the record, the Request-URI the endpoint's own
 Contact, the CSeq one above the highest the other endpoint used, out the
@@ -2696,7 +2704,7 @@ The watchdog is the backstop for a half-dead call whose BYE was lost. It
 fires the per-dialog media watcher goroutine, which calls
 `dialog.end(endRTPSilence)` (the session records `media.CloseSilence` before
 `Done` fires, and `Cause()` reports it) and then sends a BYE to both
-endpoints (`byeBothEnds`, wired at `edge.go:274`; §7.7). The call is counted
+endpoints (`byeBothEnds`, wired at `edge.go:297`; §7.7). The call is counted
 in `freesbc_edge_calls_ended_total{reason="rtp_silence"}` and its `"call
 ended"` line carries `reason=rtp_silence`. That watcher is launched by `confirm` (`dialog.go:1082-1121`), so it
 exists only for a **confirmed** dialog; an early one is reclaimed by
