@@ -205,7 +205,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | carrier directory refresh (`carrierDirectory.Run`) | `Run` (`edge.go:739-743`) | `listenCtx` cancel |
 | per confirmed dialog: media watcher (`<-sess.Done()`, then end the dialog) | `dialog.confirm` (`dialog.go:1082`) | session `Done` closed |
 | WebRTC establishment | `startWebRTC` (`media.go:327`) | `WebRTCSession.Start` returns |
-| `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:123-128`); `ack2xx` also from the re-INVITE relay (`indialog.go:112`) | its 5 s BYE context / after one write |
+| `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:130-136`); `ack2xx` also from the re-INVITE relay (`indialog.go:112`) | its 5 s BYE context / after one write |
 | background wait for a CANCELled INVITE's or abandoned re-INVITE's final (`lingerForFinal`; at most `maxCancelLingers`) | `drainCancelledInvite` and `abandonReInvite` after the inline `cancelDrain` (`invite_leg.go:378`) | a final, the transaction's `Done`, or `cancelLinger` (then `Terminate`) |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:460,499`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:905`) | its 5 s BYE context |
@@ -1647,14 +1647,27 @@ Remove it when sipgo delivers responses to one transaction in arrival order
 **2xx retransmissions and late forks (Timer M).** The INVITE client
 transaction is **not** terminated after a 2xx: sipgo keeps it in the RFC 6026
 Accepted state until Timer M (64·T1) and passes every later 2xx to the
-`OnRetransmission` hook `watch2xx` installs (`invite_leg.go:84-97`). A
+`OnRetransmission` hook `watch2xx` installs (`invite_leg.go:88-91`). A
 retransmission of the confirmed dialog's own 2xx is relayed again — the same
 response, never re-negotiated — so one lost 200 on the caller's leg does not
 fail the call (RFC 3261 §13.3.1.4, §16.7 step 10). A 2xx from **another**
 fork, after the record is confirmed, is a second dialog with no media anchor:
-FreeSBC ACKs and BYEs it once (`refuse2xx`, `invite_leg.go:123`) and only
+FreeSBC ACKs and BYEs it once (`refuse2xx`, `invite_leg.go:130`) and only
 re-ACKs its retransmissions (`reject2xx` remembers the tag). The same
 applies to a 2xx FreeSBC cannot anchor and to one that races a CANCEL.
+
+**No callback keeps an ended dialog alive (issue #228).** A server or client
+transaction lives until its terminate timers (about 32 s), and a stopped
+`time.Timer` stays in the runtime's timer heap, with its closure, until the
+heap is cleaned up. So the callbacks registered on them (`OnCancel`,
+`OnRetransmission`, the ACK and owed-answer backstops, a `lingerForFinal`
+goroutine) capture a `dialogHook` (`dialog.go`), not the `*dialog`, `inviteLeg`
+or `owedAnswer.release` bound to it. `dialog.end` calls `release`, after which
+`hook.dialog()` is nil: a CANCEL or timer then does nothing, and a late 2xx is
+ACKed and BYEd from the far side alone (the refused tags live on the hook).
+Otherwise the record, its media session and its forks would stay reachable for
+those 32 s and the memory held would scale with the call rate
+(`TestEndedDialogNotRetainedByTransactionHooks`).
 
 `count()` counts only confirmed dialogs; that is what `ActiveCalls()` reports
 (`edge.go:317`). `freesbc_active_sip_dialogs` is a separate mechanism over

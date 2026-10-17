@@ -356,8 +356,9 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// client its 487 only after the hook returns, so it does no network
 	// I/O: it marks the call cancelled (from now on no 2xx can confirm it)
 	// and hands the CANCEL to a goroutine.
+	h := d.hook // not d: the transaction outlives the call (dialogHook)
 	if !tx.OnCancel(func(*sip.Request) {
-		if !s.cancelCall(d, cancelByCaller) {
+		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
 			// No attempt in flight (between attempts, or before the first):
 			// there is nothing to CANCEL on the wire, but the series must
 			// still stop.
@@ -656,8 +657,9 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	// keep ringing. A false return means the transaction is ALREADY
 	// terminated — the CANCEL beat this registration — and nothing has
 	// been sent yet: ending here is the whole of the work left.
+	h := d.hook // not d: the transaction outlives the call (dialogHook)
 	if !tx.OnCancel(func(*sip.Request) {
-		if !s.cancelCall(d, cancelByCaller) {
+		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
 			cancel()
 		}
 	}) {

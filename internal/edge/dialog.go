@@ -316,11 +316,11 @@ type dialog struct {
 	// answered by relaying this same response again (RFC 3261 §13.3.1.4,
 	// RFC 6026 §7.2) — never re-negotiated.
 	ok *sip.Response
-	// rejected records the To tags of 2xx responses FreeSBC refused to
-	// relay (another fork's 2xx after this record was confirmed, or one it
-	// could not anchor) and has already ACKed and BYEd: a retransmission
-	// of one is only re-ACKed.
-	rejected map[string]bool
+	// hook is what sipgo's transaction callbacks (OnCancel, OnRetransmission)
+	// capture instead of the record itself; end releases it, so a
+	// transaction that lingers after the call (Timer J/M, about 32 s) does
+	// not keep the record, its media session and its forks reachable.
+	hook *dialogHook
 
 	// origin is the o= identity per leg, indexed by plane.
 	origin [2]sdpOrigin
@@ -435,6 +435,7 @@ func (t *dialogTable) begin(req *sip.Request, callerPlane plane, limit int) (*di
 		origin:      [2]sdpOrigin{newSDPOrigin(), newSDPOrigin()},
 		cseq:        [2]uint32{fsip.CSeqNumber(req), 0},
 	}
+	d.hook = &dialogHook{d: d}
 	if f := req.From(); f != nil {
 		d.callerURI = f.Address
 	}
@@ -1014,18 +1015,7 @@ func (d *dialog) setRelayed2xx(res *sip.Response) {
 // reject2xx records a 2xx FreeSBC refuses to relay and reports whether it
 // is the first time: the first sighting is ACKed and BYEd, a
 // retransmission only re-ACKed.
-func (d *dialog) reject2xx(calleeTag string) (first bool) {
-	d.tab.mu.Lock()
-	defer d.tab.mu.Unlock()
-	if d.rejected == nil {
-		d.rejected = map[string]bool{}
-	}
-	if d.rejected[calleeTag] {
-		return false
-	}
-	d.rejected[calleeTag] = true
-	return true
-}
+func (d *dialog) reject2xx(calleeTag string) (first bool) { return d.hook.reject(calleeTag) }
 
 // track points the CANCEL bridge at the INVITE about to be sent. A
 // failover series re-tracks per attempt, deliberately overwriting the
@@ -1308,6 +1298,7 @@ func (d *dialog) endBy(reason endReason, by terminator) bool {
 	t.sessions--
 	t.metrics.SetSessions(t.sessions)
 	t.mu.Unlock()
+	d.hook.release()
 
 	if sess == nil {
 		return wasUp
@@ -1326,5 +1317,67 @@ func (d *dialog) endBy(reason endReason, by terminator) bool {
 	t.log.Info("call ended", "sip_call_id", d.callID, "reason", reason.String(),
 		"terminated_by", string(by), "duration", time.Since(confirmedAt).Round(time.Millisecond),
 		"webrtc", webrtc, "carrier", carrier, "stats", st)
+	return true
+}
+
+// dialogHook is the only reference to a dialog that a sipgo transaction
+// callback holds. A server or client transaction outlives the call by its
+// terminate timers (about 32 s), and its callbacks live as long as it does,
+// so a callback that captured the *dialog would keep the record, its media
+// session, early forks and bodies reachable for that long, at a cost that
+// scales with the call rate. dialog.end releases the hook; a callback that
+// runs afterwards sees no dialog and does what needs no record.
+type dialogHook struct {
+	mu sync.Mutex
+	d  *dialog
+	// rejected records the To tags of 2xx responses FreeSBC refused to
+	// relay (another fork's 2xx after the record was confirmed, or one it
+	// could not anchor) and has already ACKed and BYEd: a retransmission
+	// of one is only re-ACKed. It outlives the record, since the far end
+	// retransmits until Timer M.
+	rejected map[string]bool
+}
+
+// dialog is the record, or nil once it has ended.
+func (h *dialogHook) dialog() *dialog {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.d
+}
+
+// endReInviteOffer is dialog.endReInviteOffer through the hook, for a
+// callback (an owedAnswer's release) that a timer keeps alive: once the
+// record has ended there is no counter left to decrement.
+func (h *dialogHook) endReInviteOffer() {
+	if d := h.dialog(); d != nil {
+		d.endReInviteOffer()
+	}
+}
+
+// release drops the reference to the record.
+func (h *dialogHook) release() {
+	h.mu.Lock()
+	h.d = nil
+	h.mu.Unlock()
+}
+
+// isRejected reports whether a 2xx with this To tag was already refused.
+func (h *dialogHook) isRejected(tag string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rejected[tag]
+}
+
+// reject records a refused 2xx and reports whether it is the first.
+func (h *dialogHook) reject(tag string) (first bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rejected == nil {
+		h.rejected = map[string]bool{}
+	}
+	if h.rejected[tag] {
+		return false
+	}
+	h.rejected[tag] = true
 	return true
 }

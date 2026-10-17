@@ -58,7 +58,14 @@ func (s *Server) armAckTimer(d *dialog, cseq uint32) {
 	a := &ackOwed{plane: d.callerPlane, cseq: cseq, cleared: make(chan struct{})}
 	d.ack = a
 	if d.owed == nil {
-		a.timer = time.AfterFunc(s.ackBudget(), func() { s.ackExpired(d, a) })
+		// The timer captures the hook, not d: a stopped timer stays in the
+		// runtime's heap until it is cleaned up, and its closure with it.
+		h := d.hook
+		a.timer = time.AfterFunc(s.ackBudget(), func() {
+			if d := h.dialog(); d != nil {
+				s.ackExpired(d, a)
+			}
+		})
 	}
 }
 

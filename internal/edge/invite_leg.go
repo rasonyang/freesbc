@@ -82,8 +82,12 @@ func (l *inviteLeg) dialog() *dialog { return l.d }
 // retransmissions of the one relayed, and 2xx from other forks — to this
 // hook rather than to Responses(). The transaction is deliberately NOT
 // terminated after the 2xx; Timer M (64·T1) ends it.
+//
+// The hook captures the dialog's hook, not the leg or the record: the
+// transaction outlives the call by Timer M (see dialogHook).
 func (s *Server) watch2xx(l *inviteLeg) {
-	l.clTx.OnRetransmission(func(res *sip.Response) { s.onLate2xx(l, res) })
+	h, tx, src, far := l.d.hook, l.tx, l.req.Source(), l.far
+	l.clTx.OnRetransmission(func(res *sip.Response) { s.onLate2xx(h, tx, src, far, res) })
 }
 
 // onLate2xx handles a 2xx that arrived after the first one.
@@ -95,38 +99,40 @@ func (s *Server) watch2xx(l *inviteLeg) {
 // BYEd rather than relayed, once, and its own retransmissions are only
 // re-ACKed. While the record is still early the first 2xx is being
 // processed by the pump; the far end retransmits, so this one is dropped.
-func (s *Server) onLate2xx(l *inviteLeg, res *sip.Response) {
-	d := l.dialog()
+func (s *Server) onLate2xx(h *dialogHook, tx sip.ServerTransaction, src string, far side, res *sip.Response) {
 	tag := fsip.ToTag(res)
-	if ok := d.relayed2xx(tag); ok != nil {
-		// A clone carries no destination; the caller's transport source is
-		// where every response to it goes (RFC 3581).
-		out := ok.Clone()
-		out.SetDestination(l.req.Source())
-		s.metrics.ResponseOut(out.StatusCode)
-		if err := l.tx.Respond(out); err != nil {
-			s.log.Debug("relay 2xx retransmission", "err", err, "sip_call_id", fsip.CallID(res))
+	if d := h.dialog(); d != nil {
+		if ok := d.relayed2xx(tag); ok != nil {
+			// A clone carries no destination; the caller's transport source
+			// is where every response to it goes (RFC 3581).
+			out := ok.Clone()
+			out.SetDestination(src)
+			s.metrics.ResponseOut(out.StatusCode)
+			if err := tx.Respond(out); err != nil {
+				s.log.Debug("relay 2xx retransmission", "err", err, "sip_call_id", fsip.CallID(res))
+			}
+			return
 		}
-		return
+		d.tab.mu.Lock()
+		early := d.state == dialogEarly && !h.isRejected(tag)
+		d.tab.mu.Unlock()
+		if early {
+			return
+		}
 	}
-	d.tab.mu.Lock()
-	early := d.state == dialogEarly && !d.rejected[tag]
-	d.tab.mu.Unlock()
-	if early {
-		return
-	}
-	s.refuse2xx(l, res)
+	// The record has ended (or is not early): the 2xx is ACKed and BYEd.
+	s.refuse2xx(h, far, res)
 }
 
 // refuse2xx completes and tears down a dialog the far end believes it has
 // established but FreeSBC will not relay: ACK then BYE the first time, ACK
 // alone for a retransmission.
-func (s *Server) refuse2xx(l *inviteLeg, res *sip.Response) {
-	if l.dialog().reject2xx(fsip.ToTag(res)) {
-		go s.ackThenBye(res, l.far)
+func (s *Server) refuse2xx(h *dialogHook, far side, res *sip.Response) {
+	if h.reject(fsip.ToTag(res)) {
+		go s.ackThenBye(res, far)
 		return
 	}
-	go s.ack2xx(res, l.far)
+	go s.ack2xx(res, far)
 }
 
 // errNoAnswer reports a 2xx that carries no SDP on a fork that never
@@ -202,7 +208,7 @@ func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 		return nil
 	})
 	if err != nil && !errors.Is(err, errResponseDropped) && is2xx {
-		s.refuse2xx(l, res)
+		s.refuse2xx(l.d.hook, l.far, res)
 	}
 	return err
 }
@@ -249,7 +255,7 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 			// confirmed. A 2xx believes the call is up — complete and
 			// tear it down; anything else is drained below.
 			if res.StatusCode/100 == 2 {
-				s.refuse2xx(l, res)
+				s.refuse2xx(l.d.hook, l.far, res)
 				return pumpResult{responded: true, finalised: d.callerCancelled()}, true
 			}
 			s.abandonAttempt(l)
@@ -365,7 +371,8 @@ const maxCancelLingers = 4096
 // already terminated. A 2xx is the one response with work left in it: the
 // far end believes it has a live dialog, so it is completed and torn down.
 func (s *Server) drainCancelledInvite(l *inviteLeg) {
-	s.lingerForFinal(l.clTx, func(res *sip.Response) { s.refuse2xx(l, res) })
+	h, far := l.d.hook, l.far // not l: the linger can outlive the call by cancelLinger
+	s.lingerForFinal(l.clTx, func(res *sip.Response) { s.refuse2xx(h, far, res) })
 }
 
 // lingerForFinal waits on a CANCELled INVITE client transaction for the

@@ -167,7 +167,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 						}
 						answer = offerBody
 						d.setOwed(&owedAnswer{offer: offerParsed, offerer: to.plane, answerer: from.plane,
-							cseq: fsip.CSeqNumber(req), release: d.endReInviteOffer})
+							cseq: fsip.CSeqNumber(req), release: d.hook.endReInviteOffer})
 						keepSlot = true
 					}
 					fsip.SetSDPBody(relayed, answer)
