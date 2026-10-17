@@ -28,6 +28,9 @@
 #   SWITCH_EXEC SBC_EXEC     command prefix that runs a command ON that role
 #   SBC_PUBLIC SBC_PRIVATE LOADGEN_IP CARRIERGEN_IP CARRIER_IP SWITCH_IP
 #   REMOTE_PERF  path of test/perf as seen by the roles       SAMPLE_CMD
+#   SWITCH=sipp|freeswitch   sipp (default) starts the SIPp switch UAS;
+#     freeswitch starts nothing and targets the real FreeSWITCH at SWITCH_IP
+#     (set up per test/perf/freeswitch/README.md); scenarios register, call, webrtc
 # In hosts mode every *_EXEC defaults to empty (= run locally) except where you
 # set it, e.g. SBC_EXEC="ssh sbc" SWITCH_EXEC="ssh switch".
 
@@ -35,6 +38,7 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 TOPOLOGY=${TOPOLOGY:-compose}
 COMPOSE_FILE=${COMPOSE_FILE:-$HERE/docker-compose.yml}
+SWITCH=${SWITCH:-sipp}                  # sipp | freeswitch
 
 SBC_PUBLIC=${SBC_PUBLIC:-172.28.1.10}
 SBC_PRIVATE=${SBC_PRIVATE:-172.28.2.10}
@@ -100,6 +104,9 @@ shift $((OPTIND - 1))
 SCEN=${1:-}
 [[ -n $SCEN ]] || { usage >&2; exit 2; }
 case $SCEN in register|call|carrier-in|carrier-out|webrtc) ;; *) die "unknown scenario '$SCEN'" ;; esac
+case $SWITCH in sipp) ;; freeswitch)
+	case $SCEN in carrier-in|carrier-out) die "SWITCH=freeswitch supports register, call and webrtc only (the carrier scenarios need the SIPp switch)" ;; esac ;;
+*) die "SWITCH must be sipp or freeswitch, not '$SWITCH'" ;; esac
 
 if [[ -z $RATE ]]; then
 	if [[ -n $CONC ]]; then RATE=$(( (CONC + HOLD - 1) / HOLD )); else RATE=10; fi
@@ -171,7 +178,7 @@ start_carrier_uas() {
 }
 stop_roles() {
 	[[ -n ${SAMPLER_PID:-} ]] && kill "$SAMPLER_PID" 2>/dev/null
-	kill_role "$SWITCH_EXEC" switch_uas.xml
+	[[ $SWITCH == sipp ]] && kill_role "$SWITCH_EXEC" switch_uas.xml
 	kill_role "$CARRIER_EXEC" carrier_uas.xml
 	for p in $BG_PIDS; do kill "$p" 2>/dev/null; done
 }
@@ -280,7 +287,7 @@ if ! out=$($SAMPLE_CMD 2>/dev/null) || [[ -z $out ]]; then
 fi
 note "FreeSBC build: $(printf '%s\n' "${out:-}" | sed -n 's/^freesbc_build_info{\(.*\)} 1/\1/p' | head -1)"
 
-start_switch_uas
+if [[ $SWITCH == sipp ]]; then start_switch_uas; else note "switch: real FreeSWITCH at $SWITCH_IP (no SIPp UAS started)"; fi
 [[ $SCEN == carrier-out ]] && start_carrier_uas
 sleep 1
 start_sampler

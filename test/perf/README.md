@@ -9,6 +9,7 @@ WebRTC (ICE-Lite + DTLS-SRTP). Everything lives in this directory:
 | `run.sh` | Runs one scenario, samples FreeSBC while it runs, prints a summary. Step mode ramps the rate to find the highest rate under 0.1% failures. |
 | `docker-compose.yml`, `docker/` | Single-host rig: two bridge networks and five containers (FreeSBC, load generator, carrier-inbound generator, carrier, switch). |
 | `configs/perf.yaml` | FreeSBC config for the runs; every load-relevant knob annotated. `perf-wide.yaml`: 25000-call RTP range. `perf-defaults.yaml`: shield at its defaults, to show the ceiling you hit if you forget to raise it. |
+| `configs/perf-freeswitch.yaml`, `freeswitch/` | The same for a real FreeSWITCH as the switch: FreeSBC config, FreeSWITCH profile and dialplan, and how load users register ([`freeswitch/README.md`](freeswitch/README.md)). |
 | `sipp/*.xml` | SIPp scenarios (below). |
 | `pcap/` | `g711u_10s.pcap` (10 s of PCMU, 20 ms packets, 115 KB) and `gen_pcap.py` to make longer ones. |
 | `webrtcload/` | Go WebRTC load client (`package main` in this module). |
@@ -28,9 +29,9 @@ Three roles, as in the issue:
 * The generator drives the public side (UDP, or WS/WSS for WebRTC).
 * The switch is a SIPp UAS that answers REGISTER and INVITE immediately and
   echoes RTP (`-rtp_echo`), so the switch is never the bottleneck. For the
-  one "realistic" run against FreeSWITCH, point `edge.switch` at a real
-  FreeSWITCH instead and use the same generator scenarios (the UAS is only
-  needed for the raw-capacity runs).
+  "realistic" run, `SWITCH=freeswitch` puts a real FreeSWITCH there instead
+  with the same generator scenarios ([below](#load-through-a-real-freeswitch));
+  the UAS is for the raw-capacity runs.
 * Carrier outbound adds a SIPp UAS playing the carrier on the public side; the
   "switch" role then also generates the call (a UAC on the private side).
 * While a scenario runs, `run.sh` scrapes FreeSBC's admin `/metrics` every
@@ -236,7 +237,77 @@ separately (`skipped`); raise `-users`.
 
 The client needs the switch behind FreeSBC to answer and echo RTP: the SIPp
 `switch_uas.xml` does. Against a real switch, echo is whatever it provides
-(FreeSWITCH `echo` application).
+(FreeSWITCH `echo` application, as in [`freeswitch/`](freeswitch/README.md)).
+
+## Load through a real FreeSWITCH
+
+Same generator scenarios (`register`, `call`, `webrtc`), with a real
+FreeSWITCH in place of the SIPp switch UAS. Three hosts:
+
+```
+ generator host         SBC host                              FreeSWITCH host
+ (SIPp, run.sh)  --->  public 203.0.113.7 | private 10.77.0.2  --->  10.77.0.10:5090
+ 203.0.113.50                                                        profile "perf", echo on 2000
+```
+
+Files and the FreeSWITCH setup are in [`freeswitch/README.md`](freeswitch/README.md);
+the FreeSBC config is `configs/perf-freeswitch.yaml`. The profile there is a
+lab-only profile (no digest) on its own port; read its notes first.
+
+**Host prep checklist**
+
+1. FreeSBC host: `sysctl net.core.rmem_max=...` of at least 4194304 (4 MiB) and
+   `net.core.wmem_max` of at least 1048576 (1 MiB). FreeSBC asks for 4 MiB receive and
+   1 MiB send on every UDP SIP socket and only logs a WARN when the kernel caps it, so a
+   low value shows up as `freesbc_udp_receive_buffer_errors_total` rising under load.
+   The same for the FreeSWITCH and generator hosts.
+2. `ulimit -n` (systemd `LimitNOFILE`) in the hundreds of thousands on the FreeSBC
+   host (about 4 UDP sockets per call) and on FreeSWITCH.
+3. Memory: set `GOMEMLIMIT` to 80 to 90% of the cgroup or host memory the process may
+   use (`docs/performance.md`, "Memory, CPS and GOMEMLIMIT"); note the value in the run.
+4. Pin the run to one config: `freesbc run -c perf-freeswitch.yaml` with the `ADDRESS`
+   lines changed; `freesbc check -c` first. `admin.pprof` is on; reach `admin.listen`
+   (loopback) through an SSH tunnel: `ssh -L 18081:127.0.0.1:8081 sbc`, then
+   `go tool pprof http://admin:perf@127.0.0.1:18081/debug/pprof/profile?seconds=30`
+   (or `curl -u admin:perf`).
+5. **Restart FreeSBC between runs** (`systemctl restart freesbc`) so RSS, bans and
+   bindings start clean, and clear FreeSWITCH's registrations
+   (`fs_cli -x 'sofia profile perf flush_inbound_reg'`).
+6. Copy this directory to every host that runs SIPp (the generator runs `run.sh`
+   locally): `rsync -a test/perf/ sbc:/opt/freesbc/test/perf/`.
+
+**Commands** (on the generator host, repo root):
+
+```sh
+export TOPOLOGY=hosts SWITCH=freeswitch
+export SBC_PUBLIC=203.0.113.7 SBC_PRIVATE=10.77.0.2
+export LOADGEN_IP=203.0.113.50
+export SWITCH_IP=10.77.0.10            # informational with SWITCH=freeswitch
+export SBC_EXEC="ssh sbc"              # sampler runs on the FreeSBC host
+export REMOTE_PERF=/opt/freesbc/test/perf
+# smoke, then client CPS steps with media off, then concurrent calls with media
+test/perf/run.sh -r 1 -t 5 -H 5 -u 5 call
+test/perf/run.sh -n -u 5000 -s 50:1000:50:30 -H 2 call
+test/perf/run.sh -c 450 -H 30 -t 120 -u 450 call
+```
+
+`SWITCH=freeswitch` starts no SIPp UAS and refuses the carrier scenarios. Metrics
+come from the same `sample.sh` through `SBC_EXEC`; for another admin user or password
+use `SAMPLE_CMD` (see "Three real hosts"). Compare with the same command and
+`SWITCH=sipp` (a SIPp UAS on the switch host) to separate FreeSBC's cost from the
+switch's.
+
+**Counters to watch** (`metrics.csv` columns, or scrape `/metrics` and
+`/api/status`):
+
+| Counter | Reading |
+|---|---|
+| `freesbc_udp_receive_buffer_errors_total` (`udp_rcvbuf_errors`) | Must stay 0. Rising means datagrams were dropped on a full UDP receive buffer (namespace-wide, Linux only): check `rmem_max`. |
+| `freesbc_edge_invite_rejects_total{reason}` (`invite_rejects`) | `early_cap` (64 unanswered per source IP: slow answers), `session_cap`, `invite_rate`, `port_exhausted`, `draining`. FreeSBC refused the call itself. |
+| `freesbc_edge_admission_drops_total{reason}` (`admission_drops`) | `invite_not_admitted` means the generator source IP:port has no live registration. |
+| `freesbc_edge_calls_ended_total{reason}` | Why calls ended. A healthy run ends in `bye_caller`; `ack_timeout`, `rtp_silence`, `media_fault` or `answer_timeout` point at a leg problem. |
+| `freesbc_media_port_allocation_failure_total` (`port_alloc_fail`) | Zero: the `rtp` range is big enough. |
+| `shield_drops` | Zero: the shield limits are raised. |
 
 ## Three real hosts
 
@@ -282,6 +353,7 @@ test/perf/run.sh -r 50 -t 60 -H 30 call
   `SWITCH_IP:5060`, the carrier UAS on `CARRIER_IP:5060`, RTP `6000` on the
   switch and the carrier, and `rtp` range on FreeSBC. Source ports used by the
   generator: `5070` (`GEN_PORT`).
+* For a real FreeSWITCH as the switch, see [Load through a real FreeSWITCH](#load-through-a-real-freeswitch).
 * The hosts-mode path has not been exercised in this repo's own testing: the
   compose rig is the verified path.
 
@@ -300,6 +372,7 @@ test/perf/run.sh -r 50 -t 60 -H 30 call
 | `STEP_FAIL_PCT` | `0.1` | step-mode failure threshold (percent) |
 | `OUT_ROOT` | `test/perf/out` | where runs go (compose mounts only `test/perf`) |
 | `*_EXEC`, `REMOTE_PERF`, `SAMPLE_CMD` | compose exec prefixes, `/perf` | see above |
+| `SWITCH` | `sipp` | `sipp` starts the SIPp switch UAS; `freeswitch` starts nothing and targets the real FreeSWITCH at `SWITCH_IP` |
 | `FREESBC_CONFIG`, `FREESBC_VERSION` | `perf.yaml`, `git describe` | for `run.sh up` |
 
 ## Known limitations

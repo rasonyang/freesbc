@@ -1,0 +1,58 @@
+<!-- LOAD-TEST profile for FreeSBC runs (test/perf). LAB ONLY: it accepts any
+     REGISTER and any call without digest authentication, so that SIPp's
+     register.xml and uac_call.xml (which do not answer a challenge) can load
+     FreeSWITCH. Install it on a dedicated test FreeSWITCH, never on a switch
+     that has gateways or a dialplan that can reach a carrier.
+
+     Copy to <conf>/sip_profiles/perf.xml, replace 10.77.0.10 with the
+     FreeSWITCH host's private IP (the IP in edge.switch), then
+     `fs_cli -x 'reload mod_sofia'` or restart. edge.switch is 10.77.0.10:5090.
+
+     Why this is not the production layout (examples/switch/freeswitch/):
+     the production client profile has auth-calls=true and no ACL for
+     private.ip, because every client request arrives from FreeSBC's address
+     (docs/edge.md, "Never identify or trust a request by FreeSBC's IP on the
+     client port"). This profile gives that up on purpose, so contain it
+     instead: it listens on its own port (5090, not the stock 5060/5080), its
+     context "perfload" holds only an answer-and-echo extension (no bridge, no
+     gateway, no way to reach a carrier), and the firewall should allow
+     10.77.0.10:5090/udp only from the FreeSBC private IP (10.77.0.2) and the
+     RTP range only from the same host. -->
+<profile name="perf">
+  <aliases/>
+  <gateways/>
+  <domains>
+    <domain name="all" alias="true" parse="false"/>
+  </domains>
+  <settings>
+    <param name="sip-ip" value="10.77.0.10"/>
+    <param name="rtp-ip" value="10.77.0.10"/>
+    <param name="sip-port" value="5090"/>
+    <!-- No NAT between FreeSBC and the switch. -->
+    <param name="ext-sip-ip" value="10.77.0.10"/>
+    <param name="ext-rtp-ip" value="10.77.0.10"/>
+    <param name="dialplan" value="XML"/>
+    <param name="context" value="perfload"/>
+
+    <!-- Lab shortcut: no digest. REGISTER gets 200 for any user, and the INVITE
+         lands in the context above without a challenge. -->
+    <param name="auth-calls" value="false"/>
+    <param name="accept-blind-reg" value="true"/>
+    <param name="accept-blind-auth" value="true"/>
+    <!-- No apply-inbound-acl / apply-register-acl: nothing here to match. -->
+
+    <!-- Contact is stored as FreeSBC sent it, including its fsbc= parameter. -->
+    <param name="inbound-codec-prefs" value="PCMU,PCMA"/>
+    <param name="outbound-codec-prefs" value="PCMU,PCMA"/>
+    <param name="rtp-timer-name" value="soft"/>
+    <param name="rfc2833-pt" value="101"/>
+    <param name="dtmf-type" value="rfc2833"/>
+    <!-- A call whose RTP stops (generator killed) is hung up after this long. -->
+    <param name="rtp-timeout-sec" value="60"/>
+    <!-- Registrations expire as granted (SIPp asks for 86400 s); drop them
+         between runs with `fs_cli -x 'sofia profile perf flush_inbound_reg'`. -->
+    <param name="multiple-registrations" value="false"/>
+    <param name="manage-presence" value="false"/>
+    <param name="log-auth-failures" value="false"/>
+  </settings>
+</profile>
