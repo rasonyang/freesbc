@@ -1,0 +1,75 @@
+# FreeSBC configuration for load runs against a REAL FreeSWITCH (three hosts):
+#
+#   load generator (SIPp)  ->  FreeSBC  ->  FreeSWITCH
+#   203.0.113.50               public 203.0.113.7 | private 10.77.0.2  ->  10.77.0.10:5090
+#
+# Use it with SWITCH=freeswitch test/perf/run.sh (test/perf/README.md, "Load
+# through a real FreeSWITCH"); the FreeSWITCH side is test/perf/freeswitch/.
+# Change the ADDRESS lines to your hosts, then run `freesbc check -c <file>`
+# (it does not test that addresses are local; `run` does). A load-test file:
+# the admin password is a throwaway ("perf"), do not reuse it in production.
+#
+# Same shield and range settings as perf.yaml; the LIMIT notes below are what
+# a real switch adds to them.
+
+public:
+  ip: 203.0.113.7            # ADDRESS: FreeSBC's public side (advertised)
+  # bind: 203.0.113.7        # = ip here. Set it only behind 1:1 NAT (cloud VM).
+
+private:
+  ip: 10.77.0.2              # ADDRESS: FreeSBC's private side (bind = advertised).
+                             # The private SIP socket is fixed: 10.77.0.2:5060.
+
+# LIMIT rtp: (max-min+1)/2 calls per plane, and the default shield.max_sessions.
+# 20000-29999 = 5000 calls. Keep it above rate x hold; a real switch answers
+# slower than the SIPp UAS, so more calls are in flight than at the same rate
+# against the UAS. For ~24000 calls use 10000-59999 and set max_sessions to
+# match (see perf-wide.yaml).
+rtp: 20000-29999
+
+tls:
+  cert: /etc/freesbc/cert.pem   # only read by `run`, and only for the wss listener
+  key: /etc/freesbc/key.pem
+
+edge:
+  # LIMIT switch: the FreeSWITCH perf profile (test/perf/freeswitch/), a
+  # literal IP:port. FreeSBC admits private-socket traffic only from these
+  # IPs, so the FreeSWITCH host IP must be listed. The port is the profile's
+  # sip-port (5090 in the shipped snippet), not necessarily 5060.
+  switch: [10.77.0.10:5090]   # ADDRESS
+
+  listen:                      # ports on public.bind
+    udp: 5060
+    tcp: 5060
+    ws: 8080                   # for the webrtc scenario (webrtcload)
+    wss: 443
+
+  # No carriers for this mode: the carrier scenarios need the SIPp switch.
+  # LIMIT carrier_sources: left unset on purpose. The generator then takes
+  # the registered-client path, which is what a real switch behind FreeSBC
+  # sees. Admission requires a live registration at the exact transport
+  # IP:port (run.sh `call` pre-registers from the same IP:port).
+
+shield:
+  # LIMIT rate_limit: default 20/s per_ip counts EVERY public datagram (ACK,
+  # BYE, retransmissions) and silently drops the excess: one generator IP
+  # gets about 6 CPS. Raised above anything the generator can send.
+  rate_limit: 1000000/s per_ip
+  carrier_rate_limit: 1000000/s per_ip
+  ban: 1m
+  # LIMIT max_sessions: 0 = the rtp pair count. Must not exceed the range.
+  max_sessions: 0
+  # invite_rate_limit stays off: a global INVITE/s cap would hide the real CPS.
+  #
+  # Not a config key, but the limit a SLOW switch hits first: at most 64
+  # unanswered INVITEs per public source IP (maxEarlyPerSource, carriers
+  # exempt), rejected 503 with invite_rejects_total{reason="early_cap"}. It is
+  # per source IP, so one generator IP can start at most about
+  # 64 / (INVITE-to-200 time) calls per second through a switch that answers
+  # slowly. Use more generator IPs (each must pre-register from its own
+  # IP:port) or lower -r; do not read it as a FreeSBC limit.
+
+admin:
+  listen: 127.0.0.1:8081     # loopback only; reach it through an SSH tunnel
+  pprof: true                # /debug/pprof/ behind the same Basic Auth
+  password_hash: "$2y$10$sbCGIYv.0V/JCrqC.ZBQEuzSWlVidnXE898iuyV8L1lbOTHzqabju"   # password: perf

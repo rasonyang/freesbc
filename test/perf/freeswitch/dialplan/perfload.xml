@@ -1,0 +1,32 @@
+<!-- Dialplan for the "perfload" context of sip_profiles/perf.xml. Copy to
+     <conf>/dialplan/perfload.xml (the stock freeswitch.xml includes
+     dialplan/*.xml). run.sh dials sip:2000@perf.test (SERVICE=2000). -->
+<include>
+  <context name="perfload">
+    <!-- 2000: answer and echo the caller's RTP back. This is the load
+         scenario: media flows generator -> FreeSBC -> FreeSWITCH and back. -->
+    <extension name="perf_echo">
+      <condition field="destination_number" expression="^2000$">
+        <action application="answer"/>
+        <action application="echo"/>
+      </condition>
+    </extension>
+
+    <!-- 2001: answer and send a 440 Hz tone for as long as the call lasts,
+         ignoring the caller's media (FreeSWITCH is then a pure RTP source).
+         Run with SERVICE=2001. -->
+    <extension name="perf_tone">
+      <condition field="destination_number" expression="^2001$">
+        <action application="answer"/>
+        <action application="playback" data="tone_stream://%(10000,0,440);loops=-1"/>
+      </condition>
+    </extension>
+
+    <!-- Everything else: refuse. Nothing bridges anywhere. -->
+    <extension name="perf_reject">
+      <condition field="destination_number" expression="^.*$">
+        <action application="respond" data="404"/>
+      </condition>
+    </extension>
+  </context>
+</include>
