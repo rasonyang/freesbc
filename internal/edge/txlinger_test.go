@@ -16,44 +16,43 @@ import (
 	"time"
 )
 
-// TestServeTxDoesNotParkGoroutines is issue #170: once the edge has sent a
-// final response on a UDP server transaction, the goroutine that ran the
-// handler ends, instead of waiting in sipgo's TerminateGracefully for Timer
-// J; and the transaction still absorbs a retransmission, which sipgo
-// answers with the same final without running the handler again.
-func TestServeTxDoesNotParkGoroutines(t *testing.T) {
+// TestServerTxDoesNotParkGoroutines is issue #170, now a contract on sipgo
+// (fixed upstream in v1.6.0, emiago/sipgo#349; v1.4.3 and v1.5.0 fail it):
+// once the edge has sent a final response on a UDP server transaction, the
+// goroutine that ran the handler ends, instead of waiting in sipgo's
+// TerminateGracefully for Timer J; and the transaction still absorbs a
+// retransmission, which sipgo answers with the same final without running
+// the handler again.
+func TestServerTxDoesNotParkGoroutines(t *testing.T) {
 	h := startHarness(t, false)
 	phone := newUDPClient(t)
-	parked := func() (edge, sipgoServer int) {
+	parked := func() (sipgoServer int) {
 		buf := make([]byte, 16<<20)
 		n := runtime.Stack(buf, true)
 		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
 			if !strings.Contains(g, "TerminateGracefully") {
 				continue
 			}
-			if strings.Contains(g, "edge.(*Server).serveTx") {
-				edge++
-			}
 			if strings.Contains(g, "sipgo.(*Server).handleRequest") {
 				sipgoServer++
 			}
 		}
-		return edge, sipgoServer
+		return sipgoServer
 	}
-	_, before := parked()
+	before := parked()
 	const n = 50
 	for i := 0; i < n; i++ {
 		if r := phone.do(t, buildOptions(phone, fmt.Sprintf("serve-tx-%d", i)), h.publicUDP); r.StatusCode != 200 {
 			t.Fatalf("OPTIONS %d: %d", i, r.StatusCode)
 		}
 	}
-	// Give the handler goroutines time to reach the end of serveTx.
+	// Give the handler goroutines time to reach the end of sipgo's Server.handleRequest.
 	time.Sleep(100 * time.Millisecond)
 	// The fake switch and the test phones are plain sipgo servers whose
 	// goroutines from earlier tests may still be waiting; none of them
 	// took part here, so their count can only fall.
-	if edge, server := parked(); edge != 0 || server-before >= n/2 {
-		t.Fatalf("server transactions parked a goroutine: %d in serveTx, sipgo Server.handleRequest %d -> %d", edge, before, server)
+	if server := parked(); server-before >= n/2 {
+		t.Fatalf("server transactions parked a goroutine in sipgo Server.handleRequest: %d -> %d", before, server)
 	}
 
 	// A retransmission (same branch) after the handler returned: the

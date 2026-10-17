@@ -96,7 +96,6 @@ type Server struct {
 	upstreamCooldown *cooldownTable
 
 	srv    *sipgo.Server
-	routes routes // request dispatch, set in Run before any listener serves (txserve.go)
 	client *sipgo.Client
 
 	shield   *shield.Shield
@@ -616,28 +615,25 @@ func (s *Server) Run(ctx context.Context) error {
 	s.shield = sh
 	s.shieldMu.Unlock()
 
-	// Requests are dispatched by serveTx, installed on the transaction
-	// layer in place of sipgo's Server.handleRequest so that a finished
-	// transaction does not park a goroutine for 32 s (txserve.go).
-	s.routes = routes{
-		byMethod: map[sip.RequestMethod]func(*sip.Request, sip.ServerTransaction){
-			sip.REGISTER:  s.guard(s.onRegister),
-			sip.INVITE:    s.guard(s.onInvite),
-			sip.ACK:       s.guard(s.onAck),
-			sip.CANCEL:    s.guard(s.onCancel),
-			sip.BYE:       s.guard(s.onInDialog),
-			sip.INFO:      s.guard(s.onInDialog),
-			sip.PRACK:     s.guard(s.onPrackUpdate),
-			sip.UPDATE:    s.guard(s.onPrackUpdate),
-			sip.NOTIFY:    s.guard(s.onInDialog),
-			sip.SUBSCRIBE: s.guard(s.onSubscribe),
-			sip.REFER:     s.guard(s.onInDialog),
-			sip.MESSAGE:   s.guard(s.onMessage),
-			sip.OPTIONS:   s.guard(s.onOptions),
-		},
-		noRoute: s.guard(s.onNoRoute),
-	}
-	ua.TransactionLayer().OnRequest(s.serveTx)
+	// Requests are dispatched by sipgo's Server. Its handleRequest ends in
+	// ServerTx.TerminateGracefully, which since v1.6.0 returns at once for
+	// a finalised unreliable transaction and leaves it to its timers, so a
+	// finished transaction parks no goroutine (issue #170;
+	// TestServerTxDoesNotParkGoroutines guards it).
+	srv.OnRegister(s.guard(s.onRegister))
+	srv.OnInvite(s.guard(s.onInvite))
+	srv.OnAck(s.guard(s.onAck))
+	srv.OnCancel(s.guard(s.onCancel))
+	srv.OnBye(s.guard(s.onInDialog))
+	srv.OnInfo(s.guard(s.onInDialog))
+	srv.OnPrack(s.guard(s.onPrackUpdate))
+	srv.OnUpdate(s.guard(s.onPrackUpdate))
+	srv.OnNotify(s.guard(s.onInDialog))
+	srv.OnSubscribe(s.guard(s.onSubscribe))
+	srv.OnRefer(s.guard(s.onInDialog))
+	srv.OnMessage(s.guard(s.onMessage))
+	srv.OnOptions(s.guard(s.onOptions))
+	srv.OnNoRoute(s.guard(s.onNoRoute))
 
 	listenCtx, listenCancel := context.WithCancel(context.Background())
 	defer listenCancel()
@@ -863,12 +859,15 @@ func (l listener) Close() {
 
 // Serve drives the socket through sipgo's transport layer until it closes.
 //
-// This deliberately bypasses sipgo's ListenAndServe wrappers, because as of v1.4.3 those close their internal
-// listener from an unsynchronised variable written by Serve and read by a
-// separate shutdown goroutine, which the race detector correctly flags on
-// every graceful shutdown. Owning the handle here gives a clean
-// happens-before edge — it is fully constructed before any goroutine that
-// closes it exists.
+// This deliberately bypasses sipgo's ListenAndServe wrappers, because the edge hands sipgo listeners it wraps
+// itself (streamListener, dialListener), which ListenAndServe* cannot take.
+// It also keeps the shutdown race out: through v1.5.0 those wrappers closed
+// their internal listener from an unsynchronised variable written by Serve
+// and read by a separate shutdown goroutine, which the race detector flags on
+// every graceful shutdown; v1.6.0 fixed that (watchContext is started after
+// the listener exists), so only the wrapping reason remains. Owning the
+// handle here also gives a clean happens-before edge: it is fully
+// constructed before any goroutine that closes it exists.
 func (l listener) Serve(tl *sip.TransportLayer) error {
 	switch l.transport {
 	case "udp", "udp-private":
@@ -1079,11 +1078,7 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 	return func(req *sip.Request, stx sip.ServerTransaction) {
 		req, arr := s.marker.take(req)
-		// serveTx hands its own tracker in, so it can see the final too.
-		tx, ok := stx.(*finalTracker)
-		if !ok {
-			tx = &finalTracker{ServerTransaction: stx}
-		}
+		tx := &finalTracker{ServerTransaction: stx}
 		if req.Method == sip.INVITE {
 			// Registered first, so it runs last, after the panic path.
 			defer s.drainAcks(tx)
