@@ -18,7 +18,7 @@ import (
 // This file is the outbound half of the carrier stream transports: the tcp
 // and tls connections FreeSBC itself opens to a carrier.
 //
-// sipgo v1.4.3 can dial a stream destination, but it does so with one
+// sipgo v1.6.0 (unchanged since v1.4.3) can dial a stream destination, but it does so with one
 // process-wide tls.Config and the destination host it was given, so it
 // cannot carry a per-carrier server name, root set or client certificate.
 // FreeSBC therefore dials and handshakes the connection itself, wraps it in

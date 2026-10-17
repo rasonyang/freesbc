@@ -8,7 +8,7 @@ import (
 
 // MaxReadSize is the read-filter size cap a plane passes to ReadFilter.
 //
-// It must stay below sipgo's TransportBufferReadSize (32 KiB in v1.4.3):
+// It must stay below sipgo's TransportBufferReadSize (32 KiB in v1.6.0):
 // every sipgo transport reads into a buffer of that size, so no read the
 // filter sees is ever longer, and a cap at or above it could never fire.
 // An oversized UDP datagram arrives truncated to the buffer size and a

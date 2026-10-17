@@ -3,7 +3,7 @@ module github.com/freesbc/freesbc
 go 1.27.2
 
 require (
-	github.com/emiago/sipgo v1.4.3
+	github.com/emiago/sipgo v1.6.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-yaml v1.19.2
 	github.com/pion/dtls/v3 v3.1.8

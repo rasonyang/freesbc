@@ -180,8 +180,8 @@ func (s *Server) admitDialogless(req *sip.Request, src netip.AddrPort) bool {
 // dropSilently records an admission drop: it counts it by reason and logs
 // it, at WARN the first time a source IP is dropped for that reason and at
 // Debug afterwards, so a scanner cannot flood the log. Nothing is sent to
-// the requester; the handler returns without responding, and serveTx
-// (txserve.go) then terminates the server transaction unanswered (see
+// the requester; the handler returns without responding, and sipgo's
+// Server.handleRequest then terminates the server transaction unanswered (see
 // onInvite).
 func (s *Server) dropSilently(reason dropReason, req *sip.Request, src netip.AddrPort, attrs ...any) {
 	s.metrics.AdmissionDropped(reason)

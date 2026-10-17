@@ -28,7 +28,7 @@ const (
 
 // arrivalHeader is the internal header the read filter stamps on a request
 // that reached a trusted socket, and guard reads and strips again before
-// any handler runs. sipgo v1.4.3 hands a handler only the request's SOURCE,
+// any handler runs. sipgo v1.6.0 hands a handler only the request's SOURCE,
 // so the local socket — which only the transport read filter sees — has to
 // travel with the message itself.
 const arrivalHeader = "X-FreeSBC-Arrival"
@@ -149,7 +149,7 @@ func stripInternalHeaders(m headerMessage) {
 // A request that carries any such header is CLONED and stripped on the
 // copy, and the copy is returned: the original is shared with sipgo's own
 // server transaction, whose "100 Trying" timer reads its headers from
-// another goroutine (sipgo v1.4.3 transaction_server_tx.go), so editing it
+// another goroutine (sipgo v1.6.0 transaction_server_tx.go), so editing it
 // in place is a data race. A request with none — every ordinary public
 // request — is returned as it is, at no cost.
 //

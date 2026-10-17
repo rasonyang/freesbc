@@ -6,8 +6,8 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// provTable works around a sipgo v1.4.3 race that loses provisional
-// responses (re-check when upgrading sipgo; v1.6.0 has it too). Upstream:
+// provTable works around a sipgo v1.6.0 race that loses provisional
+// responses (re-check when upgrading sipgo; v1.4.3, v1.5.0 and v1.6.0 all have it). Upstream:
 // emiago/sipgo#306, with fixes proposed in #307 and #354, none merged.
 //
 // TransactionLayer.handleMessage starts one goroutine per response, so a

@@ -3,7 +3,7 @@ package sip
 import "bytes"
 
 // Malformed reports whether one SIP datagram or WebSocket frame is certain
-// to be rejected by sipgo's message parser (Parser.ParseSIP, v1.4.3). It is
+// to be rejected by sipgo's message parser (Parser.ParseSIP, v1.6.0). It is
 // the cheap pre-validation the edge's read filter runs on public reads to
 // feed the shield's offender table (issue #190), where sipgo itself only
 // logs the failure with no notion of the source.

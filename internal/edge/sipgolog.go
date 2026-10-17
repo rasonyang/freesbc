@@ -11,7 +11,7 @@ import (
 	"github.com/emiago/sipgo/sip"
 )
 
-// sipgoParseFailMsg is the message sipgo v1.4.3 logs, at Error and with the
+// sipgoParseFailMsg is the message sipgo v1.6.0 logs, at Error and with the
 // whole raw message as the "data" attribute, when its parser rejects a read
 // (sip/transport_udp.go, transport_tcp.go, transport_ws.go). The handler
 // below keys on it; TestSipgoParseFailureLogContract fails if a sipgo

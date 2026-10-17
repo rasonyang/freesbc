@@ -78,7 +78,7 @@ var hepTracerOnce sync.Once
 
 // installHEPTracer turns on sipgo's SIP debug hook, once per process.
 //
-// sipgo v1.4.3 has no write hook. Its only outbound tap is the package-level
+// sipgo v1.6.0 has no write hook. Its only outbound tap is the package-level
 // SIPDebugTracer, which fires from the UDP, TCP and WS connection writes and
 // only while sip.SIPDebug is true. Both globals are unsynchronised, so they
 // are set here, from New, before any server of this process runs. SIPTraceRead

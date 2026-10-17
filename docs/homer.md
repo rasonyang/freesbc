@@ -78,4 +78,4 @@ Exported on `/metrics` only while `hep:` is set:
 
 ## Implementation notes
 
-The mirror copies inbound messages in the read filter and outbound ones through sipgo v1.4.3's only write hook, the process-wide `sip.SIPDebugTracer`, which requires `sip.SIPDebug = true`. That flag also turns on a few extra Debug-level log lines in sipgo's WebSocket transport; they appear only at the Debug log level. Details and the reasoning are in [`design.md`](design.md) §7.1b.
+The mirror copies inbound messages in the read filter and outbound ones through sipgo v1.6.0's only write hook, the process-wide `sip.SIPDebugTracer`, which requires `sip.SIPDebug = true`. That flag also turns on a few extra Debug-level log lines in sipgo's WebSocket transport; they appear only at the Debug log level. Details and the reasoning are in [`design.md`](design.md) §7.1b.

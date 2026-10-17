@@ -115,3 +115,7 @@ Not re-run: the container rig needs a Docker daemon, and this environment has no
 2. Re-run the perf rig (`call` and `carrier-in` CPS steps) to replace the 2.3 MB/CPS figure in performance.md.
 3. Follow up with b2 (release the dialog from the `OnCancel` and `watch2xx` hooks after the call ends), then evaluate the sipgo v1.6.x upgrade in its own PR.
 4. Operators: set GOMEMLIMIT with headroom over the live heap (performance.md).
+
+## Outcome (sipgo v1.6.0 upgrade, issue #229)
+
+The upgrade was done in its own change. `serveTx` and `txserve.go` are removed and the handlers are registered with sipgo's `srv.On*` and `OnNoRoute` again. Upstream is equivalent for what `serveTx` did: v1.6.0's `ServerTx.TerminateGracefully` (`sip/transaction_server_tx.go:170`) terminates at once on a reliable transport or without a final, and otherwise logs "Server transaction retained for timer termination" and returns, leaving the transaction to its timers. It is slightly broader than `serveTx`: it also covers the 487 sipgo sends itself for a CANCEL, which `serveTx` still blocked on. `TestServeTxDoesNotParkGoroutines` became `TestServerTxDoesNotParkGoroutines` and now guards the upstream behaviour (it would fail on v1.4.3 and v1.5.0). `provTable`, the "failed to parse" rewrite, `UDPMTUSize`, the HEP tracer and `drainAcks` (the "ACK missed" Warn is still at Warn in v1.6.0) are kept.
