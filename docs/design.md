@@ -71,7 +71,7 @@ end-to-end.
 
 | Owned by FreeSBC | Delegated |
 |---|---|
-| Plane classification, admission, switch selection, cooldown, RFC 3261 §16 forwarding, proxy dialog state | SIP transaction state machines, retransmission, Timer B/F/J: `emiago/sipgo` v1.4.3 |
+| Plane classification, admission, switch selection, cooldown, RFC 3261 §16 forwarding, proxy dialog state | SIP transaction state machines, retransmission, Timer B/F/J: `emiago/sipgo` v1.6.0 |
 | Carrier directory, carrier registration tokens, topology hiding toward carriers | DNS: the Go resolver |
 | Port allocation, latching, relay loops, watchdog | SRTP transforms: `pion/srtp/v3`; DTLS handshake and key export: `pion/dtls/v3`; ICE connectivity checks: `pion/ice/v4` |
 | SDP codec intersection and body construction | SDP syntax: `pion/sdp/v3` |
@@ -209,7 +209,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | background wait for a CANCELled INVITE's or abandoned re-INVITE's final (`lingerForFinal`; at most `maxCancelLingers`) | `drainCancelledInvite` and `abandonReInvite` after the inline `cancelDrain` (`invite_leg.go:378`) | a final, the transaction's `Done`, or `cancelLinger` (then `Terminate`) |
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:460,499`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:905`) | its 5 s BYE context |
-| per request: sipgo transaction-layer goroutine running `serveTx` and the handler | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); `serveTx` does not wait for the transaction's timers (#170) |
+| per request: sipgo transaction-layer goroutine running `Server.handleRequest` and the handler | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); since sipgo v1.6.0 `TerminateGracefully` does not wait for the transaction's timers (#170) |
 | per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | the transaction's `Done` (Timer L, H or I on UDP; at once on a reliable transport) |
 | shield prune loop | `shield.New` (`shield.go:64`) | `Shield.Close` |
 | HEP writer (one per process, owned by `hep.Sender`, not by the edge) | `hep.New` from `app.Run` when `hep:` is set | `closeHEPSender` after `g.Wait()` |
@@ -353,10 +353,11 @@ what it enforces. When `hep:` is set it is also where inbound messages are
 mirrored to HOMER (§7.1b).
 
 The edge deliberately bypasses sipgo's `ListenAndServe*` helpers and calls
-`tl.ServeUDP` / `ServeTCP` / `ServeTLS` / `ln.Serve` directly, because in
-sipgo v1.4.3 those wrappers close an internal listener through an
-unsynchronised variable, which the race detector flags on every graceful
-shutdown.
+`tl.ServeUDP` / `ServeTCP` / `ServeTLS` / `ln.Serve` directly, because it
+serves listeners it wraps itself (`streamListener`, `dialListener`), which
+those helpers cannot take. Through sipgo v1.5.0 the wrappers also closed an
+internal listener through an unsynchronised variable, which the race
+detector flagged on every graceful shutdown; v1.6.0 fixed that.
 
 The topology is built once in `New`, from the configured addresses, and is
 never rewritten after binding (there is no wildcard bind whose real local
@@ -702,7 +703,7 @@ sequenceDiagram
 
 A `tcp` or `tls` carrier is a destination FreeSBC resolved from `edge.carriers`, so it is the one stream peer FreeSBC dials (a client's flow is never dialed, §7). Every request to a carrier passes `requireFlow` (`forward.go`): when sipgo's pool holds no connection to the destination and the destination is a resolved address of a carrier of that transport (`carrierTarget`), `carrierConns.ensure` (`carrierconn.go`) opens one.
 
-sipgo v1.4.3 dials a stream destination itself, but with one process-wide `tls.Config` and the destination host it was given (the IP, here), so it cannot carry a per-carrier server name, root set or client certificate. FreeSBC therefore dials, handshakes and verifies the connection (`carrierTLSConfig`: `MinVersion` TLS 1.2, `ServerName` the configured host, `RootCAs` from `ca_file` when set, else the system roots, `Certificates` from `client_cert`/`client_key`; no skip-verify), wraps it in the `streamConn` every accepted connection gets (§7: write deadline, message framer and read deadlines, per-IP and global caps, metrics) and hands it to sipgo through a `dialListener` served beside the public listeners (`Run` appends `carrierConns.listeners()`). sipgo's own `Serve` loop then pools it under the carrier's address and reads it, so responses reach the transaction layer and the carrier's requests on it reach the ordinary handlers. The sipgo user agent's own TLS config trusts nothing (`edge.go`), so a dial sipgo makes itself in a race with a closing connection fails closed. A lost connection leaves the pool through sipgo's read loop and the next request dials again; dials to one address are serialised. Shutdown closes the pool (`UserAgent.Close`) and the unread `dialListener` queue. Certificates are loaded in `edge.New`, so a bad `ca_file` or client pair fails startup.
+sipgo v1.6.0 (like v1.4.3) dials a stream destination itself, but with one process-wide `tls.Config` and the destination host it was given (the IP, here), so it cannot carry a per-carrier server name, root set or client certificate. FreeSBC therefore dials, handshakes and verifies the connection (`carrierTLSConfig`: `MinVersion` TLS 1.2, `ServerName` the configured host, `RootCAs` from `ca_file` when set, else the system roots, `Certificates` from `client_cert`/`client_key`; no skip-verify), wraps it in the `streamConn` every accepted connection gets (§7: write deadline, message framer and read deadlines, per-IP and global caps, metrics) and hands it to sipgo through a `dialListener` served beside the public listeners (`Run` appends `carrierConns.listeners()`). sipgo's own `Serve` loop then pools it under the carrier's address and reads it, so responses reach the transaction layer and the carrier's requests on it reach the ordinary handlers. The sipgo user agent's own TLS config trusts nothing (`edge.go`), so a dial sipgo makes itself in a race with a closing connection fails closed. A lost connection leaves the pool through sipgo's read loop and the next request dials again; dials to one address are serialised. Shutdown closes the pool (`UserAgent.Close`) and the unread `dialListener` queue. Certificates are loaded in `edge.New`, so a bad `ca_file` or client pair fails startup.
 
 The leg's `side` is the carrier transport's public side (`carrierSide`): the listener's, or, for a tcp/tls carrier with no listener, a synthetic side at the default port marked `outbound`, whose Via carries `;alias` (RFC 5923). Via, Record-Route and Contact therefore name `TLS`/`;transport=tls`, and the usual double Record-Route covers the udp switch leg.
 
@@ -893,7 +894,7 @@ Warn per minute (global, because sipgo's record does not carry the source
 address) reports the latest failure and how many were folded in. The transport
 label comes from the `caller=Transport<UDP>` attribute sipgo's per-transport
 logger adds. The wrapper also refuses to forward any `data` attribute added
-through `With`. Matching on the message is a sipgo v1.4.3 workaround
+through `With`. Matching on the message is a sipgo v1.6.0 workaround
 (`TestSipgoParseFailureLogContract` fails if the string changes).
 
 **Drain mode.** `Server.SetDraining` (`edge.go:343`) flips a `drainState`
@@ -1064,7 +1065,7 @@ queues, and a full queue drops the copy (`freesbc_hep_packets_dropped_total`).
   is split into complete messages by Content-Length (`nextStreamMessage`,
   `hepmirror.go:285`); a message split over two reads is not mirrored. A UDP
   datagram or WS/WSS frame is one message.
-- **Outbound** has no hook in sipgo v1.4.3. The only tap is the package-level
+- **Outbound** has no hook in sipgo v1.6.0. The only tap is the package-level
   `sip.SIPDebugTracer`, called from the UDP, TCP and WS connection writes and
   only while `sip.SIPDebug` is true. `New` installs it once per process
   (`installHEPTracer`, `hepmirror.go:59`, `sync.Once`, only when a sender was
@@ -1135,14 +1136,14 @@ RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 
 Registered handlers: `REGISTER`, `INVITE`, `ACK`, `CANCEL`, `BYE`, `INFO`,
 `NOTIFY`, `SUBSCRIBE`, `REFER`, `MESSAGE`, `PRACK`, `UPDATE`, `OPTIONS`, and
-a no-route handler for any other method (`s.routes`, `edge.go`). They are
-dispatched by `serveTx` (`txserve.go`), which `Run` installs on sipgo's
-transaction layer in place of sipgo's `Server.handleRequest` (issue #170):
-after the handler returns it leaves a UDP transaction that has sent a final
-response to sipgo's own timers (J, L, H/I) instead of waiting in
-`TerminateGracefully` for up to 32 s, and otherwise calls
-`TerminateGracefully` as sipgo does (`Terminate` when there is no final or
-the transport is reliable).
+a no-route handler for any other method, all registered in `Run` with
+sipgo's `srv.On*` and `OnNoRoute` and dispatched by sipgo's own
+`Server.handleRequest`. Since sipgo v1.6.0 its closing `TerminateGracefully`
+leaves a UDP transaction that has sent a final response to sipgo's own
+timers (J, L, H/I) and returns at once (`Terminate` when there is no final or
+the transport is reliable), so a finished transaction parks no goroutine
+(issue #170; before v1.6.0 the edge carried its own dispatcher for this, and
+`TestServerTxDoesNotParkGoroutines` now guards the upstream behaviour).
 
 | Method | Handling |
 |---|---|
@@ -1412,7 +1413,7 @@ deliver.
      `edge.carrier_sources`, held by the carrier directory, §6) → a
      **carrier** call, with the carrier's name;
    - anything else → dropped **silently** (`dropSilently`): the handler
-     returns without responding, and `serveTx` (`txserve.go`) then
+     returns without responding, and sipgo's `Server.handleRequest` then
      calls `TerminateGracefully`, which for a transaction with no final
      response is `Terminate` — it stops `Timer_1xx` (the 200 ms automatic
      "100 Trying"), removes the transaction and sends nothing, so there is
@@ -1868,7 +1869,7 @@ it writes 200 to the CANCEL, then feeds it to the INVITE server
 transaction's state machine, whose cancel action fires the `OnCancel` hook
 (registered at `invite.go:340`, `:529` and `carrier.go:254`) **while holding
 the transaction's FSM lock**; only after the hook returns does the FSM send
-the **487** toward the requester itself (sipgo v1.4.3
+the **487** toward the requester itself (sipgo v1.6.0
 `sip/transaction_layer.go` `handleRequest`,
 `sip/transaction_server_tx_fsm.go` `actCancel`). The hook therefore does no
 network I/O: it calls `cancelCall(d, cancelByCaller)` (`invite_leg.go:451`),

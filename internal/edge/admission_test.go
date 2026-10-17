@@ -45,7 +45,7 @@ func expectSilence(t *testing.T, c *client, req *sip.Request, dest string) {
 // its local address. A request whose Laddr names it reuses that connection,
 // as sip.js keeps its one WebSocket for the whole session. Without this the
 // sipgo test client dials a fresh connection per request over wss (sipgo
-// v1.4.3's TransportWSS.CreateConnection pools the connection under
+// v1.6.0's TransportWSS.CreateConnection pools the connection under
 // swapped laddr/raddr keys, so a lookup by remote address never hits), and
 // each request arrives from a new source port — which admission rightly
 // treats as a different, unregistered client.
