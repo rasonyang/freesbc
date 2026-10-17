@@ -2,6 +2,7 @@ package media
 
 import (
 	"log/slog"
+	"net"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,10 @@ func (s *Session) Start() bool {
 // talks to. rtpKind selects the RTP or RTCP socket/latch of both sides.
 // The loop exits when its socket is closed. A panic kills only this
 // session, never the process (spec §7).
+//
+// RTP loops use the batched relay (relayBatched, recvmmsg/sendmmsg) when
+// batchRelay is set and the platform has one; RTCP, a packet every few
+// seconds, always uses the plain loop.
 func (s *Session) forward(from, to Side, rtpKind bool) {
 	in, inLatch := s.pairs[from].RTCP, s.rtcp[from]
 	outSock, outLatch := s.pairs[to].RTCP, s.rtcp[to]
@@ -44,74 +49,130 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 		in, inLatch = s.pairs[from].RTP, s.rtp[from]
 		outSock, outLatch = s.pairs[to].RTP, s.rtp[to]
 	}
+	l := relayLoop{s: s, from: from, to: to, rtpKind: rtpKind, in: in, out: outSock, inLatch: inLatch, outLatch: outLatch}
+	batched := rtpKind && batchRelayAvailable && batchRelay.Load()
 	go func() {
 		defer recoverRelayPanic(nil, func() error { return s.closeWith(CloseFault) })
-		buf := make([]byte, relayBufSize)
-		for {
-			n, src, err := in.ReadFromUDP(buf[:maxPacketSize+1])
-			if err != nil {
-				return // socket closed (session teardown)
-			}
-			if n > maxPacketSize {
-				continue // oversize: forwarding it would forward a truncation
-			}
-			pkt := buf[:n]
-			if leg := s.sdes[from].Load(); leg != nil {
-				// SDES side: authenticate and decrypt BEFORE the latch may
-				// move, so a forged packet from a vouched address cannot
-				// latch the stream. permits only spares a decrypt for a
-				// source the latch would refuse anyway.
-				if !inLatch.permits(src) {
-					continue
-				}
-				ctx := leg.in.ctx.Load()
-				ok := ctx != nil
-				if ok && rtpKind {
-					pkt, ok = ctx.unprotectRTPInto(pkt, pkt)
-				} else if ok {
-					pkt, ok = ctx.unprotectRTCPInto(pkt, pkt)
-				}
-				if !ok {
-					s.counters.srtpRxDrops[from].Add(1)
-					continue
-				}
-				if !inLatch.accept(src) {
-					continue
-				}
-			} else if !inLatch.accept(src) {
-				continue // pre-latch source mismatch, or post-latch hijack
-			}
-			// Only NOW is the packet proven genuine: the latch accepted it
-			// (and, on an SDES side, it authenticated).
-			// Refresh the silence watchdog here, never on latch-accept alone:
-			// A party who knows the latched source address could
-			// feed garbage that failed auth yet renewed rtp_timeout
-			// indefinitely, keeping a dead call alive forever.
-			s.lastRx[from].Store(time.Now().UnixNano())
-			s.counters.recordRx(from, rtpKind, len(pkt))
-			if dst := outLatch.target(); dst != nil {
-				if leg := s.sdes[to].Load(); leg != nil {
-					// Encrypt in place: the read buffer has srtpMaxOverhead
-					// spare. Only done once there is a destination, since
-					// protecting advances the SRTP index.
-					ctx := leg.out.ctx.Load()
-					ok := ctx != nil
-					if ok && rtpKind {
-						pkt, ok = ctx.protectRTPInto(pkt, pkt)
-					} else if ok {
-						pkt, ok = ctx.protectRTCPInto(pkt, pkt)
-					}
-					if !ok {
-						s.counters.srtpTxDrops[to].Add(1)
-						continue
-					}
-				}
-				if n, err := outSock.WriteToUDP(pkt, dst); err == nil {
-					s.counters.recordTx(to, rtpKind, n)
-				}
-			}
+		if batched {
+			l.relayBatched()
+			return
 		}
+		l.relayPlain()
 	}()
+}
+
+// batchRelay turns on the batched RTP relay (issue #172) for sessions
+// started after it is set, where batchRelayAvailable. Off by default: on
+// loopback it is no clear win (docs/notes/172-rtp-batch-io.md), and it has
+// not been measured on a real NIC. Not configuration: tests and benchmarks
+// flip it, and a measurement build sets batchRelayBuild.
+var batchRelay atomic.Bool
+
+// batchRelayBuild is set at link time to build a binary with the batched
+// relay on, for the measurement the notes describe:
+//
+//	go build -ldflags "-X github.com/freesbc/freesbc/internal/media.batchRelayBuild=on" ./cmd/freesbc
+var batchRelayBuild string
+
+func init() {
+	if batchRelayBuild == "on" {
+		batchRelay.Store(true)
+	}
+}
+
+// relayLoop is one direction of one stream of a Session: what forward
+// hands to the read loop that relays it.
+type relayLoop struct {
+	s                 *Session
+	from, to          Side
+	rtpKind           bool
+	in, out           *net.UDPConn
+	inLatch, outLatch *latch
+}
+
+// relayPlain is the portable read loop: one recvfrom and one sendto per
+// packet.
+func (l *relayLoop) relayPlain() {
+	buf := make([]byte, relayBufSize)
+	for {
+		n, src, err := l.in.ReadFromUDP(buf[:maxPacketSize+1])
+		if err != nil {
+			return // socket closed (session teardown)
+		}
+		if n > maxPacketSize {
+			continue // oversize: forwarding it would forward a truncation
+		}
+		pkt, dst, ok := l.packet(buf[:n], src)
+		if !ok {
+			continue
+		}
+		if n, err := l.out.WriteToUDP(pkt, dst); err == nil {
+			l.s.counters.recordTx(l.to, l.rtpKind, n)
+		}
+	}
+}
+
+// packet applies everything but the I/O to one packet read from the `from`
+// side: the latch, SDES decryption and encryption, the silence watchdog
+// and the counters. It returns the bytes to send and where, or ok=false
+// when the packet is dropped. pkt must sit at the start of a
+// relayBufSize buffer, which is encrypted in place. src is not retained.
+func (l *relayLoop) packet(pkt []byte, src *net.UDPAddr) (out []byte, dst *net.UDPAddr, ok bool) {
+	s, from, to, rtpKind, inLatch := l.s, l.from, l.to, l.rtpKind, l.inLatch
+	if leg := s.sdes[from].Load(); leg != nil {
+		// SDES side: authenticate and decrypt BEFORE the latch may
+		// move, so a forged packet from a vouched address cannot
+		// latch the stream. permits only spares a decrypt for a
+		// source the latch would refuse anyway.
+		if !inLatch.permits(src) {
+			return nil, nil, false
+		}
+		ctx := leg.in.ctx.Load()
+		ok := ctx != nil
+		if ok && rtpKind {
+			pkt, ok = ctx.unprotectRTPInto(pkt, pkt)
+		} else if ok {
+			pkt, ok = ctx.unprotectRTCPInto(pkt, pkt)
+		}
+		if !ok {
+			s.counters.srtpRxDrops[from].Add(1)
+			return nil, nil, false
+		}
+		if !inLatch.accept(src) {
+			return nil, nil, false
+		}
+	} else if !inLatch.accept(src) {
+		return nil, nil, false // pre-latch source mismatch, or post-latch hijack
+	}
+	// Only NOW is the packet proven genuine: the latch accepted it
+	// (and, on an SDES side, it authenticated).
+	// Refresh the silence watchdog here, never on latch-accept alone:
+	// A party who knows the latched source address could
+	// feed garbage that failed auth yet renewed rtp_timeout
+	// indefinitely, keeping a dead call alive forever.
+	s.lastRx[from].Store(time.Now().UnixNano())
+	s.counters.recordRx(from, rtpKind, len(pkt))
+	dst = l.outLatch.target()
+	if dst == nil {
+		return nil, nil, false
+	}
+	if leg := s.sdes[to].Load(); leg != nil {
+		// Encrypt in place: the read buffer has srtpMaxOverhead
+		// spare. Only done once there is a destination, since
+		// protecting advances the SRTP index.
+		ctx := leg.out.ctx.Load()
+		ok := ctx != nil
+		if ok && rtpKind {
+			pkt, ok = ctx.protectRTPInto(pkt, pkt)
+		} else if ok {
+			pkt, ok = ctx.protectRTCPInto(pkt, pkt)
+		}
+		if !ok {
+			s.counters.srtpTxDrops[to].Add(1)
+			return nil, nil, false
+		}
+	}
+	return pkt, dst, true
 }
 
 // relayBufSize is every relay read buffer: the largest datagram relayed

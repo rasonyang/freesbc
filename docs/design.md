@@ -217,7 +217,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 **Media**
 
 Per plain `media.Session`: 4 forward loops (RTP A→B, RTP B→A, RTCP A→B,
-RTCP B→A; `relay.go:26-29`) plus 1 watchdog (`relay.go:30`) = **5
+RTCP B→A; `relay.go:27-30`) plus 1 watchdog (`relay.go:31`) = **5
 goroutines**. Per `WebRTCSession`: `publicToPrivate`, two `privateToPublic`
 (RTP and RTCP) and a watchdog (`webrtcsession.go:190-193`), plus the leg's
 `demux.readLoop` (`mux.go:74`), its `establish` goroutine (`webrtcleg.go:403`,
@@ -2445,7 +2445,7 @@ neither a client token nor a carrier is **404** (§6).
 
 | Operation | Where | Notes |
 |---|---|---|
-| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path (phones, carriers and the switch) | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer (`relay.go:40-76`) |
+| **Relay** — bytes forwarded uninterpreted | plaintext RTP and plaintext RTCP on the plain `Session` path (phones, carriers and the switch) | the relay loop copies `buf[:n]` from one socket to the other; no RTP header parsing, no SSRC rewriting, no payload-type rewriting, no sequence handling, no jitter buffer (`relay.go:95-176`; the batched variant `relay_batch_linux.go`, off by default, runs the same per-packet step) |
 | **Termination** — a protocol endpoint FreeSBC itself terminates | the DTLS handshake, SRTP/SRTCP and the ICE-Lite agent of a browser leg | the browser's cryptographic association ends at FreeSBC; SDES-SRTP legs (§8.6) are the only other SRTP |
 | **Transformation** — re-keying and rewriting | SRTP↔RTP interworking on a browser call (decrypt what the browser sends, encrypt what the switch sends; `webrtcsession.go:209-298`); SDP construction — every body on every leg is built from scratch with `sdp.Build` (§8.8) | the SRTP contexts exist only on a browser leg and an SDES leg (§8.6); SRTCP is unprotected and re-protected like SRTP, only its **contents** are never inspected |
 | **Transcoding** | **none, anywhere** | there is no codec conversion in `internal/media`; payload-type numbers must survive end to end, which is why `sdp.ErrRenumbered` rejects a renumbering answer |
@@ -2538,7 +2538,7 @@ stateDiagram-v2
     sessClosed --> [*]
 ```
 
-Transitions: `Start` (`relay.go:19-32`) is a single
+Transitions: `Start` (`relay.go:20-33`) is a single
 `CompareAndSwap(sessAllocated, sessRunning)` and returns whether *this* call
 started it, so the relay starts at most once whichever path wins; `Close`
 (`session.go:462-478`) is a single `Swap(sessClosed)` that closes both pairs,
@@ -2565,7 +2565,7 @@ outLatch.target() != nil -> write from the `to` side's own socket
 
 Every relay loop (this one and the `WebRTCSession` directions) reads
 into one buffer of `relayBufSize` = `maxPacketSize + 1 + srtpMaxOverhead`
-bytes (`relay.go:81`): one byte more than the largest datagram relayed, so an
+bytes (`relay.go:181`): one byte more than the largest datagram relayed, so an
 oversize one is detected and dropped rather than forwarded cut short
 (`ReadFromUDP` truncates silently), and room for the SRTP overhead so the
 browser leg's transforms run in place. The per-packet path allocates nothing.
@@ -2679,7 +2679,7 @@ or carrier's offer (`allocateRTP`), side B from the switch's offer
 ### 8.5 Silence watchdog
 
 `watchdog(timeout, &lastRx, done, Close)` ticks at `timeout/4`, floored at
-**10 ms** (`relay.go:91`). `lastRx` holds **one timestamp per sending side**, and the
+**10 ms** (`relay.go:194`). `lastRx` holds **one timestamp per sending side**, and the
 watchdog calls `Close` when **either** is older than `timeout`: a call is
 reclaimed when one end has gone silent, even while the other keeps
 streaming (the switch playing music on hold to a phone that vanished with
@@ -3119,7 +3119,7 @@ browser or carrier) and B the private one (the switch). **RTCP is relayed but
 never counted.** There is no drop counter, no auth-failure counter and no RTCP
 counter. Rx counts the length after inbound decryption; Tx counts the bytes
 actually written after outbound encryption, and **only when the `WriteToUDP`
-itself succeeded** (`relay.go:70-71`), so on a browser call the public-side tx
+itself succeeded** (`relay.go:109-110`), so on a browser call the public-side tx
 exceeds the private-side rx by the SRTP overhead. On a `WebRTCSession` the
 private-side rx is the raw plaintext length read off the socket before
 `protectRTPInto` (`webrtcsession.go:282`).
@@ -3500,7 +3500,7 @@ spin.
 | Umbrella | Scope |
 |---|---|
 | `edge.guard` (`edge.go:1039`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
-| `media.recoverRelayPanic` (`media/relay.go:115`) | every relay goroutine; closes **that session only** |
+| `media.recoverRelayPanic` (`media/relay.go:215`) | every relay goroutine; closes **that session only** |
 | `admin.recoverMW` (`admin/server.go:672`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` (`config/loader.go:54`) | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
 | `config.loadNoPanic` (`config/reload.go:158`) | each hot reload in `Watch`; a panic is a failed reload and the previous snapshot stays |
