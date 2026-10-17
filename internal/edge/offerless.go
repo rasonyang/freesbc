@@ -163,7 +163,12 @@ func (s *Server) armOwedTimer(d *dialog) {
 	if o == nil || o.timer != nil || d.state != dialogConfirmed {
 		return
 	}
-	o.timer = time.AfterFunc(s.ackBudget(), func() { s.owedExpired(d, o) })
+	h := d.hook // not d: a stopped timer's closure lingers (see armAckTimer)
+	o.timer = time.AfterFunc(s.ackBudget(), func() {
+		if d := h.dialog(); d != nil {
+			s.owedExpired(d, o)
+		}
+	})
 }
 
 func (s *Server) owedExpired(d *dialog, o *owedAnswer) {
