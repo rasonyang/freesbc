@@ -14,7 +14,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 **Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml` (linux archives add `freesbc.service`, see [Run as a service](#run-as-a-service)):
 
 ```sh
-v=v0.4.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
+v=v0.5.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_${os}_${arch}.tar.gz
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
