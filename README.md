@@ -14,7 +14,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 **Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml` (linux archives add `freesbc.service`, see [Run as a service](#run-as-a-service)):
 
 ```sh
-v=v0.4.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
+v=v0.5.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_${os}_${arch}.tar.gz
 curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
@@ -125,7 +125,7 @@ One small cloud VM carries 5000 concurrent calls with media, 3500 call setups pe
 | | |
 |---|---|
 | FreeSBC host | cloud VM, Intel Xeon 6982P-C, **4 vCPU (2 cores + HT), 8 GiB**, Ubuntu 24.04 |
-| FreeSBC | v0.4.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
+| FreeSBC | v0.5.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
 | Load generator | separate 8 vCPU host: SIPp 3.6.1 (UDP SIP, G.711 RTP) and `webrtcload` (ICE-Lite, DTLS-SRTP over ws/wss) |
 | Switch | separate 8 vCPU host on a private network: SIPp UAS echoing RTP, or FreeSWITCH 1.10 |
 | Media | G.711 20 ms in both directions, anchored by FreeSBC on both legs (public and private) |
