@@ -167,6 +167,9 @@ type Server struct {
 	// before Run.
 	streams   *streamTable
 	streamLim streamLimits
+	// ack2xxWait bounds drainAcks after a 2xx (ack2xxDrainWait); tests
+	// shorten it before Run.
+	ack2xxWait time.Duration
 }
 
 const (
@@ -177,6 +180,12 @@ const (
 	// switchCooldown is how long a switch node that answered nothing is
 	// skipped in favour of its alternatives (passive; see cooldown.go).
 	switchCooldown = 30 * time.Second
+
+	// ack2xxDrainWait is how long drainAcks waits, after a 2xx final, for
+	// an ACK that reuses the INVITE branch. Such an ACK follows the 2xx by
+	// one round trip; sipgo keeps the transaction for Timer L (32 s), and
+	// waiting all of it held one goroutine per INVITE for 32 s (#170).
+	ack2xxDrainWait = 8 * time.Second
 )
 
 // Option customises New.
@@ -278,6 +287,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		webrtcEnabled:    cfg.WebRTC(),
 		streams:          newStreamTable(),
 		streamLim:        defaultStreamLimits(),
+		ack2xxWait:       ack2xxDrainWait,
 	}
 	s.carrierByName = map[string]config.Carrier{}
 	for _, c := range cfg.CarrierList() {
@@ -1132,16 +1142,26 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 // A non-2xx ACK is absorbed: the edge's own client transaction toward the
 // far end already ACKs that hop. A 2xx ACK is the end-to-end one, so it is
 // forwarded as any other ACK is. The goroutine ends with the transaction
-// (sipgo's Timer L, H or I, 32 s at most), which Done() reports on every
-// path, so it cannot leak.
+// (sipgo's Timer H or I after a non-2xx, at once on a reliable transport),
+// which Done() reports on every path, so it cannot leak. After a 2xx it
+// ends at ack2xxWait instead, well before Timer L (32 s): a branch-reusing
+// ACK later than that reaches no handler and sipgo logs "ACK missed".
 func (s *Server) drainAcks(tx *finalTracker) {
 	acks, done := tx.Acks(), tx.Done()
 	go func() {
+		var bound <-chan time.Time
+		if st := tx.final.Load(); st >= 200 && st < 300 {
+			t := time.NewTimer(s.ack2xxWait)
+			defer t.Stop()
+			bound = t.C
+		}
 		for {
 			select {
 			case ack := <-acks:
 				s.onTxAck(ack, tx)
 			case <-done:
+				return
+			case <-bound:
 				return
 			}
 		}

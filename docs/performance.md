@@ -39,22 +39,23 @@ Figures marked (derived) are arithmetic on the measurements. The rig's CPU conve
 | CPU on the signaling path | about half in sipgo's transaction layer, 15 to 25% GC | M07 profiles |
 | RTP ports and sessions | the default `rtp: 20000-29999` is 5000 port pairs per plane, and `shield.max_sessions` defaults to that pair count, so a default config admits about 5000 calls; widen `rtp` (and `max_sessions` with it) above that | config; the rig used `rtp: 10000-59999` and `max_sessions: 25000`, so neither was the limit |
 
-* **RAM** (derived): `RSS ≈ 1.25 MB x CPS + 0.07 MB x concurrent calls + about 50 MB`. The CPS term dominates: at 3500 CPS carrier-in RSS was 4.6 GB, while 5000 concurrent calls held in steady state used 373 MB. At the 5000 CPS step carrier-in RSS reached **5.8 GB** (5832 MB) on this 7.4 GiB host, so a CPS-driven box needs about **1.2 GB of RAM per 1000 CPS** plus headroom.
+* **RAM** (derived): `RSS ≈ 1.25 MB x CPS + 0.07 MB x concurrent calls + about 50 MB`. The CPS term dominates: at 3500 CPS carrier-in RSS was 4.6 GB, while 5000 concurrent calls held in steady state used 373 MB. The 1.25 MB was measured before the `drainAcks` 2xx bound (see below), which removes about 24 goroutines per CPS and their stacks, so treat it as an upper figure until the next three-host run. At the 5000 CPS step carrier-in RSS reached **5.8 GB** (5832 MB) on this 7.4 GiB host, so a CPS-driven box needs about **1.2 GB of RAM per 1000 CPS** plus headroom.
 * **Calls per second are not calls held.** A call that lasts 2 s and one that lasts 240 s cost the same per call setup; the 32 s the state outlives the call is what sets the memory (see below).
 * **A lower bound is not a ceiling.** Client call setup (one source IP), registrations, WebRTC and the FreeSWITCH figures are where the rig stopped, not FreeSBC. Plan with them as floors.
 * The CPS figures are for UDP signaling and one carrier or client source per run. A carrier source is exempt from the 64-unanswered cap; a client source is not.
 
 ### Memory, CPS and GOMEMLIMIT
 
-Memory at a sustained call rate is set by state that outlives each call by a fixed time, not by concurrent calls. sipgo keeps every UDP server transaction for up to 64*T1 = 32 s after its final response (RFC 3261 Timer J for non-INVITE, Timer L after an INVITE 2xx, Timer H otherwise); stream transports (tcp, tls, ws, wss) end theirs at once. The edge's `drainAcks` adds one small goroutine per INVITE for the same 32 s.
+Memory at a sustained call rate is set by state that outlives each call by a fixed time, not by concurrent calls. sipgo keeps every UDP server transaction for up to 64*T1 = 32 s after its final response (RFC 3261 Timer J for non-INVITE, Timer L after an INVITE 2xx, Timer H otherwise); stream transports (tcp, tls, ws, wss) end theirs at once. The edge's `drainAcks` adds one small goroutine per INVITE: for 8 s after a 2xx (`ack2xxDrainWait`), otherwise until the transaction ends.
 
-| Figure per sustained CPS | Single-host, pre-sipgo v1.6.0 | Three-host, sipgo v1.6.0 |
+| Figure per sustained CPS | Single-host, pre-sipgo v1.6.0 | Three-host, sipgo v1.6.0, before the `drainAcks` bound |
 |---|---|---|
 | RSS | about 2.3 MB | about 1.25 MB (1.22 to 1.31 carrier-in, 1.30 to 1.61 client) |
 | goroutines | about 76 | about 44 (31.7 are `drainAcks`, one per INVITE) |
 
 * The drop (about 45% of RSS, 32 goroutines) is the handler goroutine sipgo v1.6.0 no longer parks (#170). What remains is the heap sipgo holds until its timers fire (1168 MB in use at 2025 CPS: `sip.NewRequest`, `sip.NewResponse`, `ParseHeader`, `sip.NewServerTx`, header clones) and the `drainAcks` stacks (about 0.3 GB of the 2.5 GB RSS at 2025 CPS). It is per-call state held for a fixed time, not a leak: goroutines return to about 33 after each run.
-* #170 is open: the decision is to bound the 2xx wait in `drainAcks` (about 8 s) and to leave sipgo's 32 s store alone (it is sipgo's to change). Expect the goroutine and stack share to fall; the heap part stays. #173 (open) covers the allocation per request.
+* #170's remaining part: `drainAcks` now stops 8 s after a 2xx (`ack2xxDrainWait`) instead of at Timer L (32 s), since a branch-reusing ACK follows the 2xx by one round trip. That cuts about 24 of the 44 goroutines per CPS (31.7 `drainAcks` held 8 s instead of 32 s). Measured locally (`TestMeasureTxLingerSustained`, call workload at 200 CPS on macOS, fake switch and clients in the same process, so compare the two runs only): 32.1 to 8.1 goroutines and 72.5 to 25.4 KiB of stack per CPS, heap unchanged (1846 to 1823 KiB per CPS). The next monthly three-host run will confirm it.
+* What remains is mostly heap: sipgo keeps each UDP transaction, and the messages it holds, for 32 s (Timer L after a 2xx, RFC 6026). That retention is left alone as a decision: it is sipgo's to change. #173 (open) covers the allocation per request.
 
 **GOMEMLIMIT.** The rig ran with `GOMEMLIMIT=6GiB` on the 7.4 GiB host (about 80%). Without a limit the Go runtime lets the heap grow to about twice the live heap (GOGC=100) before collecting; a limit makes the GC collect harder near it, trading CPU for memory. Signaling at these rates was not CPU-bound, so that trade is cheap.
 
@@ -265,7 +266,7 @@ Restart FreeSBC between runs (`docker restart freesbc-perf-freesbc-1`) so RSS an
 Issue #109's three required runs are done: the [three-host run and FreeSWITCH run](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6249040280) (M01 to M07, 2026-10-18) and the [8 hour soak](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6256238968) (M08, PASS). Open work that touches these numbers:
 
 * #235 (open): carrier-in kernel receive drops from 3750 CPS. Until the dropping socket and the cause are known, 3500 CPS is the loss-free ceiling on 4 vCPU.
-* #170 (open): bound the 2xx wait in `drainAcks` and re-measure goroutines per CPS. #173 (open): allocation per request on the signaling path. #171 (closed): re-measured, no drops through 3500 CPS. #172 (closed, not planned): batching RTP syscalls does not pay at this architecture; reopen as one reader over many sockets only if calls per core become the limit.
+* #170: the 2xx wait in `drainAcks` is bounded at 8 s; the next monthly three-host run re-measures goroutines and RSS per CPS. #173 (open): allocation per request on the signaling path. #171 (closed): re-measured, no drops through 3500 CPS. #172 (closed, not planned): batching RTP syscalls does not pay at this architecture; reopen as one reader over many sockets only if calls per core become the limit.
 
 Not measured, or only a lower bound:
 
