@@ -125,7 +125,7 @@ One small cloud VM carries 5000 concurrent calls with media, 3500 call setups pe
 | | |
 |---|---|
 | FreeSBC host | cloud VM, Intel Xeon 6982P-C, **4 vCPU (2 cores + HT), 8 GiB**, Ubuntu 24.04 |
-| FreeSBC | v0.4.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
+| FreeSBC | v0.5.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
 | Load generator | separate 8 vCPU host: SIPp 3.6.1 (UDP SIP, G.711 RTP) and `webrtcload` (ICE-Lite, DTLS-SRTP over ws/wss) |
 | Switch | separate 8 vCPU host on a private network: SIPp UAS echoing RTP, or FreeSWITCH 1.10 |
 | Media | G.711 20 ms in both directions, anchored by FreeSBC on both legs (public and private) |
