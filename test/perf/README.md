@@ -10,6 +10,7 @@ WebRTC (ICE-Lite + DTLS-SRTP). Everything lives in this directory:
 | `docker-compose.yml`, `docker/` | Single-host rig: two bridge networks and five containers (FreeSBC, load generator, carrier-inbound generator, carrier, switch). |
 | `configs/perf.yaml` | FreeSBC config for the runs; every load-relevant knob annotated. `perf-wide.yaml`: 25000-call RTP range. `perf-defaults.yaml`: shield at its defaults, to show the ceiling you hit if you forget to raise it. |
 | `configs/perf-freeswitch.yaml`, `freeswitch/` | The same for a real FreeSWITCH as the switch: FreeSBC config, FreeSWITCH profile and dialplan, and how load users register ([`freeswitch/README.md`](freeswitch/README.md)). |
+| `hosts/` | A kit for the three-host mode on cloud instances (issue #109): provisioning script, FreeSBC configs, Asterisk configs, runbook ([`hosts/RUNBOOK.md`](hosts/RUNBOOK.md)), agent references ([`hosts/STEPS.md`](hosts/STEPS.md) setup, [`hosts/MEASURE.md`](hosts/MEASURE.md) the measurements). |
 | `sipp/*.xml` | SIPp scenarios (below). |
 | `pcap/` | `g711u_10s.pcap` (10 s of PCMU, 20 ms packets, 115 KB) and `gen_pcap.py` to make longer ones. |
 | `webrtcload/` | Go WebRTC load client (`package main` in this module). |
@@ -68,9 +69,9 @@ pcap and the UAS echoes it, but SIPp does not analyse what returns. Use:
   `SBC_MEM` (default `8g`, so an OOM kills FreeSBC and not the VM). The defaults
   assume an 8-CPU VM; set the variables for another size, before `run.sh up`.
   Per-core figures are then honest for FreeSBC, but all roles still share one
-  physical CPU, its caches and the VM's virtual network: the published
-  numbers are a preliminary single-host run (`docs/performance.md`); the
-  three-host run is still to be done.
+  physical CPU, its caches and the VM's virtual network: these single-host
+  numbers are kept in `docs/performance.md` for history; the three-host
+  results (#109) are at the top of that file.
 
 ## Quick start (compose rig)
 

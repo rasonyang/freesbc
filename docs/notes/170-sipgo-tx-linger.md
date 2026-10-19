@@ -84,7 +84,7 @@ Reading:
 
 ### Perf rig (`test/perf/run.sh`)
 
-Not re-run: the container rig needs a Docker daemon, and this environment has none. The pre-#170 figures stay in performance.md: 2.3 MB RSS and about 76 goroutines per CPS, and 0.8 MB/CPS live heap at 2500 CPS carrier-in. From the dump there, 64 of those 76 goroutines per CPS were the two parked handler goroutines per call (INVITE and BYE). These are now gone; at the about 4 to 5 KiB per stack measured here, that is 0.25 to 0.3 MB of stack per CPS, plus less GC and stack-scan work. **Re-run `run.sh -n -s 1000:3500:500:60 -H 2 carrier-in` and the `call` step test to close the issue's acceptance criterion.**
+Not re-run: the container rig needs a Docker daemon, and this environment has none. The pre-#170 figures stay in performance.md: 2.3 MB RSS and about 76 goroutines per CPS, and 0.8 MB/CPS live heap at 2500 CPS carrier-in. From the dump there, 64 of those 76 goroutines per CPS were the two parked handler goroutines per call (INVITE and BYE). These are now gone; at the about 4 to 5 KiB per stack measured here, that is 0.25 to 0.3 MB of stack per CPS, plus less GC and stack-scan work. **Re-run on the three-host rig (#109, 2026-10-18):** about 1.25 MB RSS and 44 goroutines per CPS (1000 to 3500 CPS carrier-in), 31.7 of them `drainAcks`; see `docs/performance.md` and the #170 comment of that day.
 
 ## Options evaluated
 
@@ -112,7 +112,7 @@ Not re-run: the container rig needs a Docker daemon, and this environment has no
 ## Recommendation
 
 1. Keep `serveTx`. It is small, behaviour-preserving, and removes the parked goroutine per transaction now, without waiting for the upgrade.
-2. Re-run the perf rig (`call` and `carrier-in` CPS steps) to replace the 2.3 MB/CPS figure in performance.md.
+2. Re-run the perf rig (`call` and `carrier-in` CPS steps) to replace the 2.3 MB/CPS figure in performance.md. Done on 2026-10-18: about 1.25 MB/CPS.
 3. Follow up with b2 (release the dialog from the `OnCancel` and `watch2xx` hooks after the call ends), then evaluate the sipgo v1.6.x upgrade in its own PR.
 4. Operators: set GOMEMLIMIT with headroom over the live heap (performance.md).
 
