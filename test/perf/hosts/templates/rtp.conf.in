@@ -1,0 +1,8 @@
+; REHEARSAL-ONLY RTP settings for the 3-host rig (rendered from plan.env). The
+; range does not overlap FreeSWITCH (20000-59999) or the SIPp UAS (6000-6999)
+; on the same host.
+[general]
+rtpstart=10000
+rtpend=10999
+bindaddr=@C_IP@
+strictrtp=no

@@ -1,0 +1,25 @@
+#!/bin/sh
+# Select a rehearsal config and (re)start FreeSBC with it. Runs on the sbc host.
+#   freesbc-use fs|ast|sipp     install the config, run `freesbc check`, restart
+#   freesbc-use stop            stop the service
+# FreeSBC is restarted every time on purpose: RSS, bans and bindings start clean.
+set -eu
+[ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+dir=/etc/perf-kit/configs   # rendered from plan.env by provision.sh
+case ${1:-} in
+fs) f=perf-rehearsal-fs.yaml ;;
+ast) f=perf-rehearsal-ast.yaml ;;
+sipp) f=perf-rehearsal-sipp.yaml ;;
+stop) systemctl stop freesbc; echo "freesbc stopped"; exit 0 ;;
+*) echo "usage: freesbc-use fs|ast|sipp|stop" >&2; exit 2 ;;
+esac
+/usr/local/bin/freesbc check -c "$dir/$f"
+install -o root -g freesbc -m 0640 "$dir/$f" /etc/freesbc/freesbc.yaml
+systemctl restart freesbc
+sleep 2
+if ! systemctl is-active --quiet freesbc; then
+	journalctl -u freesbc -n 30 --no-pager >&2
+	echo "freesbc did not start with $f" >&2
+	exit 1
+fi
+echo "freesbc running with $f"

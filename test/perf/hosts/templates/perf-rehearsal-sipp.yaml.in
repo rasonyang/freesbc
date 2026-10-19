@@ -1,0 +1,56 @@
+# FreeSBC configuration for the 3-host rehearsal (test/perf/hosts/STEPS.md),
+# SIPp UAS as the switch (SWITCH=sipp, all five scenarios). TEMPLATE:
+# provision.sh renders it from plan.env into /etc/perf-kit/configs/ ; do not
+# edit the rendered copy.
+#
+#   loadgen (A)        sbc (B)                            switch (C)
+#   @A_IP@  ->  public @B_PUB_IP@ | private @B_PRIV_IP@  ->  @C_IP@:5060
+#
+# The SIPp switch UAS (switch_uas.xml) runs on the switch host and run.sh
+# starts it over ssh. The SIPp carrier UAS (carrier-out) runs on the loadgen
+# host at @A_CARRIER_UAS_IP@; the carrier generator (carrier-in) sends from
+# @A_CARRIERGEN_IP@. Derived from ../../configs/perf.yaml (LIMIT notes there).
+# Install with `freesbc-use sipp` on the sbc host. Throwaway admin password
+# ("perf"): rehearsal only.
+
+public:
+  ip: @B_PUB_IP@             # B's eth0 IP in the public vSwitch (advertised); public.bind = ip.
+
+private:
+  ip: @B_PRIV_IP@            # B's eth1 (second ENI) in the private vSwitch (bind = advertised).
+                             # The private SIP socket is fixed: @B_PRIV_IP@:5060.
+
+rtp: 10000-59999             # 25000 calls per plane
+
+tls:
+  cert: /etc/freesbc/cert.pem
+  key: /etc/freesbc/key.pem
+
+edge:
+  # The SIPp UAS on the switch host. The carrier-out UAC runs on the same host
+  # and IP from source port 5070, which is why it is accepted.
+  switch: [@C_IP@:5060]
+
+  listen:
+    udp: 5060
+    tcp: 5060
+    ws: 8080
+    wss: 443
+
+  # carrier-out: the switch's Request-URI host:port must equal this entry.
+  carriers:
+    perfcarrier: @A_CARRIER_UAS_IP@:5060   # carrier UAS on the loadgen host
+
+  # carrier-in: the carrier generator IP (a secondary IP of the loadgen host).
+  carrier_sources: [@A_CARRIERGEN_IP@]
+
+shield:
+  rate_limit: 1000000/s per_ip
+  carrier_rate_limit: 1000000/s per_ip
+  ban: 1m
+  max_sessions: 25000        # explicit: the pair count of rtp; no session cap in the way
+
+admin:
+  listen: 127.0.0.1:8081
+  pprof: true
+  password_hash: "$2y$10$sbCGIYv.0V/JCrqC.ZBQEuzSWlVidnXE898iuyV8L1lbOTHzqabju"   # password: perf

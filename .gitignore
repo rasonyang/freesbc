@@ -20,3 +20,6 @@ docs/audit/raw/
 
 # Third-party reference manuals (not redistributable)
 /docs/mediant-software-sbc-users-manual-ver-74.pdf
+
+# Commit stamp written before rsync to the perf hosts (test/perf/hosts/RUNBOOK.md)
+/COMMIT
