@@ -39,7 +39,12 @@
     <param name="auth-calls" value="false"/>
     <param name="accept-blind-reg" value="true"/>
     <param name="accept-blind-auth" value="true"/>
-    <!-- No apply-inbound-acl / apply-register-acl: nothing here to match. -->
+    <!-- LAB ONLY, no digest: accept only FreeSBC's private address. The
+         "freesbc_priv" list is written into acl.conf.xml by provision.sh
+         (B_PRIV_IP from plan.env: allow /32, default deny), so no other
+         host in the security group can register or call. -->
+    <param name="apply-inbound-acl" value="freesbc_priv"/>
+    <param name="apply-register-acl" value="freesbc_priv"/>
 
     <!-- Contact is stored as FreeSBC sent it, including its fsbc= parameter. -->
     <param name="inbound-codec-prefs" value="PCMU,PCMA"/>

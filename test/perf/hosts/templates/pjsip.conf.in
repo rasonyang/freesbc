@@ -1,0 +1,23 @@
+; REHEARSAL-ONLY pjsip for the 3-host rig (test/perf/hosts). TEMPLATE rendered
+; from plan.env by provision.sh. LAB ONLY: it accepts REGISTER and calls
+; without digest from one IP, FreeSBC's private IP. Do not use it as a
+; production layout (examples/switch/asterisk/ is that, and docs/edge.md
+; explains why identifying by FreeSBC's IP is unsafe there).
+; Containment: its own port (5080), a context with no Dial and no bridge, and a
+; security group that admits 5080/udp and the RTP range only from @B_PRIV_IP@.
+;
+; The endpoint, its aors and the identify live in pjsip_perf_users.conf,
+; written by provision.sh (one aor per generated user, u000001.. and w000001..).
+
+[global]
+type=global
+; Match the source IP first: every request arrives from FreeSBC's private IP.
+endpoint_identifier_order=ip,username
+
+[transport-perf]
+type=transport
+protocol=udp
+bind=@C_IP@:5080
+; No NAT between the switch and FreeSBC: no external_* addresses.
+
+#include pjsip_perf_users.conf

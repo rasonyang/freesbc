@@ -9,7 +9,7 @@ switch.
 
 | File | Install as |
 |---|---|
-| `sip_profiles/perf.xml` | `<conf>/sip_profiles/perf.xml`: a profile on `10.77.0.10:5090` that accepts any REGISTER and call without digest (lab only), context `perfload` |
+| `sip_profiles/perf.xml` | `<conf>/sip_profiles/perf.xml`: a profile on `10.77.0.10:5090` that accepts any REGISTER and call without digest (lab only, and only from the `freesbc_priv` ACL: step 1), context `perfload` |
 | `dialplan/perfload.xml` | `<conf>/dialplan/perfload.xml`: `2000` answers and runs `echo`, `2001` answers and plays a tone, anything else is 404 |
 | `../configs/perf-freeswitch.yaml` | the FreeSBC config for this mode (`edge.switch: [10.77.0.10:5090]`) |
 
@@ -34,6 +34,13 @@ from the FreeSBC private IP. If you also keep the carrier profile
    `edge.switch`. Restart FreeSWITCH (or `fs_cli -x 'reload mod_sofia'` and
    `reloadxml`). Check: `fs_cli -x 'sofia status profile perf'` shows
    `udp-ip 10.77.0.10:5090`.
+   The profile applies the ACL `freesbc_priv` to calls and registrations, so
+   define it in `autoload_configs/acl.conf.xml` inside `<network-lists>`, with
+   the FreeSBC private IP (`private.ip`) as the only allowed address, before
+   the reload:
+   `<list name="freesbc_priv" default="deny"><node type="allow" cidr="<private.ip>/32"/></list>`.
+   Without the list FreeSWITCH accepts nothing on this profile. The three-host
+   kit writes it for you (`test/perf/hosts/provision.sh switch`).
 2. Raise FreeSWITCH's own session limits in `autoload_configs/switch.conf.xml`
    (they would otherwise cap the run, and appear as 503s that are not FreeSBC's):
    `sessions-per-second` (stock 30) to above the target CPS, and `max-sessions`

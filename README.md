@@ -116,6 +116,36 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 - **Built-in security**: per-IP rate limiting, scanner fingerprinting, in-memory bans, admission control for public INVITEs and REGISTER enumeration.
 - **Embedded WebUI + REST API**: a live dashboard, a read-only config view with candidate validation and diff, Prometheus metrics, bcrypt admin login (form for the WebUI, Basic Auth for the API).
 
+## Performance
+
+One small cloud VM carries 5000 concurrent calls with media, 3500 call setups per second, and an 8 hour soak with zero failed calls and no memory growth.
+
+### System under test
+
+| | |
+|---|---|
+| FreeSBC host | cloud VM, Intel Xeon 6982P-C, **4 vCPU (2 cores + HT), 8 GiB**, Ubuntu 24.04 |
+| FreeSBC | v0.4.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
+| Load generator | separate 8 vCPU host: SIPp 3.6.1 (UDP SIP, G.711 RTP) and `webrtcload` (ICE-Lite, DTLS-SRTP over ws/wss) |
+| Switch | separate 8 vCPU host on a private network: SIPp UAS echoing RTP, or FreeSWITCH 1.10 |
+| Media | G.711 20 ms in both directions, anchored by FreeSBC on both legs (public and private) |
+| Pass line | under 0.1% failed calls, FreeSBC under 80% of its CPU, RTP sent = RTP received, no kernel receive drops |
+
+### Results
+
+| Test | Result |
+|---|---|
+| Concurrent calls with media | **5000** at 80% CPU, 500k packets/s each way, 373 MB RSS |
+| A commercial SBC's published test: 1000 calls held 600 s | passes on **one vCPU**, about 120 MB RSS, 0 of 2000 calls failed, 0% RTP loss |
+| Call setup rate (no media) | **3500 CPS** carrier to switch, **3250 CPS** switch to carrier, 2250+ CPS client to switch |
+| Soak: 3500 concurrent calls for 8 hours | **432,000 calls, 0 failed**; goroutines, RSS, file descriptors and ports flat |
+| Registrations | **19,000** held, **20,000+ REGISTER/s** at refresh using 13% of the CPU |
+| WebRTC | 100+ DTLS handshakes/s, 600+ concurrent SRTP calls (limited by the generator, not FreeSBC) |
+| With FreeSWITCH as the switch | 3000+ concurrent calls, 1500+ CPS (limited by FreeSWITCH) |
+| Latency FreeSBC adds | **under 1 ms** |
+
+A "+" marks a lower bound: the generator, the switch or the test range ran out before FreeSBC did. Method, profiles, sizing (memory follows the call rate: about 1.25 MB per sustained CPS) and the raw reports are in [docs/performance.md](docs/performance.md) and issue [#109](https://github.com/rasonyang/freesbc/issues/109); the harness to repeat it is in [test/perf/](test/perf/README.md).
+
 ## Documentation
 
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
@@ -163,7 +193,7 @@ Everything else stays on the switch; FreeSBC's contribution is a documented swit
 
 ## Status & limitations
 
-FreeSBC targets small and medium deployments on a single node; for failover, run two independent nodes ([`docs/two-node.md`](docs/two-node.md)). Preliminary single-host numbers (Docker on an Apple M3 Max VM, FreeSBC pinned to 2 cores, generator and switch on the same physical CPU, SIPp as the switch): about 1500 call setups per second, about 450 concurrent G.711 calls and about 800 concurrent WebRTC SRTP calls under 80% of the two cores, about 400 DTLS handshakes per second, and 19000 registrations held. These are not three-host or soak results and will differ on real hardware, and they predate the sipgo v1.6.0 upgrade (to be re-measured in the three-host run, #109). Memory follows the sustained call rate rather than concurrent calls, because state outlives each call by up to 32 s (sipgo keeps each UDP transaction for its timers; the handler goroutine is no longer parked for it since sipgo v1.6.0); size RAM and `GOMEMLIMIT` with [Memory, CPS and GOMEMLIMIT](docs/performance.md#memory-cps-and-gomemlimit). Method, caveats, profiles and the first bottlenecks are in [docs/performance.md](docs/performance.md); the rerunnable harness is in [test/perf/](test/perf/README.md).
+FreeSBC targets small and medium deployments on a single node; for failover, run two independent nodes ([`docs/two-node.md`](docs/two-node.md)). Measured capacity is in [Performance](#performance). Memory follows the sustained call rate rather than concurrent calls, because state outlives each call by up to 32 s (about 1.25 MB per sustained CPS; sipgo keeps each UDP transaction for its timers); size RAM and `GOMEMLIMIT` with [Memory, CPS and GOMEMLIMIT](docs/performance.md#memory-cps-and-gomemlimit). Method, caveats, profiles and the first bottlenecks are in [docs/performance.md](docs/performance.md); the rerunnable harness is in [test/perf/](test/perf/README.md).
 
 Non-goals: transcoding, CDR, clustering, and being a registrar in its own right. The edge proxy proxies registrations to the switch rather than owning users or credentials.
 

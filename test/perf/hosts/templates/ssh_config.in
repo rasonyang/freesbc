@@ -1,0 +1,30 @@
+# ssh client config for the ops user (ecs-user) on every rehearsal host (rendered
+# from plan.env by provision.sh, installed as ~ecs-user/.ssh/config).
+#
+# run.sh on the loadgen host drives the other two through these aliases:
+#   SBC_EXEC="ssh sbc sudo"   SWITCH_EXEC="ssh switch"
+# The sampler opens one ssh per sample (every 2 s), so connection sharing
+# (ControlMaster) is not optional. Every host holds ~/.ssh/aicc-dev-ecs.pem and
+# its public half is authorized for ecs-user everywhere, so no key exchange.
+# New host keys are accepted on first use (spot instances come back with new ones;
+# known_hosts stores the HostName IP, not the alias, so when one changes clear it
+# with ssh-keygen -R <its IP from plan.env> on the other hosts).
+
+Host loadgen
+  HostName @A_IP@
+Host sbc
+  HostName @B_PUB_IP@
+Host switch
+  HostName @C_IP@
+
+Host loadgen sbc switch
+  User ecs-user
+  IdentityFile ~/.ssh/aicc-dev-ecs.pem
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  LogLevel ERROR
+  ConnectTimeout 10
+  ServerAliveInterval 30
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m

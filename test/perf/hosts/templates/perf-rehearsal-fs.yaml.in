@@ -1,0 +1,46 @@
+# FreeSBC configuration for the 3-host rehearsal (test/perf/hosts/STEPS.md),
+# real FreeSWITCH as the switch. TEMPLATE: provision.sh renders it from
+# plan.env into /etc/perf-kit/configs/ ; do not edit the rendered copy.
+#
+#   loadgen (A)        sbc (B)                            switch (C)
+#   @A_IP@  ->  public @B_PUB_IP@ | private @B_PRIV_IP@  ->  @C_IP@:5090
+#
+# A and B's eth0 are in the public vSwitch, B's eth1 and C in the private one
+# (two planes, routed by the VPC). Use with SWITCH=freeswitch test/perf/run.sh
+# (register, call, webrtc; the carrier scenarios need the SIPp switch).
+# Derived from ../../configs/perf-freeswitch.yaml; the LIMIT notes are there
+# and in ../../configs/perf.yaml. Install with `freesbc-use fs` on the sbc host.
+# Throwaway admin password ("perf"): rehearsal only.
+
+public:
+  ip: @B_PUB_IP@             # B's eth0 IP in the public vSwitch (advertised); public.bind = ip.
+
+private:
+  ip: @B_PRIV_IP@            # B's eth1 (second ENI) in the private vSwitch (bind = advertised).
+                             # The private SIP socket is fixed: @B_PRIV_IP@:5060.
+
+rtp: 10000-59999             # 25000 calls per plane
+
+tls:
+  cert: /etc/freesbc/cert.pem   # self-signed, made by provision.sh; only read by `run`
+  key: /etc/freesbc/key.pem
+
+edge:
+  switch: [@C_IP@:5090]      # the FreeSWITCH profile "perf"
+
+  listen:                    # ports on public.bind
+    udp: 5060
+    tcp: 5060
+    ws: 8080                 # webrtc scenario (webrtcload)
+    wss: 443
+
+shield:
+  rate_limit: 1000000/s per_ip
+  carrier_rate_limit: 1000000/s per_ip
+  ban: 1m
+  max_sessions: 25000        # explicit: the pair count of rtp; no session cap in the way
+
+admin:
+  listen: 127.0.0.1:8081     # loopback; run.sh reaches it through SBC_EXEC
+  pprof: true
+  password_hash: "$2y$10$sbCGIYv.0V/JCrqC.ZBQEuzSWlVidnXE898iuyV8L1lbOTHzqabju"   # password: perf

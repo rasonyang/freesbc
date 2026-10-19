@@ -1,37 +1,199 @@
 # Performance
 
-Preliminary capacity numbers for FreeSBC from a **single-host** run, with the method and harness in [`test/perf/`](../test/perf/README.md) so anyone can repeat it. Read the caveats first: this is not the three-host topology that issue #109 asks for, and the numbers are not yet a basis for a production sizing. What still has to be run is in [Pending](#pending).
+Capacity numbers for FreeSBC from the formal three-host run of issue #109 (2026-10-18, with the 8 hour soak ending 2026-10-19), with the method and harness in [`test/perf/`](../test/perf/README.md) so anyone can repeat it. The run reports are the [day report](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6249040280) and the [soak report](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6256238968) on #109. The earlier single-host run (Docker on a laptop) is kept at the end for history; where the two disagree, the three-host figures stand.
 
-All figures below were measured; anything derived or estimated is marked so. Nothing here is a promise.
+All figures were measured on the rig below; anything derived is marked so. A figure is either a **knee** (the first step that failed the pass criteria) or a **lower bound**: the ladder ended because the load generator, the switch or the prescribed range ran out before FreeSBC did. The tables say which. Nothing here is a promise.
 
-## Method and topology
+## Summary
 
-Single-host Docker on Colima: one Apple M3 Max laptop, one Colima VM, five containers on two bridge networks.
+FreeSBC on one cloud VM (4 vCPU = 2 physical cores + HT, 7.4 GiB usable), real NICs, SIPp generators and switch on separate hosts.
 
-```text
- loadgen / carriergen            FreeSBC (pinned to 2 cores)               switch / carrier
- SIPp UAC, webrtcload   --->  public 172.28.1.10 | private 172.28.2.10  --->  SIPp UAS, -rtp_echo
- cpus 2-4                        cpus 0-1, 8 GiB limit                        cpus 5-7
-```
+| What | Result | Kind | Limit that ended the ladder |
+|---|---|---|---|
+| Concurrent G.711 calls, media anchored on both legs | **5000** (CPU 310 of 400, 500.6k pps / 668 Mbit/s each way, RSS 373 MB) | knee at the 80% CPU line (320) | 5500: CPU 337 and the generator at 94% of a core |
+| Soak, 8 h at 3500 concurrent (70% of 5000) | **PASS**: 432000 calls, 0 failed, no growth | measured | none |
+| Call setup, client to switch (no media, 2 s calls) | **2250 CPS** | lower bound (one generator source IP) | 2500: `503 early_cap`, 64 unanswered INVITEs per public source |
+| Call setup, carrier to switch | **3500 CPS** loss-free | knee for loss-free; failures only at 5000 | kernel receive drops from 3750 CPS (#235) |
+| Call setup, switch to carrier | **3250 CPS** | knee | 3500: carrier-leg timeouts (0.204% failed) |
+| Registrations held / refresh rate | **19000** held (binding cap 20000); refresh **20000 REGISTER/s or more** at 13% of the CPU | lower bound (range top) | none; the ladder ended at 20000/s |
+| WebRTC (ICE-Lite + DTLS-SRTP over ws/wss) | **100 DTLS handshakes/s or more**, **600 concurrent SRTP calls or more** | lower bound (generator-limited) | one `webrtcload` process at 100% (150/s) and 126% (800 calls) of a core |
+| FreeSWITCH 1.10.0 as the switch | **3000 concurrent calls or more** (CPU 211); **1500 CPS or more**; 5000 registrations | lower bound (range top, switch-limited) | 3000 is the top of the range; at 1500 CPS FreeSWITCH used 6.6 of its 8 vCPU |
+| Latency added by FreeSBC (1000 concurrent) | **below 1 ms** | measured | below the resolution of SIPp's mean (3.0 ms both ways) |
 
-* FreeSBC is pinned to **2 cores** (`cpuset: 0-1`, `SBC_CPUS`) and limited to 8 GiB (`SBC_MEM`). The load generators (SIPp UAC, `webrtcload`) get CPUs 2-4 and the "switch" and carrier (SIPp UAS with RTP echo) get CPUs 5-7, so FreeSBC, not the generator, is the saturated part (checked with `docker stats` during the runs: generators and switch stayed far below their sets). Go sees two CPUs (`nproc` 2), so `GOMAXPROCS=2`.
-* **The generator, the switch and FreeSBC share the same physical CPU, caches, memory bandwidth and the VM's virtual network (veth + Linux bridge).** On this path a `sendto` carries the delivery to the receiving container in the sender's context, so syscall cost is probably higher than on a real NIC. Per-core figures are honest for "2 vCPUs of this VM", not for a server.
-* The switch is a SIPp UAS that answers instantly and echoes RTP, so no switch is the bottleneck. **There is no run against FreeSWITCH.**
-* Signaling is UDP; media is G.711 (PCMU) 20 ms, both directions, both legs, anchored by FreeSBC. WebRTC uses ICE-Lite + DTLS-SRTP over plain `ws://` (the `webrtcload` client is a pion client).
-* Config: `test/perf/configs/perf-wide.yaml` (RTP range 10000-59999, `shield` limits raised to 1000000/s, `admin.pprof: true`). Log level is the default (INFO), so each call writes lines to stdout, which Docker stores; this cost is part of the numbers.
-* FreeSBC was restarted before each measurement. Pass criterion for CPS: under 0.1% failed calls (SIPp). Concurrent-call criterion: process CPU under 80% of the two pinned cores (160 on the "one core = 100" scale), no failed calls, FreeSBC rtp tx/rx at least 0.999.
-* Sampling: FreeSBC `/metrics` plus `/proc/<pid>` every 2 s (10 s for the soak): CPU, RSS, goroutines, open fds, `freesbc_media_ports_in_use`, live RTP pps, and the kernel's UDP `RcvbufErrors` for the container. "CPU" below is a percentage of one core (200 = both pinned cores busy).
+* **Competitor scenario** (1000 concurrent G.711 calls held 600 s, 50 CPS, SIPp switch): PASS on all four vCPU, on two and on one. 0 of 2000 calls failed in each. Process CPU 64 / 52 / 40 (100 = one vCPU), RSS about 120 MB (the competitor's published figure is 1730 MB), RTP tx/rx 1.0000, probe loss 0.000%, jitter mean 0.47 ms (p99 1.72 ms). One vCPU of this box carries that test.
+* The CPS knees are with sipgo v1.6.0 and 4 MiB UDP SIP socket buffers (#171). The signaling knees are not CPU limits: FreeSBC was at 33 to 48% average CPU at all three.
+* Media is cheap in memory and linear in CPU: about 1600 concurrent calls per vCPU. The media path is syscall-bound (about 70% of CPU flat in `sendto`/`recvfrom`); batching per socket would cut few syscalls, so #172 was closed as not worth it at this architecture.
 
-## Hardware and versions
+## Sizing guide
 
-| Item | Value |
+Figures marked (derived) are arithmetic on the measurements. The rig's CPU convention is 100 = one vCPU, and the pass line is 80% of the cores (320 of 400).
+
+| Dimension | Planning figure | Basis |
+|---|---|---|
+| Concurrent calls with media | about 1600 per vCPU, 5000 on 4 vCPU at 80% (derived: about 0.062 vCPU per 100 calls) | M02; CPU grows linearly from 250 calls (20) to 5000 (310) |
+| Call setup rate | about 2250 CPS (client, lower bound) / 3500 (carrier in) / 3250 (carrier out) on 4 vCPU, with the average CPU at 33 to 48% | M01 |
+| Memory per sustained CPS | **about 1.25 MB** and about 44 goroutines per CPS (2 s calls, measured 1000 to 3500 CPS; flat across the range) | M07, #170 |
+| Memory per concurrent media call | about 0.07 MB (derived: 373 MB RSS at 5023 calls, includes the baseline) | M02 |
+| Memory per held registration | about 7.4 KB of RSS | M04 |
+| Registrations | 19000 held; the cap is 20000 | M04 |
+| CPU on the signaling path | about half in sipgo's transaction layer, 15 to 25% GC | M07 profiles |
+| RTP ports and sessions | the default `rtp: 20000-29999` is 5000 port pairs per plane, and `shield.max_sessions` defaults to that pair count, so a default config admits about 5000 calls; widen `rtp` (and `max_sessions` with it) above that | config; the rig used `rtp: 10000-59999` and `max_sessions: 25000`, so neither was the limit |
+
+* **RAM** (derived): `RSS ≈ 1.25 MB x CPS + 0.07 MB x concurrent calls + about 50 MB`. The CPS term dominates: at 3500 CPS carrier-in RSS was 4.6 GB, while 5000 concurrent calls held in steady state used 373 MB. At the 5000 CPS step carrier-in RSS reached **5.8 GB** (5832 MB) on this 7.4 GiB host, so a CPS-driven box needs about **1.2 GB of RAM per 1000 CPS** plus headroom.
+* **Calls per second are not calls held.** A call that lasts 2 s and one that lasts 240 s cost the same per call setup; the 32 s the state outlives the call is what sets the memory (see below).
+* **A lower bound is not a ceiling.** Client call setup (one source IP), registrations, WebRTC and the FreeSWITCH figures are where the rig stopped, not FreeSBC. Plan with them as floors.
+* The CPS figures are for UDP signaling and one carrier or client source per run. A carrier source is exempt from the 64-unanswered cap; a client source is not.
+
+### Memory, CPS and GOMEMLIMIT
+
+Memory at a sustained call rate is set by state that outlives each call by a fixed time, not by concurrent calls. sipgo keeps every UDP server transaction for up to 64*T1 = 32 s after its final response (RFC 3261 Timer J for non-INVITE, Timer L after an INVITE 2xx, Timer H otherwise); stream transports (tcp, tls, ws, wss) end theirs at once. The edge's `drainAcks` adds one small goroutine per INVITE for the same 32 s.
+
+| Figure per sustained CPS | Single-host, pre-sipgo v1.6.0 | Three-host, sipgo v1.6.0 |
+|---|---|---|
+| RSS | about 2.3 MB | about 1.25 MB (1.22 to 1.31 carrier-in, 1.30 to 1.61 client) |
+| goroutines | about 76 | about 44 (31.7 are `drainAcks`, one per INVITE) |
+
+* The drop (about 45% of RSS, 32 goroutines) is the handler goroutine sipgo v1.6.0 no longer parks (#170). What remains is the heap sipgo holds until its timers fire (1168 MB in use at 2025 CPS: `sip.NewRequest`, `sip.NewResponse`, `ParseHeader`, `sip.NewServerTx`, header clones) and the `drainAcks` stacks (about 0.3 GB of the 2.5 GB RSS at 2025 CPS). It is per-call state held for a fixed time, not a leak: goroutines return to about 33 after each run.
+* #170 is open: the decision is to bound the 2xx wait in `drainAcks` (about 8 s) and to leave sipgo's 32 s store alone (it is sipgo's to change). Expect the goroutine and stack share to fall; the heap part stays. #173 (open) covers the allocation per request.
+
+**GOMEMLIMIT.** The rig ran with `GOMEMLIMIT=6GiB` on the 7.4 GiB host (about 80%). Without a limit the Go runtime lets the heap grow to about twice the live heap (GOGC=100) before collecting; a limit makes the GC collect harder near it, trading CPU for memory. Signaling at these rates was not CPU-bound, so that trade is cheap.
+
+- Set it to about 80 to 90% of the memory the process may use: the container or cgroup limit (`MemoryMax=`, `--memory`), or the host's RAM minus what else runs there. Leave GOGC at its default.
+- Measured: an 8 GiB-class host (7.4 GiB usable) with `GOMEMLIMIT=6GiB` reached 5.8 GB RSS at 5000 CPS carrier-in without being killed, and 4.58 GB at 3500 CPS with `gcAssistAlloc` visible. Size RAM for the CPS you expect with that curve, not for concurrent calls.
+- It is a soft limit. It counts goroutine stacks, which the GC cannot reclaim, and the live heap cannot be freed either. When live heap plus stacks approach the limit, the GC runs nearly continuously, and past it the process keeps growing and the OOM killer still ends it. Keep at least 30 to 50% headroom over the expected live heap. (In the single-host in-process harness a limit just above the live heap spent about 80% of the process's CPU in GC.)
+- Watch `process_resident_memory_bytes`, `go_memstats_heap_inuse_bytes`, `go_goroutines` and the GC CPU share (`go_gc_*` series) on `/metrics` under load.
+- systemd: `Environment=GOMEMLIMIT=3600MiB` next to `MemoryMax=4G` (commented example in `packaging/freesbc.service`). Docker: `--memory 8g -e GOMEMLIMIT=7GiB`.
+
+## Method and topology (three-host run)
+
+Three separate cloud VMs with real NICs on two subnets of one private network (public side and private side), all Ubuntu 24.04, kernel 6.8.
+
+| Role | CPU and memory |
 |---|---|
-| Host | Apple M3 Max, 16 cores, 128 GiB, macOS 26.6.2 |
-| Colima VM | macOS Virtualization.Framework, aarch64, **8 CPUs, 12 GiB**, Docker 28.4.0, kernel 6.8.0-64-generic (Ubuntu), `net.core.rmem_default` = `rmem_max` = 212992 |
-| Other containers in the VM | unrelated, idle (postgres, seaweedfs, buildkit); under 5% CPU |
-| Go | 1.27.2 (binary built in `golang:1.27.2`, linux/arm64, static) |
-| FreeSBC | commit `49d97140588bbeeeb1f4357ac1c48c9b89bb0cea` (`v0.1.0-182-g49d9714`) plus the harness changes in this change set (`test/perf/` only; no product code differs) |
-| SIPp | 3.6.1 (Debian `sip-tester`) |
+| FreeSBC | Intel Xeon 6982P-C, 4 vCPU = 2 cores + HT, 7.4 GiB usable |
+| Load generator (SIPp UAC, `webrtcload`) | AMD EPYC 9T24, 8 vCPU, 15 GiB |
+| Switch (SIPp UAS with `-rtp_echo`, or FreeSWITCH for M06) | Intel Xeon 6982P-C, 8 vCPU, 15 GiB |
+
+* FreeSBC: Go 1.27.2, sipgo v1.6.0, `GOMAXPROCS` at the default (the core-count rounds for M03 restrict the cores instead), `GOMEMLIMIT=6GiB`. `net.core.rmem_max` and `rmem_default` are 8 MiB on all three hosts, so the 4 MiB request of #171 is granted in full. SIPp 3.6.1 with `rtp_stream` (a thread pool; the earlier `play_pcap_audio` spawned a thread and socket per call and collapsed the generator). FreeSWITCH 1.10.0 for M06.
+* The switch is a SIPp UAS that answers instantly and echoes RTP, so no switch is the bottleneck, except in M06, where FreeSWITCH is the switch.
+* Signaling is UDP, except the wss variant of M05. Media is G.711 (PCMU) 20 ms, both directions, both legs anchored by FreeSBC.
+* Pass criteria for every quoted figure: under 0.1% failed calls, no aborted SIPp, FreeSBC CPU under 80% of its cores (320 of 400), RTP tx/rx at least 0.999 with kernel receive-buffer errors 0, no `invite_rejects` or `admission_drops`, and `rigcheck` (generator and switch under 90% of a core, under 80% of the host) OK. The CPS ladders step every 40 s (60 s where noted) and stop at the first failing step; each knee has a 90% confirm run of 120 s.
+* FreeSBC was restarted before each ladder value. Sampling and the run kit are in [`test/perf/hosts/MEASURE.md`](../test/perf/hosts/MEASURE.md).
+
+## Results (three-host run)
+
+### M03 competitor scenario
+
+1000 concurrent G.711 calls, 600 s hold, 50 CPS offered (`m03.sh`, 2000 calls), SIPp switch, plateau about 1180 s.
+
+| Cores of FreeSBC | Concurrent (avg / peak) | Failed | CPU (100 = one vCPU) | RSS max | RTP tx/rx | Verdict |
+|---|---|---|---|---|---|---|
+| all 4 vCPU | 1006 / 1020 | 0 of 2000 | 64 avg / 70 peak | 120 MB | 1.0000 | PASS |
+| 2 | 1006 / 1020 | 0 of 2000 | 52 / 57 | 117 MB | 1.0000 | PASS |
+| 1 | 1006 / 1020 | 0 of 2000 | 40 / 44 | 115 MB | 1.0000 | PASS |
+
+* Plateau RTP 100.6k pps / 134.4 Mbit/s each way. Probes (`webrtcload`, 3 x 20 calls, 120 s): 359989 sent and echoed, loss 0.000%, sequence gaps 0, jitter mean 0.47 ms (p99 1.72 ms), RTT p50 0.4 ms. INVITE to 200 mean 3.0 ms (4.0 on 2 cores, 5.0 on 1), p95 bucket under 10 ms.
+* Process CPU is lower on one core (40) than on four (64) for the same load: with `GOMAXPROCS` 1 the Go runtime has no spinning Ps, so the multi-core figures include runtime spin time.
+* The competitor ran 1000 concurrent calls on an X5670 6C/12T (8 GB, Debian 10) with 1730 MB used and "CPU Load 26%" (definition not stated). Here the whole host used at most 855 MB and 15.9% of its vCPUs on average.
+
+### M01 call setup rate (no media, 2 s calls)
+
+All three ladders on all four vCPU, 40 s steps from 250 CPS. A and C stayed below 30% of a core in every step.
+
+| Scenario | Knee | First failing step | CPU avg at the knee (of 400) | RSS at the knee | What failed first |
+|---|---|---|---|---|---|
+| client to switch | **2250 CPS** | 2500: 0.248% | 132 (33%) | 2518 MB | `503 early_cap`: 64 unanswered INVITEs per public source IP |
+| carrier to switch | **3500 CPS** | 5000: 0.101% | 190 (48%) | 4296 MB | kernel drops on FreeSBC's UDP receive buffers from 3750 |
+| switch to carrier | **3250 CPS** | 3500: 0.204% | 192 (48%) | 3960 MB | carrier leg did not answer within 10 s |
+
+* **Client to switch is a lower bound.** The generator has one source IP, and `maxEarlyPerSource` (64, `internal/edge/invite.go:35`) is per public source. At 2500 CPS FreeSBC was at 148 CPU average (37%), all 248 failures were `early_cap`, and retransmissions were 0. More source IPs were not tried.
+* **Carrier to switch.** Failures stay tiny through 4750 CPS (0.047%) and the first failing step is 5000 (0.101%), but `udp_rcvbuf_errors` is 0 only through 3500 and grows from 3750 (1378 drops, 6514 at 4000, 76009 at 5000) while FreeSBC's CPU is 209 to 265 of 400. The loss-free knee is 3500. This is a FreeSBC receive-path limit, not the CPU limit and not the generator; it is tracked as **#235** (open: which socket drops, and whether one read loop per socket, CPU peaks of 347 to 422, or GC is the cause). Retransmissions recover the calls up to 4750.
+* **Switch to carrier.** 2500 to 3000 had a handful of failures (0.001 to 0.002%, under the line); 3500 failed on carrier-leg receive timeouts, with `udp_rcvbuf_errors` 0 throughout.
+* Confirm runs at 90%, 120 s: client 2025 CPS (243000 of 243000 ok, CPU 124 / 217, RSS 2535 MB), carrier-in 3150 CPS (378000 of 378000, CPU 171 / 322, RSS 3976 MB), carrier-out 2925 CPS (351000 of 351000, CPU 171 / 294, RSS 3619 MB). All with `udp_rcvbuf_errors` 0. INVITE to 200 p95 under 5 ms at the knees.
+* The step table for carrier-in, to show how it scales (40 s steps, 100 = one vCPU):
+
+| CPS | CPU avg / peak | RSS | goroutines | rcvbuf drops |
+|---:|---:|---:|---:|---:|
+| 1000 | 64 / 105 | 1122 MB | 43971 | 0 |
+| 2000 | 120 / 191 | 2228 MB | 87534 | 0 |
+| 3000 | 173 / 296 | 3397 MB | 131206 | 0 |
+| 3500 | 190 / 339 | 4296 MB | 163419 | 0 |
+| 4000 | 213 / 358 | 4850 MB | 184853 | 6514 |
+| 5000 | 265 / 422 | 5832 MB | 275673 | 76009 |
+
+### M02 concurrent calls with media
+
+G.711 on both legs, anchored; 60 s ramp then two 60 s holds; `tx_over_rx` 1.0000, 0 failed calls, `invite_rejects`, `admission_drops`, `port_alloc_failures` and `udp_rcvbuf_errors` all 0 at every passing value.
+
+| N requested | plateau calls | CPU avg / peak (of 400) | RSS | goroutines | RTP pps each way |
+|---:|---:|---:|---:|---:|---:|
+| 250 | 283 | 20 / 21 | 42 MB | 1902 | 28350 |
+| 1000 | 1015 | 67 / 71 | 93 MB | 6705 | 101891 |
+| 2000 | 2029 | 130 / 138 | 165 MB | 13368 | 203132 |
+| 3000 | 2987 | 189 / 203 | 231 MB | 19636 | 298568 |
+| 4000 | 3999 | 251 / 271 | 304 MB | 26306 | 400209 |
+| **5000** | **5023** | **310 / 338** | **373 MB** | **32977** | **500588** |
+| 5500 | 5497 | 337 / 369 | 409 MB | 36116 | 548485 |
+
+* **Maximum 5000** (80% line is 320). 5500 is over the CPU line and its rig check is invalid: the generator's single SIPp process was at 94% of a core (86% at 5000). So quote it as "5000 or slightly more, generator-bound above".
+* At 5000: 668 Mbit/s each way, ports in use 10086 (`max_sessions` 25000 not reached), INVITE to 200 mean 8.0 ms (p95 under 20 ms).
+* **Latency added (M02c, 1000 concurrent):** via FreeSBC INVITE to 200 mean 3.0 ms (p95 under 10 ms); directly to the switch 3.0 ms (p95 under 5 ms). The difference is below the 1 ms resolution of SIPp's mean and one p95 bucket.
+* The soak load is **N70 = 0.7 x 5000 = 3500** concurrent calls.
+
+### M04 registrations
+
+* **Held:** 19000 of 19000 REGISTERs ok, 0 failed, `freesbc_active_registrations` 19000 (cap 20000). RSS 17.9 to 158.2 MB, about **7.4 KB per binding**.
+* **Refresh:** every step from 1000 to 20000 REGISTER/s passed with 0.000% failed. At 20000/s: CPU 51 average / 142 peak (13% / 36% of 4 vCPU), RSS 1.44 GB (flat from 15000/s), `udp_rcvbuf_errors` 0, no rejects or drops. **At least 20000 REGISTER/s**: that is the top of the prescribed range, not a limit.
+
+### M05 WebRTC (ICE-Lite + DTLS-SRTP)
+
+Client side over WebSocket (`-W 200` connections; 256 per source IP is the cap), switch side plain RTP echo. Both ladders stopped at the first value where the generator, not FreeSBC, was the limit: one `webrtcload` process.
+
+| Test | Maximum (valid) | FreeSBC at that point | First rig-limited value |
+|---|---|---|---|
+| DTLS handshakes/s | **100 per second or more** | CPU 64 (16%); 3000 of 3000 calls ok, DTLS p95 1.5 ms, setup p95 2.6 ms | 150/s: `webrtcload` at 100% of a core, FreeSBC at 92 |
+| concurrent SRTP calls | **600 or more** | CPU 71 average (18%); 1500 of 1500 calls ok, RSS 299 MB, goroutines 12922, fds 4448 | 800: `webrtcload` at 126% of a core, FreeSBC at 106 (the 800 run itself was clean) |
+
+* Media loss and jitter at 600 calls: 4499968 sent, 4499968 echoed, sequence gaps 0, jitter mean 0.63 ms (p99 1.45 ms), RTT p50 1.4 ms.
+* **ws and wss are the same**: `wss://:443` at 100/s and at 600 calls gave 99.35 handshakes/s, 3000 of 3000 and 1500 of 1500 ok, gaps 0, jitter 0.16/0.50 and 0.62/1.48 ms, CPU 62 and 73. No measurable TLS cost at these loads. These are lower bounds: the generator ended both ladders.
+
+### M06 FreeSWITCH as the switch
+
+FreeSWITCH 1.10.0 in Docker on the switch host (8 vCPU), `echo` on extension 2000, FreeSBC on all 4 vCPU. No WARN or ERROR in FreeSWITCH's log during the runs.
+
+| Test | Result | Reading |
+|---|---|---|
+| CPS, no media (50 to 1500, 30 s steps) | all steps pass, 0.000% failed; FreeSBC CPU 103 at 1500 (26%) | **1500 CPS or more**, switch-limited: FreeSWITCH used 6.6 of 8 vCPU (C at 83%), so the run is invalid as a FreeSBC figure. No `early_cap`: FreeSWITCH answers fast enough for one client source |
+| Concurrent calls with media | **3000** (plateau 2987), all values 250 to 3000 pass | top of the prescribed range: FreeSBC CPU 211 (53%), RSS 238 MB, 298450 pps each way, tx/rx 1.0000; FreeSWITCH 2.8 cores (36% of its host). Neither was at its limit |
+| Registrations | 5000 held | `show registrations` on FreeSWITCH = 5000, 10000 of 10000 REGISTERs ok |
+
+At 3000 calls FreeSBC's CPU is 211 with FreeSWITCH, against 189 with the SIPp switch at 3000 (M02).
+
+### M07 profiles and the #170 figure
+
+30 s CPU profiles at the confirm runs and at 5000 calls:
+
+* **Signaling (2025 CPS client, 3150 carrier-in, 2925 carrier-out):** about 50% of CPU in sipgo's transaction layer (`handleRequest`, `serverTxRequest`), the edge handlers (`onInvite`, `inviteToUpstream`) about 25%, GC 20 to 23% (`mallocgc` 12 to 20% cumulative; `copystack` about 8%, down from 11.7% on the single host). Timers are not a CPU cost.
+* **Media (5000 calls, 312% CPU):** `media.(*Session).forward` 85% cumulative, about 66 to 70% flat in `Syscall6` (`sendto` 44%, `recvfrom` 33%). On a real NIC the send share fell from the single host's 88.5% to 44%, which confirms that the veth path had inflated it. GC is not among the top entries.
+* **Goroutines at 2025 CPS (88404):** 64254 `drainAcks` timers, 16080 media readers (2 per live session), 4020 `dialog.confirm` waiters, 4020 `media.watchdog`. At 5000 calls: 32957 total, of which 20160 media readers and 2686 `drainAcks`.
+* **Heap at 5000 calls:** 123 MB in use, mostly media buffers; at 2025 CPS 1168 MB in use, per-transaction SIP messages (see the memory section).
+* **#170 RSS and goroutines per CPS** (60 s steps, `GOMEMLIMIT` 6 GiB, carrier-in): 1.23 MB and 44.0 per CPS at 1000, 1.24 and 44.0 at 2500, 1.31 and 46.5 at 3500 (RSS 4576 MB). Client calls: 1.61, 1.38, 1.30 MB per CPS at 1000, 1500, 2000 CPS (2500 stops on `early_cap`).
+
+### M08 soak (8 hours)
+
+`run.sh -i 30 -c 3500 -H 240 -t 28800 -u 3500 call`: 3500 concurrent G.711 calls (70% of the M02 maximum), 15 new calls per second, 240 s hold, 17:21 on 10-18 to 01:26 on 10-19 (8 h 05 m; plateau 7 h 57 m). No host was reclaimed or rebooted.
+
+| Result | Value |
+|---|---|
+| Calls | 432000 created, 432000 ok, **0 failed**; 0 retransmissions; INVITE to 200 mean 7.0 ms, p95 under 20 ms |
+| CPU | 235 average / 245 peak (73% of the CPU at the M02 maximum; 58 to 61% of 4 vCPU) |
+| Plateau RSS / goroutines / fds / ports (max) | 240 MB / 22122 / 14418 / 7202 |
+| Growth, first quarter to last quarter | goroutines +0.0%, RSS -0.3%, open fds +0.0%, ports in use +0.0% (limit 5%) |
+| End of run | 33 goroutines, 13 fds, 0 media ports, RSS 170 MB while draining |
+| RTP | 10.37 G packets each way, 356k pps average (490 Mbit/s), tx/rx 1.0000 |
+| Endings and drops | 432000 of 432000 `bye_caller`; `rtp_silence`, `ack_timeout`, `media_fault`, `invite_rejects`, `admission_drops`, `udp_rcvbuf_errors` all 0; no WARN or ERROR lines from FreeSBC during the soak |
+
+The generator's busiest SIPp was at 63% of a core and the switch's at 44%; neither limited it. **PASS.**
 
 ## Micro-benchmarks
 
@@ -63,11 +225,96 @@ Single-host Docker on Colima: one Apple M3 Max laptop, one Colima VM, five conta
 
 Reading them: the parallel variants are slower per operation than the serial ones for `dialogTable.begin`, `lookup` and the shield, the contention the issue predicted (one global mutex each), but at 0.2 to 1 microsecond per call they are far below the per-packet and per-transaction costs below, and did not appear among the top entries of either profile. SRTP is cheap next to the syscalls around it. Port allocation costs 48 to 172 microseconds near exhaustion, which is paid once per call leg.
 
-## Results
+## Limits a load test hits first
+
+Verified against the code at this commit; the harness configs raise or work around each.
+
+| Limit | Where | Observed here |
+|---|---|---|
+| `shield.rate_limit` default `20/s per_ip`, counts every public datagram | `internal/config/schema.go:250` | one source gets about 6 CPS before silent drops; `perf-defaults.yaml` shows it (passes 8/s, fails at 14/s) |
+| `shield.carrier_rate_limit` default `200/s per_ip` | `schema.go:253` | same for carrier sources |
+| Admission: a public INVITE needs a live registration at its exact transport address, or a carrier source | `admission.go` | generator pre-registers from the same IP:port |
+| 64 unanswered calls per public IP (`maxEarlyPerSource`); carriers exempt | `internal/edge/invite.go:35` | `early_cap` rejects at 2500 CPS from one client IP on the three-host rig (248 of 100000), 287 at 1700 CPS on the single host |
+| RTP range `20000-29999` = 5000 pairs per plane, about 5000 calls; exhaustion is 503 | config | `perf-wide.yaml` widens it to 25000 |
+| Registration caps: 20000 bindings, 10 per AoR | `internal/edge/location.go:85-86` | 19000 held |
+| UDP receive buffer was the OS default; no `SetReadBuffer` (fixed by #171: 4 MiB receive, 1 MiB send, see [edge.md](edge.md#udp-socket-buffers)) | `internal/edge/sockbuf.go` | three-host run with the 4 MiB buffers: no drops through 3500 CPS carrier-in, drops from 3750 (#235); the single-host `RcvbufErrors` numbers predate #171 |
+| 5 min silence watchdog | `rtpSilenceTimeout` | pcap covers the hold |
+
+## How to rerun
+
+The three-host run uses the kit in [`test/perf/hosts/`](../test/perf/hosts/MEASURE.md) (`MEASURE.md` defines each step M01 to M08, its ladder and its pass criteria) with `TOPOLOGY=hosts`; the setup is in "Three real hosts" of the [harness README](../test/perf/README.md). The single-host Docker scenarios still work for a quick check on a laptop:
+
+```sh
+FREESBC_CONFIG=perf-wide.yaml test/perf/run.sh up      # build + start; SBC_CPUS=0-1 LOADGEN_CPUS=2-4 SWITCH_CPUS=5-7 SBC_MEM=8g
+test/perf/run.sh -n -u 5000 -s 500:2000:100:40 -H 2 call           # client CPS
+test/perf/run.sh -n -s 1000:3500:500:60 -H 2 carrier-in            # carrier-in CPS (60 s steps; watch memory)
+test/perf/run.sh -n -s 500:2500:250:40 -H 2 carrier-out            # carrier-out CPS
+test/perf/run.sh -c 450 -H 30 -t 90 -u 450 call                    # concurrent calls; read the plateau block
+test/perf/run.sh -i 5 -u 500 -r 200 -t 10 register                 # goroutine lingering after REGISTERs
+test/perf/run.sh -u 19000 -r 6000 -t 9 register                    # registrations
+test/perf/run.sh -n -r 400 -t 20 -H 5 webrtc                       # DTLS handshakes/s
+test/perf/run.sh -c 800 -t 60 -H 30 webrtc                         # concurrent SRTP calls
+test/perf/run.sh down
+go test -run '^$' -bench . -benchtime 1s -benchmem ./internal/...  # micro-benchmarks
+```
+
+Restart FreeSBC between runs (`docker restart freesbc-perf-freesbc-1`) so RSS and registrations start clean. Profiles: see "Profiling under load" in [test/perf/README.md](../test/perf/README.md). Set `SBC_CPUS`, `LOADGEN_CPUS`, `SWITCH_CPUS` for a VM with a different CPU count, and check `colima list` first. Against a real FreeSWITCH use `SWITCH=freeswitch` (see [test/perf/README.md](../test/perf/README.md#load-through-a-real-freeswitch)).
+
+## Pending
+
+Issue #109's three required runs are done: the [three-host run and FreeSWITCH run](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6249040280) (M01 to M07, 2026-10-18) and the [8 hour soak](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6256238968) (M08, PASS). Open work that touches these numbers:
+
+* #235 (open): carrier-in kernel receive drops from 3750 CPS. Until the dropping socket and the cause are known, 3500 CPS is the loss-free ceiling on 4 vCPU.
+* #170 (open): bound the 2xx wait in `drainAcks` and re-measure goroutines per CPS. #173 (open): allocation per request on the signaling path. #171 (closed): re-measured, no drops through 3500 CPS. #172 (closed, not planned): batching RTP syscalls does not pay at this architecture; reopen as one reader over many sockets only if calls per core become the limit.
+
+Not measured, or only a lower bound:
+
+1. **Call setup with more than one source IP.** The 2250 CPS client figure is bounded by `maxEarlyPerSource` (64) at one generator IP.
+2. **WebRTC beyond one `webrtcload` process.** 100 handshakes/s and 600 concurrent SRTP calls are the generator's limit; spreading the load over several processes or hosts would find FreeSBC's.
+3. **FreeSWITCH beyond the switch's capacity.** 1500 CPS saturated the switch host (6.6 of 8 vCPU) and 3000 concurrent calls and 20000 REGISTER/s are range tops. A larger switch is needed to find FreeSBC's knee with a real switch.
+4. **More than 5000 concurrent calls**, which needs more than one SIPp process on the generator (it was at 94% of a core at 5500).
+5. **TCP and TLS SIP signaling load**, **SDES-SRTP**, and **switch-to-client calls**. The M05 runs did cover wss with DTLS-SRTP; a tls carrier leg was not loaded.
+6. **A soak with FreeSWITCH or WebRTC calls**, and soaks longer than 8 hours or above 70% of the maximum. The soak used UDP, the SIPp switch and 3500 plain calls.
+7. **Other host sizes.** Only 4 vCPU (2 cores + HT) was measured; the one-, two- and four-vCPU rounds are M03 at 1000 calls only. Per-vCPU figures above are derived from the 4 vCPU runs.
+
+## Earlier single-host run (kept for history)
+
+Preliminary numbers from the first run, before the three-host rig existed: Docker on Colima on one laptop, FreeSBC pinned to two cores, with the generator, the FreeSBC container and the switch sharing one CPU and one virtual network. **The three-host results above supersede these numbers.** They are kept to show the method's first pass and how the picture changed (the media syscall share, the per-CPS memory, the CPS knees). They predate sipgo v1.6.0 and the UDP buffer fix (#171), so memory, goroutine and receive-drop figures here are out of date; per-core figures are for 2 vCPUs of that VM, not for a server.
+
+### Method and topology
+
+Single-host Docker on Colima: one Apple M3 Max laptop, one Colima VM, five containers on two bridge networks.
+
+```text
+ loadgen / carriergen            FreeSBC (pinned to 2 cores)               switch / carrier
+ SIPp UAC, webrtcload   --->  public side | private side  --->  SIPp UAS, -rtp_echo
+ cpus 2-4                        cpus 0-1, 8 GiB limit                        cpus 5-7
+```
+
+* FreeSBC is pinned to **2 cores** (`cpuset: 0-1`, `SBC_CPUS`) and limited to 8 GiB (`SBC_MEM`). The load generators (SIPp UAC, `webrtcload`) get CPUs 2-4 and the "switch" and carrier (SIPp UAS with RTP echo) get CPUs 5-7, so FreeSBC, not the generator, is the saturated part (checked with `docker stats` during the runs: generators and switch stayed far below their sets). Go sees two CPUs (`nproc` 2), so `GOMAXPROCS=2`.
+* **The generator, the switch and FreeSBC share the same physical CPU, caches, memory bandwidth and the VM's virtual network (veth + Linux bridge).** On this path a `sendto` carries the delivery to the receiving container in the sender's context, so syscall cost is probably higher than on a real NIC. Per-core figures are honest for "2 vCPUs of this VM", not for a server.
+* The switch is a SIPp UAS that answers instantly and echoes RTP, so no switch is the bottleneck. FreeSWITCH was not used in this run; see M06 above for the three-host run against it.
+* Signaling is UDP; media is G.711 (PCMU) 20 ms, both directions, both legs, anchored by FreeSBC. WebRTC uses ICE-Lite + DTLS-SRTP over plain `ws://` (the `webrtcload` client is a pion client).
+* Config: `test/perf/configs/perf-wide.yaml` (RTP range 10000-59999, `shield` limits raised to 1000000/s, `admin.pprof: true`). Log level is the default (INFO), so each call writes lines to stdout, which Docker stores; this cost is part of the numbers.
+* FreeSBC was restarted before each measurement. Pass criterion for CPS: under 0.1% failed calls (SIPp). Concurrent-call criterion: process CPU under 80% of the two pinned cores (160 on the "one core = 100" scale), no failed calls, FreeSBC rtp tx/rx at least 0.999.
+* Sampling: FreeSBC `/metrics` plus `/proc/<pid>` every 2 s (10 s for the soak): CPU, RSS, goroutines, open fds, `freesbc_media_ports_in_use`, live RTP pps, and the kernel's UDP `RcvbufErrors` for the container. "CPU" below is a percentage of one core (200 = both pinned cores busy).
+
+### Hardware and versions
+
+| Item | Value |
+|---|---|
+| Host | Apple M3 Max, 16 cores, 128 GiB, macOS 26.6.2 |
+| Colima VM | macOS Virtualization.Framework, aarch64, **8 CPUs, 12 GiB**, Docker 28.4.0, kernel 6.8.0-64-generic (Ubuntu), `net.core.rmem_default` = `rmem_max` = 212992 |
+| Other containers in the VM | unrelated, idle (postgres, seaweedfs, buildkit); under 5% CPU |
+| Go | 1.27.2 (binary built in `golang:1.27.2`, linux/arm64, static) |
+| FreeSBC | commit `49d97140588bbeeeb1f4357ac1c48c9b89bb0cea` (`v0.1.0-182-g49d9714`) plus the harness changes in this change set (`test/perf/` only; no product code differs) |
+| SIPp | 3.6.1 (Debian `sip-tester`) |
+
+### Results
 
 All tables are one run each unless stated (single host, single run: no confidence interval). "SIPp p95" is SIPp's response-time bucket upper bound for INVITE to 200 through FreeSBC to an instant UAS (buckets 1, 2, 5, 10, 20, 50, ... ms); it includes the generator and the switch, so FreeSBC's own added latency is at most this and was not isolated.
 
-### a. Client call setup rate (signaling only)
+#### a. Client call setup rate (signaling only)
 
 Registered UA (one source socket, 5000 users) to FreeSBC to switch, UDP, no RTP, 2 s hold, 40 s per step, `run.sh -n -u 5000 -s 500:2000:100:40 -H 2 call`. FreeSBC still allocates and tears down its media ports per call.
 
@@ -82,7 +329,7 @@ Registered UA (one source socket, 5000 users) to FreeSBC to switch, UDP, no RTP,
 * **Max sustained: 1500 CPS** (under 0.1% failed), SIPp p95 under 5 ms. At that rate FreeSBC used 0.75 of its 2 cores, so the limit is not total CPU (see [bottleneck](#first-bottleneck-signaling)).
 * An earlier run of the same scenario (before the drop counter existed) failed at 1700 CPS with `invite_rejects{reason="early_cap"}` = 287: one source IP is limited to 64 unanswered INVITEs (`maxEarlyPerSource`, `internal/edge/invite.go:35`), so a single-IP generator at this rate can hit that cap as well. Carrier sources are exempt, which is why the carrier runs go higher.
 
-### b. Concurrent G.711 calls
+#### b. Concurrent G.711 calls
 
 Client calls with RTP both directions (SIPp pcap play, switch UAS echo), 30 s hold, ramp then about 60 s plateau, `run.sh -c N -H 30 -t 90 -u N call`. Every row: restart, then one run. Packets per call: about 100 pps received and 100 pps sent by FreeSBC (50 pps each way on each of two legs).
 
@@ -100,7 +347,7 @@ Client calls with RTP both directions (SIPp pcap play, switch UAS echo), 30 s ho
 * **Max with CPU under 80% of the two cores (160): about 450 concurrent calls** (449 at 122). The next measured point, 509, is at 163 to 172 and over the line; 1000 requested calls saturate both cores and fail 37% of calls. The step between 450 and 500 was not probed more finely.
 * That is about 225 calls per pinned core. Expressed per packet: about 27 microseconds of CPU per forwarded packet in this topology (122% of a core at 45.3k forwarded pps; derived).
 * Memory is small for media calls: 80 MB RSS at 509 calls, about 0.13 MB per call (derived, includes the process baseline).
-* **Caveat on the tx/rx ratio.** FreeSBC's `tx/rx` only compares what FreeSBC received with what it sent. A datagram that the kernel drops on a full receive buffer never reaches the counter, so tx/rx 1.0 does not exclude kernel loss. The sampler therefore also records the container's UDP `RcvbufErrors` (it reads `/proc/<pid>/net/snmp` itself; on Linux `/metrics` now exports the same kernel counts as `freesbc_udp_receive_buffer_errors_total` and `freesbc_udp_in_errors_total`, network-namespace wide): it was 0 in the carrier runs below, which have the counter; the client-call rows above were taken before the counter existed, so their kernel drops are unknown. SIPp does not measure received loss or jitter, so end-to-end media loss for UDP calls is **not measured**; the WebRTC runs below do measure it.
+* **Caveat on the tx/rx ratio.** FreeSBC's `tx/rx` only compares what FreeSBC received with what it sent. A datagram that the kernel drops on a full receive buffer never reaches the counter, so tx/rx 1.0 does not exclude kernel loss. The sampler therefore also records the container's UDP `RcvbufErrors` (it reads `/proc/<pid>/net/snmp` itself; on Linux `/metrics` now exports the same kernel counts as `freesbc_udp_receive_buffer_errors_total` and `freesbc_udp_in_errors_total`, network-namespace wide): it was 0 in the carrier runs below, which have the counter; the client-call rows above were taken before the counter existed, so their kernel drops are unknown. SIPp does not measure received loss or jitter, so end-to-end media loss for UDP calls was not measured here; the WebRTC runs below did, and the three-host probes (M03) measured it for UDP calls: loss 0.000%, jitter mean 0.47 ms.
 
 Carrier legs with media, same method (`carrier-in`: carrier source, no REGISTER; `carrier-out`: switch to carrier):
 
@@ -113,7 +360,7 @@ Carrier legs with media, same method (`carrier-in`: carrier source, no REGISTER;
 
 The carrier path costs the same as the client path (it adds topology hiding and a second SDP build, which does not show up). Same limit: about 450 calls under 80% of two cores.
 
-### c. Carrier call setup rate (signaling only)
+#### c. Carrier call setup rate (signaling only)
 
 2 s hold, no RTP.
 
@@ -133,9 +380,9 @@ carrier-in step table (60 s each):
 | 3000 | 0 | 126 / 219 | 7.2 GB | 252k | 155315 |
 | 3500 | 12.5% (OOM at 8 GiB) | 145 / 225 | 7.9 GB | 295k | 203948 |
 
-A run at 3500 CPS for 70 s was also killed by the memory limit (`OOMKilled=true`) after 45 s. In a shorter first sweep with 30 s steps, 3500 passed at 0.003% with 6.5 GB, which shows why the step length matters: memory keeps rising until the transaction lingering below reaches steady state (about 35 to 45 s). All rig figures in this section were taken before the sipgo v1.6.0 upgrade (see [Memory, CPS and GOMEMLIMIT](#memory-cps-and-gomemlimit)); re-measure them in the three-host run (#109). **Treat 1500 CPS (clean, 3.3 GB) as the carrier-in figure to plan with on these two cores, and 3000 CPS as a burst ceiling that needs more than 7 GB.** In every row the process was below 2 cores of CPU.
+A run at 3500 CPS for 70 s was also killed by the memory limit (`OOMKilled=true`) after 45 s. In a shorter first sweep with 30 s steps, 3500 passed at 0.003% with 6.5 GB, which shows why the step length matters: memory keeps rising until the transaction lingering below reaches steady state (about 35 to 45 s). All rig figures in this section were taken before the sipgo v1.6.0 upgrade and the receive-buffer fix (#171); the three-host run re-measured them (carrier-in 3500 CPS loss-free, see M01 above), so do not plan with the 1500 and 3000 CPS figures here. In every row the process was below 2 cores of CPU.
 
-### d. Registrations
+#### d. Registrations
 
 19000 users (the binding cap is 20000, `defaultMaxBindings`), from one socket, `run.sh -u 19000 -r <rate> register`; the first round creates the bindings, later rounds refresh them with the same Call-ID.
 
@@ -148,7 +395,7 @@ A run at 3500 CPS for 70 s was also killed by the memory limit (`OOMKilled=true`
 * 19000 bindings held (`freesbc_active_registrations` = 19000), no 503, no shield or admission drops, no kernel drops. 6000 REGISTER/s was the highest rate tried; the limit was not found.
 * After the burst, goroutines returned to the 30 baseline and the live heap after a forced GC was **54 MB for 19000 bindings (about 2.8 KB per binding, derived)**. RSS stays at 1.7 GB because Go keeps the freed memory (it had been used by the transaction goroutines above); this is retained, not live, memory.
 
-### e. WebRTC (ICE-Lite + DTLS-SRTP over ws)
+#### e. WebRTC (ICE-Lite + DTLS-SRTP over ws)
 
 DTLS handshakes per second (`webrtcload`, ICE + DTLS only, 5 s calls, `run.sh -n -r R -t 20 -H 5 webrtc`):
 
@@ -175,7 +422,7 @@ Concurrent SRTP calls (G.711 20 ms, echoed through FreeSBC and the switch UAS; `
 
 **Max concurrent SRTP calls with CPU under 80% of the two cores (160): about 800** (816 at 141, loss 0.0018%). At 1027 calls CPU is 169, still under 0.1% loss. These are the only runs with a measured end-to-end loss and jitter. Interestingly one WebRTC call costs less CPU per packet than a plain UDP call here (169% for 101k pps against 172% for 52k pps). This was not investigated; one candidate is that SIPp's pcap player sends every call's packet on the same 20 ms tick in bursts while `webrtcload` spreads them, so the receiving socket queues differ. That is a hypothesis, not a finding.
 
-### f. Mini soak (not the issue's 8 h soak)
+#### f. Mini soak (not the issue's 8 h soak)
 
 > **This is a 30 minute run. It is not the 8 to 24 hour soak the issue requires, and it does not close that criterion.**
 
@@ -194,7 +441,7 @@ RSS rose from 50.5 to 52.4 MiB over the 28 minutes (the goroutine, fd and port c
 
 An earlier attempt at the same run is discarded: the host or VM stalled for 447 s in the middle (a gap in the sampler, 459231 kernel receive-buffer drops in one interval, SIPp elapsed 2297 s). The rerun used `caffeinate` and had no gap.
 
-### g. Profiles and the first bottleneck
+#### g. Profiles and the first bottleneck
 
 CPU profiles are 30 s `/debug/pprof/profile` samples taken from inside the container under load, read with the matching binary.
 
@@ -205,109 +452,10 @@ CPU profiles are 30 s `/debug/pprof/profile` samples taken from inside the conta
 1. A goroutine dump at 2500 CPS (carrier-in): 189159 goroutines, **159195 of them (84%) in one stack**: `sipgo.(*Server).handleRequest` (`server.go:267`) blocked in `sip.(*ServerTx).TerminateGracefully` (`transaction_server_tx.go:181`), which waits on `<-tx.Done()` until the transaction's timers expire (Timer J, 32 s, for non-INVITE over UDP, and Timer H/I for INVITE). A further 19932 are the media UDP readers. Goroutines scale at about 76 per CPS (75961 at 1000 CPS, 114k at 1500, 155k at 2000) and are flat in time at a given rate.
 2. Memory follows: about 2.3 MB of RSS per CPS (2.3 GB at 1000, 3.3 GB at 1500, 7.2 GB at 3000). At 3500 CPS the 8 GiB limit killed the process. Live-heap profile at 2500 CPS (2.0 GB in use): sipgo `NewRequest`, `NewResponse`, `ParseHeader` and header clones, `NewServerTx`, plus `dialogTable.begin` and port allocation. These are the lingering per-transaction objects.
 
-   **Since the sipgo v1.6.0 upgrade** the handler goroutine is no longer parked: v1.6.0's `ServerTx.TerminateGracefully` returns at once for a finalised unreliable transaction and leaves the transaction to sipgo's timers (the edge's own `serveTx`, #170, did the same on v1.4.3 and v1.5.0 and was removed). The goroutine counts, stack memory and the 64 parked goroutines per CPS above are therefore gone, but the rig numbers in this section have not been re-measured since. sipgo still keeps the transaction record, request and response until its timers expire (up to 32 s), and other state (sipgo client transactions toward the switch, dialog and media objects, ended-dialog hooks) may also be held for a similar time, so RSS per CPS is not expected to be zero. In the in-process harness the removal took 64 goroutines and about 0.5 MB of stack per CPS out of calls and halved RSS per request/s for transactions the edge answers itself. See [the research note](notes/170-sipgo-tx-linger.md).
+   **Since the sipgo v1.6.0 upgrade** the handler goroutine is no longer parked: v1.6.0's `ServerTx.TerminateGracefully` returns at once for a finalised unreliable transaction and leaves the transaction to sipgo's timers (the edge's own `serveTx`, #170, did the same on v1.4.3 and v1.5.0 and was removed). The goroutine counts, stack memory and the 64 parked goroutines per CPS above are therefore gone, and the three-host run re-measured it (about 44 goroutines and 1.25 MB of RSS per CPS, see the [memory section](#memory-cps-and-gomemlimit)). sipgo still keeps the transaction record, request and response until its timers expire (up to 32 s), and other state (sipgo client transactions toward the switch, dialog and media objects, ended-dialog hooks) may also be held for a similar time, so RSS per CPS is not expected to be zero. In the in-process harness the removal took 64 goroutines and about 0.5 MB of stack per CPS out of calls and halved RSS per request/s for transactions the edge answers itself. See [the research note](notes/170-sipgo-tx-linger.md).
 3. CPU profile at 2500 CPS (31.9 s of CPU in 30 s, one core of two): `syscall` 21.6% flat (`sendto` 10.1% and `recvfrom` 8.5% cumulative), GC 22% (`gcBgMarkWorker` 9% plus `gcAssistAlloc` 12.8%), goroutine stack growth `runtime.copystack` 11.7% (every request starts a new goroutine that grows its stack), `mallocgc` 16%. FreeSBC's own handlers (`onInvite`, `relayResponseHide`, `onInDialog`) are under 25% each cumulative and mostly time inside `sendto`.
-4. Failure mode: before calls fail, the kernel drops datagrams on the SIP sockets (`RcvbufErrors` 406 at 1500 CPS, 22552 at 2000, 155315 at 3000; none below 1500). The receive buffer is the Linux default (212992 bytes on this VM; `rmem_max` is the same) and FreeSBC does not call `SetReadBuffer`; each UDP socket has one reader loop. Bursts plus GC pauses fill it, SIPp retransmits (T1 500 ms), and above ~1500 to 1600 CPS retransmissions no longer rescue the calls. Issue #171 now sets 4 MiB receive and 1 MiB send buffers on the UDP SIP sockets; these numbers predate it and were not re-measured.
+4. Failure mode: before calls fail, the kernel drops datagrams on the SIP sockets (`RcvbufErrors` 406 at 1500 CPS, 22552 at 2000, 155315 at 3000; none below 1500). The receive buffer is the Linux default (212992 bytes on this VM; `rmem_max` is the same) and FreeSBC does not call `SetReadBuffer`; each UDP socket has one reader loop. Bursts plus GC pauses fill it, SIPp retransmits (T1 500 ms), and above ~1500 to 1600 CPS retransmissions no longer rescue the calls. Issue #171 (closed) set 4 MiB receive and 1 MiB send buffers on the UDP SIP sockets, and the three-host run re-measured it: no drops through 3500 CPS carrier-in (the drops from 3750 are #235).
 
 **Media: the first limit is the per-packet `sendto` syscall.** CPU profile at 509 concurrent calls (51k pps in, 51k out, process at 163%): **93.7% of all samples are in `syscall.Syscall6`; 88.5% are under `net.(*UDPConn).WriteTo` / `syscall.sendto`, 5.5% under `recvfrom`**, called from `media.(*Session).forward`. SRTP, mutexes, the scheduler and GC together are under 6%. There is one `recvfrom` and one `sendto` per packet. On this topology the send cost is inflated because the veth/bridge delivery to the next container is charged to the sender, so on a real NIC the share will be lower but the syscall will probably still lead; that is untested.
 
-**Goroutines after REGISTER bursts: transaction timers, not a leak (before sipgo v1.6.0).** A burst of 2000 REGISTERs from 500 users (`run.sh -u 500 -r 200 -t 10 register`, i.e. four rounds) left **2027 goroutines, 2000 of them in the same `ServerTx.TerminateGracefully` stack**. Counted every 10 s after the last REGISTER: 2030, 1531, 530, 30, 30, 30, 30. They drain to the 30-goroutine baseline within about 40 s, which matches the 32 s Timer J. With sipgo v1.6.0 these goroutines are no longer parked, so this drain-to-baseline curve is expected to be flat; it has not been re-measured. The report of about 1360 goroutines still present after a minute did **not** reproduce in this setup (UDP, instant 200 from the switch, no digest challenge). If it recurs, collect `/debug/pprof/goroutine?debug=1` at that moment: stacks other than `TerminateGracefully` would indicate something else (a TCP/WS connection per user, for example, holds goroutines for as long as the connection lives).
-
-## Sizing guidance
-
-From this single-host, two-core, Docker-on-Colima topology only. Treat as a floor to test against on real hardware, not as a prediction. Figures marked (derived) are arithmetic on the measurements.
-
-| Dimension | Figure measured | Per core (derived) | Notes |
-|---|---|---|---|
-| Client call setup | 1500 CPS (fails at 1600), 0.75 core used | not CPU-bound | memory about 2.3 MB per CPS before sipgo v1.6.0, not re-measured (see [below](#memory-cps-and-gomemlimit)) |
-| Carrier call setup | in: 1500 clean, 3000 burst; out: 1250 clean | | in at 3000 needs >7 GB |
-| Concurrent UDP G.711 calls | about 450 under 80% of 2 cores | about 225 | 27 us CPU per forwarded packet; ~0.13 MB per call |
-| Concurrent WebRTC SRTP calls | about 800 under 80% of 2 cores | about 400 | end-to-end loss 0.0018% at 816 |
-| DTLS handshakes | about 400/s | about 200/s | |
-| Registrations | 19000 held (cap 20000); 6000 REGISTER/s refresh | | live heap about 2.8 KB per binding |
-| RAM | signaling at high CPS: about 430 CPS per GB (before sipgo v1.6.0, not re-measured); media calls: about 7000 per GB (derived from RSS) | | the high-CPS figure was dominated by parked transaction goroutines and lingering transactions; see [below](#memory-cps-and-gomemlimit) |
-
-Practical reading, with the caveats above: a pair of cores handles on the order of 1000 calls per second of setup or a few hundred concurrent media calls; the media path is syscall-bound, so more cores help roughly linearly only if the network path scales, which was not measured here (two cores only). Provision RAM for CPS, not for concurrent calls. The rtp range (5000 calls per plane with the default `20000-29999`) is well above the 450 to 800 calls two cores sustained here. Use `perf-wide.yaml` or a wider `rtp` for larger tests.
-
-### Memory, CPS and GOMEMLIMIT
-
-Memory at a sustained call rate is set by state that outlives each call by a fixed time, not by concurrent calls. sipgo keeps every UDP server transaction for up to 64*T1 = 32 s after its final response (RFC 3261 Timer J for non-INVITE, Timer L after an INVITE 2xx, Timer H otherwise), so that a retransmitted request is answered again rather than handled twice; stream transports (tcp, tls, ws, wss) end theirs at once. Before sipgo v1.6.0 each of those transactions also parked a handler goroutine for the whole time (first fixed in the edge by #170's `serveTx`, since the v1.6.0 upgrade by sipgo itself), and the numbers below were measured then. Now the goroutine is gone, but the transaction record and the parsed request and response are still held by sipgo's timers, and the edge's own sipgo client transactions toward the other leg, and the objects of an ended dialog that are still reachable (dialog and media hooks), may also stay for up to about 32 s. Treat memory as proportional to CPS x up to 32 s until the three-host run (#109) gives a new per-CPS figure.
-
-| Figure | Before sipgo v1.6.0 (perf rig, carrier-in) | With sipgo v1.6.0 |
-|---|---|---|
-| goroutines per sustained CPS | about 76, 64 of them parked handler goroutines (INVITE and BYE) | the 64 are gone. `drainAcks` (added after the rig run) keeps one small goroutine per INVITE for 32 s, so expect about 44 (in-process harness: 160 to 96, of which 64 are the harness's fake switch). Not measured on the rig |
-| RSS per sustained CPS | about 2.3 MB (unset GOMEMLIMIT, GOGC 100) | not re-measured on the rig; the in-process harness shows 20% less for calls (with the fake switch's lingering state in both) and 55% less per request/s the edge answers itself |
-| live heap per sustained CPS | about 0.8 MB (2.0 GB at 2500 CPS) | not re-measured: the transaction objects are still held until sipgo's timers |
-
-Until the rig is re-run (#109), plan with the measured **2.3 MB per sustained CPS** (pre-v1.6.0) as an upper bound. Add about 0.13 MB per concurrent media call and a 50 MB base. At 1500 CPS that is about 3.5 GB.
-
-**GOMEMLIMIT.** Without it the Go runtime lets the heap grow to about twice the live heap (GOGC=100) before collecting, which is where most of the 2.3 MB/CPS (pre-v1.6.0) comes from. Setting a memory limit makes the GC collect harder as the process approaches it. That trades CPU for memory, and signaling at high CPS was not CPU-bound here (below 2 cores even at 3000 CPS, pre-v1.6.0):
-
-- Set it to about 80 to 90% of the memory the process may use: the container or cgroup limit (`MemoryMax=`, `--memory`), or the host's RAM minus what else runs there. Leave GOGC at its default.
-- It is a soft limit. It counts goroutine stacks, which the GC cannot reclaim, and the live heap (about 0.8 MB per sustained CPS, pre-v1.6.0) cannot be freed either. When live heap plus stacks approach the limit, the GC runs nearly continuously: in the harness, a limit just above the live heap spent about 80% of the process's CPU in GC. Past the limit the process keeps growing and the OOM killer still ends it. So a limit lowers RSS at a given CPS and raises the ceiling before OOM, but does not remove it: keep at least 30 to 50% headroom over the expected live heap.
-- Watch `process_resident_memory_bytes`, `go_memstats_heap_inuse_bytes`, `go_goroutines` and the GC CPU share (`go_gc_*` series) on `/metrics` under load.
-- systemd: `Environment=GOMEMLIMIT=3600MiB` next to `MemoryMax=4G` (commented example in `packaging/freesbc.service`). Docker: `--memory 8g -e GOMEMLIMIT=7GiB`.
-
-In the in-process harness at 300 calls/s (`TestMeasureTxLingerSustained`, research note), a limit of 650MiB took RSS from 860 to 624 MiB at 22% → 38% GC CPU with the parked goroutines gone (#170, same effect as sipgo v1.6.0), while with them the same limit needed 63% GC CPU, because 178 MiB of parked stacks counted against it.
-
-## Limits a load test hits first
-
-Verified against the code at this commit; the harness configs raise or work around each.
-
-| Limit | Where | Observed here |
-|---|---|---|
-| `shield.rate_limit` default `20/s per_ip`, counts every public datagram | `internal/config/schema.go:250` | one source gets about 6 CPS before silent drops; `perf-defaults.yaml` shows it (passes 8/s, fails at 14/s) |
-| `shield.carrier_rate_limit` default `200/s per_ip` | `schema.go:253` | same for carrier sources |
-| Admission: a public INVITE needs a live registration at its exact transport address, or a carrier source | `admission.go` | generator pre-registers from the same IP:port |
-| 64 unanswered calls per public IP (`maxEarlyPerSource`); carriers exempt | `internal/edge/invite.go:35` | 287 `early_cap` rejects at 1700 CPS from one client IP |
-| RTP range `20000-29999` = 5000 pairs per plane, about 5000 calls; exhaustion is 503 | config | `perf-wide.yaml` widens it to 25000 |
-| Registration caps: 20000 bindings, 10 per AoR | `internal/edge/location.go:85-86` | 19000 held |
-| UDP receive buffer was the OS default; no `SetReadBuffer` (fixed by #171: 4 MiB receive, 1 MiB send, see [edge.md](edge.md#udp-socket-buffers)) | `internal/edge/sockbuf.go` | kernel drops before calls fail; the `RcvbufErrors` numbers in this document predate #171 and have not been re-measured |
-| 5 min silence watchdog | `rtpSilenceTimeout` | pcap covers the hold |
-
-## How to rerun
-
-```sh
-FREESBC_CONFIG=perf-wide.yaml test/perf/run.sh up      # build + start; SBC_CPUS=0-1 LOADGEN_CPUS=2-4 SWITCH_CPUS=5-7 SBC_MEM=8g
-test/perf/run.sh -n -u 5000 -s 500:2000:100:40 -H 2 call           # a. client CPS
-test/perf/run.sh -n -s 1000:3500:500:60 -H 2 carrier-in            # c. carrier-in CPS (60 s steps; watch memory)
-test/perf/run.sh -n -s 500:2500:250:40 -H 2 carrier-out            # c. carrier-out CPS
-test/perf/run.sh -c 450 -H 30 -t 90 -u 450 call                    # b. concurrent calls; read the plateau block
-test/perf/run.sh -i 5 -u 500 -r 200 -t 10 register                 # goroutine lingering after REGISTERs
-test/perf/run.sh -u 19000 -r 6000 -t 9 register                    # d. registrations
-test/perf/run.sh -n -r 400 -t 20 -H 5 webrtc                       # e. DTLS handshakes/s
-test/perf/run.sh -c 800 -t 60 -H 30 webrtc                         # e. concurrent SRTP calls
-test/perf/run.sh down
-go test -run '^$' -bench . -benchtime 1s -benchmem ./internal/...  # micro-benchmarks
-```
-
-Restart FreeSBC between runs (`docker restart freesbc-perf-freesbc-1`) so RSS and registrations start clean. Profiles: see "Profiling under load" in [test/perf/README.md](../test/perf/README.md). Set `SBC_CPUS`, `LOADGEN_CPUS`, `SWITCH_CPUS` for a VM with a different CPU count, and check `colima list` first.
-
-## Pending
-
-Issue #109 stays open. These are required before it can close, and none has been done:
-
-1. **Three-host run.** Load generator, FreeSBC (separate `public.bind` and `private.ip`) and a SIPp switch on three machines with a real NIC. Everything above must be repeated there; the single-host numbers will not carry over (especially the syscall cost). On each machine, with this repo checked out and SIPp installed (see "Three real hosts" in the harness README):
-
-   ```sh
-   export TOPOLOGY=hosts
-   export SBC_PUBLIC=<fsbc public ip> SBC_PRIVATE=<fsbc private ip>
-   export LOADGEN_IP=<generator ip> CARRIERGEN_IP=<second generator ip, in edge.carrier_sources>
-   export SWITCH_IP=<switch ip> CARRIER_IP=<carrier uas ip>
-   export SBC_EXEC="ssh sbc" SWITCH_EXEC="ssh switch" CARRIER_EXEC="ssh carrier"
-   export REMOTE_PERF=/opt/freesbc/test/perf      # test/perf on every host that runs SIPp
-   test/perf/run.sh -n -u 5000 -s 500:4000:250:40 -H 2 call
-   test/perf/run.sh -c 1000 -H 30 -t 90 -u 1000 call
-   ```
-
-   Use the same config as `perf.yaml` with the `ADDRESS` lines changed, raise `ulimit -n`, and take profiles with `admin.pprof`. All memory and goroutine figures above predate sipgo v1.6.0 and must be re-measured in this run.
-2. **A run against FreeSWITCH** as the switch (`SWITCH=freeswitch test/perf/run.sh`, same generator scenarios, the `echo` application; setup, FreeSBC config `test/perf/configs/perf-freeswitch.yaml` and exact commands in [test/perf/README.md](../test/perf/README.md#load-through-a-real-freeswitch) and [test/perf/freeswitch/](../test/perf/freeswitch/README.md)), because a real switch is slower than the SIPp UAS and its answer latency interacts with the 64 early-dialog cap.
-3. **An 8 to 24 hour soak at about 70% of the measured maximum**, showing no growth in goroutines, RSS, fds and ports in use. For example, at 70% of 450 calls:
-
-   ```sh
-   test/perf/run.sh -i 30 -c 315 -H 60 -t 28800 -u 315 call     # 8 hours; use -t 86400 for 24 hours
-   ```
-
-   Holds above 900 s are not supported with media (the pcap is capped; the 5 minute silence watchdog ends the call). Read `metrics.csv` for flat `goroutines`, `rss_bytes`, `open_fds` and `ports_in_use`, and for `ports_in_use` back to 0 at the end.
-
-Also not measured here: end-to-end loss and jitter for UDP calls (SIPp does not analyse received RTP), the latency FreeSBC itself adds (needs a run directly against the switch), TCP/TLS/WSS signaling load, SDES-SRTP, and switch-to-client calls.
+**Goroutines after REGISTER bursts: transaction timers, not a leak (before sipgo v1.6.0).** A burst of 2000 REGISTERs from 500 users (`run.sh -u 500 -r 200 -t 10 register`, i.e. four rounds) left **2027 goroutines, 2000 of them in the same `ServerTx.TerminateGracefully` stack**. Counted every 10 s after the last REGISTER: 2030, 1531, 530, 30, 30, 30, 30. They drain to the 30-goroutine baseline within about 40 s, which matches the 32 s Timer J. With sipgo v1.6.0 these goroutines are no longer parked, so this drain-to-baseline curve is expected to be flat; the three-host run saw goroutines return to about 33 after each run. The report of about 1360 goroutines still present after a minute did **not** reproduce in this setup (UDP, instant 200 from the switch, no digest challenge). If it recurs, collect `/debug/pprof/goroutine?debug=1` at that moment: stacks other than `TerminateGracefully` would indicate something else (a TCP/WS connection per user, for example, holds goroutines for as long as the connection lives).

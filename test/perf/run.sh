@@ -146,15 +146,19 @@ if [[ $SCEN != register && $SCEN != webrtc && $HOLD -gt 8 ]]; then
 	PCAP="$RO/g711u.pcap"
 fi
 
-# Scenario files; -n strips the pcap play action.
+# Scenario files. rtp_stream (uac_call.xml) needs the literal pcap path: SIPp
+# does not expand the -key [pcap] inside an rtp_stream attribute (it does for
+# play_pcap_audio). -n strips the whole <nop> action instead.
 SC_DIR="$REMOTE_PERF/sipp"
-if (( NOMEDIA )); then
-	mkdir -p "$RUN_DIR/sipp"
-	for f in uac_call carrier_in_uac switch_uac_carrier; do
+mkdir -p "$RUN_DIR/sipp"
+for f in uac_call carrier_in_uac switch_uac_carrier; do
+	if (( NOMEDIA )); then
 		sed '/<nop>$/,/<\/nop>/d' "$HERE/sipp/$f.xml" > "$RUN_DIR/sipp/$f.xml"
-	done
-	SC_DIR="$RO/sipp"
-fi
+	else
+		sed "s|\[pcap\]|$PCAP|g" "$HERE/sipp/$f.xml" > "$RUN_DIR/sipp/$f.xml"
+	fi
+done
+SC_DIR="$RO/sipp"
 
 # ---------------------------------------------------------------- roles
 BG_PIDS=""
@@ -208,6 +212,7 @@ sipp_run() {
 	local lim=()
 	[[ -n $CONC && $label != reg* ]] && lim=(-l $(( CONC + CONC / 10 + 10 )))
 	$ex sipp -sf "$xml" -i "$lip" -p "$GEN_PORT" -r "$rate" -m "$total" -d "$holdms" \
+		-rtp_threadtasks "$RTP_THREADTASKS" \
 		-recv_timeout 10000 -nostdin -trace_stat -stat_delimiter , -fd 1 -stf "$RO/sipp-$label.csv" \
 		"${lim[@]+"${lim[@]}"}" "$@" "$target" >"$RUN_DIR/sipp-$label.log" 2>&1
 	return 0
@@ -250,6 +255,10 @@ register_rounds() {
 TOTAL_DEFAULT=$(awk -v r="$RATE" -v t="$DUR" 'BEGIN { n = int(r * t + 0.5); if (n < 1) n = 1; print n }')
 HOLD_MS=$((HOLD * 1000))
 MEDIA_KEY=(-key pcap "$PCAP")
+# rtp_stream pool size (see uac_call.xml). 1000 concurrent calls
+# with the default 20 tasks/thread made one thread per 20 calls; that is fine,
+# but pin it so runs are comparable. Overridable on the command line.
+RTP_THREADTASKS=${RTP_THREADTASKS:-100}
 
 preregister() {
 	note "registering $USERS users from $LOADGEN_IP:$GEN_PORT at $REG_RATE/s"

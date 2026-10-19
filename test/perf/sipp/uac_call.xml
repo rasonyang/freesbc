@@ -5,6 +5,17 @@
   Registered-client call: INVITE with a PCMU offer, ACK, G.711 20 ms RTP from
   a pcap while the call is held for -d ms, BYE.
 
+  rtp_stream, not play_pcap_audio. play_pcap_audio spawns one thread (and one
+  socket) per call; at 1000 concurrent calls the three-host loadgen drowned
+  (load 650, ksoftirqd saturated, SIPp watchdog aborted the run).
+  rtp_stream plays from SIPp's thread pool (-rtp_threadtasks). Because that
+  pool sends from the single global media socket (-mp, default 6000), the SDP
+  must name that port: [media_port], not the per-call [auto_media_port]. The
+  UAS side already advertises m=audio 6000 and echoes from -mp 6000.
+  rtp_stream sends the file's bytes as the PCMU payload, so with a pcap the
+  payload is the capture's bytes, not audio; packet size (160 bytes) and rate
+  (20 ms) are those of G.711, which is what the load measures.
+
   Public INVITE admission requires the INVITE's source to be the exact
   IP:port of a live registration. run.sh therefore runs register.xml first,
   from the SAME local IP:port (-i/-p), for every user in users.csv, and only
@@ -40,7 +51,7 @@
       s=-
       c=IN IP[media_ip_type] [media_ip]
       t=0 0
-      m=audio [auto_media_port] RTP/AVP 0 101
+      m=audio [media_port] RTP/AVP 0 101
       a=rtpmap:0 PCMU/8000
       a=rtpmap:101 telephone-event/8000
       a=fmtp:101 0-15
@@ -72,7 +83,7 @@
 
   <nop>
     <action>
-      <exec play_pcap_audio="[pcap]"/>
+      <exec rtp_stream="[pcap],1,0"/>
     </action>
   </nop>
 
