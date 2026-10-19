@@ -210,7 +210,7 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:94-97`).
 | `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:460,499`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:905`) | its 5 s BYE context |
 | per request: sipgo transaction-layer goroutine running `Server.handleRequest` and the handler | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); since sipgo v1.6.0 `TerminateGracefully` does not wait for the transaction's timers (#170) |
-| per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | the transaction's `Done` (Timer L, H or I on UDP; at once on a reliable transport) |
+| per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | after a 2xx, `ack2xxDrainWait` (8 s) or the transaction's `Done`, whichever is first; otherwise the transaction's `Done` (Timer H or I on UDP; at once on a reliable transport) |
 | shield prune loop | `shield.New` (`shield.go:64`) | `Shield.Close` |
 | HEP writer (one per process, owned by `hep.Sender`, not by the edge) | `hep.New` from `app.Run` when `hep:` is set | `closeHEPSender` after `g.Wait()` |
 
@@ -1860,11 +1860,14 @@ and sipgo refuses an ACK in `TransactionRequest`. An ACK whose top Via
 matches a live INVITE server transaction (every non-2xx ACK, which reuses the
 INVITE branch, and the 2xx ACK of a client that reuses it too) goes to
 sipgo's transaction, never to the ACK handler. `guard` therefore starts
-`drainAcks` (`edge.go`) for every INVITE: it reads `tx.Acks()` until the
+`drainAcks` (`edge.go:1149`) for every INVITE: it reads `tx.Acks()` until the
 transaction ends, so sipgo parks no goroutine and logs no `ACK missed`. After
 a non-2xx final the ACK is absorbed (Debug log; the edge's own client
 transaction ACKs the far end's hop), after a 2xx it runs through
-`guard(onAck)` like any ACK. An ACK that cannot be routed is dropped with no
+`guard(onAck)` like any ACK. After a 2xx the drainer stops at
+`ack2xxDrainWait` (8 s) instead of Timer L (32 s, #170): a branch-reusing
+2xx ACK follows the 2xx by one round trip, and one later than 8 s reaches no
+handler (sipgo logs `ACK missed`). An ACK that cannot be routed is dropped with no
 response. An ACK body is only
 ever the answer to an owed offer (§7.9a): `takeOwed` matches the answerer's
 plane and the INVITE's CSeq, and the body is rebuilt for the far end and kept
@@ -3502,8 +3505,9 @@ spin.
   media session** until a final response, a CANCEL or the 5-minute backstop
   (`inviteTimeout`, `invite.go:24`).
 - **Each INVITE leaves one ACK drainer goroutine** (`drainAcks`, `edge.go`)
-  that outlives the handler and ends when sipgo's server transaction does
-  (Timer L, H or I, 32 s at most).
+  that outlives the handler: after a 2xx it ends at `ack2xxDrainWait` (8 s),
+  otherwise when sipgo's server transaction does (Timer H or I, 32 s at
+  most).
 - **Carrier DNS never blocks a request.** Lookups run in the refresh
   goroutine under a 3 s per-query timeout; handlers read the published
   snapshot.
@@ -4454,6 +4458,7 @@ code constant.
 |---|---|---|
 | `rtpSilenceTimeout` | 5 min (`edge.go:161`) | media silence; the only automatic reclaim for a confirmed call whose BYE was lost |
 | `switchCooldown` | 30 s (`edge.go:165`) | a switch node that answered nothing is skipped while alternatives exist |
+| `ack2xxDrainWait` | 8 s (`edge.go:188`) | how long `drainAcks` reads an INVITE server transaction's ACKs after a 2xx final (§7.8); a non-2xx keeps it to the transaction's end |
 | `udpSIPReadBuffer` / `udpSIPWriteBuffer` | 4 MiB / 1 MiB (`sockbuf.go:16-17`) | requested kernel receive and send buffer of each UDP SIP socket (§4.3); capped by the host's sysctl |
 | `udpServingTimeout` | 5 s (`edge.go:771`) | startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
 | `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, a ws/wss connection's HTTP upgrade request (§7.1a), and the dial plus handshake of a connection FreeSBC opens to a tcp/tls carrier (§6.10) |

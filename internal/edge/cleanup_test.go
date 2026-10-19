@@ -75,7 +75,7 @@ func TestCaseE_NoLeaksAfterCalls(t *testing.T) {
 	// fake switch (a plain sipgo server) parks a goroutine per server
 	// transaction in TerminateGracefully for the RFC 3261 Timer J period
 	// (32s on UDP), and the edge's drainAcks keeps one per INVITE
-	// transaction until sipgo's Timer L, so a run of calls leaves dozens
+	// transaction for 8 s after its 2xx, so a run of calls leaves dozens
 	// of perfectly correct goroutines behind that simply have not aged out
 	// yet. Waiting them out would make this a 30-second test.
 	//
