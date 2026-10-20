@@ -202,8 +202,8 @@ The generator's busiest SIPp was at 63% of a core and the switch's at 44%; neith
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `media.Session.forward` (one packet, one hop, real loopback sockets) | 16293 | 16 | 1 |
-| `media.Session.forward`, parallel | 6026 | 17 | 1 |
+| `media.Session.forward` (one packet, one hop, real loopback sockets) | 16293 | 0 | 0 |
+| `media.Session.forward`, parallel | 6026 | 1 | 0 |
 | SRTP protect RTP, AES-CM-HMAC-SHA1-80 | 387 | 0 | 0 |
 | SRTP unprotect RTP, AES-CM-HMAC-SHA1-80 | 430 | 0 | 0 |
 | SRTP protect RTP, AEAD-AES-GCM | 146 | 0 | 0 |
@@ -221,10 +221,29 @@ The generator's busiest SIPp was at 63% of a core and the switch's at 44%; neith
 | shield `CheckFrom`, parallel / parallel one source | 655 / 518 | 16 | 1 |
 | port pool allocate+release, 0% / 50% / 99% occupied | 47825 / 65535 / 172470 | 768 | 17 |
 | port pool, exhausted | 2578 | 132 | 5 |
-| `sdp.Parse` plain / sdes / webrtc | 2619 / 3204 / 5476 | 2265 / 2842 / 4773 | 32 / 39 / 43 |
-| `sdp.Build`+marshal plain / sdes / webrtc | 1250 / 1360 / 2043 | 1344 / 1617 / 2273 | 31 / 34 / 41 |
+| `sdp.Parse` plain / sdes / webrtc | 2619 / 3204 / 5476 | 2225 / 2802 / 4677 | 29 / 36 / 39 |
+| `sdp.Build`+marshal plain / sdes / webrtc | 359 / 446 / 662 | 352 / 480 / 704 | 1 / 1 / 1 |
+| `sdp.Negotiate` plain / webrtc | 357 / 485 | 112 / 176 | 1 / 1 |
 
-Reading them: the parallel variants are slower per operation than the serial ones for `dialogTable.begin`, `lookup` and the shield, the contention the issue predicted (one global mutex each), but at 0.2 to 1 microsecond per call they are far below the per-packet and per-transaction costs below, and did not appear among the top entries of either profile. SRTP is cheap next to the syscalls around it. Port allocation costs 48 to 172 microseconds near exhaustion, which is paid once per call leg.
+Reading them: the parallel variants are slower per operation than the serial ones for `dialogTable.begin`, `lookup` and the shield, the contention the issue predicted (one global mutex each), but at 0.2 to 1 microsecond per call they are far below the per-packet and per-transaction costs below, and did not appear among the top entries of either profile. SRTP is cheap next to the syscalls around it. Port allocation costs 48 to 172 microseconds near exhaustion, which is paid once per call leg. The `forward`, `Parse`, `Build` and `Negotiate` rows are after #173 (relay on `netip.AddrPort`, Build's append writer, Negotiate without maps); their ns/op were measured on a busier host, so compare the ratio to the earlier figures (Build about 0.3x, Negotiate about 0.12x, Parse and `forward` unchanged) rather than the absolute time.
+
+**Full call (#173).** `BenchmarkEdgeCall` (`internal/edge/callbench_test.go`) runs one whole client call per iteration through a real edge over UDP loopback, with raw-socket client and switch peers that allocate almost nothing: INVITE with SDP, 180, 200 with SDP, ACK, BYE, its 200. So allocs/op is the edge's and sipgo's cost per call. `BenchmarkEdgeCallParallel` runs calls from every CPU at once and `BenchmarkEdgeCallPhases` splits the count by message. Base is main before #173 with the same benchmark file, run interleaved with the change (`go test ./internal/edge -run '^$' -bench BenchmarkEdgeCall -benchmem -benchtime=5000x -count=6`, darwin/arm64):
+
+| Benchmark | allocs/op before | after | B/op before | after |
+|---|---:|---:|---:|---:|
+| `BenchmarkEdgeCall` | 1125 | 777 (-31%) | 66279 | 58853 (-11%) |
+| `BenchmarkEdgeCallParallel` | 1143 | 795 (-30%) | 66268 | 58863 (-11%) |
+
+| Phase (`BenchmarkEdgeCallPhases`) | allocs before | after | B before | after |
+|---|---:|---:|---:|---:|
+| INVITE (client to edge to switch) | 315 | 246 | 18473 | 17234 |
+| 180 | 132 | 90 | 7186 | 6594 |
+| 200 with SDP | 297 | 160 | 20900 | 16968 |
+| ACK | 130 | 96 | 6499 | 5800 |
+| BYE | 145 | 114 | 7958 | 7530 |
+| 200 to the BYE | 100 | 67 | 4353 | 3957 |
+
+The rest (about 4 allocations) is teardown. ns/op is loopback round trips and does not move. Under `BenchmarkEdgeCallParallel` on Linux (Docker `golang:1.27.2`, 8 vCPU, 100000 calls, three interleaved CPU profiles each), throughput went from about 12200 to 15800 calls/s and CPU per call (edge, sipgo and the benchmark's peers) from 464 to 389 microseconds. GC's share stayed about the same at the higher rate (`gcBgMarkWorker` 18.0% to 16.6%, `mallocgc` 11.1% to 10.7%), so GC CPU per call fell by about a fifth; stack growth (`newstack`) fell from 8.2% to 4.6%, because `guard` now grows each handler goroutine's stack once, while it is shallow (`growStack`).
 
 ## Limits a load test hits first
 
@@ -266,7 +285,7 @@ Restart FreeSBC between runs (`docker restart freesbc-perf-freesbc-1`) so RSS an
 Issue #109's three required runs are done: the [three-host run and FreeSWITCH run](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6249040280) (M01 to M07, 2026-10-18) and the [8 hour soak](https://github.com/rasonyang/freesbc/issues/109#issuecomment-6256238968) (M08, PASS). Open work that touches these numbers:
 
 * #235 (open): carrier-in kernel receive drops from 3750 CPS. Until the dropping socket and the cause are known, 3500 CPS is the loss-free ceiling on 4 vCPU.
-* #170: the 2xx wait in `drainAcks` is bounded at 8 s; the next monthly three-host run re-measures goroutines and RSS per CPS. #173 (open): allocation per request on the signaling path. #171 (closed): re-measured, no drops through 3500 CPS. #172 (closed, not planned): batching RTP syscalls does not pay at this architecture; reopen as one reader over many sockets only if calls per core become the limit.
+* #170: the 2xx wait in `drainAcks` is bounded at 8 s; the next monthly three-host run re-measures goroutines and RSS per CPS. #173: a full client call allocates 777 times, down from 1125 (see Micro-benchmarks); the next three-host run re-measures the GC share at the CPS knees. #171 (closed): re-measured, no drops through 3500 CPS. #172 (closed, not planned): batching RTP syscalls does not pay at this architecture; reopen as one reader over many sockets only if calls per core become the limit.
 
 Not measured, or only a lower bound:
 
