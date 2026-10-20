@@ -22,6 +22,8 @@ Principles of the schema:
 
 `check` stops after step 4. It does not test whether an address is assigned to this host, does not open `tls` files and binds nothing; `run` does those.
 
+Writing a first file with `freesbc init` (prompts, flags, `FREESBC_*` variables), the service layout (`/etc/freesbc`, `root:freesbc` mode 0640) and the `freesbc.env` file that supplies `${VAR}` values under systemd are in [install.md](install.md).
+
 ## Top-level keys
 
 | Key | Required | Reload |

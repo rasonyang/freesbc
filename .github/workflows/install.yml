@@ -1,0 +1,92 @@
+# Runs install.sh against the real GitHub releases: after each successful
+# Release run, weekly, and by hand. It uses the checked-out install.sh (not
+# the release asset), so it also covers releases published before install.sh
+# was one. ci.yml tests the script on every PR against a local release.
+name: Install
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: ubuntu:24.04 (${{ matrix.name }})
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # As root with no systemd running: the service step is skipped.
+          - name: latest
+            version: ''
+            flags: ''
+          - name: latest, --no-service
+            version: ''
+            flags: --no-service
+          - name: pinned v0.5.0, --no-service
+            version: v0.5.0
+            flags: --no-service
+    steps:
+      - name: install curl
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl ca-certificates
+      - uses: actions/checkout@v7
+
+      - name: install.sh ${{ matrix.flags }}
+        env:
+          FREESBC_VERSION: ${{ matrix.version }}
+        run: sh install.sh ${{ matrix.flags }}
+
+      - name: freesbc version
+        env:
+          FREESBC_VERSION: ${{ matrix.version }}
+        run: |
+          want=${FREESBC_VERSION:-$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/rasonyang/freesbc/releases/latest)}
+          want=${want##*/}
+          got=$(/usr/local/bin/freesbc version | awk '{print $2}')
+          echo "freesbc $got"
+          [ "$got" = "$want" ] || { echo "::error::version is $got, want $want"; exit 1; }
+
+  macos:
+    name: macOS (${{ matrix.name }})
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: latest
+            version: ''
+          - name: pinned v0.5.0
+            version: v0.5.0
+    env:
+      FREESBC_VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install.sh
+        run: FREESBC_PREFIX="${RUNNER_TEMP}/freesbc" sh install.sh
+
+      - name: freesbc version
+        run: |
+          want=${FREESBC_VERSION:-$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/rasonyang/freesbc/releases/latest)}
+          want=${want##*/}
+          got=$("${RUNNER_TEMP}/freesbc/bin/freesbc" version | awk '{print $2}')
+          echo "freesbc $got"
+          [ "$got" = "$want" ] || { echo "::error::version is $got, want $want"; exit 1; }

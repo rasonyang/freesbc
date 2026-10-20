@@ -1,6 +1,7 @@
 # Builds prebuilt freesbc binaries for a version tag and attaches them to
-# the GitHub Release: one tar.gz per OS/arch plus SHA256SUMS. Runs on every
-# pushed v* tag; run it by hand with a tag to backfill an existing release.
+# the GitHub Release: one tar.gz per OS/arch, install.sh and SHA256SUMS.
+# Runs on every pushed v* tag; run it by hand with a tag to backfill an
+# existing release.
 name: Release
 
 on:
@@ -56,8 +57,14 @@ jobs:
             tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "$stage"
           done
+          # The installer is published beside the tarballs so the
+          # releases/latest/download/install.sh URL matches the release. A
+          # backfilled tag from before install.sh existed has none.
+          if [ -f install.sh ]; then install -m 0755 install.sh dist/install.sh; fi
           cd dist
-          sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+          sums=(./*.tar.gz)
+          if [ -f install.sh ]; then sums+=(./install.sh); fi
+          sha256sum "${sums[@]}" | sed 's| \./| |' > SHA256SUMS
           cat SHA256SUMS
 
       - name: sanity check linux/amd64 binary
@@ -73,9 +80,11 @@ jobs:
       - name: publish release assets
         run: |
           set -euo pipefail
+          assets=(dist/*.tar.gz dist/SHA256SUMS)
+          if [ -f dist/install.sh ]; then assets+=(dist/install.sh); fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            gh release create "$TAG" "${assets[@]}" \
               --title "$TAG" --generate-notes --verify-tag
           fi
