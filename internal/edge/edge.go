@@ -991,21 +991,33 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 	privateAddr := s.privAddr.String()
 	// trusted names the trusted socket a read arrived on, or arrPublic. The
 	// trusted socket is UDP only; a stream read on the same port number
-	// is a public client in a different port space.
+	// is a public client in a different port space. It is
+	// fsip.SameListener against the private bind, without the string round
+	// trip for the *net.UDPAddr every UDP read carries.
 	trusted := func(info sip.TransportReadProps) arrival {
-		if info.LocalAddr == nil {
+		if info.LocalAddr == nil || !strings.EqualFold(info.Transport, "udp") {
 			return arrPublic
 		}
-		local := info.LocalAddr.String()
-		if fsip.SameListener(info.Transport, local, "udp", privateAddr) {
+		if ap, ok := udpAddrPort(info.LocalAddr); ok && s.privAddr.IsValid() {
+			if sameListenerAddr(ap, s.privAddr) {
+				return arrPrivate
+			}
+			return arrPublic
+		}
+		if fsip.SameListener(info.Transport, info.LocalAddr.String(), "udp", privateAddr) {
 			return arrPrivate
 		}
 		return arrPublic
 	}
-	base := fsip.ReadFilter(maxMessageSize, func(info sip.TransportReadProps) bool {
-		if trusted(info) != arrPublic {
+	// accept is the trust decision for a read under the size cap; a is
+	// trusted(info).
+	accept := func(info sip.TransportReadProps, a arrival) bool {
+		if a != arrPublic {
 			// Only an upstream IP may speak on a trusted socket. Anything
 			// else is misrouted or hostile.
+			if ap, ok := udpAddrPort(info.RemoteAddr); ok {
+				return s.topo.fromUpstream(ap.Addr())
+			}
 			ip, ok := fsip.AddrOf(info.RemoteAddr)
 			return ok && s.topo.fromUpstream(ip)
 		}
@@ -1020,7 +1032,7 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		sh := s.shield
 		s.shieldMu.RUnlock()
 		if sh != nil && info.RemoteAddr != nil {
-			if ap, err := netip.ParseAddrPort(info.RemoteAddr.String()); err == nil {
+			if ap, ok := readAddrPort(info.RemoteAddr); ok {
 				if sh.BannedFrom(ap, info.Transport) {
 					// A stream from a banned source is closed on its next
 					// read, so a ban also ends connections opened before it.
@@ -1042,16 +1054,23 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 			}
 		}
 		return true
-	})
+	}
+	// The size cap alone: accept runs below, with the arrival computed once
+	// per read.
+	base := fsip.ReadFilter(maxMessageSize, nil)
 	return func(info sip.TransportReadProps, data []byte) ([]byte, error) {
 		out, err := base(info, data)
 		if len(out) == 0 || err != nil {
 			return out, err
 		}
+		a := trusted(info)
+		if !accept(info, a) {
+			return nil, nil
+		}
 		// Mirror to HOMER what the shield accepted, before the arrival
 		// stamp: the per-process secret must never leave the process.
 		s.hep.inbound(info, out, fsip.IsByteStream(info.Transport))
-		if a := trusted(info); a != arrPublic {
+		if a != arrPublic {
 			return s.marker.stamp(a, out), nil
 		}
 		// A datagram or frame sipgo's parser is certain to reject strikes its
@@ -1068,6 +1087,54 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		}
 		return out, nil
 	}
+}
+
+// readAddrPort is netip.ParseAddrPort(a.String()), the address of a read,
+// without the string round trip for the *net.UDPAddr and *net.TCPAddr
+// sipgo's transports report. The result is the same: String prints an
+// IPv4-mapped address in dotted form, so it parses unmapped, and Unmap
+// does that here. A zone, an out-of-range port or any other net.Addr type
+// takes the string path, so nothing but the cost changes.
+func readAddrPort(a net.Addr) (netip.AddrPort, bool) {
+	if ap, ok := udpAddrPort(a); ok {
+		return ap, true
+	}
+	if t, ok := a.(*net.TCPAddr); ok && t != nil && t.Zone == "" && t.Port >= 0 && t.Port <= 0xffff {
+		if ip, ok := netip.AddrFromSlice(t.IP); ok {
+			return netip.AddrPortFrom(ip.Unmap(), uint16(t.Port)), true
+		}
+		return netip.AddrPort{}, false
+	}
+	if a == nil {
+		return netip.AddrPort{}, false
+	}
+	ap, err := netip.ParseAddrPort(a.String())
+	return ap, err == nil
+}
+
+// udpAddrPort is readAddrPort's fast path for a *net.UDPAddr: ok is false
+// when a is not one it can convert exactly (nil, zoned, an out-of-range
+// port, an IP of neither 4 nor 16 bytes), and the caller then falls back
+// to the string form.
+func udpAddrPort(a net.Addr) (netip.AddrPort, bool) {
+	u, ok := a.(*net.UDPAddr)
+	if !ok || u == nil || u.Zone != "" || u.Port < 0 || u.Port > 0xffff {
+		return netip.AddrPort{}, false
+	}
+	ip, ok := netip.AddrFromSlice(u.IP)
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(u.Port)), true
+}
+
+// sameListenerAddr is fsip.SameListener's address rule (sameAddr) on parsed
+// addresses: the same port, and the same host or a wildcard on either side.
+func sameListenerAddr(local, bind netip.AddrPort) bool {
+	if local.Port() != bind.Port() {
+		return false
+	}
+	return local.Addr() == bind.Addr() || local.Addr().IsUnspecified() || bind.Addr().IsUnspecified()
 }
 
 // guard wraps every handler with the panic umbrella and the security
@@ -1087,6 +1154,7 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 // transport, before anything can copy, log or forward the headers.
 func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 	return func(req *sip.Request, stx sip.ServerTransaction) {
+		growStack()
 		req, arr := s.marker.take(req)
 		tx := &finalTracker{ServerTransaction: stx}
 		if req.Method == sip.INVITE {
@@ -1128,6 +1196,40 @@ func (s *Server) guard(next handler) func(*sip.Request, sip.ServerTransaction) {
 		s.metrics.RequestIn(req.Method.String(), req.Transport())
 		next(req, tx, inbound{src: src, arr: arr})
 	}
+}
+
+// growStackFrame is the frame growStack occupies (issue #173). A handler
+// goroutine starts on a small stack (2 KiB once the runtime's adaptive
+// start has settled) and the INVITE, ACK and BYE paths, through the relay
+// and the SDP code, run it past 8 KiB, so it used to be grown and copied
+// several times, the later copies deep in the call with many frames to
+// move. A frame this size, entered at the top of guard while the stack is
+// still shallow, makes the runtime grow it straight to 16 KiB in one cheap
+// copy. The measured paths fit in that (BenchmarkEdgeCallParallel shows no
+// stack growth inside guard after growStack); a rarer, deeper one grows
+// once more, as it did before. A larger frame would land every handler,
+// a REGISTER or an OPTIONS included, on 32 KiB.
+const growStackFrame = 12 << 10
+
+// growSink keeps growStack's frame from being optimised away: the pad is
+// indexed by a value the compiler cannot know. Its value means nothing; it
+// is atomic only because every handler goroutine writes it.
+var growSink atomic.Uint32
+
+// growStack grows the calling goroutine's stack once, while it is shallow
+// (issue #173). Its frame is growStackFrame bytes, so the prologue's stack
+// check makes the runtime grow the stack before the body runs; the grown
+// stack is kept when it returns, and the handler's deep frames then fit
+// without another copy. It must not be inlined: the pad would then stay in
+// guard's frame for the whole request and push every handler frame 12 KiB
+// deeper.
+//
+//go:noinline
+func growStack() {
+	var pad [growStackFrame]byte
+	i := growSink.Load() % growStackFrame
+	pad[i] = 1
+	growSink.Store(uint32(pad[(i+1)%growStackFrame]))
 }
 
 // drainAcks reads the ACKs sipgo hands an INVITE server transaction.

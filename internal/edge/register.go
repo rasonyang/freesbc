@@ -431,7 +431,7 @@ func (s *Server) registeredContact(user, token string) sip.Uri {
 	params.Add(contactTokenParam, token)
 	return sip.Uri{
 		User:      user,
-		Host:      s.topo.private.advIP.String(),
+		Host:      s.topo.private.host(),
 		Port:      s.topo.private.advPort,
 		UriParams: params,
 	}

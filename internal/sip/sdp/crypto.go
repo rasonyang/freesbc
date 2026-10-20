@@ -115,11 +115,19 @@ func (c Crypto) Validate() error {
 // Value renders the attribute value ("<tag> <suite> inline:<base64>"), the
 // part after "a=crypto:". It contains the key: use it only to build the
 // SDP body, never for logging.
-func (c Crypto) Value() string {
-	mat := make([]byte, 0, len(c.Key)+len(c.Salt))
-	mat = append(mat, c.Key...)
-	mat = append(mat, c.Salt...)
-	return strconv.Itoa(c.Tag) + " " + string(c.Suite) + " inline:" + base64.StdEncoding.EncodeToString(mat)
+func (c Crypto) Value() string { return string(c.appendValue(nil)) }
+
+// appendValue appends Value to buf. The key material is concatenated in a
+// stack buffer, so Build writes an a=crypto line with no allocation of its
+// own.
+func (c Crypto) appendValue(buf []byte) []byte {
+	var stack [64]byte
+	mat := append(append(stack[:0], c.Key...), c.Salt...)
+	buf = strconv.AppendInt(buf, int64(c.Tag), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, c.Suite...)
+	buf = append(buf, " inline:"...)
+	return base64.StdEncoding.AppendEncode(buf, mat)
 }
 
 // NewCrypto generates fresh random key material for suite with the given

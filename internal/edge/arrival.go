@@ -6,7 +6,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
-	"strings"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -118,12 +117,55 @@ type headerMessage interface {
 	RemoveHeader(name string) bool
 }
 
+// isInternalHeader reports whether name starts with internalHeaderPrefix in
+// any case. It folds ASCII only, which is the same answer strings.ToLower
+// gives here: no non-ASCII rune lower-cases to a letter of the prefix (only
+// the Kelvin sign and a dotted capital I lower-case into ASCII, to k and
+// i). Unlike ToLower, it allocates nothing, and it runs on every header of
+// every message.
+func isInternalHeader(name string) bool {
+	return asciiHasPrefixFold(name, internalHeaderPrefix)
+}
+
+// asciiHasPrefixFold reports whether s starts with prefix, ASCII letters
+// compared without case. prefix must be lower case.
+func asciiHasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && asciiEqualFold(s[:len(prefix)], prefix)
+}
+
+// asciiEqualFold reports whether a and b are equal with ASCII letters
+// compared without case: the equality sipgo's own header lookup uses
+// (GetHeaders lower-cases ASCII only), without its allocation for a name
+// that is not already lower case. Unlike strings.EqualFold it does not fold
+// Unicode, so a non-ASCII byte matches only itself.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca == cb {
+			continue
+		}
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // internalHeaderNames lists, one entry per occurrence, the exact names of
-// the X-FreeSBC-* headers m carries.
+// the X-FreeSBC-* headers m carries. It allocates only when there is one.
 func internalHeaderNames(m headerMessage) []string {
 	var names []string
 	for _, h := range m.Headers() {
-		if strings.HasPrefix(strings.ToLower(h.Name()), internalHeaderPrefix) {
+		if isInternalHeader(h.Name()) {
 			names = append(names, h.Name())
 		}
 	}
@@ -157,13 +199,28 @@ func stripInternalHeaders(m headerMessage) {
 // the one the read filter inserts directly after the request line — equals
 // a marker value exactly (constant-time). Anything else, a forged value
 // included, is arrPublic.
+//
+// One scan finds both the marker and whether there is anything to strip:
+// the marker's name has the internal prefix, so only those headers are
+// compared further.
 func (m *arrivalMarker) take(req *sip.Request) (*sip.Request, arrival) {
 	result := arrPublic
-	if hs := req.GetHeaders(arrivalHeader); len(hs) > 0 &&
-		subtle.ConstantTimeCompare([]byte(hs[0].Value()), m.private) == 1 {
+	var marker sip.Header
+	internal := false
+	for _, h := range req.Headers() {
+		name := h.Name()
+		if !isInternalHeader(name) {
+			continue
+		}
+		internal = true
+		if marker == nil && asciiEqualFold(name, arrivalHeader) {
+			marker = h
+		}
+	}
+	if marker != nil && subtle.ConstantTimeCompare([]byte(marker.Value()), m.private) == 1 {
 		result = arrPrivate
 	}
-	if len(internalHeaderNames(req)) == 0 {
+	if !internal {
 		return req, result
 	}
 	clean := req.Clone()

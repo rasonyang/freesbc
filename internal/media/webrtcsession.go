@@ -236,14 +236,14 @@ func (s *WebRTCSession) publicToPrivate(conn net.Conn, in *SRTPContext) {
 		if rtcp {
 			sock, lat = s.priv.RTCP, s.privRTCP
 		}
-		dst := lat.target()
-		if dst == nil {
+		dst := lat.dest()
+		if !dst.IsValid() {
 			// FreeSWITCH has not sent us anything yet, so we don't know
 			// which source/port to answer. Nothing to do but drop; media
 			// starts flowing as soon as its first packet latches.
 			continue
 		}
-		if w, err := sock.WriteToUDP(pkt, dst); err == nil {
+		if w, err := sock.WriteToUDPAddrPort(pkt, dst); err == nil {
 			s.counters.recordTx(SideB, !rtcp, w)
 		}
 	}
@@ -259,14 +259,14 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 	}
 	buf := make([]byte, relayBufSize)
 	for {
-		n, src, err := sock.ReadFromUDP(buf[:maxPacketSize+1])
+		n, src, err := sock.ReadFromUDPAddrPort(buf[:maxPacketSize+1])
 		if err != nil {
 			return // socket closed (session teardown)
 		}
 		if n > maxPacketSize {
 			continue // oversize: forwarding it would forward a truncation
 		}
-		if !lat.accept(src) {
+		if !lat.acceptFrom(src) {
 			continue // pre-latch source mismatch, or post-latch hijack
 		}
 		if !s.leg.mediaVerified() {

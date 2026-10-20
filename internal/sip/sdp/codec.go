@@ -49,54 +49,79 @@ func Negotiate(offer, answer []Codec) ([]Codec, error) {
 	// codec is matched by its offered number first. An answer codec is
 	// renumbered only when its encoding was offered and none of the
 	// numbers the offer gave that encoding is the one it answered on.
-	offered := make(map[string]bool, len(offer)) // key
-	offeredAt := make(map[ptKey]bool, len(offer))
-	for _, o := range offer {
-		offered[o.key()] = true
-		offeredAt[ptKey{o.PayloadType, o.key()}] = true
-	}
-	byPT := make(map[uint8]Codec, len(answer))
-	for _, a := range answer {
-		if offeredAt[ptKey{a.PayloadType, a.key()}] {
-			if _, dup := byPT[a.PayloadType]; !dup {
-				byPT[a.PayloadType] = a
+	//
+	// Codec lists are short (Parse caps them at MaxCodecs), so the offer
+	// is scanned linearly and the answer accepted on each payload number
+	// is kept in a fixed table: no map and no key string per codec.
+	var byPT [256]int32 // 1 + index in answer of the codec accepted on that PT; 0 = none
+	for i, a := range answer {
+		at, enc := offered(offer, a)
+		if at {
+			if byPT[a.PayloadType] == 0 {
+				byPT[a.PayloadType] = int32(i) + 1
 			}
 			continue
 		}
-		if offered[a.key()] {
-			return nil, fmt.Errorf("%w: offered %s, answered %s", ErrRenumbered, Describe(offerOf(offer, a.key())), a)
+		if enc {
+			return nil, fmt.Errorf("%w: offered %s, answered %s", ErrRenumbered, Describe(offerOf(offer, a)), a)
 		}
 	}
-	var out []Codec
+	// Count first so the result is one exact allocation, made only on
+	// success.
+	n, media := 0, false
 	for _, o := range offer {
-		a, ok := byPT[o.PayloadType]
-		if !ok || a.key() != o.key() {
+		if a, ok := acceptedOn(answer, &byPT, o); ok && a.sameEncoding(o) {
+			n++
+			media = media || !o.IsTelephoneEvent()
+		}
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: offer %s vs answer %s", ErrNoCommonCodec, Describe(offer), Describe(answer))
+	}
+	if !media {
+		return nil, fmt.Errorf("%w: only telephone-event in common", ErrNoCommonCodec)
+	}
+	out := make([]Codec, 0, n)
+	for _, o := range offer {
+		a, ok := acceptedOn(answer, &byPT, o)
+		if !ok || !a.sameEncoding(o) {
 			continue
 		}
 		merged := o
 		merged.FMTP = a.FMTP
 		out = append(out, merged)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: offer %s vs answer %s", ErrNoCommonCodec, Describe(offer), Describe(answer))
-	}
-	if !HasMedia(out) {
-		return nil, fmt.Errorf("%w: only telephone-event in common", ErrNoCommonCodec)
-	}
 	return out, nil
 }
 
-// ptKey is one offered (payload number, encoding) pair.
-type ptKey struct {
-	pt  uint8
-	key string
+// offered reports whether the offer has a's encoding on a's payload
+// number (at), and whether it has a's encoding at all (enc).
+func offered(offer []Codec, a Codec) (at, enc bool) {
+	for _, o := range offer {
+		if o.sameEncoding(a) {
+			enc = true
+			if o.PayloadType == a.PayloadType {
+				return true, true
+			}
+		}
+	}
+	return false, enc
 }
 
-// offerOf is the offered codecs of one encoding, for the renumber error.
-func offerOf(offer []Codec, key string) []Codec {
+// acceptedOn is the answer codec Negotiate accepted on o's payload number.
+func acceptedOn(answer []Codec, byPT *[256]int32, o Codec) (Codec, bool) {
+	i := byPT[o.PayloadType]
+	if i == 0 {
+		return Codec{}, false
+	}
+	return answer[i-1], true
+}
+
+// offerOf is the offered codecs of a's encoding, for the renumber error.
+func offerOf(offer []Codec, a Codec) []Codec {
 	var out []Codec
 	for _, o := range offer {
-		if o.key() == key {
+		if o.sameEncoding(a) {
 			out = append(out, o)
 		}
 	}

@@ -149,3 +149,37 @@ func BenchmarkBuildMarshal(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkNegotiate intersects a typical offer with its answer (issue
+// #173): the plain G.711 case and a browser offer answered by a switch.
+func BenchmarkNegotiate(b *testing.B) {
+	pcmu := Codec{PayloadType: 0, Name: "PCMU", ClockRate: 8000}
+	pcma := Codec{PayloadType: 8, Name: "PCMA", ClockRate: 8000}
+	g722 := Codec{PayloadType: 9, Name: "G722", ClockRate: 8000}
+	te := Codec{PayloadType: 101, Name: "telephone-event", ClockRate: 8000, FMTP: "0-16"}
+	opus := Codec{PayloadType: 111, Name: "opus", ClockRate: 48000, Channels: 2, FMTP: "minptime=10;useinbandfec=1"}
+	red := Codec{PayloadType: 63, Name: "red", ClockRate: 48000, Channels: 2}
+	te48 := Codec{PayloadType: 110, Name: "telephone-event", ClockRate: 48000}
+	te8 := Codec{PayloadType: 126, Name: "telephone-event", ClockRate: 8000}
+	cases := []struct {
+		name          string
+		offer, answer []Codec
+	}{
+		{"plain", []Codec{pcmu, pcma, g722, te}, []Codec{pcmu, te}},
+		{"webrtc", []Codec{opus, red, g722, pcmu, pcma, te48, te8}, []Codec{opus, pcmu, te8}},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			if _, err := Negotiate(c.offer, c.answer); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := Negotiate(c.offer, c.answer); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

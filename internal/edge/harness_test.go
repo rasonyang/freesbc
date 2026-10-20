@@ -68,7 +68,7 @@ type portBand struct {
 
 // take returns the first port of n consecutive ports that probe free,
 // advancing the cursor past them. It gives up after one full lap.
-func (b *portBand) take(t *testing.T, n int, free func(port int) bool) int {
+func (b *portBand) take(t testing.TB, n int, free func(port int) bool) int {
 	t.Helper()
 	b.mu.Lock()
 	defer b.mu.Unlock()

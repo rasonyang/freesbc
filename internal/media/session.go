@@ -1,7 +1,6 @@
 package media
 
 import (
-	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -72,6 +71,11 @@ const LearnDelay = 3 * time.Second
 // that latches fixes where the stream's reverse direction is sent; after
 // that only a better-vouched source (see latchRank) or an authorised
 // relatch moves it (RTP-hijack hardening).
+//
+// Addresses are netip values, so the per-packet path (ReadFromUDPAddrPort,
+// acceptFrom, dest, WriteToUDPAddrPort) allocates nothing. Sources are
+// compared as net.IP.Equal compared them: an IPv4-mapped IPv6 address
+// equals its IPv4 form and the zone is ignored (hostOf).
 type latch struct {
 	mu       sync.Mutex
 	mode     LatchMode
@@ -82,14 +86,15 @@ type latch struct {
 	// sigSource is the IP the side's SIP signalling came from, when the
 	// signaling plane knows it (setSignallingSource); zero otherwise.
 	sigSource netip.Addr
-	// dst is the PROVISIONAL send-to address seeded from SDP. It carries
-	// the reverse direction until an inbound packet latches — and, while
-	// learning is delayed, until LearnDelay has passed since then.
-	dst *net.UDPAddr
-	// remote is the source an ACCEPTED INBOUND packet latched, rank how
-	// well signalling vouched for it (rankNone = not latched), and
-	// learnedAt when it latched.
-	remote    *net.UDPAddr
+	// dst is the PROVISIONAL send-to address seeded from SDP (invalid when
+	// none). It carries the reverse direction until an inbound packet
+	// latches — and, while learning is delayed, until LearnDelay has
+	// passed since then.
+	dst netip.AddrPort
+	// remote is the source an ACCEPTED INBOUND packet latched (unmapped,
+	// zone kept for sending), rank how well signalling vouched for it
+	// (rankNone = not latched), and learnedAt when it latched.
+	remote    netip.AddrPort
 	rank      latchRank
 	learnedAt time.Time
 	// allowLoopback lets seed install a loopback destination. It comes
@@ -146,8 +151,8 @@ func (l *latch) relatch(addr netip.AddrPort) {
 	l.mu.Lock()
 	l.expected = addr.Addr()
 	l.signalled = netip.AddrPort{}
-	l.dst = nil
-	l.remote = nil
+	l.dst = netip.AddrPort{}
+	l.remote = netip.AddrPort{}
 	l.rank = rankNone
 	l.mu.Unlock()
 	l.seed(addr)
@@ -190,7 +195,7 @@ func (l *latch) seed(addr netip.AddrPort) {
 	if ip.IsLoopback() && !l.allowLoopback {
 		return // arm the source check, but never send to it
 	}
-	l.dst = &net.UDPAddr{IP: net.IP(ip.AsSlice()), Port: int(addr.Port())}
+	l.dst = netip.AddrPortFrom(ip.WithZone(""), addr.Port())
 }
 
 // unicastMediaAddr reports whether ip can be a unicast RTP peer at all:
@@ -207,18 +212,29 @@ func unicastMediaAddr(ip netip.Addr) bool {
 	return true
 }
 
+// hostOf is src's address as the latch compares it: unmapped and without
+// a zone, which is how net.IP.Equal (and netip.AddrFromSlice) saw a
+// *net.UDPAddr source before the relay moved to netip.
+func hostOf(src netip.AddrPort) netip.Addr {
+	return src.Addr().Unmap().WithZone("")
+}
+
+// sameSource reports whether src is the latched remote.
+func (l *latch) sameSource(src netip.AddrPort) bool {
+	return l.rank != rankNone && hostOf(l.remote) == hostOf(src) && l.remote.Port() == src.Port()
+}
+
 // rankOf is how well signalling vouches for src under the latch's mode.
-func (l *latch) rankOf(src *net.UDPAddr) latchRank {
-	ip, ok := netip.AddrFromSlice(src.IP)
-	if !ok {
+func (l *latch) rankOf(src netip.AddrPort) latchRank {
+	if !src.Addr().IsValid() {
 		return rankNone
 	}
-	ip = ip.Unmap()
+	ip := hostOf(src)
 	if l.mode == LatchStrict && (!l.expected.IsValid() || ip != l.expected.Unmap()) {
 		return rankNone // strict: reject until SetExpectedRemote arms the latch
 	}
 	switch {
-	case l.signalled.IsValid() && ip == l.signalled.Addr() && src.Port == int(l.signalled.Port()):
+	case l.signalled.IsValid() && ip == l.signalled.Addr() && src.Port() == l.signalled.Port():
 		return rankExact
 	case l.expected.IsValid() && ip == l.expected.Unmap(),
 		l.sigSource.IsValid() && ip == l.sigSource:
@@ -227,37 +243,34 @@ func (l *latch) rankOf(src *net.UDPAddr) latchRank {
 	return rankAny
 }
 
-// accept reports whether a packet from src may be processed, latching the
-// stream to src when it is the first acceptable source or a better-vouched
-// one than the source already latched.
-func (l *latch) accept(src *net.UDPAddr) bool {
+// acceptFrom reports whether a packet from src may be processed, latching
+// the stream to src when it is the first acceptable source or a
+// better-vouched one than the source already latched.
+func (l *latch) acceptFrom(src netip.AddrPort) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.rank != rankNone && l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port {
+	if l.sameSource(src) {
 		return true
 	}
 	r := l.rankOf(src)
 	if r <= l.rank {
 		return false // unacceptable, or no better than the latched source
 	}
-	l.remote = &net.UDPAddr{
-		IP:   append(net.IP(nil), src.IP...),
-		Port: src.Port,
-		Zone: src.Zone,
-	}
+	l.remote = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 	l.rank = r
 	l.learnedAt = l.clock()
 	return true
 }
 
-// permits reports whether accept would take a packet from src, without
-// latching to it. The SDES path checks it before spending a decrypt on a
-// source the latch refuses anyway, and calls accept only once the packet
-// has authenticated, so a forged packet never moves the latch.
-func (l *latch) permits(src *net.UDPAddr) bool {
+// permitsFrom reports whether acceptFrom would take a packet from src,
+// without latching to it. The SDES path checks it before spending a
+// decrypt on a source the latch refuses anyway, and calls acceptFrom only
+// once the packet has authenticated, so a forged packet never moves the
+// latch.
+func (l *latch) permitsFrom(src netip.AddrPort) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.rank != rankNone && l.remote.IP.Equal(src.IP) && l.remote.Port == src.Port {
+	if l.sameSource(src) {
 		return true
 	}
 	return l.rankOf(src) > l.rank
@@ -268,13 +281,13 @@ func (l *latch) permits(src *net.UDPAddr) bool {
 // the address the side's SIP came from, so it is plausibly where the
 // endpoint listens — not a private address behind a NAT.
 func (l *latch) learningDelayed() bool {
-	return l.dst != nil && l.sigSource.IsValid() && l.signalled.Addr() == l.sigSource
+	return l.dst.IsValid() && l.sigSource.IsValid() && l.signalled.Addr() == l.sigSource
 }
 
-// target returns where the reverse direction is sent: the latched remote,
+// dest returns where the reverse direction is sent: the latched remote,
 // the SDP-seeded destination before latching (or while learning is
-// delayed), or nil when there is neither.
-func (l *latch) target() *net.UDPAddr {
+// delayed), or an invalid AddrPort when there is neither.
+func (l *latch) dest() netip.AddrPort {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.rank == rankNone {

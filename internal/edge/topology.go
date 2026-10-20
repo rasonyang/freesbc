@@ -69,12 +69,41 @@ type side struct {
 	// FreeSBC only over the connection FreeSBC opened. Its Via carries the
 	// RFC 5923 alias parameter to say so.
 	outbound bool
+	// advHost and upTransport are advIP.String() and transport upper-cased,
+	// made once by withNames rather than on every Via, Contact and
+	// Record-Route. A side without them (the zero side) computes them on use.
+	advHost     string
+	upTransport string
+}
+
+// withNames returns s with advHost and upTransport filled in.
+func (s side) withNames() side {
+	s.advHost = s.advIP.String()
+	s.upTransport = strings.ToUpper(s.transport)
+	return s
+}
+
+// host is the advertised IP as a URI host.
+func (s side) host() string {
+	if s.advHost != "" {
+		return s.advHost
+	}
+	return s.advIP.String()
+}
+
+// upperTransport is the transport as sipgo's message transport and a Via
+// name it: "UDP", "TCP", ...
+func (s side) upperTransport() string {
+	if s.upTransport != "" {
+		return s.upTransport
+	}
+	return strings.ToUpper(s.transport)
 }
 
 // uri is the SBC's own URI on this side, as it appears in Record-Route,
 // Via sent-by and Contact.
 func (s side) uri() sip.Uri {
-	u := sip.Uri{Host: s.advIP.String(), Port: s.advPort}
+	u := sip.Uri{Host: s.host(), Port: s.advPort}
 	if s.transport != "udp" {
 		u.UriParams = sip.NewParams()
 		u.UriParams.Add("transport", s.transport)
@@ -90,7 +119,7 @@ func (s side) recordRoute() *sip.RecordRouteHeader {
 	}
 	params.Add("lr", "")
 	return &sip.RecordRouteHeader{
-		Address: sip.Uri{Host: s.advIP.String(), Port: s.advPort, UriParams: params},
+		Address: sip.Uri{Host: s.host(), Port: s.advPort, UriParams: params},
 	}
 }
 
@@ -105,8 +134,8 @@ func (s side) via(branch string) *sip.ViaHeader {
 	v := &sip.ViaHeader{
 		ProtocolName:    "SIP",
 		ProtocolVersion: "2.0",
-		Transport:       strings.ToUpper(s.transport),
-		Host:            s.advIP.String(),
+		Transport:       s.upperTransport(),
+		Host:            s.host(),
 		Port:            s.advPort,
 		Params:          sip.NewParams(),
 	}
@@ -157,6 +186,45 @@ type topology struct {
 	// media advertised addresses.
 	publicMediaIP  netip.Addr
 	privateMediaIP netip.Addr
+	// publicHost is publicMediaIP.String(), the address every public side
+	// advertises: the host a masked identity URI gets (hostOf).
+	publicHost string
+}
+
+// hostOf is ip.String(), made once for public.ip, the address topology
+// hiding writes into every masked URI.
+func (t *topology) hostOf(ip netip.Addr) string {
+	if t.publicHost != "" && ip == t.publicMediaIP {
+		return t.publicHost
+	}
+	return ip.String()
+}
+
+// parseIPHost is netip.ParseAddr(host) for a host that may well be a DNS
+// name, without the error ParseAddr allocates to reject one. ParseAddr
+// takes the first '.' or ':' to choose IPv4 or IPv6 and rejects anything
+// with neither; its IPv4 form has only digits and dots. A host that fails
+// those checks could never parse, and is turned away here; every other
+// host is parsed, so the result is ParseAddr's own.
+func parseIPHost(host string) (netip.Addr, bool) {
+	for i := 0; i < len(host); i++ {
+		switch host[i] {
+		case ':':
+			ip, err := netip.ParseAddr(host)
+			return ip, err == nil
+		case '.':
+			for j := 0; j < len(host); j++ {
+				if c := host[j]; c != '.' && (c < '0' || c > '9') {
+					return netip.Addr{}, false
+				}
+			}
+			ip, err := netip.ParseAddr(host)
+			return ip, err == nil
+		case '%':
+			return netip.Addr{}, false
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // buildTopology resolves the config into the runtime model. priv is the
@@ -191,9 +259,10 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 			advIP:     priv.Addr(),
 			advPort:   int(priv.Port()),
 			laddr:     sipAddr(priv.Addr(), int(priv.Port())),
-		},
+		}.withNames(),
 		publicMediaIP:  cfg.PublicIP(),
 		privateMediaIP: priv.Addr(),
+		publicHost:     cfg.PublicIP().String(),
 	}
 	pubIP, bind := cfg.PublicIP(), cfg.PublicBind()
 	for _, tr := range config.Transports {
@@ -210,7 +279,7 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 		if tr == "udp" {
 			s.laddr = sipAddr(bind, port)
 		}
-		t.public[tr] = s
+		t.public[tr] = s.withNames()
 	}
 	// A tcp or tls carrier is dialed by FreeSBC, so it needs no listener. It
 	// still needs a side to name in Via, Record-Route and Contact; one
@@ -224,7 +293,7 @@ func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {
 		if c.Transport == config.CarrierTLS {
 			port = config.DefaultCarrierTLSPort
 		}
-		t.public[c.Transport] = side{plane: planePublic, transport: c.Transport, advIP: pubIP, advPort: port, outbound: true}
+		t.public[c.Transport] = side{plane: planePublic, transport: c.Transport, advIP: pubIP, advPort: port, outbound: true}.withNames()
 	}
 	return t
 }
@@ -261,8 +330,8 @@ func (t *topology) publicSide(transport string) (side, bool) {
 // whatever the router maps there, which need not be FreeSBC, and claiming it
 // would swallow a Route meant for another host.
 func (t *topology) isSelf(u sip.Uri) bool {
-	ip, err := netip.ParseAddr(u.Host)
-	if err != nil {
+	ip, ok := parseIPHost(u.Host)
+	if !ok {
 		return false
 	}
 	ip = ip.Unmap()
@@ -294,8 +363,8 @@ func (t *topology) isSelfVia(v *sip.ViaHeader) bool {
 	if v == nil {
 		return false
 	}
-	ip, err := netip.ParseAddr(v.Host)
-	if err != nil {
+	ip, ok := parseIPHost(v.Host)
+	if !ok {
 		return false
 	}
 	ip = ip.Unmap()

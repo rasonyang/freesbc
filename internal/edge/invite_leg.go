@@ -103,8 +103,9 @@ func (s *Server) onLate2xx(h *dialogHook, tx sip.ServerTransaction, src string, 
 	tag := fsip.ToTag(res)
 	if d := h.dialog(); d != nil {
 		if ok := d.relayed2xx(tag); ok != nil {
-			// A clone carries no destination; the caller's transport source
-			// is where every response to it goes (RFC 3581).
+			// The stored 2xx is shared, so it is cloned, and sent to the
+			// caller's transport source, where every response to it goes
+			// (RFC 3581).
 			out := ok.Clone()
 			out.SetDestination(src)
 			s.metrics.ResponseOut(out.StatusCode)
@@ -203,8 +204,11 @@ func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 		}
 		s.armOwedTimer(l.dialog())
 		s.armAckTimer(l.dialog(), fsip.CSeqNumber(l.req))
-		// What retransmissions of this 2xx are answered with.
-		l.dialog().setRelayed2xx(out.Clone())
+		// What retransmissions of this 2xx are answered with. Stored last:
+		// nothing changes out after adapt (relayResponseHide only reads and
+		// sends it), so onLate2xx can clone it from another goroutine
+		// without a copy here.
+		l.dialog().setRelayed2xx(out)
 		return nil
 	})
 	if err != nil && !errors.Is(err, errResponseDropped) && is2xx {

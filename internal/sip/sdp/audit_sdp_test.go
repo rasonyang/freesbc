@@ -3,6 +3,7 @@ package sdp
 import (
 	"errors"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -220,6 +221,27 @@ func FuzzAuditParseBuild(f *testing.F) {
 				t.Fatalf("PT %d > 127 accepted", c.PayloadType)
 			}
 		}
+		// Issue #173: the rewritten Negotiate and Build must match the
+		// implementations they replaced on whatever Parse accepts.
+		if len(sess.Audio.Codecs) > 1 {
+			half := sess.Audio.Codecs[len(sess.Audio.Codecs)/2:]
+			got, gerr := Negotiate(sess.Audio.Codecs, half)
+			want, werr := negotiateRef(sess.Audio.Codecs, half)
+			if errText(gerr) != errText(werr) || !reflect.DeepEqual(got, want) {
+				t.Fatalf("Negotiate differs from the reference:\n got %#v, %v\nwant %#v, %v", got, gerr, want, werr)
+			}
+		}
+		checkBuildMatchesReference(t, Build{
+			Address: advertised, Port: 40000, Codecs: sess.Audio.Codecs, SessionID: 1, SessionVersion: 1,
+			Direction: sess.Audio.Direction, RTCPMux: sess.Audio.RTCPMux, Crypto: sess.Audio.Crypto,
+		}, sess)
+		if sess.Audio.WebRTC() {
+			checkBuildMatchesReference(t, Build{
+				Address: advertised, Port: 40000, Codecs: sess.Audio.Codecs, SessionID: 1, SessionVersion: 1,
+				DTLS: true, RTCPMux: true, ICEUfrag: sess.Audio.ICEUfrag, ICEPwd: sess.Audio.ICEPwd,
+				Fingerprint: sess.Audio.Fingerprint, Setup: sess.Audio.Setup,
+			}, sess)
+		}
 		codecs, err := Negotiate(sess.Audio.Codecs, sess.Audio.Codecs)
 		if err != nil {
 			return
@@ -248,12 +270,22 @@ func FuzzAuditBuildNoSentinelLeak(f *testing.F) {
 	f.Add("a=rtcp:47111 IN IP4 "+auditSentinelIP, "a=candidate:1 1 UDP 1 "+auditSentinelIP+" 47110 typ host", "a=fmtp:0 x=1")
 	advertised := netip.MustParseAddr("10.0.0.1")
 	f.Fuzz(func(t *testing.T, a1, a2, a3 string) {
+		// Issue #173: canonicalFMTP matches the implementation it replaced
+		// on arbitrary text, for every codec with an fmtp rule.
+		for _, raw := range []string{a1, a2, a3} {
+			for _, name := range []string{"opus", "AMR", "amr-wb", "g729", "iLBC", "g7221", "telephone-event", "pcmu"} {
+				if got, want := canonicalFMTP(name, raw), canonicalFMTPRef(name, raw); got != want {
+					t.Fatalf("canonicalFMTP(%q, %q) = %q, reference %q", name, raw, got, want)
+				}
+			}
+		}
 		body := "v=0\r\no=- 1 1 IN IP4 " + auditSentinelIP + "\r\ns=-\r\nc=IN IP4 " + auditSentinelIP +
 			"\r\nt=0 0\r\nm=audio 47110 RTP/AVP 0 96\r\n" + a1 + "\r\n" + a2 + "\r\n" + a3 + "\r\n"
 		sess, err := Parse([]byte(body))
 		if err != nil {
 			return
 		}
+		checkBuildMatchesReference(t, Build{Address: advertised, Port: 40000, Codecs: sess.Audio.Codecs, SessionID: 1, SessionVersion: 1}, sess)
 		out, err := Build{Address: advertised, Port: 40000, Codecs: sess.Audio.Codecs, SessionID: 1, SessionVersion: 1}.MarshalDeclining(sess)
 		if err != nil {
 			return
