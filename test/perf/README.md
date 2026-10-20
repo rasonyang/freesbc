@@ -114,7 +114,10 @@ the first step whose failed-call percentage exceeds `STEP_FAIL_PCT` (0.1) and
 prints a table plus `max sustained rate under 0.1% failures`. `steps.csv` has the
 table: per step the failure rate plus FreeSBC's CPU (average and peak, one core =
 100), peak RSS, goroutines, ports, RTP pps and `udp_rcvbuf_errors` over the step
-(its first 5 s skipped). Each step is its own SIPp process (own stats file); the metrics CSV spans
+(its first 5 s skipped), then per FreeSBC UDP SIP socket the kernel drops in the
+step (`udp_pub_drops`, `udp_priv_drops`) and the largest sampled receive queue
+(`udp_pub_rxq_peak_bytes`, `udp_priv_rxq_peak_bytes`), which name the socket that
+loses datagrams when `udp_rcvbuf_errors` rises. Each step is its own SIPp process (own stats file); the metrics CSV spans
 the whole ramp.
 
 **Soak** (issue: 8-24 h at about 70% of the maximum): pick 70% of the step-mode
@@ -138,7 +141,9 @@ Each run creates `out/<timestamp>-<scenario>/`:
 | File | Content |
 |---|---|
 | `summary.txt` | The printed summary. |
-| `metrics.csv` | `ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors`; counters are cumulative. `udp_rcvbuf_errors` is the kernel's `RcvbufErrors` for the FreeSBC process's network namespace (datagrams dropped because a UDP receive buffer was full; in hosts mode it is host-wide). CPU% is the delta of `cpu_s` over the delta of `ts` (100 = one core). |
+| `metrics.csv` | `ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors,udp_pub_drops,udp_priv_drops,udp_pub_rxq_bytes,udp_priv_rxq_bytes`; counters are cumulative. `udp_rcvbuf_errors` is the kernel's `RcvbufErrors` for the FreeSBC process's network namespace (datagrams dropped because a UDP receive buffer was full; in hosts mode it is host-wide). The `udp_pub_*` and `udp_priv_*` columns are per socket: `sample.sh` reads the `drops` and `rx_queue` columns of `/proc/<pid>/net/udp` and `udp6` for every UDP socket on port 5060 (`SIP_PORT` on the FreeSBC host), and `scrape.awk` counts the one on `SBC_PRIVATE` as private and any other as public. `*_drops` are cumulative; `*_rxq_bytes` is the bytes queued at the sample. They assume a little-endian host and no other 5060 socket in the namespace. CPU% is the delta of `cpu_s` over the delta of `ts` (100 = one core). |
+| `steps.csv` | Step mode only: one row per step, see above. |
+| `pprof/` | With `PROFILE_AT` only: `r<RATE>-cpu.pb.gz`, `-trace.out`, `-goroutine.txt`, `-heap.pb.gz`. |
 | `sipp-*.csv`, `sipp-*.log` | SIPp's raw stats (`prereg`, `main`, `main.rdN` for register rounds, `rNNN` for step mode) and screen output. |
 | `webrtc.csv`, `webrtc.log` | Per-call rows and the report of `webrtcload`. |
 | `users.csv`, `g711u.pcap` | Inputs generated for the run. |
@@ -195,6 +200,22 @@ docker exec $C curl -s -u admin:perf -o /tmp/cpu.pb.gz 'localhost:8081/debug/ppr
 docker cp $C:/tmp/cpu.pb.gz . && docker cp $C:/usr/local/bin/freesbc ./freesbc-linux
 go tool pprof -top -nodecount=30 freesbc-linux cpu.pb.gz
 docker exec $C curl -s -u admin:perf 'localhost:8081/debug/pprof/goroutine?debug=1' | head -40
+```
+
+In step mode `PROFILE_AT=<rate>` does this for one step, in the background so
+the step timing is unchanged: `PROFILE_DELAY` (5) seconds after the step at that
+rate starts, it saves a CPU profile of `PROFILE_SECS` (30) seconds and, at the
+same time, a 5 s execution trace, then a goroutine dump (`debug=1`) and a heap
+profile into `<run dir>/pprof/r<rate>-*`. The run waits for them before its
+final sample. The profiles come through `sample.sh pprof KIND [SECONDS]` on the
+FreeSBC host (the same `SBC_EXEC` and `ADMIN_*` as the sampler; override with
+`PROFILE_CMD`). Pick a rate whose step lasts at least `PROFILE_DELAY +
+PROFILE_SECS` so the CPU profile covers one load level:
+
+```sh
+PROFILE_AT=4000 test/perf/run.sh -n -s 3500:4250:250:40 -H 2 carrier-in
+go tool pprof -top -nodecount=30 freesbc-linux out/<run>/pprof/r4000-cpu.pb.gz
+go tool trace out/<run>/pprof/r4000-trace.out
 ```
 
 ## WebRTC load client
@@ -257,10 +278,11 @@ lab-only profile (no digest) on its own port; read its notes first.
 
 **Host prep checklist**
 
-1. FreeSBC host: `sysctl net.core.rmem_max=...` of at least 4194304 (4 MiB) and
-   `net.core.wmem_max` of at least 1048576 (1 MiB). FreeSBC asks for 4 MiB receive and
-   1 MiB send on every UDP SIP socket and only logs a WARN when the kernel caps it, so a
-   low value shows up as `freesbc_udp_receive_buffer_errors_total` rising under load.
+1. FreeSBC host: `sysctl net.core.rmem_max=...` of at least 8388608 (8 MiB) and
+   `net.core.wmem_max` of at least 1048576 (1 MiB). FreeSBC asks for 8 MiB receive and
+   1 MiB send on every UDP SIP socket (Linux allocates double: 16 MiB of receive
+   buffer) and only logs a WARN when the kernel caps it, so a low value shows up as
+   `freesbc_udp_receive_buffer_errors_total` rising under load.
    The same for the FreeSWITCH and generator hosts.
 2. `ulimit -n` (systemd `LimitNOFILE`) in the hundreds of thousands on the FreeSBC
    host (about 4 UDP sockets per call) and on FreeSWITCH.
@@ -304,6 +326,7 @@ switch's.
 | Counter | Reading |
 |---|---|
 | `freesbc_udp_receive_buffer_errors_total` (`udp_rcvbuf_errors`) | Must stay 0. Rising means datagrams were dropped on a full UDP receive buffer (namespace-wide, Linux only): check `rmem_max`. |
+| `freesbc_udp_socket_drops_total{socket}` (`udp_pub_drops`, `udp_priv_drops`) | Which SIP socket dropped: `public` (generators and carriers to FreeSBC) or `private` (switch to FreeSBC). `freesbc_udp_socket_rx_queue_bytes` (`udp_*_rxq_bytes`) near the socket's 16 MiB receive buffer (Linux's double of the 8 MiB request; `rx_queue` counts kernel truesize, about 1.75 KiB per SIP datagram) means its reader is behind. |
 | `freesbc_edge_invite_rejects_total{reason}` (`invite_rejects`) | `early_cap` (64 unanswered per source IP: slow answers), `session_cap`, `invite_rate`, `port_exhausted`, `draining`. FreeSBC refused the call itself. |
 | `freesbc_edge_admission_drops_total{reason}` (`admission_drops`) | `invite_not_admitted` means the generator source IP:port has no live registration. |
 | `freesbc_edge_calls_ended_total{reason}` | Why calls ended. A healthy run ends in `bye_caller`; `ack_timeout`, `rtp_silence`, `media_fault` or `answer_timeout` point at a leg problem. |
@@ -373,6 +396,7 @@ test/perf/run.sh -r 50 -t 60 -H 30 call
 | `STEP_FAIL_PCT` | `0.1` | step-mode failure threshold (percent) |
 | `OUT_ROOT` | `test/perf/out` | where runs go (compose mounts only `test/perf`) |
 | `*_EXEC`, `REMOTE_PERF`, `SAMPLE_CMD` | compose exec prefixes, `/perf` | see above |
+| `PROFILE_AT`, `PROFILE_SECS`, `PROFILE_DELAY`, `PROFILE_CMD` | off, `30`, `5`, `$SBC_EXEC $REMOTE_PERF/sample.sh pprof` | step mode: profile the step at that rate (see "Profiling under load") |
 | `SWITCH` | `sipp` | `sipp` starts the SIPp switch UAS; `freeswitch` starts nothing and targets the real FreeSWITCH at `SWITCH_IP` |
 | `FREESBC_CONFIG`, `FREESBC_VERSION` | `perf.yaml`, `git describe` | for `run.sh up` |
 

@@ -175,7 +175,7 @@ On Linux the private socket installs a BPF receive filter: a datagram is deliver
 
 ## UDP socket buffers
 
-FreeSBC asks the kernel for a 4 MiB receive buffer and a 1 MiB send buffer on every UDP SIP socket (the public `edge.listen.udp` socket and the private `private.ip:5060` socket). The sizes are fixed, not configurable, and `rmem_default` need not be raised because the size is set explicitly. RTP sockets are not resized. The kernel caps the request at `net.core.rmem_max` and `net.core.wmem_max` (Linux) or `kern.ipc.maxsockbuf` (macOS), so raise them to at least 4 MiB and 1 MiB:
+FreeSBC asks the kernel for an 8 MiB receive buffer and a 1 MiB send buffer on every UDP SIP socket (the public `edge.listen.udp` socket and the private `private.ip:5060` socket). The sizes are fixed, not configurable, and `rmem_default` need not be raised because the size is set explicitly. RTP sockets are not resized. The kernel caps the request at `net.core.rmem_max` and `net.core.wmem_max` (Linux) or `kern.ipc.maxsockbuf` (macOS), so raise them to at least 8 MiB and 1 MiB; only then is the receive request granted in full. Linux then allocates double the request (16 MiB of receive buffer per socket, the extra half for its own bookkeeping) and `getsockopt` reports that doubled figure. The receive request was 4 MiB until #235 raised it; a host still at `rmem_max` 4 MiB runs, warns once per socket and keeps the smaller buffer:
 
 ```sh
 sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
@@ -184,7 +184,7 @@ net.core.rmem_max = 8388608
 net.core.wmem_max = 8388608
 ```
 
-Apply it before FreeSBC starts (a running socket keeps the size it got). If the grant falls short FreeSBC still starts and logs one warning per socket, `udp socket receive buffer below request; datagrams may drop under bursts` (or `... send buffer below request`), with the address, `requested` and `effective` bytes. Without the larger buffer a burst or a GC pause overflows the socket and the kernel drops datagrams silently; the signal is the `RcvbufErrors` counter, `nstat -az UdpRcvbufErrors`, `freesbc_udp_receive_buffer_errors_total` on `/metrics` (Linux), or the `RcvbufErrors` column of the `Udp:` lines in `/proc/net/snmp`.
+Apply it before FreeSBC starts (a running socket keeps the size it got). If the grant falls short FreeSBC still starts and logs one warning per socket, `udp socket receive buffer below request; datagrams may drop under bursts` (or `... send buffer below request`), with the address, `requested` and `effective` bytes. Without the larger buffer a burst or a GC pause overflows the socket and the kernel drops datagrams silently; the signal is the `RcvbufErrors` counter, `nstat -az UdpRcvbufErrors`, `freesbc_udp_receive_buffer_errors_total` on `/metrics` (Linux; `freesbc_udp_socket_drops_total{socket="public|private"}` names which SIP socket dropped), or the `RcvbufErrors` column of the `Udp:` lines in `/proc/net/snmp`.
 
 ## Multiple switches (`edge.switch`)
 

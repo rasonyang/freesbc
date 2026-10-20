@@ -83,7 +83,7 @@ Asterisk (`pjsip set logger on`, or `sip set debug on` for chan_sip):
 
 ## SIP datagrams lost under bursts
 
-Symptom: calls or REGISTERs fail at high rates with no FreeSBC log line, and `nstat -az UdpRcvbufErrors` (or `RcvbufErrors` in `/proc/net/snmp`) keeps rising. Check the startup log for `udp socket receive buffer below request`: the kernel capped the 4 MiB request FreeSBC makes on its UDP SIP sockets. Raise `net.core.rmem_max` and `net.core.wmem_max` and restart FreeSBC; see [UDP socket buffers](edge.md#udp-socket-buffers).
+Symptom: calls or REGISTERs fail at high rates with no FreeSBC log line, and `nstat -az UdpRcvbufErrors` (or `RcvbufErrors` in `/proc/net/snmp`) keeps rising. Check the startup log for `udp socket receive buffer below request`: the kernel capped the 8 MiB request FreeSBC makes on its UDP SIP sockets. Raise `net.core.rmem_max` to at least 8 MiB (and `net.core.wmem_max` to at least 1 MiB) and restart FreeSBC; see [UDP socket buffers](edge.md#udp-socket-buffers). `freesbc_udp_socket_drops_total{socket="public|private"}` on `/metrics` (Linux) names which SIP socket drops, and `freesbc_udp_socket_rx_queue_bytes{socket}` shows its queue at the scrape. Drops with the full buffer granted, at carrier-in rates above about 3500 CPS on 4 vCPU, are GC mark phases keeping the socket's reader waiting for a CPU ([performance.md](performance.md), #235); in a local test more CPUs, or a higher `GOGC` at a large cost in memory, moved the onset up.
 
 ### Order of checks
 

@@ -183,7 +183,7 @@ Do not `. freesbc.env` instead: the shell would expand the `$` in a bcrypt hash.
 
 ### Tuning and reload
 
-For bursty traffic raise `net.core.rmem_max` and `net.core.wmem_max` to at least 4 MiB and 1 MiB, so the UDP SIP sockets get their requested buffers ([UDP socket buffers](edge.md#udp-socket-buffers)).
+For bursty traffic raise `net.core.rmem_max` and `net.core.wmem_max` to at least 8 MiB and 1 MiB, so the UDP SIP sockets get their requested buffers ([UDP socket buffers](edge.md#udp-socket-buffers)).
 
 There is no `ExecReload` (FreeSBC has no SIGHUP handler): a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`. A bad config or a bind error exits 1 and systemd retries every 5 s, so run `freesbc check` before a restart. The unit's comments cover `LimitNOFILE`, an optional `MemoryMax` with `GOMEMLIMIT`, and dropping the capability when no port is below 1024.
 

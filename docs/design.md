@@ -319,10 +319,13 @@ sockets on separate addresses, so they have separate port namespaces.
 
 Both UDP SIP sockets (`udp` and `udp-private`) are opened in `openListener`
 (`edge.go:875`) and sized right after the bind (`sizeUDPSocket`,
-`sockbuf.go`): receive buffer `udpSIPReadBuffer` 4 MiB and send buffer
-`udpSIPWriteBuffer` 1 MiB (`sockbuf.go:16-17`), fixed constants rather than
+`sockbuf.go`): receive buffer `udpSIPReadBuffer` 8 MiB and send buffer
+`udpSIPWriteBuffer` 1 MiB (`sockbuf.go:19-20`), fixed constants rather than
 config (issue #171; the OS default overflowed under bursts and the kernel
-dropped datagrams, `UdpRcvbufErrors`). The effective sizes are read back with
+dropped datagrams, `UdpRcvbufErrors`). The receive request was 4 MiB until
+issue #235 doubled it as a stopgap: a GC mark phase can keep a socket's single
+read loop waiting for a CPU long enough to fill 4 MiB at carrier-in rates
+above ~3500 CPS (see `docs/performance.md`). The effective sizes are read back with
 `getsockopt` (`sockbuf_unix.go`, halved on Linux, which reports double the
 grant; unknown elsewhere). A read-back below the
 request, or a `SetReadBuffer`/`SetWriteBuffer` error, logs one Warn per socket
@@ -3714,6 +3717,7 @@ permanent series per call."
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end()` (`dialog.go:1197`, `Metrics.MediaEnded`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Counter | — | Linux only: the kernel's `RcvbufErrors` and `InErrors` from the `Udp:` lines of `/proc/net/snmp` plus `Udp6RcvbufErrors` and `Udp6InErrors` from `/proc/net/snmp6`, IPv4 + IPv6 summed, read at scrape time (`readUDPStats`, `udpstats.go:28`, called from `Collect`, `admin/metrics.go:165`). The kernel keeps them per network namespace, so they cover every UDP socket in it, not only FreeSBC's, and `InErrors` already includes `RcvbufErrors`. A datagram dropped on a full receive buffer never reaches `freesbc_rtp_packets_rx_total`, so rx/tx 1.0 does not exclude kernel loss; these series do. An absent `snmp6` (IPv6 disabled) leaves IPv4 alone; an unreadable or unparsable `/proc/net/snmp`, or any other OS, exports neither series (no error metric, no log) |
+| `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collectUDPSockets`, `admin/metrics.go:304`; `readUDPSockets`, `udpstats.go:138`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go:200`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
 | `freesbc_media_port_allocation_failure_total` | Counter | — | edge `rejectMedia` on `ErrPortsExhausted` (`invite.go:731`) |
 | `freesbc_webrtc_ice_failure_total` | Counter | — | edge `WebRTCFailure`: every leg failure that is not a DTLS one (`ErrICEFailed`, `ErrWebRTCNotReady`, a leg closed before it established) |
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
@@ -4474,7 +4478,7 @@ code constant.
 | `rtpSilenceTimeout` | 5 min (`edge.go:161`) | media silence; the only automatic reclaim for a confirmed call whose BYE was lost |
 | `switchCooldown` | 30 s (`edge.go:165`) | a switch node that answered nothing is skipped while alternatives exist |
 | `ack2xxDrainWait` | 8 s (`edge.go:188`) | how long `drainAcks` reads an INVITE server transaction's ACKs after a 2xx final (§7.8); a non-2xx keeps it to the transaction's end |
-| `udpSIPReadBuffer` / `udpSIPWriteBuffer` | 4 MiB / 1 MiB (`sockbuf.go:16-17`) | requested kernel receive and send buffer of each UDP SIP socket (§4.3); capped by the host's sysctl |
+| `udpSIPReadBuffer` / `udpSIPWriteBuffer` | 8 MiB / 1 MiB (`sockbuf.go:19-20`) | requested kernel receive and send buffer of each UDP SIP socket (§4.3); capped by the host's sysctl |
 | `udpServingTimeout` | 5 s (`edge.go:771`) | startup: every UDP listener pooled by sipgo before `ready` closes (§4) |
 | `streamHandshakeTimeout` | 10 s (`stream.go`) | a new tls/wss connection's TLS handshake, a ws/wss connection's HTTP upgrade request (§7.1a), and the dial plus handshake of a connection FreeSBC opens to a tcp/tls carrier (§6.10) |
 | `streamIdleTimeout` | 60 s | a stream connection silent this long and in no use (no binding, dialog or carrier source) is closed; an in-use one is re-armed |

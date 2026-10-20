@@ -225,7 +225,9 @@ in step mode run.sh itself would call an aborted step a pass), CPU (`steps.csv` 
 320 (80% of 4 vCPU), `udp_rcvbuf_errors` 0, and no `invite_rejects`/`admission_drops` at that step. If the
 first failing step has low FreeSBC CPU, look at A's SIPp CPU (`hostmon-loadgen.csv`; a single SIPp process tops
 out at a few thousand CPS) and at `udp_rcvbuf_errors` / `rmem_max`: then the knee is rig-limited and a
-lower bound.
+lower bound. When `udp_rcvbuf_errors` rises, `steps.csv` `udp_pub_drops` / `udp_priv_drops` name the FreeSBC
+socket that dropped (public 5060: generator or carrier to FreeSBC; private 5060: switch to FreeSBC), and
+`udp_*_rxq_peak_bytes` how full its receive queue got.
 
 **Record.** Per scenario: knee (CPS), `steps.csv` (paste it), CPU avg/peak at the knee, RSS peak, goroutines,
 retransmissions, `rt_p95_bucket_ms`, `cps_median`/`cps_max`, what failed first, and whether the limit was FreeSBC,
@@ -388,7 +390,10 @@ test/perf/hosts/pprof.sh m01-call-<cps>cps 30          # CPU 30 s, goroutines, h
 test/perf/hosts/pprof.sh m02-<calls>calls 30
 ```
 
-Files land in `results/<date>/pprof/`. Read them on A: `go tool pprof -top -nodecount=30 results/<date>/pprof/freesbc-linux results/<date>/pprof/m02-...-cpu.pb.gz`
+Files land in `results/<date>/pprof/`. To profile one CPS step of a step run instead, set `PROFILE_AT=<cps>` on
+run.sh (`PROFILE_AT=4000 test/perf/run.sh -n -s 3500:4250:250:40 -H 2 carrier-in`): 5 s into that step it saves a
+30 s CPU profile, a 5 s trace, a goroutine dump and a heap profile to `out/<run>/pprof/` without delaying the steps
+(`daily-report.sh` copies them with the run). Read them on A: `go tool pprof -top -nodecount=30 results/<date>/pprof/freesbc-linux results/<date>/pprof/m02-...-cpu.pb.gz`
 (the Go toolchain is installed on A). **Record:** the top 15 functions by cumulative CPU for each, goroutine count by top
 stack groups (`goroutine.txt`), heap in use and the top allocators, and what they suggest (syscall cost, GC share, timers). This is the data
 the 80% claim needs. **Duration:** inside M01 and M02 (about 2 minutes of work each).
