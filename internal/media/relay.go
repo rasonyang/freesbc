@@ -48,7 +48,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 		defer recoverRelayPanic(nil, func() error { return s.closeWith(CloseFault) })
 		buf := make([]byte, relayBufSize)
 		for {
-			n, src, err := in.ReadFromUDP(buf[:maxPacketSize+1])
+			n, src, err := in.ReadFromUDPAddrPort(buf[:maxPacketSize+1])
 			if err != nil {
 				return // socket closed (session teardown)
 			}
@@ -61,7 +61,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				// move, so a forged packet from a vouched address cannot
 				// latch the stream. permits only spares a decrypt for a
 				// source the latch would refuse anyway.
-				if !inLatch.permits(src) {
+				if !inLatch.permitsFrom(src) {
 					continue
 				}
 				ctx := leg.in.ctx.Load()
@@ -75,10 +75,10 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 					s.counters.srtpRxDrops[from].Add(1)
 					continue
 				}
-				if !inLatch.accept(src) {
+				if !inLatch.acceptFrom(src) {
 					continue
 				}
-			} else if !inLatch.accept(src) {
+			} else if !inLatch.acceptFrom(src) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
 			// Only NOW is the packet proven genuine: the latch accepted it
@@ -89,7 +89,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// indefinitely, keeping a dead call alive forever.
 			s.lastRx[from].Store(time.Now().UnixNano())
 			s.counters.recordRx(from, rtpKind, len(pkt))
-			if dst := outLatch.target(); dst != nil {
+			if dst := outLatch.dest(); dst.IsValid() {
 				if leg := s.sdes[to].Load(); leg != nil {
 					// Encrypt in place: the read buffer has srtpMaxOverhead
 					// spare. Only done once there is a destination, since
@@ -106,7 +106,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 						continue
 					}
 				}
-				if n, err := outSock.WriteToUDP(pkt, dst); err == nil {
+				if n, err := outSock.WriteToUDPAddrPort(pkt, dst); err == nil {
 					s.counters.recordTx(to, rtpKind, n)
 				}
 			}

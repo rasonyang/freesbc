@@ -1,6 +1,7 @@
 package sdp
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -33,6 +34,11 @@ func fmtpInt(lo, hi uint64) fmtpParam {
 		n, err := strconv.ParseUint(v, 10, 64)
 		if err != nil || n < lo || n > hi {
 			return "", false
+		}
+		if v[0] != '0' || len(v) == 1 {
+			// Base-10 ParseUint took digits only, so with no leading
+			// zero v is already FormatUint(n): return it unallocated.
+			return v, true
 		}
 		return strconv.FormatUint(n, 10), true
 	}
@@ -127,78 +133,126 @@ const maxFMTP = 512
 // for the named codec, or "" when nothing survives. It is the only way an
 // fmtp value enters a Codec parsed by this package and the only form Build
 // writes, so the emitted text is always the proxy's own rendering.
+//
+// The canonical form is rendered into a stack buffer (it is never longer
+// than raw, which is at most maxFMTP), and a value that is already
+// canonical — every value Build re-filters after Parse — is returned as
+// raw itself, so the common case allocates nothing (issue #173).
 func canonicalFMTP(name, raw string) string {
 	if raw == "" || len(raw) > maxFMTP {
 		return ""
 	}
-	name = strings.ToLower(name)
-	if name == "telephone-event" {
-		return canonicalEvents(raw)
+	var stack [maxFMTP]byte
+	out := appendCanonicalFMTP(stack[:0], name, raw)
+	if string(out) == raw {
+		return raw
 	}
-	allow, ok := fmtpAllow[name]
+	return string(out)
+}
+
+// appendCanonicalFMTP appends canonicalFMTP(name, raw) to dst, for a raw
+// already checked against maxFMTP.
+func appendCanonicalFMTP(dst []byte, name, raw string) []byte {
+	var nameBuf [64]byte
+	lname := lowerName(nameBuf[:0], name)
+	if string(lname) == "telephone-event" {
+		return appendEvents(dst, raw)
+	}
+	allow, ok := fmtpAllow[string(lname)]
 	if !ok {
-		return ""
+		return dst
 	}
-	var out []string
-	seen := map[string]bool{}
-	for _, seg := range strings.Split(raw, ";") {
+	// Every key that can be seen is an allowlist key, and no codec has
+	// more than len(seenBuf) of them, so seen stays on the stack.
+	var seenBuf [16]string
+	seen := seenBuf[:0]
+	first := true
+	for rest, more := raw, true; more; {
+		var seg string
+		seg, rest, more = strings.Cut(rest, ";")
 		k, v, ok := strings.Cut(seg, "=")
 		if !ok {
 			continue
 		}
 		k = strings.ToLower(strings.TrimSpace(k))
 		check, ok := allow[k]
-		if !ok || seen[k] {
+		if !ok || slices.Contains(seen, k) {
 			continue
 		}
 		cv, ok := check(strings.TrimSpace(v))
 		if !ok {
 			continue
 		}
-		seen[k] = true
-		out = append(out, k+"="+cv)
+		seen = append(seen, k)
+		if !first {
+			dst = append(dst, ';')
+		}
+		first = false
+		dst = append(dst, k...)
+		dst = append(dst, '=')
+		dst = append(dst, cv...)
 	}
-	return strings.Join(out, ";")
+	return dst
 }
 
-// canonicalEvents extracts an RFC 4733 §7.1.1 event list ("0-15,66,70")
-// from a telephone-event fmtp value. Anything that is not an event list
-// (some stacks append ";key=value" noise) is dropped.
-func canonicalEvents(raw string) string {
-	for _, seg := range strings.Split(raw, ";") {
-		if ev, ok := parseEventList(strings.TrimSpace(seg)); ok {
-			return ev
+// lowerName appends strings.ToLower(name) to dst, without allocating for
+// a short ASCII name (every parsed encoding name).
+func lowerName(dst []byte, name string) []byte {
+	if len(name) > cap(dst)-len(dst) || !isASCII(name) {
+		return append(dst, strings.ToLower(name)...)
+	}
+	for i := 0; i < len(name); i++ {
+		dst = append(dst, lowerASCII(name[i]))
+	}
+	return dst
+}
+
+// appendEvents appends the RFC 4733 §7.1.1 event list ("0-15,66,70") of a
+// telephone-event fmtp value to dst. Anything that is not an event list
+// (some stacks append ";key=value" noise) is dropped: the first segment
+// that is a valid list wins.
+func appendEvents(dst []byte, raw string) []byte {
+	for rest, more := raw, true; more; {
+		var seg string
+		seg, rest, more = strings.Cut(rest, ";")
+		if out, ok := appendEventList(dst, strings.TrimSpace(seg)); ok {
+			return out
 		}
 	}
-	return ""
+	return dst
 }
 
-func parseEventList(v string) (string, bool) {
-	if v == "" {
-		return "", false
+// appendEventList appends the canonical form of one event list (at most
+// 64 entries) to dst, or returns dst unchanged and false when v is not an
+// event list.
+func appendEventList(dst []byte, v string) ([]byte, bool) {
+	if v == "" || strings.Count(v, ",") >= 64 {
+		return dst, false
 	}
-	parts := strings.Split(v, ",")
-	if len(parts) > 64 {
-		return "", false
-	}
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
+	out := dst
+	for i, rest, more := 0, v, true; more; i++ {
+		var p string
+		p, rest, more = strings.Cut(rest, ",")
 		lo, hi, isRange := strings.Cut(strings.TrimSpace(p), "-")
 		a, ok := eventNumber(lo)
 		if !ok {
-			return "", false
+			return dst, false
 		}
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = strconv.AppendInt(out, int64(a), 10)
 		if !isRange {
-			out = append(out, strconv.Itoa(a))
 			continue
 		}
 		b, ok := eventNumber(hi)
 		if !ok || b < a {
-			return "", false
+			return dst, false
 		}
-		out = append(out, strconv.Itoa(a)+"-"+strconv.Itoa(b))
+		out = append(out, '-')
+		out = strconv.AppendInt(out, int64(b), 10)
 	}
-	return strings.Join(out, ","), true
+	return out, true
 }
 
 func eventNumber(s string) (int, bool) {

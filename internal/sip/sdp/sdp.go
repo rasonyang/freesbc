@@ -9,8 +9,11 @@
 // the plane that relays them and lives there; this package only parses,
 // intersects, renders and builds.
 //
-// It is built on github.com/pion/sdp/v3; there is no string manipulation
-// of SDP anywhere in the package. Every input is treated as untrusted:
+// Parsing is built on github.com/pion/sdp/v3; no received SDP text is
+// ever edited or copied. Bodies are written field by field from typed
+// values by an append-based writer (build.go) whose output is pion's
+// marshalling of the same description, byte for byte: the pion version is
+// kept in the tests as the reference. Every input is treated as untrusted:
 // Parse enforces size and cardinality limits before doing any work, so a
 // malicious offer can neither exhaust memory nor make the proxy build an
 // unbounded answer.
@@ -104,17 +107,60 @@ type Codec struct {
 	FMTP        string // canonical allowlisted fmtp parameters, without the payload type
 }
 
-// key is the transcoding-free identity of a codec: two codecs are the same
-// stream if and only if their name (case-insensitively), clock rate and
-// channel count agree. The payload NUMBER is deliberately not part of it —
-// matching is what lets the proxy detect that both sides mean "opus", and
-// the offerer's number is then what both sides use.
-func (c Codec) key() string {
-	ch := c.Channels
-	if ch == 0 {
-		ch = 1
+// sameEncoding is the transcoding-free identity of a codec: two codecs are
+// the same stream if and only if their name (case-insensitively), clock
+// rate and channel count (0 meaning 1) agree. The payload NUMBER is
+// deliberately not part of it — matching is what lets the proxy detect
+// that both sides mean "opus", and the offerer's number is then what both
+// sides use.
+//
+// It compares in place rather than building a key string, so negotiating
+// a call allocates nothing per codec (issue #173).
+func (c Codec) sameEncoding(o Codec) bool {
+	return c.ClockRate == o.ClockRate && c.channels() == o.channels() && sameName(c.Name, o.Name)
+}
+
+// channels is the channel count with the rtpmap default (1) applied.
+func (c Codec) channels() int {
+	if c.Channels == 0 {
+		return 1
 	}
-	return fmt.Sprintf("%s/%d/%d", strings.ToLower(c.Name), c.ClockRate, ch)
+	return c.Channels
+}
+
+// sameName reports strings.ToLower(a) == strings.ToLower(b) without
+// allocating when both names are ASCII, which every parsed name is
+// (validEncodingName). A caller-built name with other bytes takes the
+// exact ToLower comparison, so the result is the same for every input.
+func sameName(a, b string) bool {
+	if !isASCII(a) || !isASCII(b) {
+		return strings.ToLower(a) == strings.ToLower(b)
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // IsTelephoneEvent reports whether this is an RFC 4733 DTMF payload. The

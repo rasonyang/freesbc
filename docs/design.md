@@ -2583,12 +2583,15 @@ Every relay loop (this one and the `WebRTCSession` directions) reads
 into one buffer of `relayBufSize` = `maxPacketSize + 1 + srtpMaxOverhead`
 bytes (`relay.go:81`): one byte more than the largest datagram relayed, so an
 oversize one is detected and dropped rather than forwarded cut short
-(`ReadFromUDP` truncates silently), and room for the SRTP overhead so the
+(a UDP read truncates silently), and room for the SRTP overhead so the
 browser leg's transforms run in place. The per-packet path allocates nothing.
 
 Packets are sent **from the `to` side's own socket**, so the far remote sees
-the port it already talks to. A `nil` destination (the far side has not
-latched or been seeded) means the packet is dropped.
+the port it already talks to. No destination (the far side has not
+latched or been seeded) means the packet is dropped. Sources and
+destinations are `netip.AddrPort` values (`ReadFromUDPAddrPort`,
+`WriteToUDPAddrPort`), compared unmapped and without a zone, as
+`net.IP.Equal` compared them.
 
 Every relay goroutine carries `recoverRelayPanic`, which logs the panic and
 stack and calls `Close` — a panic kills one session, never the process.
@@ -2932,7 +2935,11 @@ the RTP forward loop.
 ### 8.8 SDP construction
 
 `internal/sip/sdp` is a typed, bounded parse of only the parts an SBC acts
-on, built on `pion/sdp/v3` with **no string manipulation of SDP anywhere**.
+on. Parsing is built on `pion/sdp/v3` and no received SDP text is ever
+edited or copied; bodies are written field by field from typed values by an
+append-based writer whose output is byte for byte what pion's marshaller
+produced from the same description (the pion version is kept in the tests
+as the reference, `TestBuildMatchesPionReference`).
 
 Parse limits: `MaxSize = 16 KiB`, `MaxMediaDescriptions = 16`,
 `MaxAttributes = 256` (session level and per media section),

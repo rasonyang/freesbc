@@ -1,14 +1,11 @@
 package sdp
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/netip"
 	"strconv"
 	"strings"
-
-	// pion's package is also called sdp; alias it so this package can
-	// keep the name that reads best at its own call sites.
-	pionsdp "github.com/pion/sdp/v3"
 )
 
 // Build describes the SDP body the proxy wants to emit on one leg. Every
@@ -136,90 +133,170 @@ func (b Build) marshal(offer *Session) ([]byte, error) {
 	}
 
 	addrType := AddrType(b.Address)
-	conn := &pionsdp.ConnectionInformation{
-		NetworkType: "IN",
-		AddressType: addrType,
-		Address:     &pionsdp.Address{Address: b.Address.String()},
-	}
-	sd := &pionsdp.SessionDescription{
-		Version: 0,
-		Origin: pionsdp.Origin{
-			Username:       "FreeSBC",
-			SessionID:      b.SessionID,
-			SessionVersion: b.SessionVersion,
-			NetworkType:    "IN",
-			AddressType:    addrType,
-			UnicastAddress: b.Address.String(),
-		},
-		SessionName:           "FreeSBC",
-		ConnectionInformation: conn,
-		TimeDescriptions:      []pionsdp.TimeDescription{{Timing: pionsdp.Timing{StartTime: 0, StopTime: 0}}},
-	}
-
-	md := &pionsdp.MediaDescription{
-		MediaName: pionsdp.MediaName{
-			Media:  "audio",
-			Port:   pionsdp.RangedPort{Value: b.Port},
-			Protos: b.protos(),
-		},
-	}
-	for _, c := range b.Codecs {
-		md.MediaName.Formats = append(md.MediaName.Formats, strconv.Itoa(int(c.PayloadType)))
-	}
-
-	// ICE/DTLS block first (that is the conventional order a browser
-	// expects to read), then rtpmap/fmtp, then direction and rtcp.
-	if b.DTLS {
-		md.Attributes = append(md.Attributes,
-			attr("ice-lite", ""),
-			attr("ice-ufrag", b.ICEUfrag),
-			attr("ice-pwd", b.ICEPwd),
-			// One host candidate at our stable public media address is the
-			// whole candidate set an ICE-Lite agent has (RFC 5245 §4.2).
-			// Component 1 only: rtcp-mux means there is no component 2.
-			attr("candidate", fmt.Sprintf("1 1 UDP %d %s %d typ host", iceLitePriority, b.Address.String(), b.Port)),
-			attr("end-of-candidates", ""),
-			attr("fingerprint", b.Fingerprint.String()),
-			attr("setup", b.Setup),
-		)
-	}
-	for _, c := range b.Codecs {
-		md.Attributes = append(md.Attributes, attr("rtpmap", rtpmapValue(c)))
-		// Filtered again here, not only in Parse: a Codec may have been
-		// built by the caller, and the emitted text must be this package's
-		// own rendering whatever its origin.
-		if f := canonicalFMTP(c.Name, c.FMTP); f != "" {
-			md.Attributes = append(md.Attributes, attr("fmtp", fmt.Sprintf("%d %s", c.PayloadType, f)))
-		}
-	}
-	for _, c := range b.Crypto {
-		md.Attributes = append(md.Attributes, attr("crypto", c.Value()))
-	}
 	dir := b.Direction
 	if dir == "" {
 		dir = SendRecv
 	}
-	md.Attributes = append(md.Attributes, attr(string(dir), ""))
+
+	// The body is written straight into one buffer sized up front. The
+	// layout is exactly what pion/sdp's marshaller produced from the
+	// structs this function used to build (TestBuildMatchesPionReference
+	// keeps that implementation as the reference): every line ends CRLF,
+	// an attribute with an empty value is written without a colon, and
+	// lists are joined the way pion joins them.
+	buf := make([]byte, 0, b.sizeHint(offer, len(dir)))
+	buf = append(buf, "v=0\r\no=FreeSBC "...)
+	buf = strconv.AppendUint(buf, b.SessionID, 10)
+	buf = append(buf, ' ')
+	buf = strconv.AppendUint(buf, b.SessionVersion, 10)
+	buf = append(buf, " IN "...)
+	buf = append(buf, addrType...)
+	buf = append(buf, ' ')
+	buf = b.Address.AppendTo(buf)
+	buf = append(buf, "\r\ns=FreeSBC\r\nc=IN "...)
+	buf = append(buf, addrType...)
+	buf = append(buf, ' ')
+	buf = b.Address.AppendTo(buf)
+	buf = append(buf, "\r\nt=0 0\r\n"...)
+	if offer == nil {
+		return b.appendAudio(buf, string(dir)), nil
+	}
+	for i, sec := range offer.Sections {
+		if i == offer.AudioIndex {
+			buf = b.appendAudio(buf, string(dir))
+		} else {
+			buf = appendDeclined(buf, sec)
+		}
+	}
+	return buf, nil
+}
+
+// appendAudio writes the live audio m= section.
+func (b Build) appendAudio(buf []byte, dir string) []byte {
+	buf = append(buf, "m=audio "...)
+	buf = strconv.AppendInt(buf, int64(b.Port), 10)
+	buf = append(buf, ' ')
+	buf = append(buf, b.proto()...)
+	buf = append(buf, ' ')
+	for i, c := range b.Codecs {
+		if i > 0 {
+			buf = append(buf, ' ')
+		}
+		buf = strconv.AppendUint(buf, uint64(c.PayloadType), 10)
+	}
+	buf = append(buf, "\r\n"...)
+
+	// ICE/DTLS block first (that is the conventional order a browser
+	// expects to read), then rtpmap/fmtp, then direction and rtcp.
+	if b.DTLS {
+		buf = append(buf, "a=ice-lite\r\n"...)
+		buf = appendAttr(buf, "ice-ufrag", b.ICEUfrag)
+		buf = appendAttr(buf, "ice-pwd", b.ICEPwd)
+		// One host candidate at our stable public media address is the
+		// whole candidate set an ICE-Lite agent has (RFC 5245 §4.2).
+		// Component 1 only: rtcp-mux means there is no component 2.
+		buf = append(buf, "a=candidate:1 1 UDP "...)
+		buf = strconv.AppendInt(buf, iceLitePriority, 10)
+		buf = append(buf, ' ')
+		buf = b.Address.AppendTo(buf)
+		buf = append(buf, ' ')
+		buf = strconv.AppendInt(buf, int64(b.Port), 10)
+		buf = append(buf, " typ host\r\na=end-of-candidates\r\na=fingerprint:"...)
+		buf = append(buf, b.Fingerprint.Hash...)
+		buf = append(buf, ' ')
+		buf = append(buf, b.Fingerprint.Value...)
+		buf = append(buf, "\r\n"...)
+		buf = appendAttr(buf, "setup", b.Setup)
+	}
+	for _, c := range b.Codecs {
+		buf = append(buf, "a=rtpmap:"...)
+		buf = strconv.AppendUint(buf, uint64(c.PayloadType), 10)
+		buf = append(buf, ' ')
+		buf = append(buf, c.Name...)
+		buf = append(buf, '/')
+		buf = strconv.AppendUint(buf, uint64(c.ClockRate), 10)
+		if c.Channels > 1 {
+			buf = append(buf, '/')
+			buf = strconv.AppendInt(buf, int64(c.Channels), 10)
+		}
+		buf = append(buf, "\r\n"...)
+		// Filtered again here, not only in Parse: a Codec may have been
+		// built by the caller, and the emitted text must be this package's
+		// own rendering whatever its origin.
+		if f := canonicalFMTP(c.Name, c.FMTP); f != "" {
+			buf = append(buf, "a=fmtp:"...)
+			buf = strconv.AppendUint(buf, uint64(c.PayloadType), 10)
+			buf = append(buf, ' ')
+			buf = append(buf, f...)
+			buf = append(buf, "\r\n"...)
+		}
+	}
+	for _, c := range b.Crypto {
+		buf = append(buf, "a=crypto:"...)
+		buf = c.appendValue(buf)
+		buf = append(buf, "\r\n"...)
+	}
+	buf = appendAttr(buf, dir, "")
 	if b.RTCPMux {
-		md.Attributes = append(md.Attributes, attr("rtcp-mux", ""))
+		buf = append(buf, "a=rtcp-mux\r\n"...)
 	}
 	// No a=rtcp line otherwise: RTCP rides the RFC 3550 default of RTP+1,
 	// and stating it explicitly only invites disagreement.
 	// ptime is not emitted: the proxy does not repacketize, so claiming a
 	// packetization interval it does not enforce would be a lie the far
 	// side could act on.
-	if offer == nil {
-		sd.MediaDescriptions = append(sd.MediaDescriptions, md)
-		return sd.Marshal()
+	return buf
+}
+
+// appendAttr writes one a= line: "a=key:value", or "a=key" when value is
+// empty.
+func appendAttr(buf []byte, key, value string) []byte {
+	buf = append(buf, "a="...)
+	buf = append(buf, key...)
+	if value != "" {
+		buf = append(buf, ':')
+		buf = append(buf, value...)
 	}
-	for i, sec := range offer.Sections {
-		if i == offer.AudioIndex {
-			sd.MediaDescriptions = append(sd.MediaDescriptions, md)
-		} else {
-			sd.MediaDescriptions = append(sd.MediaDescriptions, declinedSection(sec))
+	return append(buf, "\r\n"...)
+}
+
+// sizeHint is an upper bound on the body's length for the usual inputs,
+// so the buffer is allocated once; an underestimate only costs a regrow.
+// The constants are each line's fixed text plus the widest number it can
+// carry.
+func (b Build) sizeHint(offer *Session, dirLen int) int {
+	addr := 15 // dotted IPv4
+	if !b.Address.Is4() {
+		addr = 39 + 1 + len(b.Address.Zone())
+	}
+	// v=, o=, s=, c=, t= and the audio m= line without its formats.
+	n := 5 + (10 + 20 + 1 + 20 + 8 + addr + 2) + 11 + (9 + addr + 2) + 7 + (8 + 5 + 1 + 17 + 1 + 2)
+	n += 4 + dirLen + 12 // direction, rtcp-mux
+	for _, c := range b.Codecs {
+		n += 4                                // format
+		n += 9 + 3 + 1 + len(c.Name) + 22 + 2 // rtpmap
+		if c.FMTP != "" {
+			n += 7 + 3 + 1 + len(c.FMTP) + 2
 		}
 	}
-	return sd.Marshal()
+	for _, c := range b.Crypto {
+		n += 9 + 20 + 1 + len(c.Suite) + 8 + base64.StdEncoding.EncodedLen(len(c.Key)+len(c.Salt)) + 2
+	}
+	if b.DTLS {
+		n += 12 + (14 + len(b.ICEUfrag)) + (12 + len(b.ICEPwd)) + (48 + addr) + 21 + (10 + len(b.Setup))
+		if b.Fingerprint != nil {
+			n += 14 + len(b.Fingerprint.Hash) + 1 + len(b.Fingerprint.Value) + 2
+		}
+	}
+	if offer != nil {
+		for _, sec := range offer.Sections {
+			n += 2 + len(sec.Media) + 3 + 18 + 2
+			for _, p := range sec.Proto {
+				n += 1 + len(p)
+			}
+		}
+	}
+	return n
 }
 
 // iceLitePriority is the priority of the single host candidate an ICE-Lite
@@ -229,37 +306,33 @@ func (b Build) marshal(offer *Session) ([]byte, error) {
 // component 1.
 const iceLitePriority = 126<<24 | 65535<<8 | (256 - 1)
 
-func (b Build) protos() []string {
+// proto is the audio section's transport.
+func (b Build) proto() string {
 	if b.DTLS {
 		// SAVPF (RFC 5124) is what every browser offers and answers.
-		return []string{"UDP", "TLS", "RTP", "SAVPF"}
+		return "UDP/TLS/RTP/SAVPF"
 	}
 	if len(b.Crypto) > 0 {
-		return []string{"RTP", "SAVP"}
+		return "RTP/SAVP"
 	}
-	return []string{"RTP", "AVP"}
+	return "RTP/AVP"
 }
 
-func rtpmapValue(c Codec) string {
-	if c.Channels > 1 {
-		return fmt.Sprintf("%d %s/%d/%d", c.PayloadType, c.Name, c.ClockRate, c.Channels)
-	}
-	return fmt.Sprintf("%d %s/%d", c.PayloadType, c.Name, c.ClockRate)
-}
-
-func attr(k, v string) pionsdp.Attribute { return pionsdp.Attribute{Key: k, Value: v} }
-
-// declinedSection is an RFC 3264 §6 rejected stream: the offered media
+// appendDeclined writes an RFC 3264 §6 rejected stream: the offered media
 // type and transport, port 0, no attributes, no connection information.
-func declinedSection(sec Section) *pionsdp.MediaDescription {
-	return &pionsdp.MediaDescription{
-		MediaName: pionsdp.MediaName{
-			Media:   sec.Media,
-			Port:    pionsdp.RangedPort{Value: 0},
-			Protos:  sec.Proto,
-			Formats: []string{placeholderFormat(sec.Proto)},
-		},
+func appendDeclined(buf []byte, sec Section) []byte {
+	buf = append(buf, "m="...)
+	buf = append(buf, sec.Media...)
+	buf = append(buf, " 0 "...)
+	for i, p := range sec.Proto {
+		if i > 0 {
+			buf = append(buf, '/')
+		}
+		buf = append(buf, p...)
 	}
+	buf = append(buf, ' ')
+	buf = append(buf, placeholderFormat(sec.Proto)...)
+	return append(buf, "\r\n"...)
 }
 
 // placeholderFormat is the fmt token a declined m= line carries. RFC 4566
