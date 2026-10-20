@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/emiago/sipgo/sip"
 
@@ -138,8 +139,8 @@ var uriHostRe = regexp.MustCompile(`(sips?:(?:[^@\s>;,]*@)?)(\[[0-9a-fA-F:.]+\]|
 // isSwitchHost reports whether host is the private socket's IP or the IP of
 // an edge.switch node.
 func (s *Server) isSwitchHost(host string) bool {
-	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
-	if err != nil {
+	ip, ok := parseIPHost(strings.Trim(host, "[]"))
+	if !ok {
 		return false
 	}
 	ip = ip.Unmap()
@@ -157,7 +158,7 @@ func (s *Server) isSwitchHost(host string) bool {
 // maskURI rewrites a private host to the public address, dropping the port.
 func (s *Server) maskURI(u *sip.Uri, pub netip.Addr) {
 	if s.isSwitchHost(u.Host) {
-		u.Host, u.Port = pub.String(), 0
+		u.Host, u.Port = s.topo.hostOf(pub), 0
 	}
 }
 
@@ -165,8 +166,44 @@ func (s *Server) maskURI(u *sip.Uri, pub netip.Addr) {
 // masked.
 type identityMsg interface {
 	fsip.Editable
+	Headers() []sip.Header
 	From() *sip.FromHeader
 	To() *sip.ToHeader
+}
+
+// identityHeaderIndex is the index of name in identityHeaders, compared
+// without ASCII case as sipgo's GetHeaders compares, or -1.
+func identityHeaderIndex(name string) int {
+	for i, n := range identityHeaders {
+		if asciiEqualFold(name, n) {
+			return i
+		}
+	}
+	return -1
+}
+
+// headersNamed is m.GetHeaders(name) without its cost: sipgo lower-cases
+// the name of every header the message carries on each call, allocating
+// for each one outside its short list of common names. The match is the
+// same, ASCII letters without case.
+func headersNamed(m interface{ Headers() []sip.Header }, name string) []sip.Header {
+	var hs []sip.Header
+	for _, h := range m.Headers() {
+		if asciiEqualFold(h.Name(), name) {
+			hs = append(hs, h)
+		}
+	}
+	return hs
+}
+
+// hasHeader is len(m.GetHeaders(name)) > 0, allocation-free.
+func hasHeader(m interface{ Headers() []sip.Header }, name string) bool {
+	for _, h := range m.Headers() {
+		if asciiEqualFold(h.Name(), name) {
+			return true
+		}
+	}
+	return false
 }
 
 // maskIdentity applies the identity rule of the file comment to a message
@@ -178,11 +215,24 @@ func (s *Server) maskIdentity(out identityMsg, pub netip.Addr) {
 	if t := out.To(); t != nil {
 		s.maskURI(&t.Address, pub)
 	}
-	for _, name := range identityHeaders {
-		hs := out.GetHeaders(name)
-		if len(hs) == 0 {
+	// One pass says which identity headers the message carries at all;
+	// most carry none, and then nothing below runs. Rewriting one name's
+	// headers neither adds nor removes another's, so the set holds.
+	var present uint32
+	for _, h := range out.Headers() {
+		if i := identityHeaderIndex(h.Name()); i >= 0 {
+			present |= 1 << i
+		}
+	}
+	if present == 0 {
+		return
+	}
+	pubHost := s.topo.hostOf(pub)
+	for k, name := range identityHeaders {
+		if present&(1<<k) == 0 {
 			continue
 		}
+		hs := headersNamed(out, name)
 		vals := make([]string, len(hs))
 		changed := false
 		for i, h := range hs {
@@ -193,9 +243,9 @@ func (s *Server) maskIdentity(out identityMsg, pub netip.Addr) {
 				}
 				changed = true
 				if pub.Is6() {
-					return g[1] + "[" + pub.String() + "]"
+					return g[1] + "[" + pubHost + "]"
 				}
-				return g[1] + pub.String()
+				return g[1] + pubHost
 			})
 		}
 		if changed {
@@ -212,7 +262,7 @@ func (s *Server) maskIdentity(out identityMsg, pub netip.Addr) {
 // is a switch address and cur is the masked form of it (same user, host
 // public.ip), cur becomes real again.
 func (s *Server) restoreURI(cur *sip.Uri, real sip.Uri, pub netip.Addr) {
-	if s.isSwitchHost(real.Host) && cur.Host == pub.String() && cur.User == real.User {
+	if s.isSwitchHost(real.Host) && cur.Host == s.topo.hostOf(pub) && cur.User == real.User {
 		cur.Host, cur.Port = real.Host, real.Port
 	}
 }
@@ -271,13 +321,38 @@ var clientHeaderAllowlist = func() map[string]bool {
 func filterToClient(m headerSet) {
 	var drop []string
 	for _, h := range m.Headers() {
-		if !clientHeaderAllowlist[strings.ToLower(h.Name())] {
+		if !allowedToClient(h.Name()) {
 			drop = append(drop, h.Name())
 		}
 	}
 	for _, n := range drop {
 		m.RemoveHeader(n)
 	}
+}
+
+// allowedToClient is clientHeaderAllowlist[strings.ToLower(name)] without
+// the allocation ToLower makes for every name with a capital letter. An
+// ASCII name is lower-cased into a stack buffer, which is exactly what
+// ToLower does to it; any other name (or one too long for the buffer,
+// which no allowlisted name is) goes through ToLower itself, since a
+// non-ASCII rune can lower-case into ASCII (the Kelvin sign to k).
+func allowedToClient(name string) bool {
+	var buf [32]byte
+	if len(name) > len(buf) {
+		return clientHeaderAllowlist[strings.ToLower(name)]
+	}
+	b := buf[:len(name)]
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= utf8.RuneSelf {
+			return clientHeaderAllowlist[strings.ToLower(name)]
+		}
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return clientHeaderAllowlist[string(b)]
 }
 
 // hideToPublic strips everything private from a prepared request going to a
@@ -298,7 +373,7 @@ func (s *Server) hideToPublic(out *sip.Request, to side, recordRoute, inDialog b
 		fsip.RemoveHeaders(out, "Route")
 	}
 	s.maskIdentity(out, to.advIP)
-	if len(out.GetHeaders("Contact")) > 0 {
+	if hasHeader(out, "Contact") {
 		// An ACK or BYE may carry the switch's own Contact.
 		fsip.SetContact(out, to.uri())
 	}
@@ -315,7 +390,7 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 	case respToSwitch:
 		fsip.RemoveHeaders(res, "Via")
 		var vias []sip.Header
-		for _, h := range orig.GetHeaders("Via") {
+		for _, h := range headersNamed(orig, "Via") {
 			if v, ok := h.(*sip.ViaHeader); ok {
 				vias = append(vias, v.Clone())
 			}
@@ -329,7 +404,7 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 		}
 	case respToCarrier:
 		var keep []*sip.RecordRouteHeader
-		for _, h := range res.GetHeaders("Record-Route") {
+		for _, h := range headersNamed(res, "Record-Route") {
 			if rr, ok := h.(*sip.RecordRouteHeader); ok && !s.isPrivateURI(rr.Address) {
 				keep = append(keep, rr)
 			}
@@ -338,7 +413,7 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 		for _, rr := range keep {
 			res.AppendHeader(rr)
 		}
-		if len(res.GetHeaders("Contact")) > 0 {
+		if hasHeader(res, "Contact") {
 			if pub, ok := s.publicSideFor(orig); ok {
 				fsip.SetContact(res, pub.uri())
 			} else {
@@ -353,7 +428,7 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 			s.maskIdentity(res, pub.advIP)
 			// A REGISTER response lists the client's own bindings, which
 			// register.go restores; every other Contact is the switch's.
-			if orig.Method != sip.REGISTER && len(res.GetHeaders("Contact")) > 0 {
+			if orig.Method != sip.REGISTER && hasHeader(res, "Contact") {
 				fsip.SetContact(res, pub.uri())
 			}
 		}
@@ -367,7 +442,7 @@ func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHid
 // it. Entries of other hops, such as the client's own proxies, stay.
 func (s *Server) hideRecordRoutesToClient(res *sip.Response) {
 	var keep []*sip.RecordRouteHeader
-	for _, h := range res.GetHeaders("Record-Route") {
+	for _, h := range headersNamed(res, "Record-Route") {
 		if rr, ok := h.(*sip.RecordRouteHeader); ok && !s.isPrivateURI(rr.Address) && (s.isPublicURI(rr.Address) || !s.isSwitchHost(rr.Address.Host)) {
 			keep = append(keep, rr)
 		}
@@ -386,7 +461,7 @@ func (s *Server) hideRecordRoutesToClient(res *sip.Response) {
 // the bottom of the list is where they belong).
 func (s *Server) addPrivateRecordRoute(res *sip.Response) {
 	var all []*sip.RecordRouteHeader
-	for _, h := range res.GetHeaders("Record-Route") {
+	for _, h := range headersNamed(res, "Record-Route") {
 		if rr, ok := h.(*sip.RecordRouteHeader); ok {
 			all = append(all, rr)
 		}
@@ -425,8 +500,8 @@ func (s *Server) isPublicURI(u sip.Uri) bool {
 }
 
 func sideMatches(sd side, u sip.Uri) bool {
-	ip, err := netip.ParseAddr(u.Host)
-	if err != nil {
+	ip, ok := parseIPHost(u.Host)
+	if !ok {
 		return false
 	}
 	port := u.Port

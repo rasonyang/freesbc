@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -89,7 +88,7 @@ func (s *Server) prepareForward(req *sip.Request, from, to side, dest string, re
 
 	out.PrependHeader(to.via(fsip.NewBranch()))
 
-	out.SetTransport(strings.ToUpper(to.transport))
+	out.SetTransport(to.upperTransport())
 	out.SetDestination(dest)
 	if to.laddr.IP != nil && to.laddr.Port > 0 {
 		// Pin the sending socket. sipgo's transport layer looks a
@@ -201,10 +200,11 @@ var errResponseDropped = errors.New("proxy: response cannot be routed back")
 // else in the response is the far end's and is left alone, except the Allow
 // and Supported values the proxy cannot carry (sanitizeExtensions).
 //
-// adapt runs on the clone after the Via is popped and the rewrite applied,
-// before anything is sent. It is where each loop rewrites the Contact and
-// the SDP body; the error it returns is the caller's own (a failed media
-// negotiation), and aborts the relay without sending or counting anything.
+// adapt runs on the clone after the Via is popped, the rewrite applied and
+// the destination set, before anything is sent, and is the last to change
+// it. It is where each loop rewrites the Contact and the SDP body; the error
+// it returns is the caller's own (a failed media negotiation), and aborts
+// the relay without sending or counting anything.
 //
 // A failure to send is logged, not returned: the transaction layer owns
 // retransmission, and there is nothing a relay loop can do about it.
@@ -220,12 +220,15 @@ func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, 
 	sanitizeExtensions(out)
 	stripInternalHeaders(out) // only FreeSBC adds X-FreeSBC-*, and never to a response
 	s.hideResponse(out, orig, mode)
+	out.SetDestination(orig.Source())
+	// adapt makes the last change to out: from here on it is only read, so
+	// adapt may hand it to another goroutine (relayInviteResponse keeps a 2xx
+	// for its retransmissions).
 	if adapt != nil {
 		if err := adapt(out); err != nil {
 			return err
 		}
 	}
-	out.SetDestination(orig.Source())
 	s.metrics.ResponseOut(out.StatusCode)
 	if err := tx.Respond(out); err != nil {
 		s.log.Debug("relay response", "err", err,
@@ -325,11 +328,17 @@ func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTran
 
 // writeRequest sends a request outside any transaction (an ACK), after
 // requireFlow.
+//
+// The deadline bounds the carrier dial requireFlow may make, which only a
+// stream transport can need: requireFlow passes every other request without
+// looking at ctx, so a UDP ACK is sent without building one.
 func (s *Server) writeRequest(req *sip.Request) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
-	defer cancel()
-	if err := s.requireFlow(ctx, req); err != nil {
-		return err
+	if streamIndex(sip.NetworkToLower(req.Transport())) >= 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
+		defer cancel()
+		if err := s.requireFlow(ctx, req); err != nil {
+			return err
+		}
 	}
 	return s.client.WriteRequest(req, noBuild)
 }

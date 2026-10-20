@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -967,7 +966,7 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: b.cseq, MethodName: sip.BYE})
 	cl := sip.ContentLengthHeader(0) // stream transports need it (see TeardownRequest)
 	req.AppendHeader(&cl)
-	req.SetTransport(strings.ToUpper(toward.transport))
+	req.SetTransport(toward.upperTransport())
 	req.SetDestination(b.remote)
 	if toward.laddr.IP != nil && toward.laddr.Port > 0 {
 		// Pinned to the listener, as prepareForward does, so the BYE leaves

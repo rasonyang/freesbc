@@ -187,7 +187,7 @@ func (s *Server) carrierContactURI(pub side, user, token string) sip.Uri {
 	if pub.transport != "udp" {
 		params.Add("transport", pub.transport)
 	}
-	return sip.Uri{User: user, Host: pub.advIP.String(), Port: pub.advPort, UriParams: params}
+	return sip.Uri{User: user, Host: pub.host(), Port: pub.advPort, UriParams: params}
 }
 
 // registerToCarrier proxies a REGISTER the switch sent for a carrier.

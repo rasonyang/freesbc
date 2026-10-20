@@ -2,7 +2,6 @@ package edge
 
 import (
 	"errors"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -155,11 +154,21 @@ func (m *Metrics) RequestIn(method, transport string) {
 	m.requestsIn[methodIndex(method)][transportIndex(transport)].Add(1)
 }
 
+// responseClassKeys are responsesOut's keys by code/100, boxed once: a
+// string built per response, or a string variable converted to a map key,
+// would allocate on every relayed response.
+var responseClassKeys = [...]any{1: "1xx", 2: "2xx", 3: "3xx", 4: "4xx", 5: "5xx", 6: "6xx"}
+
 func (m *Metrics) ResponseOut(code int) {
 	if code < 100 || code > 699 {
 		return
 	}
-	bump(&m.responsesOut, strconv.Itoa(code/100)+"xx")
+	key := responseClassKeys[code/100]
+	v, ok := m.responsesOut.Load(key)
+	if !ok {
+		v, _ = m.responsesOut.LoadOrStore(key, new(atomic.Uint64))
+	}
+	v.(*atomic.Uint64).Add(1)
 }
 
 func (m *Metrics) Registered()         { m.registrationTotal.Add(1) }
