@@ -11,81 +11,25 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 
 ## Install
 
-**Prebuilt binary**: each [release](../../releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, this README, the license and `freesbc.example.yaml` (linux archives add `freesbc.service`, see [Run as a service](#run-as-a-service)):
+```sh
+curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install.sh | sh
+```
+
+Linux or macOS, amd64 or arm64. It installs the latest release in `/usr/local/bin` after checking it against the release's `SHA256SUMS`. Run as root on a systemd host, it also sets up the `freesbc` user, `/etc/freesbc` and the unit (not started), and prints the steps left to start the service ([details](docs/install.md#run-as-a-systemd-service)).
+
+Then write a config and run it:
 
 ```sh
-v=v0.5.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
-curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/freesbc_${v}_${os}_${arch}.tar.gz
-curl -LO https://github.com/rasonyang/freesbc/releases/download/$v/SHA256SUMS
-shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
-./freesbc check -c freesbc.example.yaml
+freesbc init  -c freesbc.yaml    # asks for the switch, detects the addresses
+freesbc check -c freesbc.yaml    # validate; errors name the line and key
+freesbc run   -c freesbc.yaml    # SIGINT/SIGTERM to stop
 ```
 
-**From source**: requires Go >= 1.27.2:
+To read the script before it runs: `curl -fsSLo install.sh https://github.com/rasonyang/freesbc/releases/latest/download/install.sh; less install.sh; sh install.sh`.
 
-```sh
-go build -o freesbc ./cmd/freesbc
-```
+Manual download and checksum, building from source, the systemd layout and the full `freesbc init` reference: [`docs/install.md`](docs/install.md).
 
-### Run as a service
-
-The linux archives also hold `freesbc.service`, a systemd unit that runs FreeSBC as the unprivileged `freesbc` user, with `CAP_NET_BIND_SERVICE` for listen ports below 1024 (such as `wss: 443`) and a read-only filesystem. FreeSBC writes no files: logs go to stderr, so journald needs nothing. As root, from the unpacked archive:
-
-```sh
-useradd --system --no-create-home --shell /usr/sbin/nologin freesbc
-install -m 0755 freesbc /usr/local/bin/freesbc
-install -m 0644 freesbc.service /etc/systemd/system/freesbc.service
-install -d -m 0750 -o root -g freesbc /etc/freesbc
-/usr/local/bin/freesbc init -c /etc/freesbc/freesbc.yaml   # prompts on a terminal; in a script pass --switch etc. (see Quick start)
-chown root:freesbc /etc/freesbc/freesbc.yaml && chmod 0640 /etc/freesbc/freesbc.yaml
-/usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml
-systemctl enable --now freesbc
-journalctl -u freesbc -f
-```
-
-The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service cannot change its own config; `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead, `install -m 0640 -o root -g freesbc` it in place of `init` and edit the addresses. For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode); the unit reads it if present. `freesbc check` does not read that file, so check such a config with `env $(grep -v '^#' /etc/freesbc/freesbc.env) /usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml` (not `. freesbc.env`, which would expand the `$` in a bcrypt hash). For bursty traffic raise `net.core.rmem_max` and `net.core.wmem_max` to at least 4 MiB and 1 MiB so the UDP SIP sockets get their requested buffers ([docs/edge.md](docs/edge.md#udp-socket-buffers)). There is no `ExecReload`: a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`.
-
-## Quick start
-
-> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (networking and deployment topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
-
-```sh
-./freesbc init  -c freesbc.yaml        # asks for the switch, detects the addresses
-./freesbc check -c freesbc.yaml        # validate; errors name the line and key
-./freesbc run   -c freesbc.yaml
-./freesbc version                      # print the build version
-```
-
-`freesbc init` writes a minimal config (mode 0600) and refuses to overwrite an existing file. On a terminal it prompts for each value, showing a detected default that Enter accepts: `edge.switch` first (no default), then `private.ip` (the local address that routes to the switch), `public.bind` (the local address toward the default route), `public.ip` and the UDP port, and finally an optional admin password (no echo, stored as a bcrypt hash). It asks before contacting `https://api.ipify.org` for `public.ip` (falling back to cloud instance metadata); `public.bind` is omitted when it equals `public.ip`. When they differ (1:1 NAT), `init`, `check` and `run` print the ports your router must forward to `public.bind` (every `edge.listen` port and the `rtp` range, same numbers); see docs/config.md. It fails if `private.ip` equals `public.bind`: the topology needs a second IP or NIC. When stdin is not a terminal it never prompts; give flags or environment variables (flag, then env, then detected default):
-
-```sh
-./freesbc init -c freesbc.yaml --switch 10.77.0.10:5060 \
-    --private-ip 10.77.0.2 --public-ip 203.0.113.7 --public-bind 172.31.5.10
-# also: --udp-port N, --no-public-lookup; env FREESBC_SWITCH, FREESBC_PRIVATE_IP,
-# FREESBC_PUBLIC_IP, FREESBC_PUBLIC_BIND, FREESBC_UDP_PORT
-```
-
-Alternatively copy the annotated `freesbc.example.yaml` and edit it by hand.
-
-A minimal config (every key is documented in [`docs/config.md`](docs/config.md)):
-
-```yaml
-public:
-  ip: 203.0.113.7            # advertised to phones, browsers, carriers
-private:
-  ip: 10.77.0.2              # faces the switch
-edge:
-  switch: [10.77.0.10:5060]  # the switch, literal IP:port
-  listen:
-    udp: 5060                # ports on public.bind
-```
-
-`freesbc.yaml` is gitignored since it may hold real addresses and a password hash. `-c` defaults to `freesbc.yaml`; a positional argument is a usage error.
-
-The config file is watched. A `shield` edit is validated and applied atomically; a bad edit never takes down the process, because the previous config stays active and the error is logged. Everything else (addresses, `rtp`, `tls`, `edge`, `admin`) is read once at startup: a reload that edits it is logged as a warning listing the keys, and the running process keeps its startup values until restarted.
-
-On SIGINT/SIGTERM FreeSBC drops its calls with their media released; no BYE is sent. A second SIGINT/SIGTERM exits at once.
+> **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
 ## How it fits together
 
@@ -148,6 +92,7 @@ A "+" marks a lower bound: the generator, the switch or the test range ran out b
 
 ## Documentation
 
+- [`docs/install.md`](docs/install.md): install script, manual download, source build, systemd service, `freesbc init`
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
 - [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, non-goals, known limitations
 - [`docs/two-node.md`](docs/two-node.md): two independent FreeSBC nodes for failover and rolling restarts (carriers, switch, clients; FreeSWITCH and Asterisk examples)

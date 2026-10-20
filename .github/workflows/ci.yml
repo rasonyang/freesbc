@@ -82,3 +82,119 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+  # install.sh: syntax and shellcheck, then end-to-end runs against a
+  # release packaged exactly as release.yml does it (linux/amd64 only) and
+  # served from localhost through FREESBC_BASE_URL. install.yml runs the
+  # script against the real GitHub releases after each release.
+  install:
+    name: install.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TAG: v0.0.0-ci
+      BAD: v0.0.0-bad
+      FREESBC_BASE_URL: http://127.0.0.1:18080
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: sh -n and shellcheck
+        run: |
+          sh -n install.sh
+          shellcheck install.sh
+
+      - name: package a test release
+        run: |
+          set -euo pipefail
+          name="freesbc_${TAG}_linux_amd64"
+          stage="${RUNNER_TEMP}/stage/${name}"
+          srv="${RUNNER_TEMP}/srv/download/${TAG}"
+          mkdir -p "$stage" "$srv"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${TAG}" \
+            -o "${stage}/freesbc" ./cmd/freesbc
+          chmod 0755 "${stage}/freesbc"
+          cp README.md freesbc.example.yaml "$stage"/
+          if [ -f LICENSE ]; then cp LICENSE "$stage"/; fi
+          cp packaging/freesbc.service "$stage"/
+          tar -C "${RUNNER_TEMP}/stage" -czf "${srv}/${name}.tar.gz" "$name"
+          (cd "$srv" && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS && cat SHA256SUMS)
+          # A second release whose tarball no longer matches its own line.
+          bad="${RUNNER_TEMP}/srv/download/${BAD}"
+          mkdir -p "$bad"
+          cp "${srv}/${name}.tar.gz" "${bad}/freesbc_${BAD}_linux_amd64.tar.gz"
+          (cd "$bad" && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
+          printf 'corrupt' | dd of="${bad}/freesbc_${BAD}_linux_amd64.tar.gz" bs=1 seek=100 conv=notrunc
+
+      - name: serve it on localhost
+        run: |
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory "${RUNNER_TEMP}/srv" \
+            > "${RUNNER_TEMP}/http.log" 2>&1 &
+          for _ in $(seq 50); do
+            curl -fsS -o /dev/null "${FREESBC_BASE_URL}/download/${TAG}/SHA256SUMS" 2> /dev/null && exit 0
+            sleep 0.2
+          done
+          echo "::error::http.server did not start"; cat "${RUNNER_TEMP}/http.log"; exit 1
+
+      - name: usage errors
+        run: |
+          sh install.sh --help > /dev/null
+          rc=0; sh install.sh --bogus 2> /dev/null || rc=$?
+          [ "$rc" = 2 ] || { echo "::error::unknown flag exited $rc, want 2"; exit 1; }
+
+      - name: dry run installs nothing
+        run: |
+          set -euo pipefail
+          FREESBC_VERSION="$TAG" FREESBC_PREFIX="${RUNNER_TEMP}/dry" sh install.sh --dry-run --no-service
+          [ ! -e "${RUNNER_TEMP}/dry" ] || { echo "::error::--dry-run created the prefix"; exit 1; }
+          # As root on a systemd host: the service steps are printed, not run.
+          out=$(sudo env FREESBC_BASE_URL="$FREESBC_BASE_URL" FREESBC_VERSION="$TAG" \
+            FREESBC_PREFIX="${RUNNER_TEMP}/dry" sh install.sh --dry-run)
+          echo "$out"
+          grep -q '^+ systemctl daemon-reload' <<< "$out"
+          if [ -e "${RUNNER_TEMP}/dry" ] || [ -e /etc/systemd/system/freesbc.service ] || id freesbc 2> /dev/null; then
+            echo "::error::--dry-run changed the system"; exit 1
+          fi
+
+      - name: install --no-service, then re-run
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            FREESBC_VERSION="$TAG" FREESBC_PREFIX="${RUNNER_TEMP}/p" sh install.sh --no-service
+            got=$("${RUNNER_TEMP}/p/bin/freesbc" version | awk '{print $2}')
+            [ "$got" = "$TAG" ] || { echo "::error::run $run: version is $got, want $TAG"; exit 1; }
+          done
+
+      - name: corrupted tarball fails and installs nothing
+        run: |
+          if FREESBC_VERSION="$BAD" FREESBC_PREFIX="${RUNNER_TEMP}/bad" sh install.sh --no-service; then
+            echo "::error::install.sh accepted a tarball that does not match SHA256SUMS"; exit 1
+          fi
+          [ ! -e "${RUNNER_TEMP}/bad" ] || { echo "::error::a failed verification left files behind"; exit 1; }
+
+      # The runner has systemd and passwordless sudo, so the service step runs
+      # for real: user, /etc/freesbc, unit with ExecStart under the prefix,
+      # init from FREESBC_* and a config that is never overwritten. The unit
+      # must be installed but not enabled or started.
+      - name: install as root with the service step
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            sudo env FREESBC_BASE_URL="$FREESBC_BASE_URL" FREESBC_VERSION="$TAG" FREESBC_PREFIX=/opt/freesbc \
+              FREESBC_SWITCH=10.0.0.5 FREESBC_PRIVATE_IP=10.0.0.2 FREESBC_PUBLIC_IP=203.0.113.7 \
+              FREESBC_PUBLIC_BIND=192.0.2.10 sh install.sh
+            [ "$run" = 2 ] || sum=$(sudo sha256sum /etc/freesbc/freesbc.yaml)
+          done
+          [ "$sum" = "$(sudo sha256sum /etc/freesbc/freesbc.yaml)" ] || { echo "::error::re-run changed the config"; exit 1; }
+          id freesbc
+          [ "$(stat -c '%a %U:%G' /etc/freesbc)" = "750 root:freesbc" ]
+          [ "$(sudo stat -c '%a %U:%G' /etc/freesbc/freesbc.yaml)" = "640 root:freesbc" ]
+          grep -qx 'ExecStart=/opt/freesbc/bin/freesbc run -c /etc/freesbc/freesbc.yaml' /etc/systemd/system/freesbc.service
+          systemctl cat freesbc > /dev/null
+          [ "$(systemctl is-enabled freesbc || true)" = disabled ]
+          [ "$(systemctl is-active freesbc || true)" = inactive ]
+          got=$(/opt/freesbc/bin/freesbc version | awk '{print $2}')
+          [ "$got" = "$TAG" ] || { echo "::error::version is $got, want $TAG"; exit 1; }
