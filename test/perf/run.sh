@@ -33,6 +33,13 @@
 #     (set up per test/perf/freeswitch/README.md); scenarios register, call, webrtc
 # In hosts mode every *_EXEC defaults to empty (= run locally) except where you
 # set it, e.g. SBC_EXEC="ssh sbc" SWITCH_EXEC="ssh switch".
+#
+# Profiles (step mode, needs admin.pprof: true):
+#   PROFILE_AT=RATE  PROFILE_DELAY s [5] into the step at RATE, save in the
+#     background a CPU profile of PROFILE_SECS [30], a 5 s execution trace,
+#     a goroutine dump (debug=1) and a heap profile to <run dir>/pprof/
+#   PROFILE_CMD  the command that prints one profile on the FreeSBC host
+#     [$SBC_EXEC $REMOTE_PERF/sample.sh pprof]; sample.sh's ADMIN_* apply
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -71,6 +78,10 @@ else
 	REMOTE_PERF=${REMOTE_PERF:-$HERE}
 fi
 SAMPLE_CMD=${SAMPLE_CMD-$SBC_EXEC $REMOTE_PERF/sample.sh}
+PROFILE_AT=${PROFILE_AT:-}
+PROFILE_SECS=${PROFILE_SECS:-30}
+PROFILE_DELAY=${PROFILE_DELAY:-5}
+PROFILE_CMD=${PROFILE_CMD-$SBC_EXEC $REMOTE_PERF/sample.sh pprof}
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 note() { echo "[$(date +%H:%M:%S)] $*" >&2; }
@@ -191,17 +202,43 @@ trap 'echo; note "interrupted"; exit 130' INT TERM
 
 # ---------------------------------------------------------------- sampler
 METRICS="$RUN_DIR/metrics.csv"
-echo "ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors" > "$METRICS"
+echo "ts,cpu_s,rss_bytes,open_fds,goroutines,heap_inuse_bytes,ports_in_use,active_calls,active_regs,webrtc_sessions,edge_sessions,rtp_pkts_rx,rtp_pkts_tx,rtp_bytes_rx,rtp_bytes_tx,port_alloc_fail,invite_rejects,admission_drops,shield_drops,udp_rcvbuf_errors,udp_pub_drops,udp_priv_drops,udp_pub_rxq_bytes,udp_priv_rxq_bytes" > "$METRICS"
 sample_once() {
 	local ts out
 	ts=$(date +%s)
 	out=$($SAMPLE_CMD 2>/dev/null) || return 1
 	[[ -n $out ]] || return 1
-	printf '%s\n' "$out" | awk -v ts="$ts" -f "$HERE/scrape.awk" >> "$METRICS"
+	printf '%s\n' "$out" | awk -v ts="$ts" -v priv="$SBC_PRIVATE" -f "$HERE/scrape.awk" >> "$METRICS"
 }
 start_sampler() {
 	( while :; do sample_once; sleep "$INTERVAL"; done ) &
 	SAMPLER_PID=$!
+}
+
+# ---------------------------------------------------------------- profiles
+# profile_step RATE: in the background, PROFILE_DELAY s into the step, save a
+# CPU profile (PROFILE_SECS) and a 5 s execution trace taken at the same time,
+# then a goroutine dump and a heap profile, as pprof/rRATE-*. The step loop
+# does not wait for it; the run waits for it before its final sample.
+PROFILE_PID=""
+profile_step() {
+	local r=$1 d="$RUN_DIR/pprof"
+	mkdir -p "$d"
+	(
+		p="$d/r$r"
+		sleep "$PROFILE_DELAY"
+		note "pprof: r$r: cpu ${PROFILE_SECS}s + trace 5s, then goroutine and heap, into $d"
+		$PROFILE_CMD profile "$PROFILE_SECS" >"$p-cpu.pb.gz" 2>/dev/null &
+		$PROFILE_CMD trace 5 >"$p-trace.out" 2>/dev/null &
+		$PROFILE_CMD goroutine >"$p-goroutine.txt" 2>/dev/null
+		$PROFILE_CMD heap >"$p-heap.pb.gz" 2>/dev/null
+		wait
+		for f in "$p"-*; do
+			[[ -s $f ]] || note "pprof: $f is empty (admin.pprof off? ADMIN_* or PROFILE_CMD wrong?)"
+		done
+		note "pprof: r$r done"
+	) &
+	PROFILE_PID=$!
 }
 
 # ---------------------------------------------------------------- SIPp
@@ -316,12 +353,13 @@ elif [[ -n $STEP ]]; then
 	[[ $SCEN == call ]] && preregister
 	BEST=0 FIRST_BAD=""
 	STEPS="$RUN_DIR/steps.csv"
-	echo "rate,created,failed_pct,verdict,cpu_avg_pct,cpu_peak_pct,rss_peak_mb,goroutines_peak,ports_peak,rtp_rx_pps,rtp_tx_pps,udp_rcvbuf_errors" > "$STEPS"
+	echo "rate,created,failed_pct,verdict,cpu_avg_pct,cpu_peak_pct,rss_peak_mb,goroutines_peak,ports_peak,rtp_rx_pps,rtp_tx_pps,udp_rcvbuf_errors,udp_pub_drops,udp_priv_drops,udp_pub_rxq_peak_bytes,udp_priv_rxq_peak_bytes" > "$STEPS"
 	r=$S_FROM
 	while (( r <= S_TO )); do
 		total=$((r * S_SECS))
 		note "step: $r calls/s for ${S_SECS}s ($total calls, hold ${HOLD}s)"
 		st0=$(date +%s)
+		[[ $r == "$PROFILE_AT" ]] && profile_step "$r"
 		one_load "r$r" "$r" "$total"
 		st1=$(date +%s)
 		# resources over the step, skipping its first 5 s (ramp-up)
@@ -336,17 +374,23 @@ elif [[ -n $STEP ]]; then
 	echo
 	echo "== step result =="
 	column -s, -t "$STEPS" 2>/dev/null || cat "$STEPS"
+	[[ -z $PROFILE_AT || -n $PROFILE_PID ]] || note "PROFILE_AT=$PROFILE_AT matched no step: no profiles taken"
 	echo "max sustained rate under ${STEP_FAIL_PCT}% failures: ${BEST} calls/s (hold ${HOLD}s, media $((1 - NOMEDIA)))${FIRST_BAD:+; first failing step: $FIRST_BAD}"
 else
 	[[ $SCEN == call ]] && preregister
 	CAP=""
 	[[ -n $CONC ]] && CAP=" concurrency cap $CONC"
 	note "load: $RATE/s for ${DUR}s = $TOTAL_DEFAULT calls, hold ${HOLD}s$CAP"
+	[[ -z $PROFILE_AT ]] || note "PROFILE_AT applies to step mode (-s) only: no profiles taken"
 	one_load main "$RATE" "$TOTAL_DEFAULT"
 fi
 
 # Let the last RTP counters and the teardown show up before the final sample.
 sleep $((INTERVAL + 1))
+if [[ -n $PROFILE_PID ]]; then
+	note "waiting for the profiles of step $PROFILE_AT"
+	wait "$PROFILE_PID"
+fi
 sample_once
 [[ -n ${SAMPLER_PID:-} ]] && kill "$SAMPLER_PID" 2>/dev/null && SAMPLER_PID=""
 T_END=$(date +%s)

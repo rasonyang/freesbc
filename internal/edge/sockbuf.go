@@ -8,12 +8,15 @@ import (
 // Kernel buffer sizes requested for every UDP SIP socket (public and
 // private). The OS default (212992 bytes on Linux) overflows under a burst
 // or a GC pause and the kernel drops datagrams silently (UdpRcvbufErrors,
-// issue #171). Fixed constants, not config: the request is capped by
-// net.core.rmem_max / wmem_max (Linux) or kern.ipc.maxsockbuf (macOS), which
-// is the operator's knob. RTP sockets are left alone: each carries one
-// ~50 pps stream.
+// issue #171). The receive request is 8 MiB (4 MiB until issue #235): a GC
+// mark phase can keep a socket's single read loop off the CPU long enough for
+// carrier-in traffic above ~3500 CPS to fill 4 MiB. Fixed constants, not
+// config: the request is capped by net.core.rmem_max / wmem_max (Linux) or
+// kern.ipc.maxsockbuf (macOS), which is the operator's knob; Linux grants
+// double the (capped) request for its bookkeeping. RTP sockets are left
+// alone: each carries one ~50 pps stream.
 const (
-	udpSIPReadBuffer  = 4 << 20
+	udpSIPReadBuffer  = 8 << 20
 	udpSIPWriteBuffer = 1 << 20
 )
 

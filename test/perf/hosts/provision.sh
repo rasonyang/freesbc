@@ -174,7 +174,7 @@ render_kit() {
 sysctl_setup() {
 	log "sysctl: rmem_max/wmem_max/rmem_default 8388608, backlog, ephemeral ports 60000-65535"
 	cat >/etc/sysctl.d/90-freesbc-perf.conf <<-'EOF'
-		# FreeSBC asks for 4 MiB receive / 1 MiB send per UDP SIP socket; the kernel caps it.
+		# FreeSBC asks for 8 MiB receive / 1 MiB send per UDP SIP socket; the kernel caps it.
 		net.core.rmem_max = 8388608
 		net.core.wmem_max = 8388608
 		# Thousands of RTP flows: deeper input queues, more UDP memory (pages).

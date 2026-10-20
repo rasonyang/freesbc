@@ -2,6 +2,7 @@
 # sample, columns as in scrape.awk). Prints key=value lines.
 #   awk -F, -f summarize_metrics.awk metrics.csv
 function num(x) { return (x == "") ? -1 : x + 0 }
+function cv(name) { return (name in col) ? num($col[name]) : -1 }
 NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
 {
 	n++
@@ -16,6 +17,7 @@ NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
 		rxb0 = num($col["rtp_bytes_rx"]); txb0 = num($col["rtp_bytes_tx"])
 		rej0 = num($col["invite_rejects"]); adm0 = num($col["admission_drops"]); shd0 = num($col["shield_drops"])
 		rbe0 = num($col["udp_rcvbuf_errors"])
+		pd0 = cv("udp_pub_drops"); vd0 = cv("udp_priv_drops")
 		af0 = num($col["port_alloc_fail"])
 	} else if (cpu >= 0 && pcpu >= 0 && t > pt) {
 		c = (cpu - pcpu) / (t - pt) * 100
@@ -36,6 +38,9 @@ NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
 	rxbl = num($col["rtp_bytes_rx"]); txbl = num($col["rtp_bytes_tx"])
 	rejl = num($col["invite_rejects"]); adml = num($col["admission_drops"]); shdl = num($col["shield_drops"])
 	rbel = num($col["udp_rcvbuf_errors"])
+	pdl = cv("udp_pub_drops"); vdl = cv("udp_priv_drops")
+	q = cv("udp_pub_rxq_bytes"); if (q >= 0 && (q > peakpq || peakpq == "")) peakpq = q
+	q = cv("udp_priv_rxq_bytes"); if (q >= 0 && (q > peakvq || peakvq == "")) peakvq = q
 	afl = num($col["port_alloc_fail"])
 }
 END {
@@ -61,5 +66,9 @@ END {
 	if (rejl >= 0) printf "invite_rejects=%d\n", rejl - rej0
 	if (adml >= 0) printf "admission_drops=%d\n", adml - adm0
 	if (shdl >= 0) printf "shield_drops=%d\n", shdl - shd0
-	if (rbel >= 0) printf "udp_rcvbuf_errors=%d   (datagrams the kernel dropped on FreeSBC's UDP sockets: receive buffer full)\n", rbel - rbe0
+	if (rbel >= 0) printf "udp_rcvbuf_errors=%d   (datagrams the kernel dropped on a full UDP receive buffer, whole namespace)\n", rbel - rbe0
+	pd = (pdl >= 0 && pd0 >= 0) ? pdl - pd0 : "n/a"; vd = (vdl >= 0 && vd0 >= 0) ? vdl - vd0 : "n/a"
+	if (pd != "n/a" || vd != "n/a")
+		printf "udp_pub_drops=%s udp_priv_drops=%s udp_pub_rxq_peak_bytes=%s udp_priv_rxq_peak_bytes=%s   (per FreeSBC UDP SIP socket)\n", \
+			pd, vd, (peakpq == "" ? "n/a" : peakpq), (peakvq == "" ? "n/a" : peakvq)
 }

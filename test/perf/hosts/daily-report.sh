@@ -4,7 +4,7 @@
 #   test/perf/hosts/daily-report.sh [YYYY-MM-DD]       default: today
 #
 # Gathers into /opt/freesbc/results/<date>/:
-#   runs/<run>/      summary.txt, metrics.csv, steps.csv, webrtc.log, sipp-*.csv (no pcap, no users.csv)
+#   runs/<run>/      summary.txt, metrics.csv, steps.csv, webrtc.log, sipp-*.csv, pprof/ (no pcap, no users.csv)
 #   notes/<role>.md  each role's /opt/freesbc/results/<role>/notes.md
 #   changes/         unified diff (about 80 lines max) of every kit file the agents modified
 #                    (found through the *.orig-* backups under /opt/freesbc/test/perf, on all hosts)
@@ -52,6 +52,7 @@ for r in "$PERF"/out/"$STAMP"-*; do
 		[ -f "$r/$f" ] && cp "$r/$f" "$D/runs/$n/"
 	done
 	cp "$r"/sipp-*.csv "$r"/probe-*.log "$r"/probe-*.csv "$D/runs/$n/" 2>/dev/null || true
+	if [ -d "$r/pprof" ]; then cp -r "$r/pprof" "$D/runs/$n/"; fi # run.sh PROFILE_AT
 done
 
 # ------------------------------------------------------------- notes, progress

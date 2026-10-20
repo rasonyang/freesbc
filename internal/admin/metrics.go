@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,6 +28,8 @@ type collector struct {
 	tlsExpiry   *prometheus.Desc
 	udpRcvbuf   *prometheus.Desc
 	udpInErrors *prometheus.Desc
+	udpSockDrop *prometheus.Desc
+	udpSockRxQ  *prometheus.Desc
 	tlsDiffers  *prometheus.Desc
 
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
@@ -89,6 +92,8 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
 		udpRcvbuf:   prometheus.NewDesc("freesbc_udp_receive_buffer_errors_total", "Kernel UDP datagrams dropped on a full socket receive buffer (RcvbufErrors, IPv4 + IPv6), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		udpInErrors: prometheus.NewDesc("freesbc_udp_in_errors_total", "Kernel UDP receive errors (InErrors, IPv4 + IPv6; includes the receive buffer drops), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
+		udpSockDrop: prometheus.NewDesc("freesbc_udp_socket_drops_total", "Datagrams the kernel dropped on one of FreeSBC's UDP SIP sockets (the drops column of /proc/net/udp and udp6: mostly a full receive buffer), by socket (public: the edge.listen.udp listener; private: private.ip:5060). Read at scrape time; Linux only.", []string{"socket"}, nil),
+		udpSockRxQ:  prometheus.NewDesc("freesbc_udp_socket_rx_queue_bytes", "Bytes waiting in the kernel receive queue of one of FreeSBC's UDP SIP sockets at scrape time (rx_queue of /proc/net/udp and udp6), by socket (public, private). Linux only.", []string{"socket"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
 		hepSent:    prometheus.NewDesc("freesbc_hep_packets_sent_total", "SIP messages written to the HOMER collector as HEP packets; absent when the hep section is off.", nil, nil),
@@ -151,6 +156,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.healthSt
 	ch <- c.udpRcvbuf
 	ch <- c.udpInErrors
+	ch <- c.udpSockDrop
+	ch <- c.udpSockRxQ
 	ch <- c.hepSent
 	ch <- c.hepDropped
 	ch <- c.hepErrors
@@ -182,6 +189,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.udpRcvbuf, prometheus.CounterValue, float64(u.RcvbufErrors))
 		ch <- prometheus.MustNewConstMetric(c.udpInErrors, prometheus.CounterValue, float64(u.InErrors))
 	}
+	c.collectUDPSockets(ch)
 	g(c.healthSt, healthLevel(healthStatus(c.health.evaluate())))
 	fails := c.audit.failures()
 	for _, reason := range authFailureReasons {
@@ -286,6 +294,49 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		if len(parts) == 3 {
 			counter(c.proxyCarrierReq, float64(v), parts[0], parts[1], parts[2])
 		}
+	}
+}
+
+// collectUDPSockets exports the kernel drop count and receive queue of the
+// UDP SIP sockets the edge bound (Deps.ListenerInfos: the public udp
+// listener and the private socket). A socket missing from /proc/net/udp{,6}
+// exports nothing, and so does every socket off Linux.
+func (c *collector) collectUDPSockets(ch chan<- prometheus.Metric) {
+	if c.deps.ListenerInfos == nil {
+		return
+	}
+	var want []netip.AddrPort
+	label := map[netip.AddrPort]string{}
+	for _, l := range c.deps.ListenerInfos() {
+		if l.Transport != "udp" {
+			continue
+		}
+		ap, err := netip.ParseAddrPort(l.Bind)
+		if err != nil {
+			continue
+		}
+		ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+		if _, dup := label[ap]; dup {
+			continue // one series per address; a duplicate would fail the scrape
+		}
+		socket := "public"
+		if l.Private {
+			socket = "private"
+		}
+		want = append(want, ap)
+		label[ap] = socket
+	}
+	stats, ok := readUDPSockets(want)
+	if !ok {
+		return
+	}
+	for _, ap := range want {
+		st, found := stats[ap]
+		if !found {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.udpSockDrop, prometheus.CounterValue, float64(st.Drops), label[ap])
+		ch <- prometheus.MustNewConstMetric(c.udpSockRxQ, prometheus.GaugeValue, float64(st.RxQueue), label[ap])
 	}
 }
 
