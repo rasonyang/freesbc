@@ -81,11 +81,29 @@ func TestAdmissionBanLowAndSlowScanner(t *testing.T) {
 	if total != 1 || top[0].Reason != shield.StrikeAdmissionUDP || top[0].Source != "127.0.0.1" {
 		t.Errorf("offenders = %+v (total %d)", top, total)
 	}
-	// Banned: the read filter drops it, so admission no longer sees it.
+	// Banned: the read filter drops it, so admission no longer sees it, and
+	// the drop is counted as a shield "banned" drop (issue #249).
+	sh := h.srv.currentShield()
+	bannedDrops := func() int64 { return sh.Stats().DropsByReason["banned"] }
+	before := bannedDrops()
+	strikes := top[0].Strikes
 	scanOnce(t, h)
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(5 * time.Second)
+	for bannedDrops() < before+1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("banned drops = %d, want %d: the read filter did not count the banned read", bannedDrops(), before+1)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := bannedDrops(); n != before+1 {
+		t.Errorf("banned drops = %d, want exactly %d for one banned read", n, before+1)
+	}
 	if n := admissionDrops(h, dropInviteNotAdmitted); n != 4 {
 		t.Errorf("drops after the ban = %d, want 4 (read filter drops first)", n)
+	}
+	if top, _ := sh.Offenders(10); len(top) != 1 || top[0].Strikes != strikes {
+		t.Errorf("offenders after the ban = %+v, want admission strikes unchanged at %d", top, strikes)
 	}
 }
 

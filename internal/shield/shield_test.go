@@ -207,6 +207,44 @@ func TestBannedUnmaps4in6(t *testing.T) {
 	}
 }
 
+// Issue #249: DropBanned is the read filter's check, so it counts each
+// banned read it drops as a "banned" drop, exactly once; BannedFrom stays
+// side-effect free for every other caller, and an unbanned source counts
+// nothing.
+func TestDropBannedCountsOnlyBannedReads(t *testing.T) {
+	s := testShield(t, shieldCfg)
+	banned := func() int64 { return s.Stats().DropsByReason["banned"] }
+	bad := netip.MustParseAddrPort("198.51.100.80:5060")
+	good := netip.MustParseAddrPort("198.51.100.81:5060")
+	if s.CheckFrom(bad, "sipvicious", "tcp") != Drop {
+		t.Fatal("scanner UA must be dropped")
+	}
+	before := banned()
+
+	for _, tr := range []string{"udp", "tcp"} {
+		if !s.BannedFrom(bad, tr) {
+			t.Fatalf("%s: the scanner IP must be banned", tr)
+		}
+	}
+	if got := banned(); got != before {
+		t.Fatalf("BannedFrom counted %d banned drops, want none", got-before)
+	}
+
+	if !s.DropBanned(bad, "udp") {
+		t.Fatal("DropBanned must report a banned source")
+	}
+	if got := banned(); got != before+1 {
+		t.Fatalf("banned drops = %d after one DropBanned, want %d", got, before+1)
+	}
+
+	if s.DropBanned(good, "udp") || s.DropBanned(good, "tcp") {
+		t.Fatal("DropBanned reported an unbanned source as banned")
+	}
+	if got := banned(); got != before+1 {
+		t.Fatalf("banned drops = %d after an unbanned source, want %d", got, before+1)
+	}
+}
+
 // Carrier sources are exempt from the scanner ban and use carrier_rate_limit.
 func TestCarrierSourceExemptFromScannerBanAndUsesCarrierLimit(t *testing.T) {
 	cfg, err := config.Parse([]byte(shieldCfg))
