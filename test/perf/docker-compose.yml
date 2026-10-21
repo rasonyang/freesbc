@@ -6,6 +6,7 @@
 #   carrier    172.28.1.30  ----+
 #
 # The addresses match test/perf/configs/perf*.yaml. Run it through run.sh, or:
+#   export GO_VERSION=$(sed -n 's/^go //p' go.mod)   # the image builds need it
 #   docker compose -f test/perf/docker-compose.yml up -d --build
 #   docker compose -f test/perf/docker-compose.yml down
 #
@@ -41,6 +42,8 @@ services:
       context: ../..
       dockerfile: test/perf/docker/Dockerfile.freesbc
       args:
+        # go.mod's `go` line; run.sh sets it.
+        GO_VERSION: ${GO_VERSION:-}
         VERSION: ${FREESBC_VERSION:-perf}
     image: freesbc-perf-freesbc
     # Pick the config with FREESBC_CONFIG, e.g. perf-wide.yaml for >5000 calls.
@@ -63,6 +66,8 @@ services:
     build:
       context: ../..
       dockerfile: test/perf/docker/Dockerfile.tools
+      args:
+        GO_VERSION: ${GO_VERSION:-}
     cpuset: ${LOADGEN_CPUS:-2-4}
     networks:
       public:

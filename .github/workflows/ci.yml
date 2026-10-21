@@ -41,6 +41,20 @@ jobs:
       - name: go mod tidy
         run: go mod tidy -diff
 
+      # Every golang:<version> image tag (the perf rig, docs) must match
+      # go.mod's go line. docs/performance.md records past runs' Go.
+      - name: golang image tags match go.mod
+        run: |
+          want=$(sed -n 's/^go //p' go.mod)
+          [ -n "$want" ] || { echo "::error::no go line in go.mod"; exit 1; }
+          stale=$(git grep -noE 'golang:[0-9]([0-9.]*[0-9])?' -- . ':!docs/performance.md' ':!docs/notes/' \
+            | awk -v want="golang:$want" '{ t = $0; sub(/^.*golang:/, "golang:", t) } t != want')
+          if [ -n "$stale" ]; then
+            echo "::error::golang image tags differ from go.mod's go $want:"
+            echo "$stale"
+            exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
 

@@ -57,9 +57,9 @@ pcap and the UAS echoes it, but SIPp does not analyse what returns. Use:
 ## Prerequisites
 
 * Docker with Compose v2 (Linux, or Colima / Docker Desktop; give the VM
-  several CPUs). Images build from this repo: the `freesbc` binary
-  (`golang:1.27.2`), SIPp 3.6.1 from Debian's `sip-tester` package (built with
-  PCAP play and RTP echo) and `webrtcload`.
+  several CPUs). Images build from this repo: the `freesbc` binary (in the
+  `golang` image of the Go version in `go.mod`), SIPp 3.6.1 from Debian's
+  `sip-tester` package (built with PCAP play and RTP echo) and `webrtcload`.
 * On the host that runs `run.sh`: `bash`, `awk`, `sed`, and `python3` only when
   a scenario holds calls longer than 8 s (it generates a longer pcap).
 * The rig shares the Docker VM's CPUs between generator, FreeSBC and switch,
