@@ -4,10 +4,11 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![Go](https://img.shields.io/badge/go-1.27.3-00ADD8.svg)](go.mod)
 
-- **Pure Go, one static binary, zero external dependencies**: no database, no Redis, no kernel modules, and **no external media process**.
-- **Keeps your switch off the public internet**: FreeSBC is the only element with a public address. FreeSWITCH or Asterisk stays on a private LAN and only ever talks to FreeSBC.
-- **Phones, browsers and carriers through one public address**: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS WebRTC browsers, and carriers (the switch uses FreeSBC as its outbound proxy).
-- **Embedded WebUI, REST API and Prometheus metrics** behind a bcrypt-checked admin login (a login form for the WebUI, Basic Auth for the API and metrics).
+- **One static Go binary, nothing else to run**: no database, no Redis, no kernel modules, and **no external media process**.
+- **Keeps your switch off the public internet**: FreeSBC is the only element with a public address; FreeSWITCH or Asterisk stays on a private LAN and only ever talks to FreeSBC.
+- **Phones, browsers and carriers through one public address**: SIP over UDP, TCP and TLS, WebRTC over WS/WSS, and carriers.
+- **Built for the open internet**: per-IP rate limits, scanner fingerprinting, REGISTER brute-force and enumeration bans, and silent drops for calls from unregistered sources.
+- **Embedded WebUI, REST API and Prometheus metrics** behind a bcrypt-checked admin login.
 
 ## Install
 
@@ -31,6 +32,18 @@ Manual download and checksum, building from source, the systemd layout and the f
 
 > **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
+## Performance
+
+Measured on one 4 vCPU / 8 GiB cloud VM running FreeSBC v0.5.0, with the load generator and the switch on separate hosts:
+
+- **5000 concurrent calls with media** at 80% CPU (373 MB RSS); one vCPU passes a commercial SBC's published 1000-call test.
+- **3500 CPS** carrier to switch (3250 switch to carrier).
+- **8 hour soak** at 3500 concurrent calls: 432,000 calls, 0 failed, no growth.
+- **19,000 registrations** held.
+- **Under 1 ms** of added latency.
+
+Method, all results, sizing and which figures are lower bounds: [docs/performance.md](docs/performance.md); the harness to repeat it: [test/perf/](test/perf/README.md).
+
 ## How it fits together
 
 ```text
@@ -44,59 +57,22 @@ Manual download and checksum, building from source, the systemd layout and the f
                   └── carriers: the switch sends carrier traffic to FreeSBC as its outbound proxy
 ```
 
-- **Clients.** REGISTER is proxied to the switch verbatim (the switch is the registrar; FreeSBC holds no credential) with the Contact rewritten to carry an `fsbc=` token. Calls to clients and from clients are proxied with FreeSBC on the path.
-- **Carriers.** The switch owns carrier accounts, line selection and failover, and points each gateway at FreeSBC as outbound proxy. Requests to a host listed in `edge.carriers` are proxied to that carrier with the switch's private addresses hidden; inbound carrier requests are delivered to the switch's carrier port with an `X-FreeSBC-Carrier` header.
-- **Topology hiding.** Every SDP body is constructed by FreeSBC, never copied from the other leg, and all media is anchored on FreeSBC ports. No SDP, Contact or Request-URI carries the switch's address to a public party, or the public party's address to the switch. Every public leg, client or carrier, also hides the switch in Via, Record-Route, Contact and identity headers; client legs additionally drop the switch's Server, User-Agent, Warning, `X-` and other `P-` headers. The Call-ID and the NOTIFY and MESSAGE bodies are the switch's own text and pass through, so set the switch to keep its name out of them: [switch-side requirements](docs/edge.md#switch-side-requirements).
-- **Shield.** Per-IP rate limiting (separate limits for carrier sources) and scanner fingerprinting with an in-memory ban; every denial is a silent drop. FreeSBC touches no kernel firewall state. The private socket is trusted and exempt, so keep it unreachable from anywhere else.
+- **Clients.** REGISTER goes verbatim to the switch, which is the registrar (FreeSBC holds no credential), and calls to and from clients are proxied with FreeSBC on the path; several switches form a pool hashed per user.
+- **Carriers.** The switch owns carrier accounts and failover and uses FreeSBC as its outbound proxy to carriers listed by IP or DNS (SRV/A/AAAA, cached), with deterministic carrier registration tokens; inbound carrier calls reach the switch's carrier port tagged `X-FreeSBC-Carrier`.
+- **Media.** Every stream is anchored on FreeSBC ports, with hardened first-packet latching, a silence watchdog and no transcoding; browser legs (ICE-Lite, DTLS-SRTP) are relayed to plain RTP.
+- **Topology hiding.** FreeSBC builds every SDP itself and hides the switch from every public leg, but the Call-ID and NOTIFY and MESSAGE bodies are the switch's own text: see the [switch-side requirements](docs/edge.md#switch-side-requirements).
+- **Trust.** Only the private socket is trusted and exempt from the shield, so keep it unreachable from anywhere else; bans live in memory and FreeSBC touches no kernel firewall state.
 
 Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
-
-## Features
-
-- **Edge proxy**: SIP/UDP, TCP, TLS, WS and WSS interworking in front of a private switch; REGISTER proxying; a multi-switch pool with per-user hashing.
-- **Carrier path**: carrier directory by literal IP or DNS (SRV/A/AAAA, cached), switch-to-carrier proxying with topology hiding, inbound carrier delivery to the switch's carrier port, and deterministic carrier registration tokens.
-- **Media anchoring**: RTP relay on FreeSBC ports with hardened first-packet latching and a silence watchdog; no transcoding.
-- **WebRTC**: ICE-Lite, DTLS-SRTP and RTCP-mux terminated for browsers (any of `edge.listen.ws`/`wss`), relayed to plain RTP.
-- **Built-in security**: per-IP rate limiting, scanner fingerprinting, in-memory bans, admission control for public INVITEs and REGISTER enumeration.
-- **Embedded WebUI + REST API**: a live dashboard, a read-only config view with candidate validation and diff, Prometheus metrics, bcrypt admin login (form for the WebUI, Basic Auth for the API).
-
-## Performance
-
-One small cloud VM carries 5000 concurrent calls with media, 3500 call setups per second, and an 8 hour soak with zero failed calls and no memory growth.
-
-### System under test
-
-| | |
-|---|---|
-| FreeSBC host | cloud VM, Intel Xeon 6982P-C, **4 vCPU (2 cores + HT), 8 GiB**, Ubuntu 24.04 |
-| FreeSBC | v0.5.0 (sipgo v1.6.0, Go 1.27.2), one process, `GOMEMLIMIT=6GiB` |
-| Load generator | separate 8 vCPU host: SIPp 3.6.1 (UDP SIP, G.711 RTP) and `webrtcload` (ICE-Lite, DTLS-SRTP over ws/wss) |
-| Switch | separate 8 vCPU host on a private network: SIPp UAS echoing RTP, or FreeSWITCH 1.10 |
-| Media | G.711 20 ms in both directions, anchored by FreeSBC on both legs (public and private) |
-| Pass line | under 0.1% failed calls, FreeSBC under 80% of its CPU, RTP sent = RTP received, no kernel receive drops |
-
-### Results
-
-| Test | Result |
-|---|---|
-| Concurrent calls with media | **5000** at 80% CPU, 500k packets/s each way, 373 MB RSS |
-| A commercial SBC's published test: 1000 calls held 600 s | passes on **one vCPU**, about 120 MB RSS, 0 of 2000 calls failed, 0% RTP loss |
-| Call setup rate (no media) | **3500 CPS** carrier to switch, **3250 CPS** switch to carrier, 2250+ CPS client to switch |
-| Soak: 3500 concurrent calls for 8 hours | **432,000 calls, 0 failed**; goroutines, RSS, file descriptors and ports flat |
-| Registrations | **19,000** held, **20,000+ REGISTER/s** at refresh using 13% of the CPU |
-| WebRTC | 100+ DTLS handshakes/s, 600+ concurrent SRTP calls (limited by the generator, not FreeSBC) |
-| With FreeSWITCH as the switch | 3000+ concurrent calls, 1500+ CPS (limited by FreeSWITCH) |
-| Latency FreeSBC adds | **under 1 ms** |
-
-A "+" marks a lower bound: the generator, the switch or the test range ran out before FreeSBC did. Method, profiles, sizing (memory follows the call rate: about 1.25 MB per sustained CPS) and the raw reports are in [docs/performance.md](docs/performance.md) and issue [#109](https://github.com/rasonyang/freesbc/issues/109); the harness to repeat it is in [test/perf/](test/perf/README.md).
 
 ## Documentation
 
 - [`docs/install.md`](docs/install.md): install script, manual download, source build, systemd service, `freesbc init`
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
-- [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, non-goals, known limitations
+- [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, scope rule, non-goals, known limitations
 - [`docs/two-node.md`](docs/two-node.md): two independent FreeSBC nodes for failover and rolling restarts (carriers, switch, clients; FreeSWITCH and Asterisk examples)
 - [`docs/homer.md`](docs/homer.md): mirror SIP signaling to a HOMER collector over HEP (setup, what is mirrored, security notes)
+- [`docs/performance.md`](docs/performance.md): method, all results, sizing (memory, CPS and `GOMEMLIMIT`), lower bounds
 - [`docs/troubleshooting.md`](docs/troubleshooting.md): calls that connect and then drop (`call ended` reasons, lost ACK, RTP silence, session timers)
 - [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
 - [`examples/switch/`](examples/switch/README.md): verified FreeSWITCH and Asterisk configurations for the reference topology
@@ -118,38 +94,11 @@ Bind the admin listener **private**. Validation rejects a non-loopback `admin.li
 
 ## Not in scope
 
-FreeSBC does only what is necessary to make one switch on a private LAN safely reachable from the public internet. Anything the switch (FreeSWITCH or Asterisk) already does well, FreeSBC does not do.
+FreeSBC does only what is necessary to make one switch on a private LAN safely reachable from the public internet; anything the switch does well, it does not do ([scope rule](docs/edge.md#scope-rule)).
 
-A feature is in scope only if it passes one of these:
+No transcoding, not a B2BUA, not a registrar, no clustering (for failover, run two independent nodes: [`docs/two-node.md`](docs/two-node.md)), and all state is in memory.
 
-1. Only the edge can see or do it: the public wire before rewrite, TLS/WSS/WebRTC termination, NAT and latching, topology hiding, media anchoring, public-side admission, or FreeSBC's own state (sockets, ports, bindings, bans, reloads).
-2. The switch cannot do it well from behind the edge.
-
-Everything else stays on the switch; FreeSBC's contribution is a documented switch-side example (see [`examples/switch/`](examples/switch/README.md)), not a feature. Concrete examples that stay on the switch:
-
-- Per-carrier and per-user concurrency and CPS limits: FreeSWITCH `limit`, `max-sessions`, `sessions-per-second`; Asterisk `GROUP()` / `GROUP_COUNT()`.
-- Maximum call duration: FreeSWITCH `sched_hangup`; Asterisk `Dial` `L()` and `TIMEOUT(absolute)`.
-- Toll-fraud protection: switch authentication plus dialplan rules.
-- Call history and CDR: the switch's CDR and CEL.
-- Call lifecycle events: the switch's event system.
-- RTCP reporting to HOMER: the switch receives the relayed RTCP and can report it ([setup](docs/edge.md#rtcp-and-call-quality-in-homer)).
-- Config version history: the operator's VCS.
-- Editing the config through the admin API: edit the file, run `freesbc check`, and the watcher reloads it. Like nginx, there is no write API.
-
-## Status & limitations
-
-FreeSBC targets small and medium deployments on a single node; for failover, run two independent nodes ([`docs/two-node.md`](docs/two-node.md)). Measured capacity is in [Performance](#performance). Memory follows the sustained call rate rather than concurrent calls, because state outlives each call by up to 32 s (about 1.25 MB per sustained CPS; sipgo keeps each UDP transaction for its timers); size RAM and `GOMEMLIMIT` with [Memory, CPS and GOMEMLIMIT](docs/performance.md#memory-cps-and-gomemlimit). Method, caveats, profiles and the first bottlenecks are in [docs/performance.md](docs/performance.md); the rerunnable harness is in [test/perf/](test/perf/README.md).
-
-Non-goals: transcoding, CDR, clustering, and being a registrar in its own right. The edge proxy proxies registrations to the switch rather than owning users or credentials.
-
-- No transcoding; left to the switch.
-- All state is in memory; a restart drops every call, dialog and binding.
-- SDES-SRTP (`a=crypto`) is off unless `edge.srtp` or a carrier's `srtp` enables it, and then only over TLS/WSS signaling (or `edge.allow_insecure_sdes`); browser legs get DTLS-SRTP.
-- Switches are UDP only (carriers may be udp, tcp or tls); switches are literal `IP:port`, with no DNS.
-- Call-ID passes through the proxy unchanged, and so do the NOTIFY and MESSAGE bodies the switch writes (MWI, BLF); a switch that puts its own name in either leaks it, and the settings that decide those names are on the switch.
-- No PUBLISH, and no TURN or full ICE.
-
-See [known limitations](docs/edge.md#known-limitations) for the full list.
+Details: [non-goals](docs/edge.md#non-goals) and [known limitations](docs/edge.md#known-limitations).
 
 ## Development
 
@@ -158,24 +107,7 @@ go vet ./...
 go test ./... -race
 ```
 
-The edge suite runs entirely on `127.0.0.1` and passes on macOS and Linux. See CLAUDE.md for per-package test ports and the opt-in FreeSWITCH interop test.
-
-## Layout
-
-```text
-cmd/freesbc/          argv parsing, signal handling, exit codes
-internal/
-  app/                construction and lifecycle: builds every component and runs it
-  config/             freesbc.yaml: parse, validate, hot reload
-  sip/                SIP protocol primitives
-  sip/sdp/            SDP subsystem (parse, codec negotiation, construction)
-  edge/               SIP/RTP/WebRTC proxy between public parties and the switch
-  media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
-  shield/             per-IP rate limiting, scanner fingerprinting, in-memory bans
-  admin/              operator HTTP API, Prometheus metrics, embedded WebUI
-```
-
-Everything is under `internal/`: the only consumer is `cmd/freesbc`, so no package here carries an API promise. Dependencies run one way: `cmd/freesbc -> app -> {edge, admin}`.
+The edge suite runs entirely on `127.0.0.1` and passes on macOS and Linux. See CLAUDE.md for per-package test ports and the opt-in FreeSWITCH interop test, and [`docs/design.md` §17](docs/design.md#17-package-ownership-map) for the package layout and what each package owns.
 
 ## License
 

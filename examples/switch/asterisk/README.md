@@ -123,7 +123,7 @@ What `test/run.sh` showed (Asterisk 22.10.1):
 
 ## Policy FreeSBC deliberately does not do
 
-All of these are the switch's job (they pass neither of the two questions of the [scope rule](../../../README.md#not-in-scope)). `extensions.conf` carries working examples.
+All of these are the switch's job (they pass neither of the two questions of the [scope rule](../../../docs/edge.md#scope-rule)). `extensions.conf` carries working examples.
 
 ```asterisk
 ; per-user and per-carrier concurrency
