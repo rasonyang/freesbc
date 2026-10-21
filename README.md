@@ -10,6 +10,11 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 - **Built for the open internet**: per-IP rate limits, scanner fingerprinting, REGISTER brute-force and enumeration bans, and silent drops for calls from unregistered sources.
 - **Embedded WebUI, REST API and Prometheus metrics** behind a bcrypt-checked admin login.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/webui-dark.png">
+  <img alt="FreeSBC WebUI dashboard during a test call load" src="docs/images/webui-light.png" width="720">
+</picture>
+
 ## Install
 
 ```sh
@@ -65,6 +70,22 @@ Method, all results, sizing and which figures are lower bounds: [docs/performanc
 
 Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
 
+## Admin & WebUI
+
+Add an `admin` block, with a bcrypt hash from `freesbc hash-password`:
+
+```yaml
+admin:
+  listen: 127.0.0.1:8080
+  password_hash: "$2a$10$..."   # freesbc hash-password
+```
+
+Then open `http://127.0.0.1:8080/` and sign in as `admin`: live calls, registrations, bans, health and a config validator. Prometheus scrapes `/metrics` on the same address with Basic Auth.
+
+Keep the listener private: a non-loopback `listen` needs `admin.allow_remote: true`, which in turn needs the top-level `tls` and then serves HTTPS.
+
+Endpoints, drain mode, health conditions, the audit log and pprof: [`docs/config.md`](docs/config.md#admin).
+
 ## Documentation
 
 - [`docs/install.md`](docs/install.md): install script, manual download, source build, systemd service, `freesbc init`
@@ -77,20 +98,6 @@ Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, li
 - [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
 - [`examples/switch/`](examples/switch/README.md): verified FreeSWITCH and Asterisk configurations for the reference topology
 - [`freesbc.example.yaml`](freesbc.example.yaml): annotated example
-
-## Admin & WebUI
-
-Enable the optional `admin` block (a bcrypt `password_hash`; generate with `freesbc hash-password`; the user is always `admin`), then:
-
-- browse `http://<admin.listen>/` (the login form, a cookie session; Basic Auth remains for `/metrics` and `/api/*`) for the live dashboard and the Config tab: the running file read-only, a candidate editor with Validate (the same checks as `freesbc check`, listing restart-only keys the candidate changes) and a line diff against the running file. The admin API never writes the config: edit the file, run `freesbc check -c freesbc.yaml`, and the watcher reloads it, as with nginx. Keep secrets as `${ENV}` references,
-- the Audit tab (`GET /api/audit`) lists the last 256 admin events: sign-ins (first successful login, failed login, rate-limited), logouts and drain changes (`drain_on`, `drain_off`); `freesbc_admin_auth_failures_total` counts the failures. The source is the connecting address, so behind a reverse proxy it is the proxy's,
-- the Health tab and header badge (`GET /api/health`, `GET /api/health/history`) show whether anything needs attention: a switch node cooling down, carrier DNS failing, the RTP pool at 90 % or more, the shield ban table at its cap, 2xx ACKs not coming back from one side (3 in 10 min), the TLS certificate under 30 days from expiry or expired, plus the last 200 raise and clear events (in memory; thresholds are fixed, alerting stays in Prometheus; `freesbc_admin_health_status` exposes the status as 0, 1 or 2),
-- scrape `http://<admin.listen>/metrics` with Prometheus (`basic_auth` in the scrape config),
-- set `admin.pprof: true` to also serve Go pprof under `http://<admin.listen>/debug/pprof/` behind the same auth (Basic Auth; off by default; restart-only),
-- read live state from `/api/status` (including a `reload` object: restart-only keys pending and the last failed reload), `/api/calls`, `/api/health` (overall status and the active conditions), `/api/audit`, `/api/tls` (the loaded TLS certificate, its expiry and whether the file on disk has been renewed; also the Overview's TLS card, `freesbc_tls_cert_expiry_timestamp_seconds` and `freesbc_tls_cert_disk_differs`, and the `tls_cert_renewed` health condition) and `/api/config`, and the live tables `/api/registrations`, `/api/carrier-registrations`, `/api/shield/bans`, `/api/switch-nodes` and `/api/carriers` (read-only; the WebUI's State tab shows them), and check a candidate file with `POST /api/config/validate` (body: the YAML; response `{"valid", "errors", "restart_required"}`; it writes nothing),
-- drain the node before a restart: `POST /api/drain` refuses new carrier calls (and carrier-facing OPTIONS) with `503` and `Retry-After: 30`, client calls still go through, while calls and registrations in place continue, `GET /api/drain` reports `active_calls`, `DELETE /api/drain` leaves drain mode (runtime state only; see [`docs/edge.md`](docs/edge.md) and, for a rolling restart of two nodes, [`docs/two-node.md`](docs/two-node.md)).
-
-Bind the admin listener **private**. Validation rejects a non-loopback `admin.listen` unless `admin.allow_remote: true` is set, which also requires the top-level `tls` identity and then serves HTTPS. Read the security model section of [`docs/design.md`](docs/design.md) before setting it.
 
 ## Not in scope
 

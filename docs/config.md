@@ -251,7 +251,7 @@ Optional. The section being present enables the HTTP API, `/metrics` and the Web
 |---|---|---|
 | `listen` | required | Literal `IP:port`. Loopback unless `allow_remote`. |
 | `password_hash` | required | bcrypt hash, cost at least 10. The user name is always `admin`. |
-| `allow_remote` | `false` | Permits a non-loopback `listen`; requires top-level `tls` (served over HTTPS). |
+| `allow_remote` | `false` | Permits a non-loopback `listen`; requires top-level `tls` (served over HTTPS). Read the [security model](design.md#14-security-model) before setting it. |
 | `allowed_hosts` | none | Extra host names or IP literals, no port, scheme or wildcard, no duplicates, that the `Host` header may carry (with the `listen` port). |
 | `pprof` | `false` | Serves Go `net/http/pprof` under `/debug/pprof/` on the admin listener, behind the same auth (session or Basic; no extra listener, no unauthenticated path). Off, the path answers 404. It exposes stacks and heap contents, so keep `listen` private. |
 
@@ -259,7 +259,7 @@ Web security (restart-only like the rest of `admin`):
 
 - Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` (except `/healthz`). The WebUI also carries a `Content-Security-Policy`.
 - Host check: every route except `/healthz` answers `421` unless `Host` is the `listen` IP with the listen port, on a loopback `listen` also `localhost`, `127.0.0.1` or `[::1]` with that port, or an `allowed_hosts` entry with that port (case-insensitive, trailing dot ignored). A bare host with no port is accepted only when the listen port is the scheme default (443 with TLS, 80 without). With a wildcard `listen` (`0.0.0.0`, `[::]`) any IP-literal `Host` with the listen port is accepted, since an IP literal cannot be DNS-rebound. Behind a reverse proxy or a DNS name, add the name to `allowed_hosts`. The check runs before authentication.
-- Origin check: `POST /api/config/validate`, `POST /api/drain` and `DELETE /api/drain` (any method but GET, HEAD, OPTIONS) needs an `Origin` equal to `<scheme>://<Host>`, or no `Origin` and `Sec-Fetch-Site: same-origin`; otherwise `403`. The WebUI satisfies this by itself. A script must send the header:
+- Origin check: `POST /api/config/validate`, `POST /api/drain`, `DELETE /api/drain`, `POST /api/login` and `POST /api/logout` (any method but GET, HEAD, OPTIONS) needs an `Origin` equal to `<scheme>://<Host>`, or no `Origin` and `Sec-Fetch-Site: same-origin`; otherwise `403`. The WebUI satisfies this by itself. A script must send the header:
 
   ```sh
   curl -u admin:PASSWORD -X POST -H 'Origin: http://127.0.0.1:8080' \
@@ -270,11 +270,42 @@ Web security (restart-only like the rest of `admin`):
 
 `admin.listen` must not collide with `edge.listen.tcp` / `tls` / `ws` / `wss` on `public.bind` (the same TCP address and port). Generate a hash with `freesbc hash-password` (it prompts twice without echo; in a script, `printf '%s' "$PW" | freesbc hash-password` reads one line from stdin). It never takes the password as an argument.
 
-Read-only live state (all `GET`, Basic auth, in memory, also shown in the WebUI's State tab): `/api/registrations?user=&limit=&offset=` (client bindings: `aor`, `user`, `transport`, `source`, `expires_in`; `user` is a case-insensitive substring; `limit` default 100, at most 1000; bad or negative values are `400`; the reply wraps `items` with `total`, `limit`, `offset`), `/api/carrier-registrations` (`carrier`, `user`, `token`, `node`, `expires_in`), `/api/shield/bans?limit=&offset=` (`source`, `kind` `ip` (every transport), `udp_ip` (the IP, UDP only) or `udp_socket`, `reason` `scanner`, `register`, `admission` or `malformed`, `since`, `remaining`, with `total` and `ban_adds_rejected`), `/api/shield/offenders?limit=` (sources with strikes in an open window, most first: `source` an IPv4 address or IPv6 /64, `reason` `register`, `admission` (stream strikes), `admission_udp`, `malformed` (ws/wss frames) or `malformed_udp` (one row per reason for a source in both, `strikes` being that reason's own count while `admission_ban` compares their sum), `strikes`, `since`, `remaining` seconds of the window, with `total` and `limit`; at most 1000), `/api/switch-nodes` (`address`, `state` `healthy` or `cooling_down`, `cooldown_remaining`, `last_failure`) and `/api/carriers` (`name`, `host`, `transport`, `mode`, `addresses` with `in_use`, `resolved_at`, `expires_at`, `cache_age_seconds`, `failing`, `last_error`). The lists are arrays, never `null`; see `docs/design.md` §13.3 for each shape.
+#### Endpoints
+
+Every route is served on `admin.listen`. "Session or Basic" means a `freesbc_session` cookie from `/login` or Basic credentials for `admin`; either works on every such route (see Auth model above). A wrong method is `405` with an `Allow` header. The full response shapes are in [`design.md` §13.3](design.md#133-admin-http-api).
+
+| Method | Path | Purpose | Auth |
+|---|---|---|---|
+| GET | `/` | The WebUI: Overview (status, calls, drain, health, TLS card), State, Config, Health and Audit tabs. | session or Basic |
+| GET | `/login` | The sign-in page. | none |
+| POST | `/api/login` | Sign in: JSON `{"password"}`; `204` with the session cookie, `401` wrong password, `429` over the failure limit. | none |
+| POST | `/api/logout` | End the session the cookie names and clear the cookie; always `204`. | none |
+| GET | `/assets/<file>` | WebUI static files. | none for the login page's files, session or Basic for `app.js` |
+| GET | `/healthz` | Liveness probe, always `{"status":"ok"}`; exempt from the Host check. | none |
+| GET | `/metrics` | Prometheus metrics (`basic_auth` in the scrape config). | session or Basic |
+| GET | `/debug/pprof/` | Go pprof when `admin.pprof` is true, else `404`. | session or Basic |
+| GET | `/api/status` | Version, uptime, active calls, RTP port use, listeners (`listener_info`: bound and advertised address) and the `reload` object (see [Reload classes](#reload-classes)). | session or Basic |
+| GET | `/api/calls` | Confirmed calls: `id`, `call_id`, `from`, `to`, `started`, `duration_seconds`. | session or Basic |
+| GET | `/api/registrations` | Client registration bindings, searchable and paged (below). | session or Basic |
+| GET | `/api/carrier-registrations` | The switch's registrations at carriers (below). | session or Basic |
+| GET | `/api/shield/bans` | Banned sources, paged (below). | session or Basic |
+| GET | `/api/shield/offenders` | Sources and AoRs with strikes in an open window (below). | session or Basic |
+| GET | `/api/switch-nodes` | Each `edge.switch` node: healthy or cooling down (below). | session or Basic |
+| GET | `/api/carriers` | Each carrier's resolved addresses and DNS state (below). | session or Basic |
+| GET, POST, DELETE | `/api/drain` | Report, enter or leave drain mode (below). | session or Basic |
+| GET | `/api/health` | Overall status and the active conditions (below). | session or Basic |
+| GET | `/api/health/history` | The last 200 condition raise, clear and change events. | session or Basic |
+| GET | `/api/audit` | The last 256 admin events (below). | session or Basic |
+| GET | `/api/tls` | The loaded TLS certificate, its expiry and whether the file on disk differs (see [`tls`](#tls)). | session or Basic |
+| GET | `/api/config` | The running config, `admin.password_hash` masked. | session or Basic |
+| GET | `/api/config/raw` | The file on disk, unredacted. | session or Basic |
+| POST | `/api/config/validate` | Check a candidate file, write nothing (below). | session or Basic |
+
+Read-only live state (all `GET`, session or Basic, in memory, also shown in the WebUI's State tab): `/api/registrations?user=&limit=&offset=` (client bindings: `aor`, `user`, `transport`, `source`, `expires_in`; `user` is a case-insensitive substring; `limit` default 100, at most 1000; bad or negative values are `400`; the reply wraps `items` with `total`, `limit`, `offset`), `/api/carrier-registrations` (`carrier`, `user`, `token`, `node`, `expires_in`), `/api/shield/bans?limit=&offset=` (`source`, `kind` `ip` (every transport), `udp_ip` (the IP, UDP only) or `udp_socket`, `reason` `scanner`, `register`, `admission` or `malformed`, `since`, `remaining`, with `total` and `ban_adds_rejected`), `/api/shield/offenders?limit=` (sources with strikes in an open window, most first: `source` an IPv4 address or IPv6 /64, `reason` `register`, `admission` (stream strikes), `admission_udp`, `malformed` (ws/wss frames) or `malformed_udp` (one row per reason for a source in both, `strikes` being that reason's own count while `admission_ban` compares their sum), `strikes`, `since`, `remaining` seconds of the window, with `total` and `limit`; at most 1000), `/api/switch-nodes` (`address`, `state` `healthy` or `cooling_down`, `cooldown_remaining`, `last_failure`) and `/api/carriers` (`name`, `host`, `transport`, `mode`, `addresses` with `in_use`, `resolved_at`, `expires_at`, `cache_age_seconds`, `failing`, `last_error`). The lists are arrays, never `null`; see `docs/design.md` §13.3 for each shape.
 
 `GET /api/drain` reports `{"draining", "since", "active_calls"}`; `POST` enters and `DELETE` leaves drain mode (idempotent, runtime state only, not a config key). While draining, new carrier calls (carrier to switch, switch to carrier) get `503` with `Retry-After: 30` and are counted in `freesbc_edge_invite_rejects_total{reason="draining"}`; see `docs/edge.md` and, for a rolling restart of two nodes, `docs/two-node.md`.
 
-- Health: `GET /api/health` returns `{"status": "ok"|"degraded"|"critical", "conditions": [{"id", "severity", "message", "since", "detail"?}]}` (status is the worst active severity) and `GET /api/health/history` returns `{"events": [...]}` of raise, clear and severity-change events, newest first, the last 200 in memory. Conditions: `switch_cooldown:<ip:port>`, `carrier_dns:<name>`, `config_reload_failed`, `config_restart_required` (from the same reload state as `/api/status`' `reload` object), `rtp_ports` (90 % of pairs degraded, 100 % critical), `shield_ban_cap` (clears after 60 s without a new refused ban), `ack_missed:public` / `ack_missed:private` (3 or more 2xx ACKs missing from that side within 10 min) and `admin_plain_remote`. The thresholds are fixed, not config keys; the gauge `freesbc_admin_health_status` is 0, 1 or 2. See `docs/design.md` §13.6.
+- Health: `GET /api/health` returns `{"status": "ok"|"degraded"|"critical", "conditions": [{"id", "severity", "message", "since", "detail"?}]}` (status is the worst active severity) and `GET /api/health/history` returns `{"events": [...]}` of raise, clear and severity-change events, newest first, the last 200 in memory. Conditions: `switch_cooldown:<ip:port>`, `carrier_dns:<name>`, `config_reload_failed`, `config_restart_required` (from the same reload state as `/api/status`' `reload` object), `rtp_ports` (90 % of pairs degraded, 100 % critical), `shield_ban_cap` (clears after 60 s without a new refused ban), `ack_missed:public` / `ack_missed:private` (3 or more 2xx ACKs missing from that side within 10 min), `admin_plain_remote`, `tls_cert_expiry` (degraded under 30 days, critical once expired), `tls_cert_renewed` and `tls_cert_disk_error` (see [`tls`](#tls)). The WebUI shows the status as a header badge and both lists in its Health tab. The thresholds are fixed, not config keys, and alerting stays in Prometheus: the gauge `freesbc_admin_health_status` is 0, 1 or 2. See `docs/design.md` §13.6.
 - Audit log: admin events (drain changes `drain_on` and `drain_off`, one per actual change, and sign-ins: `login_ok` on the first verification of a credential or each form login, `login_failed`, `login_limited`, and `logout` when a live session is dropped; the first three come from Basic and from `/api/login`, recorded once per lockout window per source rather than once per 429) go to the log as `admin audit` lines and into a 256-entry in-memory ring served by `GET /api/audit` and the WebUI's Audit tab; failures also count in `freesbc_admin_auth_failures_total{reason}`, where `rate_limited` counts every 429. A request with no credentials is not an event. Only the source IP is recorded (never the user, password, header or hash), and it is the connecting address: behind a reverse proxy that is the proxy's address, since `X-Forwarded-For` is not trusted.
 
 `GET /api/config/raw` returns the file unredacted on purpose; `GET /api/config` masks `admin.password_hash`.
@@ -289,7 +320,7 @@ The config API is read-only. There is no write endpoint: edit the file, run `fre
 
 `errors` lists the problems (`[]` when valid). `restart_required` lists the restart-only keys the candidate changes compared with the config the process started with (`[]` for none, and for an invalid candidate); see Reload classes. Any method other than POST is `405` with `Allow: POST`.
 
-The WebUI's Config tab has a **Download config** button that fetches `/api/config/raw` fresh (never the candidate text) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
+The WebUI's Config tab shows the running file read-only, a candidate editor whose **Validate** button calls `POST /api/config/validate` (the errors, or the restart-only keys the candidate changes), and a line diff of the running file against the candidate. It also has a **Download config** button that fetches `/api/config/raw` fresh (never the candidate text) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
 
 ### `hep`
 
