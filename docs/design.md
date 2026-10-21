@@ -1,7 +1,7 @@
 # FreeSBC Design
 
 This document describes FreeSBC as it is implemented in this repository
-(module `github.com/freesbc/freesbc`, Go 1.27.2). It describes code that
+(module `github.com/freesbc/freesbc`, Go 1.27.3). It describes code that
 exists. It contains no roadmap, no tutorial, and no generic protocol
 background; where a behaviour is unusual or fragile it is stated as the
 current behaviour without a recommendation. Every configuration key, default
@@ -416,7 +416,7 @@ Every top-level section is restart-only except `shield`. The table is
 | Hot (re-read per use) | Restart-only (`config.RestartOnlyChanges` key) |
 |---|---|
 | `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`invite.go:240`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`sessionLimit`, `invite.go:204`) | |
-| `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`shield.go:132`), re-parsing a rate-limit string only when it changes (`shield.go:233`) | `public` (`ip`, `bind`) |
+| `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`shield.go:132`), re-parsing a rate-limit string only when it changes (`shield.go:246`) | `public` (`ip`, `bind`) |
 | `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing only when the string changes (`strikeLimit`, `offenders.go`) | |
 | | `private` (`ip`) |
 | | `rtp` (the media pools read the range from `boot`, `mediapool.go:19`) |
@@ -556,13 +556,13 @@ What each handler does with the result:
 |---|---|---|---|---|
 | INVITE | `inviteToClient` | `inviteToCarrier` (`carrier.go:185`) | 404 | 404 (`invitePrivate`, `carrier.go:167`) |
 | REGISTER | 404 | `registerToCarrier` (`carrierreg.go:194`) | 404 | 404 (`onRegister`, `register.go:29-41`) |
-| OPTIONS | 200 locally (an unknown token → 404) | `optionsToCarrier` (`carrier.go:305`); 503 while draining | 200 locally; 503 while draining | 404 (`onOptions`, `edge.go:1359`) |
+| OPTIONS | 200 locally (an unknown token → 404) | `optionsToCarrier` (`carrier.go:305`); 503 while draining | 200 locally; 503 while draining | 404 (`onOptions`, `edge.go:1361`) |
 | SUBSCRIBE | `subscribeToClient` (`subscribe.go:438`); a token naming no binding → 404 | 405 | 404 | 404 |
 | BYE, INFO, NOTIFY, MESSAGE | `directionFor` by token (no binding → **481**; a MESSAGE → **404**, `indialog.go:484-488`) | 405 | 404 | 404 (`onInDialog`, `indialog.go:446-460`) |
 | REFER | 481 (no To-tag) | 481 | 481 | 481 (`indialog.go:461-466`) |
-| any other method (PUBLISH) | 405 (`onNoRoute`, `edge.go:1429`) | 405 | 405 | 405 |
+| any other method (PUBLISH) | 405 (`onNoRoute`, `edge.go:1431`) | 405 | 405 | 405 |
 
-An OPTIONS with a To tag is answered locally without classification or drain check (`onOptions`, `edge.go:1359`). A switch request that has a To tag takes the in-dialog path (§6.7), where the dialog record, not the Request-URI, decides the direction.
+An OPTIONS with a To tag is answered locally without classification or drain check (`onOptions`, `edge.go:1361`). A switch request that has a To tag takes the in-dialog path (§6.7), where the dialog record, not the Request-URI, decides the direction.
 
 ### 6.2 Inbound path: carrier to switch
 
@@ -583,7 +583,7 @@ The carrier source set for the shield (`carrierSnapshot.isSource`, IP only, so a
 - Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:35`, `invite.go:280-291`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:154-155`). The predicate is the live directory snapshot (`edge.go:594`).
 - A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:837-844`; `restoreCarrierRURI`, `hide.go:550`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
 
-A public OPTIONS from an admitted source (live registration, carrier source or a live dialog's To tag; otherwise dropped silently as `options_not_admitted`), including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1359`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
+A public OPTIONS from an admitted source (live registration, carrier source or a live dialog's To tag; otherwise dropped silently as `options_not_admitted`), including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1361`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
 
 ```mermaid
 sequenceDiagram
@@ -782,9 +782,10 @@ private UDP socket):
   and reads `skb->dev->ifindex`, so VRF, asymmetric routing, tunnels and a
   runtime interface change are dropped (docs/edge.md).
 - Every **public listener** (UDP, TCP, TLS, WS, WSS): accepted unless the source is
-  banned (`shield.Shield.BannedFrom(addr:port, transport)`, the read-only,
-  non-counting query that also matches a UDP per-socket ban; a banned stream
-  source has its connection closed on that read) or its rate-limit bucket is
+  banned (`shield.Shield.DropBanned(addr:port, transport)`: `BannedFrom`,
+  which also matches a UDP per-socket ban, plus one
+  `freesbc_shield_drops_total{reason="banned"}` per dropped read; a banned
+  stream source has its connection closed on that read) or its rate-limit bucket is
   empty (`shield.Shield.AllowRate`, one token per datagram or WS/WSS frame; a
   tcp/tls connection is charged per message it starts, §7.1a, see below). The public plane has no
   source allowlist — phones, browsers and carriers have no single fixed
@@ -848,10 +849,10 @@ lives in process memory, is never logged or sent, and a leaked secret would
 let a public sender claim the private socket.
 
 The private direction switch every handler uses is `inbound.private()`
-(`arr == arrPrivate`, `edge.go:1330`): the request reached the private
+(`arr == arrPrivate`, `edge.go:1332`): the request reached the private
 socket.
 
-**`guard`** (`edge.go:1155`) wraps every handler: it first grows the
+**`guard`** (`edge.go:1157`) wraps every handler: it first grows the
 handler goroutine's stack once (`growStack`, a 12 KiB frame entered while the
 stack is still shallow, so the runtime copies it straight to 16 KiB instead of
 growing it several times deep inside the INVITE, ACK and BYE paths; issue
@@ -876,9 +877,15 @@ before parsing: sipgo answers some messages itself before any handler runs
 transaction), so `guard` alone could not keep a ban silent. The filter
 applies the ban to every public read and exempts nothing on it; the private
 socket is never shield-checked, in the filter or in `guard`. It asks
-`shield.Shield.BannedFrom(addr:port, transport)`, and a banned stream source
-has its connection closed on that read, so a ban also ends connections opened
-before it.
+`shield.Shield.DropBanned(addr:port, transport)`, which is `BannedFrom` plus
+the count: each read it drops is one `freesbc_shield_drops_total{reason="banned"}`
+(issue #249). Such a read never reaches `guard`, so `CheckScanner` cannot count
+it; `CheckScanner` still counts a request parsed before its source was banned,
+and every other caller (the stream accept in `streamListener.prepare`, `guard`'s
+stream-close check after a `CheckScanner` drop) uses the side-effect-free
+`BannedFrom`, so each read counts once. A banned stream source has its
+connection closed on that read, so a ban also ends connections opened before
+it.
 
 The same filter charges the **rate limit**, before parsing:
 `shield.Shield.AllowRate(ip)` takes one token from the source's bucket
@@ -921,7 +928,7 @@ with a carrier caller) and switch to carrier (`inviteToCarrier`); client to
 switch (a registered source, which wins over a carrier source as in
 admission) and switch to client (`inviteToClient`) pass `carrierCall=false`
 and are admitted. A public INVITE that admission (§7.5) drops silently is
-still dropped silently, since admission runs first. `onOptions` (`edge.go:1359`)
+still dropped silently, since admission runs first. `onOptions` (`edge.go:1361`)
 reports drain too, for an out-of-dialog OPTIONS only: **503** +
 `Retry-After: 30` to a carrier source (not also a live registration; a source admission drops gets silence first), to a
 switch OPTIONS naming FreeSBC itself and to a switch OPTIONS naming a carrier
@@ -1066,7 +1073,7 @@ built in `New` from the `hep.Sender` that `app` passes in with `edge.WithHEP`
 no-op. Capture never blocks and never fails a message: `hep.Sender.Send` only
 queues, and a full queue drops the copy (`freesbc_hep_packets_dropped_total`).
 
-- **Inbound** is taken in the read filter (`edge.go:1072`), right after the
+- **Inbound** is taken in the read filter (`edge.go:1074`), right after the
   size cap, the private-source check, the ban and the rate token have accepted
   the bytes (`base`) and BEFORE `marker.stamp`. A flood the shield drops is
   therefore not mirrored, and the per-process `X-FreeSBC-Arrival` secret never
@@ -1179,7 +1186,7 @@ a phone behind NAT.
 **Advertised extensions** (`sanitizeExtensions`, `internal/edge/extensions.go:37`). Every
 request `prepareForward` builds and every response `relayResponseHide` relays
 has its `Allow` cut down to the methods above that the proxy carries
-(`allowedMethods`, `edge.go:1424`); the header is rewritten only when
+(`allowedMethods`, `edge.go:1426`); the header is rewritten only when
 something is dropped, and one left empty is removed. `Supported`,
 `Require`, `RSeq` and `RAck` pass unchanged: reliable provisional responses
 (RFC 3262) and UPDATE (RFC 3311) are end to end, and Call-ID, tags and CSeq,
@@ -1871,7 +1878,7 @@ and sipgo refuses an ACK in `TransactionRequest`. An ACK whose top Via
 matches a live INVITE server transaction (every non-2xx ACK, which reuses the
 INVITE branch, and the 2xx ACK of a client that reuses it too) goes to
 sipgo's transaction, never to the ACK handler. `guard` therefore starts
-`drainAcks` (`edge.go:1251`) for every INVITE: it reads `tx.Acks()` until the
+`drainAcks` (`edge.go:1253`) for every INVITE: it reads `tx.Acks()` until the
 transaction ends, so sipgo parks no goroutine and logs no `ACK missed`. After
 a non-2xx final the ACK is absorbed (Debug log; the edge's own client
 transaction ACKs the far end's hop), after a 2xx it runs through
@@ -3534,7 +3541,7 @@ spin.
 
 | Umbrella | Scope |
 |---|---|
-| `edge.guard` (`edge.go:1155`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
+| `edge.guard` (`edge.go:1157`) | every registered edge handler; logs, counts, and answers 500 unless a final already went out |
 | `media.recoverRelayPanic` (`media/relay.go:115`) | every relay goroutine; closes **that session only** |
 | `admin.recoverMW` (`admin/server.go:672`) | every HTTP handler; logs the panic with its stack, answers 500 with no stack in the body, and re-panics `http.ErrAbortHandler` per the stdlib convention |
 | `config.unmarshalStrict` (`config/loader.go:54`) | the go-yaml decoder inside `Parse`; a decoder panic becomes a parse error |
@@ -3712,7 +3719,7 @@ permanent series per call."
 | `freesbc_active_webrtc_sessions` | Gauge | — | edge |
 | `freesbc_registration_total` | Counter | — | edge `recordBinding` success |
 | `freesbc_registration_failure_total` | Counter | — | edge: series exhaustion, a rejected registration, and a full binding table |
-| `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `guard`, for every request the shield admits (`edge.go:1155`) |
+| `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `guard`, for every request the shield admits (`edge.go:1157`) |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | every response the edge sends or relays |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end()` (`dialog.go:1197`, `Metrics.MediaEnded`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
@@ -3741,7 +3748,11 @@ permanent series per call."
 
 `freesbc_shield_drops_total` reports the edge shield, the only shield there is
 (`edge.go` `Run` creates it). Its `banned` and `scanner` branches are
-reachable there. Current ban counts and ban-table overflow are kept in
+reachable there. `banned` counts public reads (UDP datagrams, WS/WSS frames,
+tcp/tls chunks) the read filter drops for a ban (`Shield.DropBanned`), plus
+requests `CheckScanner` drops because the ban landed after their read passed
+the filter; a connection refused at accept for a ban is
+`freesbc_edge_stream_refused_total{reason="banned"}` instead. Current ban counts and ban-table overflow are kept in
 `shield.Stats` but not exported as metrics, and there is no unban API.
 
 The Go runtime collector (`collectors.NewGoCollector`) and the process collector (`collectors.NewProcessCollector`: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and the like, Linux only apart from `process_start_time_seconds`) are registered too.
@@ -3789,7 +3800,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request, so it is always current; the health conditions and the gauge use a separate cache refreshed every 10 minutes (`tlsDiskInterval`). Never the key or PEM |
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`handleRegistrations`, `state.go:142`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go:423`) under its read lock. No Contact, token or Call-ID |
 | `/api/carrier-registrations` | GET (else 405) | Basic | array of `{"carrier","user","token","node","expires_in"}`; always an array. The switch's live registrations at carriers (`carrierRegTable.snapshot`, `carrierreg.go:312`); `token` is the opaque `fsbc` value in the carrier Contact, `node` the registering switch node |
-| `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`handleBans`, `state.go:193`): `{"items":[{"source","kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. Both ban tables merged, newest first (`Shield.Bans`, `shield.go:290`); limit and offset as for registrations. `reason` is `scanner`, `register` or `admission`; `udp_ip` is an IP banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
+| `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`handleBans`, `state.go:193`): `{"items":[{"source","kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. Both ban tables merged, newest first (`Shield.Bans`, `shield.go:303`); limit and offset as for registrations. `reason` is `scanner`, `register` or `admission`; `udp_ip` is an IP banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
 | `/api/shield/offenders` | GET (else 405) | Basic | `?limit=` (`handleOffenders`, `state.go`): `{"items":[{"source" (IPv4 address or IPv6 /64),"reason" ("register", "admission", "admission_udp", "malformed", "malformed_udp" or "register_aor", whose "source" is then the AoR),"strikes","since" (RFC 3339, the window opened),"remaining" (seconds of the window)}],"total","limit"}`, most strikes first (`Shield.Offenders`, `offenders.go`); limit default 100, at most 1000 |
 | `/api/switch-nodes` | GET (else 405) | Basic | array of `{"address","state" ("healthy" or "cooling_down"),"cooldown_remaining" (seconds),"last_failure" (RFC 3339 or null)}`; always an array, one per `edge.switch` entry, sorted by address (`cooldownTable.snapshot`, `cooldown.go:76`) |
 | `/api/carriers` | GET (else 405) | Basic | array of `{"name","host","transport","mode" ("literal", "srv", "a" or "" until resolved),"addresses":[{"address","in_use"}],"resolved_at","expires_at" (RFC 3339 or null),"cache_age_seconds" (or null),"failing","last_error"}`; always an array, sorted by name (`carrierDirectory.snapshotInfo`, `carrierdns.go:474`). `in_use` marks the first address, the one the edge sends to. While `failing`, `expires_at` is the next retry and the addresses are the last good set |
@@ -4071,7 +4082,7 @@ rules are in `docs/admin-ui.md`.
 
 The State tab's tables read state the edge records for this purpose, all in
 memory and copied under the owning lock: a ban's reason and start time
-(`banEntry`, `banlist.go:45`; `BanInfo`, `shield.go:269`), a switch node's last
+(`banEntry`, `banlist.go:45`; `BanInfo`, `shield.go:282`), a switch node's last
 penalty time (`cooldownTable.lastFail`, `cooldown.go:24`, set in `Penalize`,
 `cooldown.go:41`), and a carrier's resolution mode and last DNS error
 (`carrierEntry.mode` and `lastErr`, `carrierdns.go:134`, `:137`, set in
@@ -4098,7 +4109,7 @@ read (`fsip.MaxReadSize`, `internal/sip/readfilter.go:20`, below sipgo's
 (`private.ip:5060`, UDP) is admitted only from a switch node's IP; a request
 read there is stamped with the arrival marker (below). A public read from a
 source the shield has banned — its IP, or on UDP its exact socket
-(`Shield.BannedFrom`) — is dropped, so a ban stays silent even for what sipgo
+(`Shield.DropBanned`, which counts it as a `banned` shield drop) — is dropped, so a ban stays silent even for what sipgo
 would answer before any handler. A public read from a source whose
 rate-limit bucket is empty (`Shield.AllowRate`) is dropped too, before the
 parser, whether or not it would have parsed. The filter never returns an error, because
@@ -4107,7 +4118,7 @@ sipgo treats a filter error as fatal to the whole read loop.
 **Arrival marker.** Trust is keyed on the local socket alone, never on a
 source address. The filter stamps each request that reached the private socket
 from a switch IP with `X-FreeSBC-Arrival: <per-process 128-bit secret>;private`
-in a new byte slice (`stamp`, `arrival.go:75`). `guard` (`edge.go:1155`) calls
+in a new byte slice (`stamp`, `arrival.go:75`). `guard` (`edge.go:1157`) calls
 `take` (`arrival.go:206`) first, for every request on every transport: the
 arrival is private only when the first marker header equals the secret
 (constant-time); anything else is public. Every `X-FreeSBC-*` header — the
@@ -4221,7 +4232,7 @@ unmapped IPs, and every lookup unmaps its argument, so `::ffff:192.0.2.1` is
 seen as `192.0.2.1` (P2-SHD-009). A ban also closes the banned source's
 tcp/tls/ws/wss connection: `guard` closes the one the banning request came on,
 and the read filter closes any other on its next read (`closeStream`,
-`edge.go:1292`, P2-SHD-006). An idle connection opened before the ban stays open
+`edge.go:1294`, P2-SHD-006). An idle connection opened before the ban stays open
 until it next sends. There is no kernel enforcement and no API that lifts a
 ban.
 
@@ -4509,7 +4520,7 @@ code constant.
 | `ackTimeout` (`ackBudget`) | 32 s (`edge.go`) | also the wait for a 2xx ACK before `ack_timeout` ends the call (`ack.go`) |
 | `banCapQuiet` | 60 s (`app/health.go:22`) | how long `BanAddsRejected` must stand still before `shield_ban_cap` clears |
 | `shield.ban` | 1 h (config); a UDP socket ban at most 1 min (`socketBanMax`) | a scanner ban, a `register_ban` ban and an `admission_ban` ban |
-| shield prune tick | 1 min (`shield.go:251`) | expired bans and idle rate-limit buckets |
+| shield prune tick | 1 min (`shield.go:264`) | expired bans and idle rate-limit buckets |
 | binding / carrier-registration / subscription prune tick | 30 s (`edge.go:698`, `edge.go:708`) | expired bindings (memory only; lookups already hide them) and expired subscription records |
 | `enumWindow` | 10 min, from a source's first counted rejection | the REGISTER enumeration limit (§7.4) |
 | `shield.register_ban` window | 10 min (config), from a source's first strike | the REGISTER credential guard (§7.4) |

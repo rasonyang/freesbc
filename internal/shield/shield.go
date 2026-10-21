@@ -201,6 +201,19 @@ func (s *Shield) BannedFrom(src netip.AddrPort, transport string) bool {
 	return s.udpBans.banned(src.Addr()) || (src.Port() != 0 && s.socketBans.banned(src))
 }
 
+// DropBanned is BannedFrom plus the "banned" drop count. The read filter
+// rejects a banned read before parsing, so CheckFrom and CheckScanner never
+// see it; without this, freesbc_shield_drops_total{reason="banned"} would
+// count only requests parsed before the ban took effect. Call it once per
+// read that is dropped for the ban, and BannedFrom everywhere else.
+func (s *Shield) DropBanned(src netip.AddrPort, transport string) bool {
+	if !s.BannedFrom(src, transport) {
+		return false
+	}
+	s.dropsBanned.Add(1)
+	return true
+}
+
 // Stats is a snapshot of shield activity for metrics.
 type Stats struct {
 	BannedCurrent int

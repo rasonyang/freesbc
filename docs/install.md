@@ -80,7 +80,7 @@ tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
 
 ## Build from source
 
-Requires Go >= 1.27.2:
+Requires Go >= 1.27.3:
 
 ```sh
 go build -o freesbc ./cmd/freesbc

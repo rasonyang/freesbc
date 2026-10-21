@@ -1033,7 +1033,9 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 		s.shieldMu.RUnlock()
 		if sh != nil && info.RemoteAddr != nil {
 			if ap, ok := readAddrPort(info.RemoteAddr); ok {
-				if sh.BannedFrom(ap, info.Transport) {
+				// DropBanned counts the read as a "banned" shield drop:
+				// it never reaches guard, so CheckScanner cannot.
+				if sh.DropBanned(ap, info.Transport) {
 					// A stream from a banned source is closed on its next
 					// read, so a ban also ends connections opened before it.
 					s.closeStream(info.Transport, info.RemoteAddr.String())
