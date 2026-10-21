@@ -44,7 +44,8 @@ Everything else stays on the switch; FreeSBC's contribution is a documented
 switch-side example, not a feature. Per-carrier concurrency and CPS limits,
 maximum call duration, toll-fraud protection, CDR, call events, RTCP
 reporting, config history and a config write API are all on the far side of
-this line (README, "Not in scope"). The boundaries below follow from it.
+this line ([edge.md, "Scope rule"](edge.md#scope-rule), which lists where
+each lives on the switch). The boundaries below follow from it.
 
 **Toward public endpoints.** FreeSBC terminates SIP over UDP, TCP, TLS, WS and WSS, and
 terminates the media path: RTP, SRTP-over-DTLS, and ICE-Lite. A public
@@ -4703,6 +4704,24 @@ Stated because the code establishes them, not as future work.
 ---
 
 ## 17. Package ownership map
+
+```text
+cmd/freesbc/          argv parsing, signal handling, exit codes
+internal/
+  app/                construction and lifecycle: builds every component and runs it
+  config/             freesbc.yaml: parse, validate, hot reload
+  sip/                SIP protocol primitives
+  sip/sdp/            SDP subsystem (parse, codec negotiation, construction)
+  edge/               SIP/RTP/WebRTC proxy between public parties and the switch
+  media/              RTP/RTCP relay, port pools, WebRTC leg (ICE/DTLS/SRTP)
+  hep/                HEPv3 sender for the optional HOMER mirror
+  shield/             per-IP rate limiting, scanner fingerprinting, in-memory bans
+  admin/              operator HTTP API, Prometheus metrics, embedded WebUI
+```
+
+Everything is under `internal/`: the only consumer is `cmd/freesbc`, so no
+package carries an API promise. Dependencies run one way,
+`cmd/freesbc -> app -> {edge, admin}` (§2).
 
 | Package | Owns | Must not own |
 |---|---|---|

@@ -1,6 +1,6 @@
 # Switch-side examples
 
-Minimal, copy-pasteable configurations for the switch behind FreeSBC. They are illustrations: the list in [`docs/edge.md`](../../docs/edge.md#switch-side-requirements) ("Switch-side requirements") is normative, and if a file here disagrees with it, `docs/edge.md` wins. FreeSBC does not ship or manage switch configuration (the [scope rule](../../README.md#not-in-scope)); these are examples, not a feature.
+Minimal, copy-pasteable configurations for the switch behind FreeSBC. They are illustrations: the list in [`docs/edge.md`](../../docs/edge.md#switch-side-requirements) ("Switch-side requirements") is normative, and if a file here disagrees with it, `docs/edge.md` wins. FreeSBC does not ship or manage switch configuration (the [scope rule](../../docs/edge.md#scope-rule)); these are examples, not a feature.
 
 | Switch | Files | Verified |
 |---|---|---|

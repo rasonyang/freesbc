@@ -198,7 +198,7 @@ Not exercised: `leg_timeout`/`originate_timeout` variants, a gateway ping answer
 
 ## Policy FreeSBC deliberately does not do
 
-FreeSBC only does what the edge alone can do ([scope rule](../../../README.md#not-in-scope)). These stay on the switch. The `limit` on a gateway key, `sched_hangup` and the CDR below were run against the same setup; the per-user `limit` uses the same syntax and was not run.
+FreeSBC only does what the edge alone can do ([scope rule](../../../docs/edge.md#scope-rule)). These stay on the switch. The `limit` on a gateway key, `sched_hangup` and the CDR below were run against the same setup; the per-user `limit` uses the same syntax and was not run.
 
 **Per-carrier and per-user concurrent-call limits**, in the dialplan before the bridge (`mod_hash` is loaded in the stock config):
 

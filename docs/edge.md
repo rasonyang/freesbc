@@ -236,10 +236,27 @@ heplify -i <private-interface> -m SIPRTCP -hs 10.77.0.50:9060 -hi 42 -hn fs1
 
 Checked with FreeSWITCH 1.11.3, heplify 2.0.28 and HOMER 11: an SR from each end, in both directions, under the call's Call-ID, with rtcp-mux and with RTCP on RTP+1.
 
+## Scope rule
+
+FreeSBC does only what is necessary to make one switch on a private LAN safely reachable from the public internet. Anything the switch (FreeSWITCH or Asterisk) already does well, FreeSBC does not do. A feature is in scope only if it passes one of these:
+
+1. Only the edge can see or do it: the public wire before rewrite, TLS/WSS/WebRTC termination, NAT and latching, topology hiding, media anchoring, public-side admission, or FreeSBC's own state (sockets, ports, bindings, bans, reloads).
+2. The switch cannot do it well from behind the edge.
+
+Everything else stays on the switch; FreeSBC's contribution is a documented switch-side example (see [`examples/switch/`](../examples/switch/README.md)), not a feature. Concrete examples that stay on the switch:
+
+- Per-carrier and per-user concurrency and CPS limits: FreeSWITCH `limit`, `max-sessions`, `sessions-per-second`; Asterisk `GROUP()` / `GROUP_COUNT()`.
+- Maximum call duration: FreeSWITCH `sched_hangup`; Asterisk `Dial` `L()` and `TIMEOUT(absolute)`.
+- Toll-fraud protection: switch authentication plus dialplan rules.
+- Call history and CDR: the switch's CDR and CEL.
+- Call lifecycle events: the switch's event system.
+- Config version history: the operator's VCS.
+- Editing the config through the admin API: edit the file, run `freesbc check`, and the watcher reloads it. Like nginx, there is no write API.
+
 ## Non-goals
 
 - Business routing, dial plans, least-cost routing and number transformation: the switch's job.
-- Holding credentials, registering to carriers on its own, or terminating digest authentication.
+- Being a registrar in its own right, holding credentials, registering to carriers on its own, or terminating digest authentication: REGISTER is proxied to the switch, which owns users and credentials.
 - A B2BUA: no leg-splitting, no Call-ID rewriting, no transcoding.
 - SRV failover across targets, NAPTR, or carrier OPTIONS keep-alive of its own.
 - RTCP reporting to HOMER: the switch does it, see [RTCP and call quality in HOMER](#rtcp-and-call-quality-in-homer).
@@ -305,6 +322,7 @@ These are structural rather than scheduled, except those that link an issue.
 - **A browser offer without `a=rtcp-mux` is refused (488).** The WebRTC leg is a single ICE component carrying RTP and RTCP together, and RFC 5761 §5.1.1 lets an answer say `a=rtcp-mux` only when the offer did. Every current browser offers it.
 - **`a=fmtp` carries only allowlisted parameters.** Codec parameters cross legs re-rendered from a per-codec allowlist (opus, telephone-event events, and a few others); anything else in an fmtp line is dropped, so the far side uses the codec's defaults for it.
 - **One media session per call.** Dialogs are identified by Call-ID and both tags, and each early dialog of a forking far end gets its own answer; the anchored media follows the fork that answered last and, once one sends a 2xx, that fork. A 2xx from a second fork after that is ACKed and BYEd rather than relayed: two confirmed dialogs would need two sessions, a B2BUA's problem.
+- **SDES-SRTP is off unless enabled, and needs encrypted signaling.** `a=crypto` is ignored unless `edge.srtp` (clients) or a carrier's `srtp` enables it, and then it is used only over TLS or WSS signaling (or with `edge.allow_insecure_sdes`); browser legs get DTLS-SRTP. See [SDES-SRTP on public legs](#sdes-srtp-on-public-legs).
 - **Switches are UDP at literal addresses.** One or a pool, with per-user hashing and passive failover between pool members, but no SRV, no TCP/TLS toward the switch, and no failover to a switch outside the pool. Carriers may use UDP, TCP or TLS.
 - **IPv6 is untested**, though the code paths are address-family agnostic.
 - **PRACK with SDP is accepted only as the answer to a pending offer.** A PRACK that carries SDP when no offer of a reliable 18x is owed on its fork is refused 488, and so is one that arrives after the 2xx confirmed the dialog (the answer can still come in the ACK). An offer in a PRACK is not supported; use UPDATE.

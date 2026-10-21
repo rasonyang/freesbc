@@ -2,7 +2,7 @@
 
 FreeSBC targets small deployments, so high availability stays simple: two independent FreeSBC nodes in front of the same switch, and nothing shared between them. If a node is lost (a crash, or a drained restart), the calls in progress on it can drop, but the next call goes through the other node.
 
-FreeSBC does nothing special for this. The two nodes never talk to each other. Everything that makes the next call take the other node is configuration on the carriers, the switch and the clients, described below. This follows the [scope rule](../README.md#not-in-scope): failover between SBCs is decided by the party that dials them.
+FreeSBC does nothing special for this. The two nodes never talk to each other. Everything that makes the next call take the other node is configuration on the carriers, the switch and the clients, described below. This follows the [scope rule](edge.md#scope-rule): failover between SBCs is decided by the party that dials them.
 
 The concrete configuration is in [`examples/switch/freeswitch/`](../examples/switch/freeswitch/README.md) and [`examples/switch/asterisk/`](../examples/switch/asterisk/README.md) (section "Two FreeSBC nodes" in each README). Both run two nodes in Docker, and `test/run.sh` in each checks the failover. This guide says, for each switch behaviour it relies on, whether those tests exercise it. Anything marked "not exercised" is expected from the documentation or the code, not observed.
 
