@@ -63,6 +63,10 @@ OUT_ROOT=${OUT_ROOT:-$HERE/out}
 
 if [[ $TOPOLOGY == compose ]]; then
 	DC="docker compose -f $COMPOSE_FILE"
+	# The images build in golang:$GO_VERSION, go.mod's `go` line (no Go
+	# toolchain needed here).
+	GO_VERSION=$(sed -n 's/^go //p' "$HERE/../../go.mod" 2>/dev/null)
+	export GO_VERSION
 	LOADGEN_EXEC=${LOADGEN_EXEC-$DC exec -T loadgen}
 	CARRIERGEN_EXEC=${CARRIERGEN_EXEC-$DC exec -T carriergen}
 	CARRIER_EXEC=${CARRIER_EXEC-$DC exec -T carrier}
@@ -87,6 +91,8 @@ die() { echo "run.sh: $*" >&2; exit 1; }
 note() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
 usage() { sed -n '2,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+[[ $TOPOLOGY != compose || -n $GO_VERSION ]] || die "cannot read the go line from $HERE/../../go.mod"
 
 # ---------------------------------------------------------------- up / down
 case ${1:-} in
