@@ -153,7 +153,7 @@
   // ---- dashboard ----
 
   function renderStatus(data) {
-    $("header-version").textContent = "v" + data.version;
+    $("header-version").textContent = data.version;
     $("stat-version").textContent = data.version;
     $("stat-uptime").textContent = fmtDuration(data.uptime_seconds);
     $("stat-active-calls").textContent = fmtInt(data.active_calls);

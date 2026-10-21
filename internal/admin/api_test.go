@@ -23,6 +23,26 @@ func TestAPIStatus(t *testing.T) {
 	}
 }
 
+// The version is shown as the build set it: a release tag already carries
+// its "v", so neither the API nor the header adds one (#254).
+func TestAPIStatusVersionVerbatim(t *testing.T) {
+	deps := emptyDeps()
+	deps.Version = "v0.6.0"
+	var st struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(authGET(t, newTestServer(t, deps), "/api/status"), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Version != "v0.6.0" {
+		t.Errorf("version = %q, want v0.6.0", st.Version)
+	}
+	js := uiGet(t, testServer(t), "/assets/app.js", true).Body.String()
+	if !strings.Contains(js, `$("header-version").textContent = data.version;`) {
+		t.Error("app.js must show the header version as the API reports it")
+	}
+}
+
 // listener_info pairs each bound listener with its advertised address, and
 // the older listeners strings stay.
 func TestAPIStatusListenerInfo(t *testing.T) {
