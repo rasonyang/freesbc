@@ -2,6 +2,9 @@
 # Release run, weekly, and by hand. It uses the checked-out install.sh (not
 # the release asset), so it also covers releases published before install.sh
 # was one. ci.yml tests the script on every PR against a local release.
+# The FREESBC_VERIFY=require runs check the latest release's signed
+# SHA256SUMS with a real cosign; pinned old releases keep the default
+# (auto), since releases up to v0.6.1 are unsigned.
 name: Install
 
 on:
@@ -14,6 +17,16 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The last release published without SHA256SUMS.sigstore.json. While it
+  # is the latest, the require runs are skipped with a notice; any later
+  # release without a bundle fails them.
+  LAST_UNSIGNED: v0.6.1
+  COSIGN_VERSION: v3.1.3
+  # sha256 of cosign-linux-amd64 from cosign_checksums.txt of v3.1.3 (the
+  # container cannot run cosign-installer, which needs envsubst).
+  COSIGN_LINUX_AMD64_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
 
 concurrency:
   group: install-${{ github.ref }}
@@ -34,12 +47,19 @@ jobs:
           - name: latest
             version: ''
             flags: ''
+            verify: ''
           - name: latest, --no-service
             version: ''
             flags: --no-service
+            verify: ''
+          - name: latest, FREESBC_VERIFY=require
+            version: ''
+            flags: ''
+            verify: require
           - name: pinned v0.5.0, --no-service
             version: v0.5.0
             flags: --no-service
+            verify: ''
     steps:
       - name: install curl
         run: |
@@ -47,12 +67,33 @@ jobs:
           apt-get install -y -qq --no-install-recommends curl ca-certificates
       - uses: actions/checkout@v7
 
+      - name: skip require while the latest release is unsigned
+        if: matrix.verify == 'require'
+        run: |
+          latest=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/rasonyang/freesbc/releases/latest)
+          if [ "${latest##*/}" = "$LAST_UNSIGNED" ]; then
+            echo "::notice::the latest release is $LAST_UNSIGNED, the last unsigned one; skipping FREESBC_VERIFY=require"
+            echo SKIP=1 >> "$GITHUB_ENV"
+          fi
+
+      - name: install cosign ${{ env.COSIGN_VERSION }}
+        if: matrix.verify == 'require' && env.SKIP != '1'
+        run: |
+          curl -fsSL -o /usr/local/bin/cosign \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_LINUX_AMD64_SHA256}  /usr/local/bin/cosign" | sha256sum -c -
+          chmod 0755 /usr/local/bin/cosign
+          cosign version
+
       - name: install.sh ${{ matrix.flags }}
+        if: env.SKIP != '1'
         env:
           FREESBC_VERSION: ${{ matrix.version }}
+          FREESBC_VERIFY: ${{ matrix.verify }}
         run: sh install.sh ${{ matrix.flags }}
 
       - name: freesbc version
+        if: env.SKIP != '1'
         env:
           FREESBC_VERSION: ${{ matrix.version }}
         run: |
@@ -73,17 +114,39 @@ jobs:
         include:
           - name: latest
             version: ''
+            verify: ''
+          - name: latest, FREESBC_VERIFY=require
+            version: ''
+            verify: require
           - name: pinned v0.5.0
             version: v0.5.0
+            verify: ''
     env:
       FREESBC_VERSION: ${{ matrix.version }}
+      FREESBC_VERIFY: ${{ matrix.verify }}
     steps:
       - uses: actions/checkout@v7
 
+      - name: skip require while the latest release is unsigned
+        if: matrix.verify == 'require'
+        run: |
+          latest=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/rasonyang/freesbc/releases/latest)
+          if [ "${latest##*/}" = "$LAST_UNSIGNED" ]; then
+            echo "::notice::the latest release is $LAST_UNSIGNED, the last unsigned one; skipping FREESBC_VERIFY=require"
+            echo SKIP=1 >> "$GITHUB_ENV"
+          fi
+
+      - uses: sigstore/cosign-installer@v4.1.2
+        if: matrix.verify == 'require' && env.SKIP != '1'
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
       - name: install.sh
+        if: env.SKIP != '1'
         run: FREESBC_PREFIX="${RUNNER_TEMP}/freesbc" sh install.sh
 
       - name: freesbc version
+        if: env.SKIP != '1'
         run: |
           want=${FREESBC_VERSION:-$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/rasonyang/freesbc/releases/latest)}
           want=${want##*/}

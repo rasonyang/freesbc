@@ -101,6 +101,11 @@ jobs:
   # release packaged exactly as release.yml does it (linux/amd64 only) and
   # served from localhost through FREESBC_BASE_URL. install.yml runs the
   # script against the real GitHub releases after each release.
+  #
+  # A pull request has no OIDC token to sign with, so the FREESBC_VERIFY
+  # cases use a stub cosign: it accepts only the verify-blob call install.sh
+  # must make (bundle, identity regexp and issuer below, exactly) and passes
+  # when the blob's sha256 equals the digest recorded in the fixture bundle.
   install:
     name: install.sh
     runs-on: ubuntu-latest
@@ -108,6 +113,11 @@ jobs:
     env:
       TAG: v0.0.0-ci
       BAD: v0.0.0-bad
+      SIGNED: v0.0.0-signed
+      TAMPERED: v0.0.0-tampered
+      BROKEN: v0.0.0-broken
+      CERT_IDENTITY: '^https://github\.com/rasonyang/freesbc/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$'
+      CERT_ISSUER: https://token.actions.githubusercontent.com
       FREESBC_BASE_URL: http://127.0.0.1:18080
     steps:
       - uses: actions/checkout@v7
@@ -143,6 +153,78 @@ jobs:
           (cd "$bad" && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
           printf 'corrupt' | dd of="${bad}/freesbc_${BAD}_linux_amd64.tar.gz" bs=1 seek=100 conv=notrunc
 
+      - name: package signed test releases
+        run: |
+          set -euo pipefail
+          base="${RUNNER_TEMP}/stage/freesbc_${TAG}_linux_amd64"
+          # release T: the staged build as release T, with its SHA256SUMS.
+          release() {
+            local n="freesbc_${1}_linux_amd64" d="${RUNNER_TEMP}/srv/download/${1}"
+            mkdir -p "$d"
+            rm -rf "${RUNNER_TEMP}/stage/${n}"
+            cp -R "$base" "${RUNNER_TEMP}/stage/${n}"
+            tar -C "${RUNNER_TEMP}/stage" -czf "${d}/${n}.tar.gz" "$n"
+            (cd "$d" && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
+          }
+          # sign T: a fixture bundle carrying the digest of T's SHA256SUMS,
+          # where a real Sigstore bundle carries it too.
+          sign() {
+            local d="${RUNNER_TEMP}/srv/download/${1}"
+            printf '{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":{},"messageSignature":{"messageDigest":{"algorithm":"SHA2_256","digest":"%s"},"signature":""}}\n' \
+              "$(openssl dgst -sha256 -binary "${d}/SHA256SUMS" | base64)" > "${d}/SHA256SUMS.sigstore.json"
+          }
+          release "$SIGNED"; sign "$SIGNED"
+          # A changed tarball, with SHA256SUMS rewritten to match it and the
+          # original bundle kept: only the signature can catch it.
+          release "$TAMPERED"; sign "$TAMPERED"
+          t="${RUNNER_TEMP}/srv/download/${TAMPERED}"
+          cp "${t}/SHA256SUMS" "${RUNNER_TEMP}/tampered.orig"
+          echo changed > "${RUNNER_TEMP}/stage/freesbc_${TAMPERED}_linux_amd64/EXTRA"
+          tar -C "${RUNNER_TEMP}/stage" -czf "${t}/freesbc_${TAMPERED}_linux_amd64.tar.gz" "freesbc_${TAMPERED}_linux_amd64"
+          (cd "$t" && sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS)
+          if cmp -s "${t}/SHA256SUMS" "${RUNNER_TEMP}/tampered.orig"; then echo "::error::SHA256SUMS did not change"; exit 1; fi
+          release "$BROKEN"
+          echo 'not a bundle' > "${RUNNER_TEMP}/srv/download/${BROKEN}/SHA256SUMS.sigstore.json"
+
+      - name: write the stub cosign
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/stub"
+          # The expected identity and issuer are written into the stub, so
+          # it does not depend on the environment install.sh runs in.
+          {
+          echo '#!/bin/sh'
+          echo '# Stub cosign for the install job: see the job comment in ci.yml.'
+          printf "want_identity='%s'\nwant_issuer='%s'\n" "$CERT_IDENTITY" "$CERT_ISSUER"
+          cat << 'EOF'
+          set -eu
+          fail() { echo "stub cosign: $*" >&2; exit 1; }
+          [ "${1:-}" = verify-blob ] || fail "want verify-blob, got: $*"
+          shift
+          bundle= identity= issuer= blob=
+          while [ $# -gt 0 ]; do
+            case $1 in
+            --bundle) bundle=$2; shift 2 ;;
+            --certificate-identity-regexp) identity=$2; shift 2 ;;
+            --certificate-oidc-issuer) issuer=$2; shift 2 ;;
+            -*) fail "unexpected flag $1" ;;
+            *) [ -z "$blob" ] || fail "more than one blob"; blob=$1; shift ;;
+            esac
+          done
+          [ "$identity" = "$want_identity" ] || fail "identity regexp is '$identity', want '$want_identity'"
+          [ "$issuer" = "$want_issuer" ] || fail "issuer is '$issuer', want '$want_issuer'"
+          [ -f "$bundle" ] || fail "no bundle file: '$bundle'"
+          [ -f "$blob" ] || fail "no blob file: '$blob'"
+          want=$(sed -n 's/.*"messageDigest":{"algorithm":"SHA2_256","digest":"\([^"]*\)".*/\1/p' "$bundle")
+          [ -n "$want" ] || fail "no digest in the bundle"
+          got=$(openssl dgst -sha256 -binary "$blob" | base64)
+          [ "$got" = "$want" ] || fail "digest mismatch: blob $got, bundle $want"
+          echo 'Verified OK' >&2
+          EOF
+          } > "${RUNNER_TEMP}/stub/cosign"
+          chmod 0755 "${RUNNER_TEMP}/stub/cosign"
+          head -n 4 "${RUNNER_TEMP}/stub/cosign"
+
       - name: serve it on localhost
         run: |
           python3 -m http.server 18080 --bind 127.0.0.1 --directory "${RUNNER_TEMP}/srv" \
@@ -158,6 +240,8 @@ jobs:
           sh install.sh --help > /dev/null
           rc=0; sh install.sh --bogus 2> /dev/null || rc=$?
           [ "$rc" = 2 ] || { echo "::error::unknown flag exited $rc, want 2"; exit 1; }
+          rc=0; FREESBC_VERIFY=yes sh install.sh 2> /dev/null || rc=$?
+          [ "$rc" = 2 ] || { echo "::error::FREESBC_VERIFY=yes exited $rc, want 2"; exit 1; }
 
       - name: dry run installs nothing
         run: |
@@ -188,6 +272,40 @@ jobs:
             echo "::error::install.sh accepted a tarball that does not match SHA256SUMS"; exit 1
           fi
           [ ! -e "${RUNNER_TEMP}/bad" ] || { echo "::error::a failed verification left files behind"; exit 1; }
+
+      # FREESBC_VERIFY with the stub cosign. Each failing case must exit
+      # non-zero and leave its prefix uncreated.
+      - name: signature of SHA256SUMS
+        run: |
+          set -euo pipefail
+          stub="${RUNNER_TEMP}/stub:${PATH}"
+          # inst NAME TAG VERIFY PATH [FLAGS]: install TAG into prefix NAME.
+          inst() {
+            local p="${RUNNER_TEMP}/sig-${1}"
+            env PATH="$4" FREESBC_VERSION="$2" FREESBC_VERIFY="$3" FREESBC_PREFIX="$p" sh install.sh --no-service "${@:5}"
+          }
+          # must_fail NAME TAG VERIFY PATH WHY
+          must_fail() {
+            if inst "$1" "$2" "$3" "$4"; then echo "::error::$5"; exit 1; fi
+            [ ! -e "${RUNNER_TEMP}/sig-${1}" ] || { echo "::error::$1: a failed verification left files behind"; exit 1; }
+          }
+          # installed NAME: the binary is in prefix NAME and runs.
+          installed() {
+            got=$("${RUNNER_TEMP}/sig-${1}/bin/freesbc" version | awk '{print $2}')
+            [ "$got" = "$TAG" ] || { echo "::error::$1: version is $got, want $TAG"; exit 1; }
+          }
+          ! env PATH=/usr/bin:/bin sh -c 'command -v cosign' || { echo "::error::cosign in /usr/bin or /bin"; exit 1; }
+
+          out=$(inst dry "$SIGNED" require "$stub" --dry-run 2>&1); echo "$out"
+          grep -q 'verified the signature of SHA256SUMS' <<< "$out"
+          [ ! -e "${RUNNER_TEMP}/sig-dry" ] || { echo "::error::--dry-run created the prefix"; exit 1; }
+          inst signed "$SIGNED" require "$stub"; installed signed
+          must_fail tampered "$TAMPERED" auto "$stub" "a tampered SHA256SUMS passed the signature check"
+          must_fail nocosign "$SIGNED" require /usr/bin:/bin "require installed without cosign"
+          must_fail nobundle "$TAG" require "$stub" "require installed a release with no bundle"
+          inst unsigned "$TAG" auto "$stub"; installed unsigned
+          inst off "$BROKEN" off "$stub"; installed off
+          must_fail broken "$BROKEN" auto "$stub" "auto accepted a broken bundle"
 
       # The runner has systemd and passwordless sudo, so the service step runs
       # for real: user, /etc/freesbc, unit with ExecStart under the prefix,

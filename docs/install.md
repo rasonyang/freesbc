@@ -14,9 +14,9 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 
 ### What it does
 
-1. Detects the OS (`linux` or `darwin`) and the CPU (`x86_64`/`amd64` as `amd64`, `aarch64`/`arm64` as `arm64`). Anything else exits with an error. It needs `curl` or `wget`, `tar`, and `sha256sum` or `shasum`.
+1. Detects the OS (`linux` or `darwin`) and the CPU (`x86_64`/`amd64` as `amd64`, `aarch64`/`arm64` as `arm64`). Anything else exits with an error. It needs `curl` or `wget`, `tar`, and `sha256sum` or `shasum`; [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) (v2.4.2 or later, v3 recommended) is optional and checks the signature.
 2. Resolves the latest tag from the `releases/latest` redirect (no GitHub API call, so no rate limit), unless `FREESBC_VERSION` pins one.
-3. Downloads `freesbc_<tag>_<os>_<arch>.tar.gz` and `SHA256SUMS` into a temporary directory and verifies the tarball's hash. A mismatch exits non-zero and installs nothing.
+3. Downloads `SHA256SUMS` into a temporary directory and, when `cosign` is installed, its signature `SHA256SUMS.sigstore.json`, and checks that `SHA256SUMS` was signed by this repository's release workflow (see [Integrity](#integrity); `FREESBC_VERIFY` controls it). Then it downloads `freesbc_<tag>_<os>_<arch>.tar.gz` and verifies the tarball's hash against `SHA256SUMS`. A bad signature or a mismatch exits non-zero and installs nothing.
 4. Installs `freesbc` to `$FREESBC_PREFIX/bin` (default `/usr/local/bin`), using `sudo` only when that directory is not writable, and prints `freesbc version`. The new binary replaces the old one by a rename, so a running process is not disturbed; restart it to switch.
 5. On Linux with systemd, run as root, unless `--no-service`: creates the `freesbc` system user and `/etc/freesbc` (mode 0750, `root:freesbc`), installs `/etc/systemd/system/freesbc.service` (with `ExecStart` pointing at `$FREESBC_PREFIX/bin`) and runs `systemctl daemon-reload`. It does **not** enable or start the service: the config needs addresses first. The layout is the one described in [Run as a systemd service](#run-as-a-systemd-service). Not root or no systemd, it skips this step and says why.
 6. In that service step it never overwrites an existing `/etc/freesbc/freesbc.yaml`. When there is none and `FREESBC_SWITCH`, `FREESBC_PRIVATE_IP` and `FREESBC_PUBLIC_IP` are all set, it writes one with `freesbc init -c /etc/freesbc/freesbc.yaml`, sets it to `root:freesbc` mode 0640 and runs `freesbc check` on it. Piped from `curl`, stdin is not a terminal, so `init` cannot prompt; these variables are the only way to answer it.
@@ -43,6 +43,7 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 | `FREESBC_VERSION` | latest release | Install this tag, for example `v0.5.0` |
 | `FREESBC_PREFIX` | `/usr/local` | Install the binary in `$FREESBC_PREFIX/bin` |
 | `FREESBC_BASE_URL` | `https://github.com/rasonyang/freesbc/releases` | Download from a mirror, or a local file server for testing (files under `<base>/download/<tag>/`, the tag from `<base>/latest`) |
+| `FREESBC_VERIFY` | `auto` | The signature check of `SHA256SUMS` (see [Integrity](#integrity)): `auto` checks it when `cosign` is installed and the release has a bundle, and says so when it does not; `require` fails when `cosign` or the bundle is missing; `off` skips it, for a mirror that does not carry the bundle. Any other value exits 2 |
 | `FREESBC_SWITCH`, `FREESBC_PRIVATE_IP`, `FREESBC_PUBLIC_IP` | unset | All three set: write `/etc/freesbc/freesbc.yaml` with `freesbc init` in the service step (see step 6) |
 | `FREESBC_PUBLIC_BIND`, `FREESBC_UDP_PORT` | unset | Read by that `init` as well (see [`freesbc init`](#freesbc-init)) |
 
@@ -55,7 +56,43 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 
 ### Integrity
 
-The script verifies the tarball against `SHA256SUMS`, which comes from the same release. That catches a corrupted or truncated download, not a compromised release: whoever can replace the tarball can replace `SHA256SUMS` too. There is no signature yet.
+`SHA256SUMS` lists the hash of every tarball and of `install.sh`, so one signature over it covers them all. The hash check alone catches a corrupted or truncated download, not a compromised release: whoever can replace a tarball can replace `SHA256SUMS` too. The signature closes that gap.
+
+Every release after v0.6.1 signs `SHA256SUMS` with [Sigstore](https://www.sigstore.dev/) keyless signing: `release.yml` runs `cosign sign-blob` with the workflow's GitHub OIDC token, so no signing key exists to leak. Fulcio issues a short-lived certificate that names the workflow and the ref it ran from, the signature is logged in the public Rekor transparency log, and everything needed to verify it is in the release asset `SHA256SUMS.sigstore.json`. Releases up to v0.6.1 are unsigned.
+
+A valid signature has:
+
+- issuer `https://token.actions.githubusercontent.com`;
+- identity `https://github.com/rasonyang/freesbc/.github/workflows/release.yml@refs/tags/<tag>` for a release made by pushing its tag, or `...release.yml@refs/heads/main` for a release built or rebuilt by hand (`release.yml` run from `main` with a `tag` input, to backfill one). Both are accepted by this regular expression, which `install.sh` and the commands below use:
+
+  ```
+  ^https://github\.com/rasonyang/freesbc/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$
+  ```
+
+  A run from any other branch is rejected, and so is any other repository or workflow file. `release.yml` verifies its own signature with the same expression before it uploads anything.
+
+`install.sh` checks the signature before the tarball's hash, as `FREESBC_VERIFY` says. Under the default `auto`, it skips the check with a note when `cosign` is not installed or the release has no bundle. Use `FREESBC_VERIFY=require` to make either an error:
+
+```sh
+curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install.sh | FREESBC_VERIFY=require sh
+```
+
+`cosign` reads the bundle from v2.4.2 on (the first version that detects the protobuf bundle format without `--new-bundle-format`; v2.4.1 and older fail on it, so the check fails closed). Use v3 or later when you can: it is what `release.yml` signs with and what CI verifies with.
+
+To check a release by hand:
+
+```sh
+v=v0.7.0 os=linux arch=amd64   # a release after v0.6.1; os: linux|darwin, arch: amd64|arm64
+base=https://github.com/rasonyang/freesbc/releases/download/$v
+curl -fsSLO $base/SHA256SUMS -O $base/SHA256SUMS.sigstore.json -O $base/freesbc_${v}_${os}_${arch}.tar.gz
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/rasonyang/freesbc/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+```
+
+`cosign` prints `Verified OK`, and the hash check prints `OK` for the tarball. Only then trust the tarball. The same works for a mirror: verify the files you got from it.
 
 ### Read it before running it
 
@@ -65,9 +102,24 @@ less install.sh
 sh install.sh
 ```
 
+`curl | sh` cannot check the script it is running, and neither can the script downloaded above. To run only a signed `install.sh`, take it from a release, check it against that release's signed `SHA256SUMS`, then run it pinned to the same release:
+
+```sh
+v=v0.7.0   # a release after v0.6.1
+base=https://github.com/rasonyang/freesbc/releases/download/$v
+curl -fsSLO $base/install.sh -O $base/SHA256SUMS -O $base/SHA256SUMS.sigstore.json
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/rasonyang/freesbc/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+less install.sh
+FREESBC_VERSION=$v FREESBC_VERIFY=require sh install.sh
+```
+
 ## Release download
 
-Each [release](https://github.com/rasonyang/freesbc/releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `SHA256SUMS`. Each archive holds the binary, the README, the license and `freesbc.example.yaml`; linux archives add `freesbc.service` (see [Run as a systemd service](#run-as-a-systemd-service)).
+Each [release](https://github.com/rasonyang/freesbc/releases) carries `freesbc_<version>_<os>_<arch>.tar.gz` for linux and darwin on amd64 and arm64, plus `install.sh`, `SHA256SUMS` and (after v0.6.1) its signature `SHA256SUMS.sigstore.json`. Each archive holds the binary, the README, the license and `freesbc.example.yaml`; linux archives add `freesbc.service` (see [Run as a systemd service](#run-as-a-systemd-service)).
 
 ```sh
 v=v0.5.0 os=linux arch=amd64   # os: linux|darwin, arch: amd64|arm64
@@ -77,6 +129,8 @@ shasum -a 256 -c --ignore-missing SHA256SUMS   # Linux: sha256sum -c --ignore-mi
 tar -xzf freesbc_${v}_${os}_${arch}.tar.gz && cd freesbc_${v}_${os}_${arch}
 ./freesbc check -c freesbc.example.yaml
 ```
+
+The hash check alone only proves an intact download; to check the signature of `SHA256SUMS` first, see [Integrity](#integrity).
 
 ## Build from source
 
