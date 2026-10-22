@@ -583,6 +583,11 @@ a.badge:hover { filter: brightness(0.95); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+/* theme.js sets data-theme-switching for two frames around a scheme change,
+ * so colours switch at once instead of fading from the old scheme. */
+:root[data-theme-switching] *,
+:root[data-theme-switching] *::before,
+:root[data-theme-switching] *::after { transition: none !important; }
 @media (forced-colors: active) {
   .btn, .badge, .card, .alert { border-color: CanvasText; }
   .dot { forced-color-adjust: none; }
