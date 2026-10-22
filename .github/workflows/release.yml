@@ -1,7 +1,10 @@
 # Builds prebuilt freesbc binaries for a version tag and attaches them to
-# the GitHub Release: one tar.gz per OS/arch, install.sh and SHA256SUMS.
-# Runs on every pushed v* tag; run it by hand with a tag to backfill an
-# existing release.
+# the GitHub Release: one tar.gz per OS/arch, install.sh, SHA256SUMS and
+# SHA256SUMS.sigstore.json, a Sigstore bundle signing SHA256SUMS keyless
+# through GitHub OIDC (no key exists; the certificate names this workflow
+# and its ref, and the signature is logged in Rekor). Runs on every pushed
+# v* tag; run it by hand from main with a tag to backfill an existing
+# release (it then signs as refs/heads/main, which install.sh accepts).
 name: Release
 
 on:
@@ -16,6 +19,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write # the OIDC token cosign trades for its signing certificate
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -77,10 +81,28 @@ jobs:
           file "${dir}/freesbc"
           "${dir}/freesbc" check -c "${dir}/freesbc.example.yaml"
 
+      - uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Verified at once with the identity and issuer install.sh and
+      # docs/install.md use, so a signature they would reject is never
+      # published.
+      - name: sign SHA256SUMS
+        env:
+          CERT_IDENTITY: '^https://github\.com/rasonyang/freesbc/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$'
+          CERT_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+          cosign verify-blob --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "$CERT_IDENTITY" \
+            --certificate-oidc-issuer "$CERT_ISSUER" dist/SHA256SUMS
+
       - name: publish release assets
         run: |
           set -euo pipefail
-          assets=(dist/*.tar.gz dist/SHA256SUMS)
+          assets=(dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json)
           if [ -f dist/install.sh ]; then assets+=(dist/install.sh); fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber

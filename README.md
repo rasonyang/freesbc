@@ -21,7 +21,7 @@ An open-source SIP/WebRTC edge proxy with the Caddy experience: **one binary, on
 curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install.sh | sh
 ```
 
-Linux or macOS, amd64 or arm64. It installs the latest release in `/usr/local/bin` after checking it against the release's `SHA256SUMS`. Run as root on a systemd host, it also sets up the `freesbc` user, `/etc/freesbc` and the unit (not started), and prints the steps left to start the service ([details](docs/install.md#run-as-a-systemd-service)).
+Linux or macOS, amd64 or arm64. It installs the latest release in `/usr/local/bin` after checking it against the release's `SHA256SUMS` (and that file's signature, when `cosign` is installed). Run as root on a systemd host, it also sets up the `freesbc` user, `/etc/freesbc` and the unit (not started), and prints the steps left to start the service ([details](docs/install.md#run-as-a-systemd-service)).
 
 Then write a config and run it:
 
@@ -31,9 +31,9 @@ freesbc check -c freesbc.yaml    # validate; errors name the line and key
 freesbc run   -c freesbc.yaml    # SIGINT/SIGTERM to stop
 ```
 
-To read the script before it runs: `curl -fsSLo install.sh https://github.com/rasonyang/freesbc/releases/latest/download/install.sh; less install.sh; sh install.sh`.
+To read the script before it runs: `curl -fsSLo install.sh https://github.com/rasonyang/freesbc/releases/latest/download/install.sh; less install.sh; sh install.sh`. Releases sign `SHA256SUMS` with Sigstore (keyless, through GitHub OIDC); with [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) installed the script checks that signature too, and `FREESBC_VERIFY=require` makes it mandatory. To check `install.sh` itself against the signed `SHA256SUMS` before running it, see [Integrity](docs/install.md#integrity).
 
-Manual download and checksum, building from source, the systemd layout and the full `freesbc init` reference: [`docs/install.md`](docs/install.md).
+Manual download with checksum and signature checks, building from source, the systemd layout and the full `freesbc init` reference: [`docs/install.md`](docs/install.md).
 
 > **Read before exposing to the public internet:** [`docs/design.md`](docs/design.md) (topology, security model) and [`docs/edge.md`](docs/edge.md) (switch-side requirements).
 
