@@ -25,6 +25,22 @@
     else root.setAttribute("data-theme", mode);
   }
 
+  // Make a scheme change with transitions off (ui.css,
+  // [data-theme-switching]), so buttons and links switch at once instead of
+  // fading from the old colours. Reading a computed style flushes the new
+  // scheme while the attribute is set; it comes off two frames later, after
+  // that style has been painted.
+  function suppress(change) {
+    root.setAttribute("data-theme-switching", "");
+    if (change) change();
+    void window.getComputedStyle(root).color;
+    window.requestAnimationFrame(function () {
+      window.requestAnimationFrame(function () {
+        root.removeAttribute("data-theme-switching");
+      });
+    });
+  }
+
   function save(mode) {
     try {
       if (mode === "system") localStorage.removeItem(KEY);
@@ -32,8 +48,19 @@
     } catch (e) { /* follow the OS next time */ }
   }
 
+  // The first apply runs before first paint, so nothing can transition yet.
   var mode = read();
   apply(mode);
+
+  // Following the OS, a change of its scheme repaints the page too.
+  if (window.matchMedia) {
+    var dark = window.matchMedia("(prefers-color-scheme: dark)");
+    if (dark.addEventListener) {
+      dark.addEventListener("change", function () {
+        if (mode === "system") suppress();
+      });
+    }
+  }
 
   // Wire every [data-theme-toggle] button once the DOM exists. The button
   // shows the icon of the current mode and cycles system → light → dark.
@@ -51,7 +78,7 @@
       sync(btn);
       btn.addEventListener("click", function () {
         mode = ORDER[(ORDER.indexOf(mode) + 1) % ORDER.length];
-        apply(mode);
+        suppress(function () { apply(mode); });
         save(mode);
         buttons.forEach(sync);
       });

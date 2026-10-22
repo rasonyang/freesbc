@@ -102,7 +102,9 @@ Tailwind v4 defaults, so a class in a Tailwind codebase maps 1:1.
 
 - `color-scheme: light dark` on `:root` means the OS decides.
   `<html data-theme="light|dark">` pins a choice. `theme.js` toggles the
-  attribute and stores the choice under `freesbc-theme`.
+  attribute and stores the choice under `freesbc-theme`. On a scheme change
+  (toggle or OS) it sets `data-theme-switching` for two frames, which turns
+  transitions off so colours switch at once instead of fading.
 - Components never use `@media (prefers-color-scheme)` or `[data-theme]`.
   When a component needs a different recipe per theme, use `light-dark()`
   inside the component (see `.btn[data-variant="destructive"]`).
