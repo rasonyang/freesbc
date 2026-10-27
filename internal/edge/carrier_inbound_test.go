@@ -158,6 +158,76 @@ func TestCarrierInviteDeliveredToCarrierPort(t *testing.T) {
 	waitForRelease(t, rig.harness)
 }
 
+// A re-INVITE from a carrier carries X-FreeSBC-Carrier to the switch's
+// carrier port and counts as an inbound carrier INVITE, like the initial
+// INVITE, ACK and BYE. A client's re-INVITE gets no such header (#263).
+func TestCarrierReInviteStampedForSwitch(t *testing.T) {
+	phone := newUDPClient(t) // stands in for the carrier's gateway
+	rig := startCarrierRig(t, fmt.Sprintf("alpha: 127.0.0.1:%d", portOf(phone.local)), "", nil)
+	answerWithEcho(rig.cs)
+	answerWithEcho(rig.fs)
+	rtp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtp.Close()
+	offer := phoneOfferSDP(rtp.LocalAddr().(*net.UDPAddr).Port)
+
+	invite := phone.buildInvite("+442071234567", "+15551230000", "example.com", offer)
+	res := phone.do(t, invite, rig.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("carrier INVITE: got %d, want 200", res.StatusCode)
+	}
+	sendAck(t, phone, invite, res, rig.publicUDP)
+	if n := rig.srv.metrics.Snapshot().CarrierRequests["alpha/inbound/INVITE"]; n != 1 {
+		t.Fatalf("carrier INVITE metric before the re-INVITE = %d, want 1", n)
+	}
+
+	_, reRes := auditPhoneReInvite(t, rig.harness, phone, invite, res, 2, offer)
+	if reRes.StatusCode != 200 {
+		t.Fatalf("carrier re-INVITE: got %d, want 200", reRes.StatusCode)
+	}
+	got := rig.cs.waitFor(sip.INVITE, 2, 3*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("the switch's carrier port saw %d INVITEs, want 2", len(got))
+	}
+	if hs := carrierHeaders(got[1]); len(hs) != 1 || hs[0] != "alpha" {
+		t.Errorf("re-INVITE X-FreeSBC-Carrier = %v, want [alpha]", hs)
+	}
+	if n := rig.srv.metrics.Snapshot().CarrierRequests["alpha/inbound/INVITE"]; n != 2 {
+		t.Errorf("carrier INVITE metric after the re-INVITE = %d, want 2", n)
+	}
+
+	// A registered client's re-INVITE reaches the client port unstamped.
+	client := newUDPClient(t)
+	auditRegisterPhone(t, rig.harness, client, "1001")
+	crtp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer crtp.Close()
+	coffer := phoneOfferSDP(crtp.LocalAddr().(*net.UDPAddr).Port)
+	ci := client.buildInvite("1001", "2002", "example.com", coffer)
+	cres := client.do(t, ci, rig.publicUDP)
+	if cres.StatusCode != 200 {
+		t.Fatalf("client INVITE: got %d, want 200", cres.StatusCode)
+	}
+	sendAck(t, client, ci, cres, rig.publicUDP)
+	if _, r := auditPhoneReInvite(t, rig.harness, client, ci, cres, 2, coffer); r.StatusCode != 200 {
+		t.Fatalf("client re-INVITE: got %d, want 200", r.StatusCode)
+	}
+	cg := rig.fs.waitFor(sip.INVITE, 2, 3*time.Second)
+	if len(cg) != 2 {
+		t.Fatalf("the switch's client port saw %d INVITEs, want 2", len(cg))
+	}
+	if hs := carrierHeaders(cg[1]); len(hs) != 0 {
+		t.Errorf("client re-INVITE carries X-FreeSBC-Carrier = %v, want none", hs)
+	}
+	if n := rig.srv.metrics.Snapshot().CarrierRequests["alpha/inbound/INVITE"]; n != 2 {
+		t.Errorf("carrier INVITE metric after the client re-INVITE = %d, want still 2", n)
+	}
+}
+
 // Every X-FreeSBC-* header a public sender writes is removed before
 // anything else, on the carrier path and on the client path alike; the only
 // one the switch sees is the one FreeSBC itself adds.
