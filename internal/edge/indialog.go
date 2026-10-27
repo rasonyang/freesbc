@@ -71,6 +71,9 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 	s.noteOutbound(req, d, hide)
 	s.restoreToSwitch(req, out, from, to, d)
 	s.retargetInDialog(req, out, to, d)
+	if !onPrivate {
+		s.stampCarrier(out, req, d)
+	}
 	fsip.SetContact(out, to.uri())
 	if offerless {
 		stripBody(out)
