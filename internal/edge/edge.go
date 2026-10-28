@@ -528,7 +528,11 @@ func (s *Server) publicListeners() []bound {
 // localInterface returns the name of the interface that owns ip. It is the
 // one lookup behind checkLocalAddr and the private socket's ingress filter
 // (privateSocketFilter): both need the interface, and private.ip must be
-// assigned to a local interface for either to mean anything.
+// assigned to a local interface for either to mean anything. An IPv4
+// loopback address inside a loopback interface's prefix counts as owned by
+// that interface when the kernel accepts a bind to it: Linux routes all of
+// 127.0.0.0/8 to lo, so 127.0.0.3 needs no alias there, while macOS refuses
+// the bind until `ifconfig lo0 alias` adds it.
 func localInterface(ip netip.Addr) (string, bool, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -550,18 +554,45 @@ func localInterface(ip netip.Addr) (string, bool, error) {
 			}
 		}
 	}
+	if !want.Is4() || !want.IsLoopback() {
+		return "", false, nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if p, ok := a.(*net.IPNet); ok && p.Contains(want.AsSlice()) {
+				pc, err := net.ListenPacket("udp4", netip.AddrPortFrom(want, 0).String())
+				if err != nil {
+					return "", false, nil // the kernel refuses it: not ours
+				}
+				pc.Close()
+				return iface.Name, true, nil
+			}
+		}
+	}
 	return "", false, nil
 }
 
-// checkLocalAddr fails unless ip is assigned to a local interface: a bind
-// to anything else fails late and obscurely, and an address that is not
-// ours would be advertised to peers that can never reach it.
+// checkLocalAddr fails unless ip is assigned to a local interface, or is an
+// IPv4 loopback address the kernel binds without an alias (any 127/8 address
+// on Linux): a bind to anything else fails late and obscurely, and an
+// address that is not ours would be advertised to peers that can never reach
+// it.
 func checkLocalAddr(key string, ip netip.Addr) error {
 	_, ok, err := localInterface(ip)
 	if err != nil {
 		return fmt.Errorf("proxy: list local addresses: %w", err)
 	}
 	if !ok {
+		if ip.Unmap().Is4() && ip.IsLoopback() {
+			return fmt.Errorf("proxy: %s %s is not assigned to any local interface and the kernel refuses to bind it (on macOS: sudo ifconfig lo0 alias %s up)", key, ip, ip.Unmap())
+		}
 		return fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
 	}
 	return nil
