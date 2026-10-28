@@ -48,7 +48,8 @@ func redactConfig(cfg *config.Config) any {
 		view["hep"] = v
 	}
 	if cfg.Admin != nil {
-		a := map[string]any{"listen": cfg.Admin.Listen, "allow_remote": cfg.Admin.AllowRemote}
+		a := map[string]any{"listen": cfg.Admin.Listen, "allow_remote": cfg.Admin.AllowRemote,
+			"allowed_hosts": cfg.Admin.AllowedHosts, "pprof": cfg.Admin.Pprof}
 		if cfg.Admin.PasswordHash != "" {
 			a["password_hash"] = "***"
 		}

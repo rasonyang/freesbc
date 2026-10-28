@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -79,6 +80,85 @@ func TestRedactConfigHEP(t *testing.T) {
 		`"redact_auth":false`, `"ca":"/etc/ca.pem"`, `"key":"/etc/c.key"`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("%s missing from %s", want, b)
+		}
+	}
+}
+
+// Every yaml key of config.Config must appear in the view, so a key added to
+// the schema and forgotten in redactConfig fails here. Every optional section
+// is populated so the walk sees it; password_hash must be present but masked.
+func TestRedactConfigCoversSchema(t *testing.T) {
+	cfg := cfgWithAdminHash(t)
+	cfg.TLS = &config.TLSConfig{Cert: "/etc/cert.pem", Key: "/etc/key.pem"}
+	cfg.Edge.Carriers = map[string]config.CarrierConfig{
+		"secure": {Host: "sip.example.com", Transport: "tls", SRTP: "optional",
+			CAFile: "/etc/ca.pem", ClientCert: "/etc/c.pem", ClientKey: "/etc/c.key"},
+	}
+	cfg.Admin.AllowedHosts = []string{"sbc.example.com"}
+	cfg.Admin.Pprof = true
+	redact := true
+	cfg.HEP = &config.HEPConfig{Address: "192.0.2.9:9060", Transport: "tls", CaptureID: 7, NodeName: "edge1",
+		RedactAuth: &redact, TLS: &config.HEPTLSConfig{CA: "/etc/ca.pem", Cert: "/etc/c.pem", Key: "/etc/c.key"}}
+	b, err := json.Marshal(redactConfig(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view any
+	if err := json.Unmarshal(b, &view); err != nil {
+		t.Fatal(err)
+	}
+	checkViewKeys(t, reflect.TypeOf(config.Config{}), view, "")
+	admin := view.(map[string]any)["admin"].(map[string]any)
+	if admin["password_hash"] != "***" {
+		t.Errorf("admin.password_hash = %v, want masked", admin["password_hash"])
+	}
+}
+
+// checkViewKeys walks typ's yaml tags beside the decoded JSON view v.
+func checkViewKeys(t *testing.T, typ reflect.Type, v any, path string) {
+	t.Helper()
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Errorf("%s: view is %T, want an object", path, v)
+			return
+		}
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			key, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+			if key == "" || key == "-" {
+				continue
+			}
+			child, ok := m[key]
+			if !ok {
+				t.Errorf("config key %s%s missing from the /api/config view", path, key)
+				continue
+			}
+			checkViewKeys(t, f.Type, child, path+key+".")
+		}
+	case reflect.Map:
+		if typ.Elem().Kind() != reflect.Struct {
+			return
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			t.Errorf("%s: view is %T, want an object", path, v)
+			return
+		}
+		for name, child := range m {
+			checkViewKeys(t, typ.Elem(), child, path+name+".")
+		}
+	case reflect.Slice:
+		if typ.Elem().Kind() != reflect.Struct {
+			return
+		}
+		items, _ := v.([]any)
+		for _, child := range items {
+			checkViewKeys(t, typ.Elem(), child, path)
 		}
 	}
 }

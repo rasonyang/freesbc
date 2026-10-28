@@ -720,7 +720,7 @@ Inbound admission (§6.2) uses the transport the request arrived on (`req.Transp
 - Metrics: `freesbc_edge_carrier_requests_total{carrier,direction,method}` (`direction` is `inbound` for carrier to switch, `outbound` for switch to carrier; `internal/edge/metrics.go:222`, `internal/admin/metrics.go:111`) and `freesbc_edge_carrier_registrations{carrier}`, the live registration count per configured carrier with zeros included (`SetCarrierRegistrations`, `edge/metrics.go:232`; `publishCarrierRegistrations`, `carrierreg.go:126`). Admission drops count in `freesbc_edge_admission_drops_total`.
 - The admin status JSON carries the same two values as `carrier_requests_total` and `carrier_registrations` (`internal/admin/server.go:167-171`). The carriers' resolution state and the switch's carrier registrations are listed by `GET /api/carriers` and `GET /api/carrier-registrations` (§13.3).
 - The call list names the ends of a carrier call as `carrier:<name>` and `switch:<ip:port>` (`dialogTable.calls`, `dialog.go:557-563`).
-- The redacted config view shows `edge.carriers` (`internal/admin/redact.go:19`).
+- The redacted config view shows `edge.carriers` (`internal/admin/redact.go:22`).
 
 ## 7. SIP processing — edge plane (proxy)
 
@@ -3823,10 +3823,16 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 "Basic" in the Auth column means Basic credentials **or** a valid session cookie (§13.4): a browser signed in through `/login` reaches every `/api/*` route with its cookie, while Prometheus and curl keep sending Basic.
 
 `GET /api/config` shows the running snapshot in the config's own shape with
-JSON keys (`redactConfig`, `redact.go:9`): `public`, `private`, `rtp` (`min`,
-`max`), `edge` (`switch`, `switch_carrier_port`, `listen`, `carriers`,
-`carrier_sources`), `shield` (`ban` as a duration string) and, when present,
-`tls` (`cert`, `key` paths) and `admin` (`listen`, `allow_remote`, and
+JSON keys (`redactConfig`, `redact.go:10`): `public` (`ip`, `bind`), `private`
+(`ip`), `rtp` (`min`, `max`), `edge` (`switch`, `switch_carrier_port`,
+`listen` and `advertise` with `udp`, `tcp`, `tls`, `ws`, `wss`, `carriers`,
+`carrier_sources`, `srtp`, `allow_insecure_sdes`), `shield` (`rate_limit`,
+`carrier_rate_limit`, `ban` as a duration string, `max_sessions`,
+`invite_rate_limit`, `register_ban`, `register_ban_aor`, `admission_ban`)
+and, when present, `tls` (`cert`, `key` paths), `hep` (`address`,
+`transport`, `capture_id`, `node_name`, `redact_auth`, and `tls` with `ca`,
+`cert`, `key` paths when set) and `admin` (`listen`, `allow_remote`,
+`allowed_hosts`, `pprof`, and
 `password_hash: "***"` only when the hash is non-empty). The one secret,
 `admin.password_hash`, is masked; no other config value is secret.
 `GET /api/config/raw` is deliberately unredacted: it is the operator's view of
