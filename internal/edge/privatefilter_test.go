@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"runtime"
 	"syscall"
@@ -24,6 +25,43 @@ func TestLocalInterface(t *testing.T) {
 	}
 	if _, ok, err := localInterface(netip.MustParseAddr("192.0.2.250")); err != nil || ok {
 		t.Fatalf("localInterface(192.0.2.250) = _, %v, %v; want not found", ok, err)
+	}
+	if err := checkLocalAddr("private.ip", netip.MustParseAddr("192.0.2.250")); err == nil {
+		t.Fatal("checkLocalAddr(192.0.2.250) = nil; want an error")
+	}
+}
+
+// An in-prefix loopback address nobody aliased is ours exactly when the
+// kernel binds it: always on Linux (all of 127/8 routes to lo), on macOS
+// only with an `ifconfig lo0 alias`.
+func TestLocalInterfaceLoopbackPrefix(t *testing.T) {
+	ip := netip.MustParseAddr("127.77.0.3")
+	pc, bindErr := net.ListenPacket("udp4", netip.AddrPortFrom(ip, 0).String())
+	if pc != nil {
+		pc.Close()
+	}
+	if runtime.GOOS == "linux" && bindErr != nil {
+		t.Fatalf("bind %s on linux: %v", ip, bindErr)
+	}
+	name, ok, err := localInterface(ip)
+	if err != nil {
+		t.Fatalf("localInterface(%s): %v", ip, err)
+	}
+	if ok != (bindErr == nil) {
+		t.Fatalf("localInterface(%s) = %q, %v; bind error %v", ip, name, ok, bindErr)
+	}
+	if ok {
+		ifi, err := net.InterfaceByName(name)
+		if err != nil || ifi.Flags&net.FlagLoopback == 0 {
+			t.Fatalf("localInterface(%s) = %q; want a loopback interface (%v)", ip, name, err)
+		}
+	}
+	if cerr := checkLocalAddr("private.ip", ip); (cerr == nil) != ok {
+		t.Fatalf("checkLocalAddr(%s) = %v; localInterface ok = %v", ip, cerr, ok)
+	}
+	// IPv6 loopback is a /128 and never widened.
+	if _, ok, err := localInterface(netip.MustParseAddr("::2")); err != nil || ok {
+		t.Fatalf("localInterface(::2) = _, %v, %v; want not found", ok, err)
 	}
 }
 
