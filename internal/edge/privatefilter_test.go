@@ -14,7 +14,7 @@ import (
 )
 
 // localInterface finds the interface that owns an address, which is what
-// checkLocalAddr and the private socket's ingress filter both rest on.
+// CheckLocalAddr and the private socket's ingress filter both rest on.
 func TestLocalInterface(t *testing.T) {
 	name, ok, err := localInterface(netip.MustParseAddr("127.0.0.1"))
 	if err != nil {
@@ -26,8 +26,8 @@ func TestLocalInterface(t *testing.T) {
 	if _, ok, err := localInterface(netip.MustParseAddr("192.0.2.250")); err != nil || ok {
 		t.Fatalf("localInterface(192.0.2.250) = _, %v, %v; want not found", ok, err)
 	}
-	if err := checkLocalAddr("private.ip", netip.MustParseAddr("192.0.2.250")); err == nil {
-		t.Fatal("checkLocalAddr(192.0.2.250) = nil; want an error")
+	if _, err := CheckLocalAddr("private.ip", netip.MustParseAddr("192.0.2.250")); err == nil {
+		t.Fatal("CheckLocalAddr(192.0.2.250) = nil; want an error")
 	}
 }
 
@@ -56,8 +56,8 @@ func TestLocalInterfaceLoopbackPrefix(t *testing.T) {
 			t.Fatalf("localInterface(%s) = %q; want a loopback interface (%v)", ip, name, err)
 		}
 	}
-	if cerr := checkLocalAddr("private.ip", ip); (cerr == nil) != ok {
-		t.Fatalf("checkLocalAddr(%s) = %v; localInterface ok = %v", ip, cerr, ok)
+	if _, cerr := CheckLocalAddr("private.ip", ip); (cerr == nil) != ok {
+		t.Fatalf("CheckLocalAddr(%s) = %v; localInterface ok = %v", ip, cerr, ok)
 	}
 	// IPv6 loopback is a /128 and never widened.
 	if _, ok, err := localInterface(netip.MustParseAddr("::2")); err != nil || ok {

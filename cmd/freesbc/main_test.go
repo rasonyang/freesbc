@@ -151,3 +151,34 @@ func TestInitArgumentHandling(t *testing.T) {
 		t.Errorf("init without a switch = %d, want 1", got)
 	}
 }
+
+// check --local-addresses without --deploy is a usage error; check --deploy
+// on a config with nothing to open passes, and fails on a missing tls pair.
+func TestCheckDeployFlags(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, extra string) string {
+		p := filepath.Join(dir, name)
+		y := "public: { ip: 127.0.0.1 }\nprivate: { ip: 192.0.2.250 }\nrtp: 10010-10029\nedge:\n  switch: [127.0.0.1:5062]\n  listen: { udp: 5060 }\n" + extra
+		if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	good := write("good.yaml", "")
+	bad := write("bad.yaml", fmt.Sprintf("tls: { cert: %q, key: %q }\n", filepath.Join(dir, "no.pem"), filepath.Join(dir, "no.key")))
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"check", "-c", good, "--local-addresses"}, 2},
+		{[]string{"check", "-c", good, "--deploy"}, 0},
+		{[]string{"check", "-c", good, "--deploy", "--local-addresses"}, 1}, // 192.0.2.250 is not local
+		{[]string{"check", "-c", bad, "--deploy"}, 1},
+		{[]string{"check", "-c", bad}, 0}, // plain check does not open files
+	} {
+		got := run(tc.args)
+		if got != tc.want {
+			t.Errorf("run(%q) = %d, want %d", tc.args, got, tc.want)
+		}
+	}
+}

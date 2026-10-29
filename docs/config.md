@@ -1,6 +1,6 @@
 # FreeSBC configuration reference
 
-One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). `freesbc init -c <file>` writes a minimal valid file (`public`, `private`, `edge.switch`, `edge.listen.udp`, optionally `admin`) from detected addresses, flags or `FREESBC_*` environment variables, and refuses to overwrite an existing file. The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate. The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
+One YAML file configures the whole process (`freesbc run -c freesbc.yaml`). `freesbc init -c <file>` writes a minimal valid file (`public`, `private`, `edge.switch`, `edge.listen.udp`, optionally `admin`) from detected addresses, flags or `FREESBC_*` environment variables, and refuses to overwrite an existing file. The annotated starting point is `freesbc.example.yaml`; `freesbc check -c <file>` validates a file without binding a socket or opening a certificate (add `--deploy` to open the TLS files and `--local-addresses` to check the bind addresses). The code is the source of truth: the schema is `internal/config/schema.go`, the rules are `internal/config/validate.go`, and the reload classes are `internal/config/restart.go`.
 
 Principles of the schema:
 
@@ -20,7 +20,7 @@ Principles of the schema:
 3. Defaults.
 4. Validation. All problems are collected and reported together. Messages never echo an expanded environment value.
 
-`check` stops after step 4. It does not test whether an address is assigned to this host, does not open `tls` files and binds nothing; `run` does those.
+`check` stops after step 4. It does not test whether an address is assigned to this host, does not open `tls` files and binds nothing; `run` does those. `check --deploy` opens the TLS files `run` opens (top-level `tls`, tls carriers, HEP TLS) and `--local-addresses` (with `--deploy`) checks `public.bind` and `private.ip`; neither binds a configured port or contacts a peer (an unaliased 127/8 address is probed with a bind on an ephemeral port, as `run` does).
 
 Writing a first file with `freesbc init` (prompts, flags, `FREESBC_*` variables), the service layout (`/etc/freesbc`, `root:freesbc` mode 0640) and the `freesbc.env` file that supplies `${VAR}` values under systemd are in [install.md](install.md).
 
@@ -84,7 +84,7 @@ in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:
 these ports MUST be reachable from clients.
 ```
 
-At startup `run` fails if `public.bind` or `private.ip` is not assigned to a local interface (`checkLocalAddr`, `internal/edge/edge.go:587`). An IPv4 loopback address counts when the kernel binds it: on Linux any 127/8 address works without an alias (for example `private.ip: 127.0.0.3` beside a switch on `127.0.0.2`), while on macOS a loopback address other than `127.0.0.1` needs `sudo ifconfig lo0 alias <ip> up`. `check` does not test this.
+At startup `run` fails if `public.bind` or `private.ip` is not assigned to a local interface (`CheckLocalAddr`, `internal/edge/edge.go:589`). An IPv4 loopback address counts when the kernel binds it: on Linux any 127/8 address works without an alias (for example `private.ip: 127.0.0.3` beside a switch on `127.0.0.2`), while on macOS a loopback address other than `127.0.0.1` needs `sudo ifconfig lo0 alias <ip> up`. `check` does not test this.
 
 ### `rtp`
 
@@ -105,7 +105,7 @@ There is one range and two independent allocators over it, one bound to `public.
 | `cert` | PEM certificate file path. |
 | `key` | PEM private key file path. |
 
-Both must be set when `tls` is present. The section is required when `edge.listen.tls` is set, when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by `check`.
+Both must be set when `tls` is present. The section is required when `edge.listen.tls` is set, when `edge.listen.wss` is set (browsers refuse an untrusted WSS certificate) or `admin.allow_remote` is true (the admin API must not carry Basic credentials in the clear). The files are opened by `run`, not by plain `check`; `check --deploy` opens them and prints the leaf's subject, SANs, issuer and not-after (expired is an error, under 30 days a warning).
 
 The leaf of the loaded pair (`Certificate[0]`, so a chain file works) is shown read-only: the WebUI's TLS certificate card on the Overview (with a banner when it expires in under 30 days or has expired; the card is absent when no listener loaded the pair), `GET /api/tls` and the gauge `freesbc_tls_cert_expiry_timestamp_seconds{path}` (not-after as Unix seconds, `path` the `cert` file; absent when nothing is loaded). `GET /api/tls` returns `{"loaded": false}` when nothing is loaded, otherwise `subject`, `sans`, `issuer`, `not_before`, `not_after`, `key_type`, `key_size`, `key_curve`, `fingerprint_sha256`, `cert_file`, `key_file`, `loaded_at`, `listeners` (`tls`, `wss`, `admin`), `days_to_expiry` (whole days, truncated toward zero: 9.99 days left is 9, 3 days and 4 minutes past is -3, under a day past is 0 with `expired: true`), `expired`, `expiring_soon` and `disk_differs`. The file is re-read each time the endpoint is asked, so `disk_differs` is always current: `disk_differs: true` means the file on disk now holds a different leaf than the one being served (or `disk_error` says it cannot be read). The key and the PEM are never exposed. `tls` is restart-only and there is no hot rotation: a renewed certificate is served only after a restart (drain first, see `docs/edge.md`). A malformed pair still fails startup. A separate check re-reads the file at admin start and every 10 minutes and caches the result: it feeds the gauge `freesbc_tls_cert_disk_differs` (1 while a renewal awaits restart, 0 otherwise; absent when nothing is loaded) and the `degraded` health conditions `tls_cert_renewed` (a renewed certificate is on disk) and `tls_cert_disk_error` (the file cannot be read or parsed, so the next restart would fail); while a renewal is pending the `tls_cert_expiry` message says so. Health and `/metrics` never read the file themselves. Alert with `freesbc_tls_cert_expiry_timestamp_seconds - time() < 14 * 86400`, or `freesbc_tls_cert_disk_differs == 1` for a renewal waiting on a restart.
 
@@ -201,7 +201,7 @@ An unknown key in the mapping is an error. `host` is required. Rules for the map
 - A literal-IP entry must not be FreeSBC's own public socket of the same transport (`public.bind` with that `edge.listen` port, or `public.ip` with its advertised port, `edge.advertise` or else the `edge.listen` port), nor an `edge.switch` node.
 - `transport` is `udp` (default), `tcp` or `tls`. A `udp` carrier requires `edge.listen.udp`. A `tcp` or `tls` carrier needs no listener to be called, because FreeSBC opens the connection; its own requests to FreeSBC (inbound calls, in-dialog requests) need the matching `edge.listen.tcp` or `edge.listen.tls`, or they can only use the connection FreeSBC opened. A `tls` carrier does not need the top-level `tls`, which is FreeSBC's server identity.
 - `srtp` is `off` (default), `optional` or `required`, the SDES-SRTP policy toward that carrier. The string form means `off`. A non-`off` value needs `transport: tls`, unless `edge.allow_insecure_sdes` is `true`; `check` fails otherwise. Unlike a client, a carrier's transport is fixed, so the rule is checked at load. Restart-only, with the rest of `edge.carriers`.
-- `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. `check` does not open these files; startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
+- `ca_file`, `client_cert` and `client_key` are valid only with `transport: tls`, and `client_cert` and `client_key` come together. `ca_file` replaces the system roots for that carrier (it does not add to them). The server certificate is verified against `host` and fails closed; there is no option to skip verification. Plain `check` does not open these files; `check --deploy` does, with the code `run` uses, and names the key and path of each failure. Startup (`run`) loads them and stops with a message naming the carrier if one is missing or malformed. All of `edge.carriers` is restart-only.
 
 An entry must equal the `host[:port]` the switch puts in the Request-URI (FreeSWITCH gateway `proxy`, Asterisk aor `contact`). That equality is what makes a request a carrier request.
 
@@ -338,7 +338,7 @@ hep:
 |---|---|---|
 | `address` | required | Literal `IP:port` of the collector (HOMER 11: 9060 for `udp` and `tcp`, 9061 for `tls`). No DNS, no wildcard. |
 | `transport` | `udp` | `udp`, `tcp` or `tls`. |
-| `tls` | none | Only with `transport: tls`; without it the system roots are used. Keys: `ca` (replaces the system roots), `cert` and `key` (client pair for HOMER's mutual TLS, both or neither). The server certificate is verified against the host of `address`, so for a literal IP it must carry that IP as a SAN; there is no option to skip verification. `check` does not open these files; `run` fails at startup on a missing or malformed one. |
+| `tls` | none | Only with `transport: tls`; without it the system roots are used. Keys: `ca` (replaces the system roots), `cert` and `key` (client pair for HOMER's mutual TLS, both or neither). The server certificate is verified against the host of `address`, so for a literal IP it must carry that IP as a SAN; there is no option to skip verification. Plain `check` does not open these files; `check --deploy` does, and `run` fails at startup on a missing or malformed one. |
 | `capture_id` | `0` | Capture agent ID (HEP chunk `0x0c`), an unsigned 32-bit integer. |
 | `node_name` | empty | Capture node name (HEP chunk `0x13`), at most 255 bytes. |
 | `redact_auth` | `true` | Masks the value of `Authorization` and `Proxy-Authorization` in the mirrored copy; the forwarded message is unchanged. |
