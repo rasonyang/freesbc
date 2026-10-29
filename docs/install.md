@@ -20,7 +20,7 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 4. Installs `freesbc` to `$FREESBC_PREFIX/bin` (default `/usr/local/bin`), using `sudo` only when that directory is not writable, and prints `freesbc version`. The new binary replaces the old one by a rename, so a running process is not disturbed; restart it to switch.
 5. On Linux with systemd, run as root, unless `--no-service`: creates the `freesbc` system user and `/etc/freesbc` (mode 0750, `root:freesbc`), installs `/etc/systemd/system/freesbc.service` (with `ExecStart` pointing at `$FREESBC_PREFIX/bin`) and runs `systemctl daemon-reload`. It does **not** enable or start the service: the config needs addresses first. The layout is the one described in [Run as a systemd service](#run-as-a-systemd-service). Not root or no systemd, it skips this step and says why.
 6. In that service step it never overwrites an existing `/etc/freesbc/freesbc.yaml`. When there is none and `FREESBC_SWITCH`, `FREESBC_PRIVATE_IP` and `FREESBC_PUBLIC_IP` are all set, it writes one with `freesbc init -c /etc/freesbc/freesbc.yaml`, sets it to `root:freesbc` mode 0640 and runs `freesbc check` on it. Piped from `curl`, stdin is not a terminal, so `init` cannot prompt; these variables are the only way to answer it.
-7. Prints the next steps: with no config yet, `init`, `chown`/`chmod`, `check` and `systemctl enable --now freesbc`; with a config, `check` and `systemctl enable --now freesbc`; without the service step, `init`, `check` and `run` on a local `freesbc.yaml`.
+7. Prints the next steps: with no config yet, `init`, `chown`/`chmod`, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; with a config, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; without the service step, `init`, `check` and `run` on a local `freesbc.yaml`.
 
 The whole body is in a `main()` function called on the last line, so a truncated download runs nothing. Running the script again is safe: it replaces the binary and the unit file and keeps the user, `/etc/freesbc` and the config. Put local unit changes in a drop-in (`systemctl edit freesbc`), which a re-run leaves alone.
 
@@ -218,16 +218,16 @@ install -m 0644 freesbc.service /etc/systemd/system/freesbc.service
 install -d -m 0750 -o root -g freesbc /etc/freesbc
 /usr/local/bin/freesbc init -c /etc/freesbc/freesbc.yaml   # prompts on a terminal; in a script pass --switch etc.
 chown root:freesbc /etc/freesbc/freesbc.yaml && chmod 0640 /etc/freesbc/freesbc.yaml
-/usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml
+/usr/local/bin/freesbc check --deploy --local-addresses -c /etc/freesbc/freesbc.yaml   # TLS files and addresses
 systemctl enable --now freesbc
 journalctl -u freesbc -f
 ```
 
-The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service can read but not change its own config. `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead of `init`, install it in place with `install -m 0640 -o root -g freesbc freesbc.example.yaml /etc/freesbc/freesbc.yaml` and edit the addresses.
+`check --deploy --local-addresses` opens the TLS certificates and keys, carrier CA files and HEP TLS files the way `run` will, prints each certificate's subject, SANs, issuer and expiry (an expired one is an error, one under 30 days a warning), and checks `public.bind` and `private.ip` are assigned to this host. It binds no configured port and contacts no peer (an unaliased 127/8 address is probed with a bind on an ephemeral port, as `run` does), so it is safe next to a running instance; run it on the target host, as the `freesbc` user to prove the service can read the files (`sudo -u freesbc`). Plain `check` opens none of this, and a bad path would otherwise turn into a restart loop under `Restart=on-failure`. The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service can read but not change its own config. `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead of `init`, install it in place with `install -m 0640 -o root -g freesbc freesbc.example.yaml /etc/freesbc/freesbc.yaml` and edit the addresses.
 
 ### Environment file
 
-For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode, `root:freesbc` 0640); the unit reads it if present (`EnvironmentFile=-`). `freesbc check` does not read that file, so check such a config with:
+For `${VAR}` values such as `admin.password_hash`, put `KEY=value` lines in `/etc/freesbc/freesbc.env` (same owner and mode, `root:freesbc` 0640); the unit reads it if present (`EnvironmentFile=-`). `freesbc check` does not read that file, so check such a config with (add `--deploy --local-addresses` as above):
 
 ```sh
 env $(grep -v '^#' /etc/freesbc/freesbc.env) /usr/local/bin/freesbc check -c /etc/freesbc/freesbc.yaml

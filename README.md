@@ -28,6 +28,7 @@ Then write a config and run it:
 ```sh
 freesbc init  -c freesbc.yaml    # asks for the switch, detects the addresses
 freesbc check -c freesbc.yaml    # validate; errors name the line and key
+freesbc check --deploy --local-addresses -c freesbc.yaml   # on the target host: TLS files and addresses
 freesbc run   -c freesbc.yaml    # SIGINT/SIGTERM to stop
 ```
 

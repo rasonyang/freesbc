@@ -526,7 +526,7 @@ func (s *Server) publicListeners() []bound {
 }
 
 // localInterface returns the name of the interface that owns ip. It is the
-// one lookup behind checkLocalAddr and the private socket's ingress filter
+// one lookup behind CheckLocalAddr and the private socket's ingress filter
 // (privateSocketFilter): both need the interface, and private.ip must be
 // assigned to a local interface for either to mean anything. An IPv4
 // loopback address inside a loopback interface's prefix counts as owned by
@@ -579,32 +579,34 @@ func localInterface(ip netip.Addr) (string, bool, error) {
 	return "", false, nil
 }
 
-// checkLocalAddr fails unless ip is assigned to a local interface, or is an
-// IPv4 loopback address the kernel binds without an alias (any 127/8 address
-// on Linux): a bind to anything else fails late and obscurely, and an
-// address that is not ours would be advertised to peers that can never reach
-// it.
-func checkLocalAddr(key string, ip netip.Addr) error {
-	_, ok, err := localInterface(ip)
+// CheckLocalAddr is the rule behind run and `freesbc check --local-addresses`.
+// It fails unless ip is assigned to a local interface, or is an IPv4 loopback
+// address the kernel binds without an alias (any 127/8 address on Linux): a
+// bind to anything else fails late and obscurely, and an address that is not
+// ours would be advertised to peers that can never reach it. It returns the
+// interface that owns ip. It binds no configured port and contacts no peer;
+// an unaliased 127/8 address is probed with a bind on an ephemeral port.
+func CheckLocalAddr(key string, ip netip.Addr) (iface string, err error) {
+	name, ok, err := localInterface(ip)
 	if err != nil {
-		return fmt.Errorf("proxy: list local addresses: %w", err)
+		return "", fmt.Errorf("proxy: list local addresses: %w", err)
 	}
 	if !ok {
 		if ip.Unmap().Is4() && ip.IsLoopback() {
-			return fmt.Errorf("proxy: %s %s is not assigned to any local interface and the kernel refuses to bind it (on macOS: sudo ifconfig lo0 alias %s up)", key, ip, ip.Unmap())
+			return "", fmt.Errorf("proxy: %s %s is not assigned to any local interface and the kernel refuses to bind it (on macOS: sudo ifconfig lo0 alias %s up)", key, ip, ip.Unmap())
 		}
-		return fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
+		return "", fmt.Errorf("proxy: %s %s is not assigned to any local interface", key, ip)
 	}
-	return nil
+	return name, nil
 }
 
 // Run binds every listener and blocks until ctx is cancelled. It returns
 // the first fatal bind error, or nil on clean shutdown.
 func (s *Server) Run(ctx context.Context) error {
-	if err := checkLocalAddr("public.bind", s.boot.PublicBind()); err != nil {
+	if _, err := CheckLocalAddr("public.bind", s.boot.PublicBind()); err != nil {
 		return err
 	}
-	if err := checkLocalAddr("private.ip", s.privAddr.Addr()); err != nil {
+	if _, err := CheckLocalAddr("private.ip", s.privAddr.Addr()); err != nil {
 		return err
 	}
 	// Every sipgo record goes through sipgoHandler: a failed parse would
@@ -979,7 +981,7 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 		if s.boot.TLS == nil {
 			return l, fmt.Errorf("%s needs the top-level tls cert and key", transport)
 		}
-		cert, err := tls.LoadX509KeyPair(s.boot.TLS.Cert, s.boot.TLS.Key)
+		cert, err := LoadTLSPair(s.boot.TLS.Cert, s.boot.TLS.Key)
 		if err != nil {
 			return l, fmt.Errorf("%s certificate: %w", transport, err)
 		}

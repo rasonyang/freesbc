@@ -300,7 +300,6 @@ setup_config() {
 	run chown root:freesbc "$CONF_PATH"
 	run chmod 0640 "$CONF_PATH"
 	run "$BIN_DIR/freesbc" check -c "$CONF_PATH"
-	CONF_WRITTEN=1
 	return 0
 }
 
@@ -312,7 +311,7 @@ next_steps() {
 	case $1 in
 	service-config)
 		printf '\nNext steps (as root):\n' >&2
-		[ "$CONF_WRITTEN" = 1 ] || printf '  %s check -c %s\n' "$cmd" "$CONF_PATH" >&2
+		printf '  %s check --deploy --local-addresses -c %s\n' "$cmd" "$CONF_PATH" >&2
 		printf '  systemctl enable --now freesbc\n' >&2
 		;;
 	service)
@@ -322,7 +321,7 @@ Next steps (as root):
   $cmd init -c $CONF_PATH
   chown root:freesbc $CONF_PATH
   chmod 0640 $CONF_PATH
-  $cmd check -c $CONF_PATH
+  $cmd check --deploy --local-addresses -c $CONF_PATH
   systemctl enable --now freesbc
 
 Or set FREESBC_SWITCH, FREESBC_PRIVATE_IP and FREESBC_PUBLIC_IP and re-run
@@ -376,7 +375,6 @@ main() {
 	PREFIX=${PREFIX%/}
 	BIN_DIR=$PREFIX/bin
 	SUDO=
-	CONF_WRITTEN=0
 
 	detect_platform
 	need tar

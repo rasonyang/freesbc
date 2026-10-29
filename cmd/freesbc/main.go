@@ -24,6 +24,8 @@ const usage = `FreeSBC — SIP/WebRTC edge session border controller
 Usage:
   freesbc run   [-c freesbc.yaml]   start the SBC
   freesbc check [-c freesbc.yaml]   validate a config file and exit
+        [--deploy [--local-addresses]]   also open the TLS files run opens and report each
+        certificate; --local-addresses checks public.bind and private.ip are on this host
   freesbc init  [-c freesbc.yaml]   write a minimal config with detected addresses
         [--switch IP[:port]] [--private-ip IP] [--public-ip IP] [--public-bind IP]
         [--udp-port N] [--no-public-lookup]   (env: FREESBC_SWITCH, FREESBC_PRIVATE_IP,
@@ -75,6 +77,11 @@ func run(args []string) int {
 	}
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	cfgPath := fs.String("c", "freesbc.yaml", "path to config file")
+	var deploy, localAddrs bool
+	if cmd == "check" {
+		fs.BoolVar(&deploy, "deploy", false, "also open the files run opens (TLS pair, carrier and HEP TLS files)")
+		fs.BoolVar(&localAddrs, "local-addresses", false, "with --deploy: public.bind and private.ip must be local")
+	}
 	var initOpts app.InitOptions
 	var udpPort string
 	if cmd == "init" {
@@ -129,6 +136,20 @@ func run(args []string) int {
 		}
 		return 0
 	case "check":
+		if localAddrs && !deploy {
+			fmt.Fprintf(os.Stderr, "freesbc check: --local-addresses needs --deploy\n\n%s", usage)
+			return 2
+		}
+		if deploy {
+			report, note, err := app.CheckDeploy(*cfgPath, localAddrs)
+			fmt.Print(report)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				return 1
+			}
+			fmt.Print(note)
+			return 0
+		}
 		note, err := app.Check(*cfgPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)

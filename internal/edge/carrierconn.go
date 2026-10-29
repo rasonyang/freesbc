@@ -3,12 +3,10 @@ package edge
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"time"
 
@@ -94,18 +92,14 @@ func newCarrierConns(s *Server, cfg *config.Config) (*carrierConns, error) {
 func carrierTLSConfig(c config.Carrier) (*tls.Config, error) {
 	conf := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: c.Host}
 	if c.CAFile != "" {
-		pem, err := os.ReadFile(c.CAFile)
+		pool, err := LoadCAPool(c.CAFile)
 		if err != nil {
-			return nil, fmt.Errorf("ca_file: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("ca_file %s: no PEM certificate found", c.CAFile)
+			return nil, fmt.Errorf("ca_file %s: %w", c.CAFile, err)
 		}
 		conf.RootCAs = pool
 	}
 	if c.ClientCert != "" {
-		cert, err := tls.LoadX509KeyPair(c.ClientCert, c.ClientKey)
+		cert, err := LoadTLSPair(c.ClientCert, c.ClientKey)
 		if err != nil {
 			return nil, fmt.Errorf("client_cert/client_key: %w", err)
 		}

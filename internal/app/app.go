@@ -7,6 +7,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -154,19 +155,26 @@ func newHEPSender(h *config.HEPConfig, log *slog.Logger) (*hep.Sender, error) {
 		Logger:    log.With("component", "hep"),
 	}
 	if h.Transport == config.HEPTLS {
-		host, _, err := net.SplitHostPort(h.Address)
-		if err != nil {
-			return nil, err
-		}
-		var ca, cert, key string
-		if h.TLS != nil {
-			ca, cert, key = h.TLS.CA, h.TLS.Cert, h.TLS.Key
-		}
-		if opts.TLS, err = hep.TLSConfig(ca, cert, key, host); err != nil {
+		var err error
+		if opts.TLS, err = hepTLSConfig(h); err != nil {
 			return nil, err
 		}
 	}
 	return hep.New(opts)
+}
+
+// hepTLSConfig is the client TLS config toward a tls collector, the one
+// `run` and `check --deploy` both build.
+func hepTLSConfig(h *config.HEPConfig) (*tls.Config, error) {
+	host, _, err := net.SplitHostPort(h.Address)
+	if err != nil {
+		return nil, err
+	}
+	var ca, cert, key string
+	if h.TLS != nil {
+		ca, cert, key = h.TLS.CA, h.TLS.Cert, h.TLS.Key
+	}
+	return hep.TLSConfig(ca, cert, key, host)
 }
 
 // closeHEPSender flushes the queue, bounded, at shutdown.
