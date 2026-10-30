@@ -84,7 +84,7 @@ in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:
 these ports MUST be reachable from clients.
 ```
 
-At startup `run` fails if `public.bind` or `private.ip` is not assigned to a local interface (`CheckLocalAddr`, `internal/edge/edge.go:589`). An IPv4 loopback address counts when the kernel binds it: on Linux any 127/8 address works without an alias (for example `private.ip: 127.0.0.3` beside a switch on `127.0.0.2`), while on macOS a loopback address other than `127.0.0.1` needs `sudo ifconfig lo0 alias <ip> up`. `check` does not test this.
+At startup `run` fails if `public.bind` or `private.ip` is not assigned to a local interface (`CheckLocalAddr`, `internal/edge/edge.go`). An IPv4 loopback address counts when the kernel binds it: on Linux any 127/8 address works without an alias (for example `private.ip: 127.0.0.3` beside a switch on `127.0.0.2`), while on macOS a loopback address other than `127.0.0.1` needs `sudo ifconfig lo0 alias <ip> up`. `check` does not test this.
 
 ### `rtp`
 
