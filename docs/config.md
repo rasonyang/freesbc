@@ -128,7 +128,7 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 
 The switch nodes, as literal `IP:port` over UDP (no DNS: a host name is a validation error). Rules: each entry is a valid IP with port 1-65535, not unspecified, not repeated, and not FreeSBC's own private socket `private.ip:5060`.
 
-One entry is a single upstream. More than one is a pool: a request is hashed to a node by FNV-1a 64 over the lower-cased user part, and a node that answered nothing is skipped for 30 s (passive cooldown), and after 3 unanswered REGISTERs in a row it is not dialed for REGISTER at all (30 s, 1 m, then 5 m; constants, see `docs/edge.md`). The nodes must share a registration store. A node is named by its `IP:port` in logs and metrics.
+One entry is a single upstream. More than one is a pool: a request is hashed to a node by FNV-1a 64 over the lower-cased user part, and a node that answered nothing is skipped for 30 s (passive cooldown), and after 3 unanswered REGISTERs in a row it is not dialed for REGISTER at all (30 s, 1 m, then 5 m; constants, see `docs/edge.md`). The nodes must share a registration store. A node is named by its `IP:port` in logs and in `GET /api/switch-nodes`.
 
 A carrier registration, and the calls delivered to it, stay on the node that registered.
 
@@ -272,7 +272,7 @@ Web security (restart-only like the rest of `admin`):
 
 #### Endpoints
 
-Every route is served on `admin.listen`. "Session or Basic" means a `freesbc_session` cookie from `/login` or Basic credentials for `admin`; either works on every such route (see Auth model above). A wrong method is `405` with an `Allow` header. The full response shapes are in [`design.md` §13.3](design.md#133-admin-http-api).
+Every route is served on `admin.listen`. "Session or Basic" means a `freesbc_session` cookie from `/login` or Basic credentials for `admin`; either works on every such route (see Auth model above). Every route that declares a method answers a wrong one with `405` and an `Allow` header; `/healthz`, `/api/status`, `/api/calls`, `/metrics` and the WebUI catch-all accept any method. The full method column and response shapes are in [`design.md` §13.3](design.md#133-admin-http-api).
 
 | Method | Path | Purpose | Auth |
 |---|---|---|---|

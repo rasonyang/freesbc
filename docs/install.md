@@ -14,7 +14,7 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 
 ### What it does
 
-1. Detects the OS (`linux` or `darwin`) and the CPU (`x86_64`/`amd64` as `amd64`, `aarch64`/`arm64` as `arm64`). Anything else exits with an error. It needs `curl` or `wget`, `tar`, and `sha256sum` or `shasum`; [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) (v2.4.2 or later, v3 recommended) is optional and checks the signature.
+1. Detects the OS (`linux` or `darwin`) and the CPU (`x86_64`/`amd64` as `amd64`, `aarch64`/`arm64` as `arm64`). Anything else exits with an error. It needs `curl` or `wget`, `tar`, `awk`, `mktemp`, and `sha256sum` or `shasum`; [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) (v2.4.2 or later, v3 recommended) is optional and checks the signature.
 2. Resolves the latest tag from the `releases/latest` redirect (no GitHub API call, so no rate limit), unless `FREESBC_VERSION` pins one.
 3. Downloads `SHA256SUMS` into a temporary directory and, when `cosign` is installed, its signature `SHA256SUMS.sigstore.json`, and checks that `SHA256SUMS` was signed by this repository's release workflow (see [Integrity](#integrity); `FREESBC_VERIFY` controls it). Then it downloads `freesbc_<tag>_<os>_<arch>.tar.gz` and verifies the tarball's hash against `SHA256SUMS`. A bad signature or a mismatch exits non-zero and installs nothing.
 4. Installs `freesbc` to `$FREESBC_PREFIX/bin` (default `/usr/local/bin`), using `sudo` only when that directory is not writable, and prints `freesbc version`. The new binary replaces the old one by a rename, so a running process is not disturbed; restart it to switch.
