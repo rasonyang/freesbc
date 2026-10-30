@@ -140,9 +140,6 @@ type offerResult struct {
 	offer *sdp.Session
 }
 
-// sess is the media session this exchange is negotiating for.
-func (o *offerResult) sess() *mediaSession { return o.dialog.session() }
-
 var (
 	// errNoUsableCodec maps to 488: the two sides share no codec and
 	// FreeSBC does not transcode.

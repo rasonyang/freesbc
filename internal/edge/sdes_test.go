@@ -181,14 +181,6 @@ func (p *sdesPeer) fromSwitch(t *testing.T, privPort int, fs *net.UDPConn, paylo
 	t.Fatalf("switch -> peer: %q never arrived as SRTP the peer could decrypt", payload)
 }
 
-// expectNone asserts the switch socket receives nothing for d.
-func expectNone(t *testing.T, fs *net.UDPConn, d time.Duration, what string) {
-	t.Helper()
-	if raw, ok := readUDP(fs, d); ok {
-		t.Errorf("%s: the switch received %d bytes, want nothing", what, len(raw))
-	}
-}
-
 func fsMediaSocket(t *testing.T, port int) *net.UDPConn {
 	t.Helper()
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})

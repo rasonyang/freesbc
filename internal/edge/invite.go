@@ -14,7 +14,6 @@ import (
 	"github.com/freesbc/freesbc/internal/config"
 	"github.com/freesbc/freesbc/internal/media"
 	fsip "github.com/freesbc/freesbc/internal/sip"
-	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
 
 // inviteTimeout bounds an INVITE transaction end to end. It is longer than
@@ -573,7 +572,7 @@ func hashUserFor(req *sip.Request) string {
 // inviteToClient handles a call FreeSWITCH is placing to a registered
 // client — acceptance criterion 3.
 func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
-	binding, ok := s.resolveTarget(req)
+	binding, ok := s.bindingForRequest(req)
 	if !ok {
 		// Nothing registered under that contact any more. 404 is the
 		// correct answer and lets FreeSWITCH fail over or play a
@@ -704,16 +703,11 @@ func (s *Server) publicSideFor(req *sip.Request) (side, bool) {
 	return s.topo.publicSide(sip.NetworkToLower(req.Transport()))
 }
 
-// resolveTarget finds the binding an inbound request is addressed to by the
-// opaque token FreeSBC put in the registered Contact. There is no
-// address-of-record fallback: an unknown or expired token is not found.
-func (s *Server) resolveTarget(req *sip.Request) (Binding, bool) {
-	return s.bindingForRequest(req)
-}
-
-// bindingForRequest extracts the binding token from a Request-URI (or from
-// the topmost Route, where a strict-routing element may have moved it) and
-// resolves it.
+// bindingForRequest finds the binding an inbound request is addressed to by
+// the opaque token FreeSBC put in the registered Contact, taken from the
+// Request-URI (or from the topmost Route, where a strict-routing element may
+// have moved it). There is no address-of-record fallback: an unknown or
+// expired token is not found.
 func (s *Server) bindingForRequest(req *sip.Request) (Binding, bool) {
 	if tok, ok := tokenOf(req.Recipient); ok {
 		if b, found := s.loc.ByToken(tok); found {
@@ -791,5 +785,3 @@ func (s *Server) rejectInviteMedia(req *sip.Request, tx sip.ServerTransaction, e
 // isInDialog reports whether a request belongs to an established dialog,
 // which RFC 3261 §12.2 identifies by the presence of a To tag.
 func isInDialog(req *sip.Request) bool { return fsip.ToTag(req) != "" }
-
-func codecNames(cs []sdp.Codec) string { return sdp.Describe(cs) }

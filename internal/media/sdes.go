@@ -139,6 +139,3 @@ func (s *Session) SetSDESRemote(side Side, k SDESKey) error {
 func (s *Session) SetSDESLocal(side Side, k SDESKey) error {
 	return s.sdesFor(side).out.set(k)
 }
-
-// SDESEnabled reports whether side is an SDES side.
-func (s *Session) SDESEnabled(side Side) bool { return s.sdes[side].Load() != nil }
