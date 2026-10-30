@@ -49,7 +49,7 @@ To confirm on the wire, capture on the FreeSBC host (`tcpdump -ni any udp port 5
 
 **Fingerprint.** `reason=rtp_silence terminated_by=proxy`, with a `duration` that runs 5 to 6 minutes past the moment the audio stopped (the watchdog polls every quarter of its timeout). FreeSBC BYEs both ends.
 
-**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP packet that fails authentication, never do. RTCP does not feed it.
+**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP packet that fails authentication, never do. RTCP also refreshes it, but RTCP packets are not counted in the RTP packet/byte metrics.
 
 The usual causes:
 

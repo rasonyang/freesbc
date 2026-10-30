@@ -48,12 +48,13 @@ FreeSWITCH version in your test notes.
   SBC's hostname, or in a lab a `mkcert` certificate whose CA is installed
   in the browser's trust store.
 - **A browser client:** `web-sip-phone`, or any sip.js page, registered as
-  `1000` with server URL `wss://<sbc-hostname>:18443`. Leave reliable
-  provisionals (100rel) unsupported or supported, never *required*:
-  FreeSBC does not relay PRACK, so an INVITE with `Require: 100rel` is
-  answered `420 Bad Extension` (sip.js: keep `sipExtension100rel` at its
-  default, not `Required`). The browser must offer `a=rtcp-mux`; every
-  current browser does by default (`rtcpMuxPolicy: "require"`).
+  `1000` with server URL `wss://<sbc-hostname>:18443`. Reliable provisionals
+  (100rel) may be unsupported, supported or required: FreeSBC forwards PRACK,
+  and a PRACK carrying SDP is accepted only as the answer to a delayed offer
+  (otherwise 488; see [Reliable provisionals, UPDATE and delayed
+  offers](../edge.md#reliable-provisionals-update-and-delayed-offers)). The
+  browser must offer `a=rtcp-mux`; every current browser does by default
+  (`rtcpMuxPolicy: "require"`).
 - **Chrome or Chromium** for `chrome://webrtc-internals`. Firefox works
   for the call tests; its equivalent page is `about:webrtc`.
 - UDP from the browser to the public RTP range (`30000-39999` below) must
