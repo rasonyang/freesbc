@@ -328,11 +328,9 @@ func (s *Sender) write(p *Packet) bool {
 	if _, err = c.Write(s.buf); err != nil {
 		s.writeErrs.Add(1)
 		if s.stream {
-			s.closeConnIf(c)
-			s.fail("write", err)
-		} else {
-			s.fail("write", err) // UDP: the socket stays
+			s.closeConnIf(c) // a stream connection is closed; a UDP socket stays
 		}
+		s.fail("write", err)
 		return false
 	}
 	s.sent.Add(1)

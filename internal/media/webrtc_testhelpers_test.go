@@ -36,7 +36,7 @@ func selfSignedForTest() (tls.Certificate, error) {
 
 // fingerprintOf renders a certificate the way SDP a=fingerprint does.
 func fingerprintOf(cert tls.Certificate) string {
-	return fingerprintHex(cert.Certificate[0])
+	return fingerprintWith("sha-256", cert.Certificate[0])
 }
 
 // rtpPacket builds a minimal valid RTP packet with a payload of n zero

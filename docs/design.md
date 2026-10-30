@@ -147,7 +147,7 @@ Created once, alive for the process lifetime:
 
 | Object | Package | Created at | Notes |
 |---|---|---|---|
-| `config.Store` | config | `app.Run` (`app.go:55`) | `atomic.Pointer[Config]` + subscriber list (no subscribers today) |
+| `config.Store` | config | `app.Run` (`app.go:55`) | `atomic.Pointer[Config]` |
 | `edge.Server` | edge | `edge.New` (`app.go:59`) | binds nothing until `Run`; keeps its startup snapshot as `boot` |
 | `edge.topology` | edge | `edge.New` (`edge.go:230`) | immutable snapshot, built once from `boot` and the private socket |
 | `edge.pubPool` / `privPool` | edge, media | `newMediaPools` (`edge.go:268`, `mediapool.go:19`) | two `media.PlanePool`s over the one `rtp` range, bound to `public.bind` and the private IP; separate port namespaces |
@@ -204,11 +204,11 @@ after the first SIGINT/SIGTERM (`cmd/freesbc/main.go:101-104`).
 | per listener: closer (`<-listenCtx.Done(); ln.Close()`) and `ln.Serve` | `Run` (`edge.go:719-729`) | `listenCtx` cancel / serve error |
 | registration and carrier-token prune ticker (30 s): `Location.Prune`, `carrierRegTable.prune`, then `publishCarrierRegistrations` | `Run` (`edge.go:772-793`) | `listenCtx` cancel |
 | carrier directory refresh (`carrierDirectory.Run`) | `Run` (`edge.go:816-819`) | `listenCtx` cancel |
-| per confirmed dialog: media watcher (`<-sess.Done()`, then end the dialog) | `dialog.confirm` (`dialog.go:1082`) | session `Done` closed |
-| WebRTC establishment | `startWebRTC` (`media.go:327`) | `WebRTCSession.Start` returns |
+| per confirmed dialog: media watcher (`<-sess.Done()`, then end the dialog) | `dialog.confirm` (`dialog.go:1070`) | session `Done` closed |
+| WebRTC establishment | `startWebRTC` (`media.go:324`) | `WebRTCSession.Start` returns |
 | `ackThenBye` (a 2xx FreeSBC will not relay) / `ack2xx` (its retransmission) | `refuse2xx` (`invite_leg.go:131-137`); `ack2xx` also from the re-INVITE relay (`indialog.go:114`) | its 5 s BYE context / after one write |
 | background wait for a CANCELled INVITE's or abandoned re-INVITE's final (`lingerForFinal`; at most `maxCancelLingers`) | `drainCancelledInvite` and `abandonReInvite` after the inline `cancelDrain` (`invite_leg.go:398`) | a final, the transaction's `Done`, or `cancelLinger` (then `Terminate`) |
-| `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:449,488`, `invite_leg.go:544,583`, `carrier.go:274`) | its 5 s CANCEL context |
+| `sendCancel` (CANCEL toward a forwarded INVITE branch) | the INVITE paths (`invite.go:448,487`, `invite_leg.go:544,583`, `carrier.go:274`) | its 5 s CANCEL context |
 | `sendMiddleBye` (media ended a confirmed dialog; one per end) | `byeBothEnds` (`indialog.go:923`) | its 5 s BYE context |
 | per request: sipgo transaction-layer goroutine running `Server.handleRequest` and the handler; `guard` grows its stack to 16 KiB once on entry (`growStack`, issue #173) | sipgo (`sip/transaction_layer.go:140`) | handler return (after the final response; `dialogTable` owns the dialog from then on); since sipgo v1.6.0 `TerminateGracefully` does not wait for the transaction's timers (#170) |
 | per INVITE server transaction: `drainAcks` (reads ACKs sipgo matches to it) | `guard` (`edge.go`) | after a 2xx, `ack2xxDrainWait` (8 s) or the transaction's `Done`, whichever is first; otherwise the transaction's `Done` (Timer H or I on UDP; at once on a reliable transport) |
@@ -402,13 +402,11 @@ Reload is driven only by `config.Watch` (`internal/config/reload.go`, `Watch` an
   goroutine logs that error and returns nil anyway (`app.go:71-77`), so a
   watcher that never started silently disables reload for the process's life.
 
-`Store.Replace` stores the new pointer atomically, then does a non-blocking
-send into every subscriber channel (coalescing). `Store.Current()` is
+`Store.Replace` stores the new pointer atomically. `Store.Current()` is
 lock-free and never nil. Snapshots are immutable by contract: a `*Config`
 handed to a `Store` is never mutated, and the compiled fields
 (`Edge.switches`, `Edge.carrierNets`, `Edge.carriers`) are populated during
-`validate`, before publication. Nothing in the process calls
-`Store.Subscribe` today.
+`validate`, before publication.
 
 There is **no reload-failure metric**.
 
@@ -419,7 +417,7 @@ Every top-level section is restart-only except `shield`. The table is
 
 | Hot (re-read per use) | Restart-only (`config.RestartOnlyChanges` key) |
 |---|---|
-| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`invite.go:240`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`sessionLimit`, `invite.go:204`) | |
+| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`invite.go:239`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`sessionLimit`, `invite.go:203`) | |
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`shield.go:132`), re-parsing a rate-limit string only when it changes (`shield.go:246`) | `public` (`ip`, `bind`) |
 | `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing only when the string changes (`strikeLimit`, `offenders.go`) | |
 | | `private` (`ip`) |
@@ -574,17 +572,17 @@ An out-of-dialog INVITE that arrives on a public listener goes through admission
 
 1. Its exact transport and IP:port is a live client registration (`Location.HasSource`): `srcClient`. A registration wins over a carrier source, so a client behind a carrier's address is never sent down the carrier path.
 2. Its source is a carrier source on the right transport: `srcCarrier`, with the carrier's name. A resolved `edge.carriers` address counts only when the request arrived over that carrier's own transport (`carrierFor(src, network)`), so a tls carrier's IP over UDP is not admitted; an `edge.carrier_sources` entry matches by IP on any public transport.
-3. Otherwise `srcDrop`: silent drop, counted as `freesbc_edge_admission_drops_total{reason="invite_not_admitted"}` (`internal/edge/invite.go:51-68`).
+3. Otherwise `srcDrop`: silent drop, counted as `freesbc_edge_admission_drops_total{reason="invite_not_admitted"}` (`internal/edge/invite.go:50-67`).
 
 The carrier source set for the shield (`carrierSnapshot.isSource`, IP only, so a carrier is rate-limited by `carrier_rate_limit` and never banned on any transport), `internal/edge/carrierdns.go:61`) is `edge.carrier_sources` plus the host prefix of every literal-IP carrier plus every resolved address of the DNS-name carriers (§6.4). `carrierFor` (`carrierdns.go:76`) names the carrier: an exact IP:port match against a resolved address wins; otherwise the first entry (sorted by name) with that IP; otherwise a source inside `carrier_sources` that matches no entry is named `unknown`.
 
-`inviteToUpstream` (`invite.go:272`) serves both clients and carriers; a non-empty carrier name selects the carrier behaviour:
+`inviteToUpstream` (`invite.go:271`) serves both clients and carriers; a non-empty carrier name selects the carrier behaviour:
 
-- Destination: the chosen node's carrier address, `<node IP>:<edge.switch_carrier_port>` (default: the node's own `edge.switch` port), never the client port (`endpoint.carrierAddr`, `topology.go:164`; the port is set in `buildTopology`, `topology.go:236-242`, and `invite.go:391-394`). Client traffic never goes to the carrier port, so the switch may run an unauthenticated profile there.
-- Node choice (`invite.go:358-379`): when the Request-URI carries a carrier-registration token that names a live binding (§6.8), the call goes to that node only, with the Request-URI replaced by the switch's original Contact (`out.Recipient = pinned.contact`, `invite.go:403-405`), so the switch can identify the call by its registration line (Asterisk `line=yes`, FreeSWITCH `${sip_gateway}`). There is no failover in that case. With no token, or an unknown or expired one (logged at WARN), the node is chosen by the hash-user pool over the lower-cased Request-URI user, i.e. the DID (`carrierHashUser`, `carrier.go:126`; Request-URI user, else To user, else Call-ID), with the same cooldown-ordered retry as the client path, and the Request-URI is left unchanged.
-- FreeSBC appends `X-FreeSBC-Carrier: <name>` after `prepareForward` (`invite.go:400-402`); `unknown` for a carrier-source address that matches no entry. The same stamp is added to ACK, re-INVITE and other in-dialog requests from a carrier (`stampCarrier`, `carrier.go:164`), which also counts them in the metric.
+- Destination: the chosen node's carrier address, `<node IP>:<edge.switch_carrier_port>` (default: the node's own `edge.switch` port), never the client port (`endpoint.carrierAddr`, `topology.go:164`; the port is set in `buildTopology`, `topology.go:236-242`, and `invite.go:390-393`). Client traffic never goes to the carrier port, so the switch may run an unauthenticated profile there.
+- Node choice (`invite.go:357-378`): when the Request-URI carries a carrier-registration token that names a live binding (§6.8), the call goes to that node only, with the Request-URI replaced by the switch's original Contact (`out.Recipient = pinned.contact`, `invite.go:402-404`), so the switch can identify the call by its registration line (Asterisk `line=yes`, FreeSWITCH `${sip_gateway}`). There is no failover in that case. With no token, or an unknown or expired one (logged at WARN), the node is chosen by the hash-user pool over the lower-cased Request-URI user, i.e. the DID (`carrierHashUser`, `carrier.go:126`; Request-URI user, else To user, else Call-ID), with the same cooldown-ordered retry as the client path, and the Request-URI is left unchanged.
+- FreeSBC appends `X-FreeSBC-Carrier: <name>` after `prepareForward` (`invite.go:399-401`); `unknown` for a carrier-source address that matches no entry. The same stamp is added to ACK, re-INVITE and other in-dialog requests from a carrier (`stampCarrier`, `carrier.go:164`), which also counts them in the metric.
 - The Contact toward the switch is FreeSBC's private address, the Record-Route is the usual RFC 5658 double pair, and the SDP is built from scratch with a private anchor port (the standard upstream offer, `buildUpstreamOffer`). Responses go back through `respToCarrier` (§6.5).
-- Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:35`, `invite.go:280-291`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:154-155`). The predicate is the live directory snapshot (`edge.go:655`).
+- Carriers are exempt from the per-source early-call cap `maxEarlyPerSource` (`invite.go:34`, `invite.go:279-290`). `shield.carrier_rate_limit` bounds them instead, and the shield never scanner-bans a carrier source (`internal/shield/shield.go:154-155`). The predicate is the live directory snapshot (`edge.go:655`).
 - A request from a carrier source that matches no dialog record and is not an INVITE (an ACK or BYE for a call whose record is gone) takes the in-dialog fallback: hashed by the DID to a node's carrier address, with the same Request-URI restoration and stamp (`directionFor`, `indialog.go:840-847`; `restoreCarrierRURI`, `hide.go:550`). `carrierFallback` (`carrier.go:140`) is the test: a carrier source that is not an exact live registration address.
 
 A public OPTIONS from an admitted source (live registration, carrier source or a live dialog's To tag; otherwise dropped silently as `options_not_admitted`), including a carrier's keepalive, is answered locally and never reaches the switch (`onOptions`, `edge.go:1394`); while draining (§7.1) an out-of-dialog one from a carrier source (not also a live registration) is **503** + `Retry-After: 30`.
@@ -627,8 +625,8 @@ The switch uses FreeSBC as its outbound proxy and addresses the carrier in the R
 
 **INVITE** (`inviteToCarrier`, `carrier.go:185`): a single attempt, shaped like `inviteToClient`.
 - No resolved address, or no public UDP side: 503. An offer with no SDP body: 488 (FreeSBC would otherwise be the offerer toward the carrier).
-- `beginDialog(planePrivate)`, `d.setCarrier(name)`: the dialog records the carrier (`dialog.go:681-692`).
-- Media is anchored on both legs. `buildPublicOffer(d, body, false)` builds the offer for the carrier on a public anchor port; the switch is answered from a private anchor port. Both SDPs are FreeSBC's own (`internal/sip/sdp.Build`). The carrier leg is always the plain RTP relay (`calleeCarrier`, `invite_leg.go:30-32`; `media.go:493-501`).
+- `beginDialog(planePrivate)`, `d.setCarrier(name)`: the dialog records the carrier (`dialog.go:674-685`).
+- Media is anchored on both legs. `buildPublicOffer(d, body, false)` builds the offer for the carrier on a public anchor port; the switch is answered from a private anchor port. Both SDPs are FreeSBC's own (`internal/sip/sdp.Build`). The carrier leg is always the plain RTP relay (`calleeCarrier`, `invite_leg.go:30-32`; `media.go:490-498`).
 - The Request-URI is the switch's, unchanged. The Contact is FreeSBC's public address with the From user (`carrier.go:234-240`).
 - Failure to send is 503; a transaction timeout is 408. A CANCEL from the switch cancels the carrier INVITE like any proxied call.
 
@@ -665,7 +663,7 @@ Max-Forwards is decremented as on any proxied request; a zero Max-Forwards is 48
 
 **Identity restored toward the switch.** A far end echoes the masked From and To in its own in-dialog requests (a client's BYE, a carrier's re-INVITE). So that the switch sees its own URIs, `restoreIdentity` (`hide.go:274`) maps each of the two tags back to the real address the record kept: the dialog's `callerURI` and `calleeURI` (`dialog.uriForTag`; `calleeURI` is updated from the switch's 2xx To, `setCalleeURI`, `invite_leg.go:176`; the early dialog's per-tag To, `setForkTo`, `invite_leg.go:173`) and the subscription's `subURI` and `notURI`. It runs from `restoreToSwitch` (`indialog.go:904`) for re-INVITE, ACK and every other in-dialog request, and from `forwardInSubscription` for a request on a subscription. `restoreURI` (`hide.go:264`) rewrites an address only when the record's host is a switch address, the user is the same and the host is `public.ip`, so a host the far end legitimately chose is never touched. A request with no record (a dialog already gone) is forwarded as received.
 
-**Client legs** follow the same rules (issues #166, #167). `inviteToClient` and `subscribeToClient` build their request with `prepareForwardFor(..., hideClient)` (`invite.go:630`, `subscribe.go:475`) and the leg's response mode is `respToSwitch` (`invite.go:681`); a client-originated INVITE uses `respToClient` (`invite.go:382`), so does REGISTER (`register.go:288`), a public MESSAGE (`message.go:77`) and a SUBSCRIBE (`relaySubscribe`, `subscribe.go:583`). The client's response to a switch-originated INVITE or SUBSCRIBE gets FreeSBC's private Record-Route inserted as for a carrier, so the switch's route set still starts at `private.ip:5060`. In-dialog routing needs nothing else: FreeSBC matches a dialog on Call-ID and both tags, `stripOwnRoutes` removes whichever of its own Routes a request carries, and the Request-URI is retargeted to the far Contact.
+**Client legs** follow the same rules (issues #166, #167). `inviteToClient` and `subscribeToClient` build their request with `prepareForwardFor(..., hideClient)` (`invite.go:629`, `subscribe.go:475`) and the leg's response mode is `respToSwitch` (`invite.go:680`); a client-originated INVITE uses `respToClient` (`invite.go:381`), so does REGISTER (`register.go:288`), a public MESSAGE (`message.go:77`) and a SUBSCRIBE (`relaySubscribe`, `subscribe.go:583`). The client's response to a switch-originated INVITE or SUBSCRIBE gets FreeSBC's private Record-Route inserted as for a carrier, so the switch's route set still starts at `private.ip:5060`. In-dialog routing needs nothing else: FreeSBC matches a dialog on Call-ID and both tags, `stripOwnRoutes` removes whichever of its own Routes a request carries, and the Request-URI is retargeted to the far Contact.
 
 **Carrier-originated request that goes to the switch** keeps the normal double Record-Route toward the switch (it is a private-side message; nothing is hidden from the switch). **The response to the carrier** (`respToCarrier`, `hide.go:405-422`) has any Record-Route naming the private socket removed and its Contact, if present, replaced by the public address, so no private address leaves in a response either.
 
@@ -923,9 +921,9 @@ through `With`. Matching on the message is a sipgo v1.6.0 workaround
 (`drain.go:23`: an atomic flag read lock-free on every INVITE, plus a mutex
 that guards the `since` time) and the gauge `freesbc_edge_draining`
 (`Metrics.SetDraining`). `beginDialog` takes a `carrierCall` flag and checks
-drain first (`invite.go:244`), before `dialogTable.begin`, the rate token and
+drain first (`invite.go:243`), before `dialogTable.begin`, the rate token and
 any media: while draining, a new carrier call is answered **503** with
-`Retry-After: 30` (`drainRetryAfter`, `invite.go:156`) through `rejectBusy` and
+`Retry-After: 30` (`drainRetryAfter`, `invite.go:155`) through `rejectBusy` and
 counted as `freesbc_edge_invite_rejects_total{reason="draining"}`
 (`rejectDraining`). Carrier calls are carrier to switch (`inviteToUpstream`
 with a carrier caller) and switch to carrier (`inviteToCarrier`); client to
@@ -949,7 +947,7 @@ restart starts not draining) and there is no automatic exit when the calls
 reach zero: the operator polls `GET /api/drain` (§13.3) and restarts. The edge
 logs each actual change at Info (`edge drain entered` / `edge drain left`).
 
-**Global call admission control.** `beginDialog` (`invite.go:242`) is the one
+**Global call admission control.** `beginDialog` (`invite.go:241`) is the one
 place every out-of-dialog INVITE passes after its cheap validation and before
 any media is allocated: `inviteToUpstream` (client and carrier to switch,
 `invite.go`), `inviteToClient` (switch to client) and `inviteToCarrier`
@@ -958,9 +956,9 @@ any media is allocated: `inviteToUpstream` (client and carrier to switch,
 `dialogTable.begin` (`dialog.go:380`): under `t.mu` it compares `t.sessions`
 with the limit and increments in the same critical section that appends the
 record, and `dialog.end` decrements in its single state transition
-(`dialog.go:1144`), so every teardown path (BYE, CANCEL, failure, watchdog,
+(`dialog.go:1132`), so every teardown path (BYE, CANCEL, failure, watchdog,
 backstops, shutdown) releases the slot. A full table answers **503** with
-`Retry-After: 5` (`rejectBusy`, `invite.go:187`; `rejectSessionCap`). Then, if
+`Retry-After: 5` (`rejectBusy`, `invite.go:186`; `rejectSessionCap`). Then, if
 `shield.invite_rate_limit` is set, `shield.Limiter.Allow` (a global token
 bucket with burst `n`, parameters passed per call so a reload applies at once,
 `internal/shield/ratelimit.go:129`) is charged once; when it refuses, the
@@ -978,8 +976,8 @@ public listener as `transport://addr`: `public.ip` against `public.bind`).
 
 **Unanswered calls per source.** Media is anchored before the switch has
 authenticated the caller, so `inviteToUpstream` admits at most
-`maxEarlyPerSource` (**64**, `invite.go:35`) calls per public source IP that
-have media and no answer yet (`admitEarly`, `invite.go:519`); one more is
+`maxEarlyPerSource` (**64**, `invite.go:34`) calls per public source IP that
+have media and no answer yet (`admitEarly`, `invite.go:518`); one more is
 refused **503** before anything is allocated. Carrier sources are exempt
 (`shield.carrier_rate_limit` bounds them instead). The count is per IP so a flood spread over many source ports is
 bounded too, and the slot is released when the INVITE handler returns
@@ -1350,7 +1348,7 @@ Credentials, challenges and nonces are never logged.
 **Failover rule**: the next node is tried whenever the attempt produced **no
 final response** (`internal/edge/register.go:166-189`). A node that answered only
 provisionally and then died is still failed over — unlike the INVITE path,
-where `responded` alone stops the series (`invite.go:480`). The cooldown
+where `responded` alone stops the series (`invite.go:479`). The cooldown
 penalty, by contrast, is applied only when the attempt produced **zero**
 responses. **Any** final response — accept, challenge, or rejection — is a
 real judgement and ends the series. A 401/407 from a node reached after failover is expected,
@@ -1417,7 +1415,7 @@ deliver.
 
 ### 7.5 INVITE classification
 
-`onInvite` (`internal/edge/invite.go:47`) dispatches on the **arrival**
+`onInvite` (`internal/edge/invite.go:46`) dispatches on the **arrival**
 `guard` passed in (§7.1), then on the request:
 
 1. **Admission** (`admitPublicInvite`, `internal/edge/admission.go:111`),
@@ -1450,21 +1448,21 @@ deliver.
    (`internal/edge/carrier.go:167`), which classifies by Request-URI alone
    (`classifySwitchRequest`, `carrier.go:103`; details in §6):
    1. the Request-URI, or the topmost remaining Route, carries an `fsbc`
-      token → `inviteToClient` (`invite.go:552`): the binding is found by
-      the token (`resolveTarget`; there is no address-of-record fallback,
+      token → `inviteToClient` (`invite.go:551`): the binding is found by
+      the token (`bindingForRequest`; there is no address-of-record fallback,
       and an unknown or expired token is **404**);
    2. the Request-URI host[:port] equals an `edge.carriers` entry →
       `inviteToCarrier` (§6);
    3. anything else → **404**. FreeSBC is never an open relay for the
       switch.
 4. Otherwise a public INVITE that passed admission → `inviteToUpstream`
-   (`invite.go:272`), for a client call or a carrier call alike. A client
+   (`invite.go:271`), for a client call or a carrier call alike. A client
    call goes to the node its From user hashes to, at the node's client port
    (`edge.switch`). A carrier call goes to a node chosen by the Request-URI
    user (or pinned by a carrier registration token) at the node's carrier
    port, stamped `X-FreeSBC-Carrier` (§6).
 
-Every path opens its record with `beginDialog` (`invite.go:242`), which
+Every path opens its record with `beginDialog` (`invite.go:241`), which
 answers **503** while draining (§7.1), **482** for a merged request and **503**
 once shutdown has begun (the dialog table is closed).
 
@@ -1492,7 +1490,7 @@ then every cooling node at the tail (`upstreamDialOrder`,
 order and, **when every name is cooling, returns the whole set as
 available** — a cooldown is a suspicion, not a verdict.
 
-`hashUserFor(req)` (`invite.go:535`) picks the From user part, falling back
+`hashUserFor(req)` (`invite.go:534`) picks the From user part, falling back
 to the To user part and then the Call-ID. From is the caller's identity, so
 a user's calls land on the same switch its REGISTER landed on (`aorOf`
 hashes the same user). A carrier's call hashes the lower-cased Request-URI
@@ -1511,7 +1509,7 @@ INVITE failover to the next upstream node happens when the INVITE could not
 be sent at all (`TransactionRequest` failed: the node is penalized and the
 next one tried), or when the pump returned
 `final == nil && !finalised && !responded && clTx.Err() != nil`
-(`invite.go:480-486`). `!responded` is an
+(`invite.go:479-485`). `!responded` is an
 invariant, not a heuristic: a node that answered had its answer negotiated
 and its media relay started, so a second attempt would apply a second answer
 and start the relay twice. A 486 is the callee's own judgement and is never
@@ -1539,7 +1537,7 @@ tags:
   the handler answers **482 Loop Detected** — when an **early** record with
   the same Call-ID and caller tag exists (a merged request, §8.2.2.2), and
   refuses every INVITE once shutdown has closed the table (`beginDialog`,
-  `invite.go:240`, then answers **503**), and with `beginFull` once
+  `invite.go:239`, then answers **503**), and with `beginFull` once
   `shield.max_sessions` records hold a slot (503 + `Retry-After`, §7.1). A confirmed record with the same
   identifiers is left alone: the new INVITE opens a record beside it. An
   INVITE can therefore never tear down another call by reusing its Call-ID.
@@ -1565,7 +1563,7 @@ session's life and its version goes up by exactly one per body that leg is
 sent (RFC 3264 §8), so an endpoint sees 1 → 2 across a re-INVITE rather than
 jumps caused by bodies built for the other leg. A call that involves a
 carrier also records the carrier's name (`carrier`, set once right after the
-record is created by `setCarrier`, `dialog.go:682`): it is what routes the
+record is created by `setCarrier`, `dialog.go:675`): it is what routes the
 dialog's later requests through the carrier rules of §6 (`hideLeg`,
 `hide.go:520`). The record also keeps the real caller and callee From/To
 addresses (`callerURI`, `calleeURI`, `uriForTag`, plus per-fork To for the early dialog), which `restoreIdentity`
@@ -1579,9 +1577,9 @@ table's mutex**; the attached `mediaSession` guards its own `codecs` and
 **Offer state.** Three fields keep two offers from ever being in flight in
 one dialog (all under the table mutex). `updateOffers` and `reInviteOffers`
 (`dialog.go:289`) count the UPDATE and re-INVITE offers FreeSBC has forwarded
-and not yet seen answered; `beginUpdateOffer` (`dialog.go:725`) refuses
+and not yet seen answered; `beginUpdateOffer` (`dialog.go:718`) refuses
 (**491**, §7.9a) when either is non-zero, and `beginReInviteOffer`
-(`dialog.go:744`) when an UPDATE offer is pending. `owed` (`dialog.go:296`) is
+(`dialog.go:737`) when an UPDATE offer is pending. `owed` (`dialog.go:296`) is
 the `owedAnswer` (`offerless.go:40`) of a delayed-offer exchange: the callee's
 parsed offer, who offered and who answers, the early fork it rode on (nil for
 an offer in a 2xx), the INVITE CSeq its ACK must carry, the `release` of the
@@ -1591,24 +1589,24 @@ and while it is both `beginUpdateOffer` and `beginReInviteOffer` refuse.
 
 **Forks (early dialogs).** While the record is early, every response of the
 forwarded INVITE is attributed to a fork by its To tag (`fork`,
-`dialog.go:816`). An `earlyFork` (`dialog.go:182`) holds that fork's own
+`dialog.go:809`). An `earlyFork` (`dialog.go:182`) holds that fork's own
 answer body, the codecs it agreed, the media address it signalled, its
 own `o=` identity and **its route** (`route`, `routed`; `setForkRoute`,
-`dialog.go:832`, written when the first response with a To tag is relayed,
+`dialog.go:825`, written when the first response with a To tag is relayed,
 before it goes out). The fork route is what lets a PRACK or UPDATE in an
 **early** dialog be matched and routed: `lookupEarly` (`dialog.go:467`)
-matches the caller's tag plus a routed fork tag, `routeFor` (`dialog.go:669`)
+matches the caller's tag plus a routed fork tag, `routeFor` (`dialog.go:662`)
 gives `retargetInDialog` the fork's contacts, and `directionFor` consults it
 for those two methods only. A re-INVITE, BYE, INFO or NOTIFY still needs a
 confirmed record. An UPDATE answered in an early dialog updates the fork
-(`noteForkUpdate`, `dialog.go:799`: the last body the caller saw, the
+(`noteForkUpdate`, `dialog.go:792`: the last body the caller saw, the
 callee's media address and codecs, and the media follows this fork), so the
-later 18x and the 2xx restate that body; `originFor` (`dialog.go:783`) gives
+later 18x and the 2xx restate that body; `originFor` (`dialog.go:776`) gives
 bodies toward the caller the fork's `o=` identity. The first body a fork sends is negotiated against the
-**original** offer (`negotiateFork`, `media.go:474`); a later body on the
+**original** offer (`negotiateFork`, `media.go:471`); a later body on the
 same fork is answered with the same bytes again; a body on another fork is
 negotiated afresh. The anchored media follows whichever fork answered last
-(`followFork` → `pointMedia`, `media.go:549,572`), re-arming the latch when
+(`followFork` → `pointMedia`, `media.go:546,569`), re-arming the latch when
 the address moves; a 2xx from a fork re-points it to that fork. A body-less
 2xx on a fork that never answered reuses the answer the media is following
 (a far end whose 183 and 200 carry different To tags); with no answer at all
@@ -1625,14 +1623,14 @@ stateDiagram-v2
     dialogEnded --> [*]
 ```
 
-Transitions: `confirm` (`dialog.go:1082`) runs **before the 2xx is
+Transitions: `confirm` (`dialog.go:1070`) runs **before the 2xx is
 relayed** (`relayInviteResponse` → `commit`, `invite_leg.go:161,494`), so
 the ACK the caller sends the instant it sees the 2xx always finds the
 record. It records the callee's tag and the route, adopts the confirming
 fork's `o=` identity for the caller's leg, drops the fork table, and refuses
 when the state is not early, **no media was ever anchored**, or the call has
-been cancelled. `endUnlessUp` (`dialog.go:1125`) ends only a still-early
-dialog and is deferred by every INVITE path; `end(reason)` (`dialog.go:1144`)
+been cancelled. `endUnlessUp` (`dialog.go:1113`) ends only a still-early
+dialog and is deferred by every INVITE path; `end(reason)` (`dialog.go:1132`)
 is the single exit for a BYE, the media watchdog, shutdown and a failed
 INVITE. `end` is idempotent — the state transition under the table mutex
 elects the one caller that does the work, and so the one whose `endReason` is
@@ -1675,7 +1673,7 @@ response, never re-negotiated — so one lost 200 on the caller's leg does not
 fail the call (RFC 3261 §13.3.1.4, §16.7 step 10). A 2xx from **another**
 fork, after the record is confirmed, is a second dialog with no media anchor:
 FreeSBC ACKs and BYEs it once (`refuse2xx`, `invite_leg.go:131`) and only
-re-ACKs its retransmissions (`reject2xx` remembers the tag). The same
+re-ACKs its retransmissions (`dialogHook.reject` remembers the tag). The same
 applies to a 2xx FreeSBC cannot anchor and to one that races a CANCEL.
 
 **No callback keeps an ended dialog alive (issue #228).** A server or client
@@ -1718,7 +1716,7 @@ same pinned socket `prepareForward` would use. A BYE toward a carrier or a
 client masks the switch's address in From/To the way §6 describes
 (`sendMiddleBye`, `indialog.go:929`). Otherwise both would keep a silent call and the switch's
 own later BYE would get 481. An early dialog is bounded by
-`inviteTimeout = 5 * time.Minute` (`invite.go:24`).
+`inviteTimeout = 5 * time.Minute` (`invite.go:23`).
 
 **A missing 2xx ACK (`ack.go`).** When `relayInviteResponse` relays the 2xx
 of an initial INVITE it records the ACK the caller's plane owes
@@ -1776,8 +1774,8 @@ where the default of `end` is wrong), `duration` (since `confirmedAt`),
 `reason` ("ending the call; sending BYE to both ends").
 
 **Why an INVITE was refused.** A final response the edge itself sends to an
-out-of-dialog INVITE goes through `rejectInvite` (`invite.go:148`), which
-counts an `inviteReject` (`invite.go:86`) in
+out-of-dialog INVITE goes through `rejectInvite` (`invite.go:147`), which
+counts an `inviteReject` (`invite.go:85`) in
 `freesbc_edge_invite_rejects_total{reason}` before answering. The set is
 fixed and every label is exported from the start:
 
@@ -1905,14 +1903,14 @@ and INVITE CSeq (`clearAck`; see "A missing 2xx ACK" in §7.7).
 **CANCEL.** When sipgo matches a CANCEL to a live INVITE server transaction
 it writes 200 to the CANCEL, then feeds it to the INVITE server
 transaction's state machine, whose cancel action fires the `OnCancel` hook
-(registered at `invite.go:340`, `:529` and `carrier.go:254`) **while holding
+(registered at `invite.go:339`, `:528` and `carrier.go:254`) **while holding
 the transaction's FSM lock**; only after the hook returns does the FSM send
 the **487** toward the requester itself (sipgo v1.6.0
 `sip/transaction_layer.go` `handleRequest`,
 `sip/transaction_server_tx_fsm.go` `actCancel`). The hook therefore does no
 network I/O: it calls `cancelCall(d, cancelByCaller)` (`invite_leg.go:535`),
 which **synchronously** marks the record cancelled (`cancelSeries`,
-`dialog.go:977`) — from that instant `confirm` refuses, so a 2xx racing the
+`dialog.go:970`) — from that instant `confirm` refuses, so a 2xx racing the
 CANCEL is ACKed and BYEd, never relayed after the 487 — takes the in-flight
 attempt, and hands the CANCEL to a goroutine (`sendCancel`,
 `invite_leg.go:544`). `sendCancel` builds the CANCEL from the **forwarded**
@@ -1922,10 +1920,10 @@ releases the media promptly instead of waiting on the forwarded INVITE's
 transaction timer).
 
 An attempt is **tracked before its INVITE is sent** (`track`,
-`dialog.go:928`), so no CANCEL can fall between the send and the
+`dialog.go:921`), so no CANCEL can fall between the send and the
 bookkeeping. A CANCEL that takes an attempt whose INVITE is not on the wire
 yet does not send its CANCEL (it would overtake the INVITE, be answered 481,
-and leave the INVITE ringing); `markSent` (`dialog.go:941`) tells the
+and leave the INVITE ringing); `markSent` (`dialog.go:934`) tells the
 sender, which CANCELs the moment the INVITE is out. `track` refuses once
 the series is cancelled, so no later attempt starts.
 
@@ -1972,7 +1970,7 @@ pins the socket it leaves by, as `forward` pins a relayed request
 **INVITE backstop (Timer C).** When `inviteTimeout` expires with the caller
 still waiting, the pump's `ctx.Done` arm runs `abandonAttempt`
 (`invite_leg.go:335`): it CANCELs the pending branch (RFC 3261 §16.8)
-and drains for its 487, and `giveUp` (`invite.go:502`) then sends the caller
+and drains for its 487, and `giveUp` (`invite.go:501`) then sends the caller
 **408 Request Timeout** (§16.7 step 6). `giveUp` synthesises a caller's
 missing final on every INVITE path: nothing when its own CANCEL already got
 it a 487 from sipgo, **408** at the backstop, **487** when an orphan CANCEL
@@ -1986,7 +1984,7 @@ ring on.
 direction, forward without Record-Route, retarget the Request-URI to the far
 end's own Contact, rewrite the Contact, and relay under a **32 s** budget
 (`indialog.go:645`). The CSeq of every in-dialog request is recorded per
-endpoint (`noteCSeq`, `dialog.go:1015`). On a forwarding failure and
+endpoint (`noteCSeq`, `dialog.go:1008`). On a forwarding failure and
 **only for BYE**, FreeSBC makes one stateless re-send attempt toward the far
 side and then answers **200** to the requester — answering 408 would tell the
 switch its hangup failed and sofia would keep the leg. A BYE ends a dialog
@@ -2038,7 +2036,7 @@ to send to. The To header is forwarded verbatim, never rewritten to the
 dialog's tag: FreeSBC does not fabricate dialog state. The first relaxed
 routing on a dialog is logged at **WARN** (Call-ID, From-tag, stray To-tag,
 the dialog's two tags) and every later one at **Debug**, since FreeSWITCH
-retries about once a second (`noteRelaxedNotify`, `dialog.go:706`); the WARN
+retries about once a second (`noteRelaxedNotify`, `dialog.go:699`); the WARN
 going quiet is the signal that the switch stopped sending the stray tag.
 There is no metric: the edge counters are per method and transport, and
 none fits a routing decision. The relaxation is NOTIFY-only and
@@ -2054,7 +2052,7 @@ fallback below), and the no-To-tag rule above is unchanged.
   **provided it arrived on the plane of the endpoint its tags say sent it**.
   A request that names the caller's tags but came in on the callee's side is
   not treated as that dialog's.
-- Otherwise, from the switch: `bindingForRequest(req)` (`invite.go:688`; an
+- Otherwise, from the switch: `bindingForRequest(req)` (`invite.go:687`; an
   in-dialog request on a confirmed dialog from the switch carries no binding
   token, so without a record this only helps a pre-dialog request, an
   early-dialog NOTIFY sent to the stored contact, or an out-of-dialog
@@ -2077,11 +2075,10 @@ fallback below), and the no-To-tag rule above is unchanged.
 the Request-URI, undoing the topology hiding applied when the dialog was
 established: sofia tolerates the SBC's URI, a strict UA does not.
 
-**Inbound target resolution** (`resolveTarget`, `invite.go:681`, via
-`bindingForRequest`): the `fsbc` token from the Request-URI, or from the
+**Inbound target resolution** (`bindingForRequest`, `invite.go:711`): the `fsbc` token from the Request-URI, or from the
 topmost foreign Route value where a strict-routing element may have moved
 it, rejected if empty or longer than **64** characters (`tokenOf`,
-`invite.go:704`) and looked up in the location table. There is no
+`invite.go:727`) and looked up in the location table. There is no
 address-of-record fallback: an unknown or expired token finds nothing, and
 the INVITE is answered **404**.
 
@@ -2244,27 +2241,27 @@ Reached whenever an INVITE carries a To tag (`onReInvite`, `indialog.go:27`).
    offerless re-INVITE: it is forwarded as it is and the exchange continues
    as §7.9a describes; steps 3 and 5-6 below are for a re-INVITE with SDP.
 3. Rebuild the offer from scratch against the session's **existing** anchor
-   ports (`anchorFor`, `media.go:717`) with the next `o=` version of the leg
-   it goes to (`rebuildInDialogOffer`, `media.go:778`); nothing is allocated.
+   ports (`anchorFor`, `media.go:714`) with the next `o=` version of the leg
+   it goes to (`rebuildInDialogOffer`, `media.go:775`); nothing is allocated.
    A re-offer **toward a browser** carries the same DTLS-SRTP block as its
    answers — `UDP/TLS/RTP/SAVPF`, the ICE-Lite credentials, the fingerprint
    and the DTLS role already in use (RFC 5763 §5, RFC 8842 §5.3) — so it
    describes the stream the browser already has. This holds whichever side
    made the initial offer: on a call the switch placed to a browser
-   (`buildPublicOffer`, `media.go:620`) the initial offer said
+   (`buildPublicOffer`, `media.go:617`) the initial offer said
    `a=setup:actpass`, and from the browser's answer on the leg's `DTLSSetup`
    is the negotiated role (`passive` when the browser answered `active`,
    `active` when it answered `passive`), so every later body — re-offer or
    answer — carries that role, never `actpass` again (RFC 8842 §5.5).
    A re-offer that cannot be rebuilt (no relayable codec, or a browser
    re-offer without `a=rtcp-mux`) is refused through `rejectMedia`
-   (`invite.go:731`, **488**).
+   (`invite.go:725`, **488**).
 4. Forward without Record-Route (hidden toward a carrier,
    `prepareForwardFor`); **retarget the Request-URI to the far end's own
    Contact** (`retargetInDialog`) and rewrite the Contact. A forward that
    cannot be sent is answered **503**.
 5. Relay responses; the first body-bearing response of **this transaction**
-   is rebuilt as an answer (`rebuildInDialogAnswer`, `media.go:828`), later
+   is rebuilt as an answer (`rebuildInDialogAnswer`, `media.go:825`), later
    ones repeat **that** body — never another re-INVITE's, so crossing
    re-INVITEs from both sides (glare) each keep their own plane's answer. A
    `clTx.Done()` yields **408**.
@@ -2332,7 +2329,7 @@ nothing; an offer that cannot be rebuilt is refused through `rejectMedia`
 requester and ends the call (a confirmed dialog: BYE to both ends; an early
 one: the INVITE is cancelled), as for a re-INVITE. In an early dialog the
 exchange works on the call's session and the fork the tags name, and
-`noteForkUpdate` (`dialog.go:799`) makes the later 18x and 2xx restate its
+`noteForkUpdate` (`dialog.go:792`) makes the later 18x and 2xx restate its
 answer. A 2xx without a body is relayed as it is.
 
 **Delayed offers** (`offerless.go`). An INVITE or re-INVITE without SDP is
@@ -2394,12 +2391,12 @@ described in §6. What belongs to the dialog and forwarding machinery:
   points: private for the switch, public for a client or a carrier. A
   carrier leg is the plain RTP relay, never the WebRTC block.
 - **Carrier → switch** is `inviteToUpstream` with a carrier name
-  (`invite.go:272`): the dialog begins on the **public** plane and
+  (`invite.go:271`): the dialog begins on the **public** plane and
   `setCarrier` is called, the leg's response mode is `respToCarrier`, and
   the destination is the node's carrier port. A call to a registration's
   Contact is pinned to the registering node alone (`order = [node]`) with
   that Contact as the Request-URI. The early-call cap does not apply
-  (`maxEarlyPerSource`, `invite.go:35`); `shield.carrier_rate_limit` bounds
+  (`maxEarlyPerSource`, `invite.go:34`); `shield.carrier_rate_limit` bounds
   carriers instead.
 - **Switch → carrier** is `inviteToCarrier` (`carrier.go:185`): the dialog
   begins on the **private** plane, `buildPublicOffer(d, body, false)` builds
@@ -2438,7 +2435,7 @@ stateDiagram-v2
 ```
 
 The classification lives in the loop of `inviteToUpstream`
-(`invite.go:380-494`) over `pumpInvite`'s `pumpResult`
+(`invite.go:379-493`) over `pumpInvite`'s `pumpResult`
 (`invite_leg.go:232`):
 
 - **Any final response ends the series.** The pump has already relayed it
@@ -2660,7 +2657,7 @@ client's SDP could point the SBC's media socket at a service on its own
 host. The policy is read once per session, at allocation. `internal/sip/sdp`
 enforces the same classes one step earlier: `Parse` refuses multicast,
 broadcast, link-local and (unless `ParseOptions.AllowLoopback`, which the
-edge derives from its media addresses, `edge/media.go:269`) loopback `c=` addresses
+edge derives from its media addresses, `edge/media.go:266`) loopback `c=` addresses
 with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
 `Address`.
 
@@ -2709,10 +2706,10 @@ Plane defaults:
 
 | Plane / leg | Mode | Set by |
 |---|---|---|
-| Public leg (side A): phone, or a carrier in either direction | **loose**, with the far end's SIP source IP as a signalled source | `allocateRTP` (`edge/media.go:229`; a caller's leg, source = the INVITE's source address, which for an inbound carrier call is the carrier's) and `buildPublicOffer` (`:620`; a callee's leg), whose answer `negotiateFork` ranks by the address the INVITE was sent to (`media.go:537-542`; for an outbound carrier call, the carrier's resolved address). A phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
+| Public leg (side A): phone, or a carrier in either direction | **loose**, with the far end's SIP source IP as a signalled source | `allocateRTP` (`edge/media.go:226`; a caller's leg, source = the INVITE's source address, which for an inbound carrier call is the carrier's) and `buildPublicOffer` (`:617`; a callee's leg), whose answer `negotiateFork` ranks by the address the INVITE was sent to (`media.go:534-539`; for an outbound carrier call, the carrier's resolved address). A phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
 | Private leg (side B): the switch | **strict** | the switch's signalled address is trustworthy, and strict already tolerates a NAT-rewritten port |
 | WebRTC public leg | none: ICE fixed the peer and SRTP authenticates every packet | |
-| WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` (`edge/media.go:299`, `:375`) |
+| WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` (`edge/media.go:296`, `:372`) |
 
 The edge seeds both sides from the signalled address: side A from a client's
 or carrier's offer (`allocateRTP`), side B from the switch's offer
@@ -2748,9 +2745,9 @@ fires the per-dialog media watcher goroutine, which calls
 `Done` fires, and `Cause()` reports it) and then sends a BYE to both
 endpoints (`byeBothEnds`, wired at `edge.go:297`; §7.7). The call is counted
 in `freesbc_edge_calls_ended_total{reason="rtp_silence"}` and its `"call
-ended"` line carries `reason=rtp_silence`. That watcher is launched by `confirm` (`dialog.go:1082-1121`), so it
+ended"` line carries `reason=rtp_silence`. That watcher is launched by `confirm` (`dialog.go:1070-1109`), so it
 exists only for a **confirmed** dialog; an early one is reclaimed by
-`endUnlessUp` and the 5-minute `inviteTimeout` (`invite.go:24`, which
+`endUnlessUp` and the 5-minute `inviteTimeout` (`invite.go:23`, which
 CANCELs the branch and answers 408) instead.
 
 ### 8.6 SRTP
@@ -2889,7 +2886,7 @@ handshake no longer leaks it.
    absorbed rather than applied.
 
 **DTLS identity.** One self-signed ECDSA P-256 certificate per process
-(`media.ProcessDTLSIdentity`, `dtlscert.go:44`), generated on first use and
+(`media.ProcessDTLSIdentity`, `dtlscert.go:41`), generated on first use and
 shared by every session. `edge.New` builds it only when `edge.listen.ws` or
 `wss` is set (`edge.go:275-280`); there is no certificate file. WebRTC binds
 the certificate to a call through the `a=fingerprint` line, not through the
@@ -3040,7 +3037,7 @@ ICE candidates can never reach FreeSWITCH.
 | DTLS | — | `a=fingerprint:<hash> <value>`, `a=setup:<role>` (the leg's `DTLSSetup`: `actpass` in FreeSBC's initial offer to a browser, otherwise `active`/`passive`) |
 | codecs | `a=rtpmap` per codec, `a=fmtp` re-rendered from the allowlist | same |
 | direction | `a=<Direction>` (default `sendrecv`) | same |
-| `a=rtcp-mux` | only when `RTCPMux` (`build.go:240-242`) | only when `RTCPMux`, which `setWebRTCBlock` always sets alongside `DTLS` (`edge/media.go:753`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1), and in FreeSBC's own offer to a browser because a browser answer without it is refused 488 (`checkOfferedWebRTC`) |
+| `a=rtcp-mux` | only when `RTCPMux` (`build.go:240-242`) | only when `RTCPMux`, which `setWebRTCBlock` always sets alongside `DTLS` (`edge/media.go:750`), so always present on a browser leg. That is correct in an answer only because a browser offer without `a=rtcp-mux` is refused 488 (`requireRTCPMux`, RFC 5761 §5.1.1), and in FreeSBC's own offer to a browser because a browser answer without it is refused 488 (`checkOfferedWebRTC`) |
 | `a=rtcp` | **never emitted** — RTCP rides the RFC 3550 default of RTP+1 | same |
 | `a=ptime` | **never emitted** — the proxy does not repacketize | same |
 
@@ -3089,16 +3086,16 @@ codec list; `rtpLeg()` (`:117`) returns an error rather than dereferencing nil,
 so a caller whose correctness rests on "this leg is never WebRTC" states the
 invariant.
 
-- **Public far end → switch** (`buildUpstreamOffer`, `media.go:172`): parse,
+- **Public far end → switch** (`buildUpstreamOffer`, `media.go:169`): parse,
   filter codecs, allocate (WebRTC if the offer is WebRTC and the edge serves
-  ws/wss, else a plain pair across the two pools, `allocateRTP` `:229`),
+  ws/wss, else a plain pair across the two pools, `allocateRTP` `:226`),
   attach the session to the dialog — from that point every failure leaves it
   to the dialog's own `end()` — and build the private body with a **fresh
   session identity** at `private.ip:privatePort`. A registered client's call
   and a carrier's inbound call (§6) share this function; for a carrier,
   `src` is the carrier's source address.
-- **Answers, per fork** (`forkAnswer` `:440` → `negotiateFork` `:474` →
-  `followFork` `:549` → `pointMedia` `:572`): one path for every
+- **Answers, per fork** (`forkAnswer` `:437` → `negotiateFork` `:471` →
+  `followFork` `:546` → `pointMedia` `:569`): one path for every
   direction. A fork's first body is negotiated against the **original offer**
   (never a previous fork's or carrier's agreement), the caller's body is built at
   the caller plane's anchor with the fork's own `o=` identity — adding the
@@ -3114,8 +3111,8 @@ invariant.
   Only the callee-facing side is ever pointed by an answer: the caller's side
   keeps the address its offer seeded. A client leg that was not offered
   WebRTC, and a carrier leg, must be the plain relay (`rtpLeg()` is checked,
-  `media.go:498-501`).
-- **Switch → public far end** (`buildPublicOffer`, `media.go:620`): the mirror
+  `media.go:495-498`).
+- **Switch → public far end** (`buildPublicOffer`, `media.go:617`): the mirror
   image of `buildUpstreamOffer`, branching on the target.
   - A **carrier** (`inviteToCarrier`, `carrier.go:217`, `toBrowser` false) and a
     **UDP phone** get the plain RTP↔RTP relay and an `RTP/AVP` offer, built
@@ -3123,24 +3120,24 @@ invariant.
     or ports reaches the carrier (§6). The carrier's answer is handled on the
     plain relay with `calleeCarrier` (`invite_leg.go:32`), and the public leg
     is ranked by the carrier address the INVITE went to.
-  - A client registered over **ws or wss** (`isBrowserTransport`, `:710`; one
+  - A client registered over **ws or wss** (`isBrowserTransport`, `:707`; one
     branch for both) is a browser: it gets an offerer `WebRTCLeg` on the
-    public pool plus a private RTP pair (`allocateOfferedWebRTC`, `:365`), the
+    public pool plus a private RTP pair (`allocateOfferedWebRTC`, `:362`), the
     private side seeded from the switch's offer, and a DTLS-SRTP offer built by
-    `setWebRTCBlock` (`:750`) — `UDP/TLS/RTP/SAVPF`, `a=ice-lite`, one host
+    `setWebRTCBlock` (`:747`) — `UDP/TLS/RTP/SAVPF`, `a=ice-lite`, one host
     candidate at `public.ip`, FreeSBC's fingerprint, `a=rtcp-mux`,
     `a=setup:actpass`. Nothing starts until the browser answers:
     `negotiateFork` requires a WebRTC answer with `a=rtcp-mux` and an
-    answerer's role (`checkOfferedWebRTC`, `:394`, else 488), and
-    `startOfferedWebRTC` (`:412`) hands its credentials, fingerprint and role
-    to the leg (`SetRemote`) and starts it through `startWebRTC` (`:327`) —
+    answerer's role (`checkOfferedWebRTC`, `:391`, else 488), and
+    `startOfferedWebRTC` (`:409`) hands its credentials, fingerprint and role
+    to the leg (`SetRemote`) and starts it through `startWebRTC` (`:324`) —
     the same establishment goroutine, 30 s deadline, fingerprint re-check and
     `webrtc media established` log as a browser-originated call. WebRTC is on
     only when `edge.listen.ws` or `wss` is set (`config.WebRTC`); a call to a
     ws/wss client without it cannot get a DTLS-SRTP offer, so `inviteToClient`
     answers **488** before allocating anything, with a warning log
-    (`invite.go:575`).
-- **In-dialog rebuild**: `anchorFor` (`:717`) returns the session's existing
+    (`invite.go:574`).
+- **In-dialog rebuild**: `anchorFor` (`:714`) returns the session's existing
   address and port — nothing allocates. Direction passes through
   **unreversed**, because FreeSBC is a relay in the middle: a caller putting
   the call on hold with `sendonly` must present as `sendonly` to the far end.
@@ -3269,7 +3266,7 @@ sequenceDiagram
     participant P as Registered phone
 
     FS->>Hc: INVITE sip:1001@private.ip:5060;fsbc=TOKEN (private socket)
-    Note over Hc: arrival = private -> invitePrivate -> classifySwitchRequest = client; resolveTarget(token) -> Binding
+    Note over Hc: arrival = private -> invitePrivate -> classifySwitchRequest = client; bindingForRequest(token) -> Binding
     Hc->>Hc: buildPublicOffer (plain RTP at public.ip:publicPort for a UDP phone; a DTLS-SRTP offer, a=setup:actpass, for a ws/wss browser)
     Hc->>P: INVITE sip:1001@ the binding.Source address (R-URI carries no token, Contact = public side, Record-Route = public only)
     P-->>Hc: 180 Ringing
@@ -3418,16 +3415,16 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | **edge binding** (`Binding`) | `Location` (`edge/location.go:59`) | `recordBinding` → `Location.Put` (`register.go:313`) | active → refreshed (same token) / expired / removed | expiry always comes from the registrar's **response**; `Source` is the transport source, never the Contact host; ≤ 10 per AoR, ≤ 20000 total (`location.go:89-90`) | handler goroutines, the WS close hook, the prune ticker | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker (`edge.go:772-793`) | `Location.mu` (RWMutex) |
 | **carrier registration** (`carrierBinding`) | `carrierRegTable` (`carrierreg.go:44`) | `registerToCarrier` on a 2xx with a granted lifetime (`carrierreg.go:194`) | live → refreshed (same deterministic token) / expired / removed | keyed by token = `carrierToken(node, Contact)`; holds the registering `edge.switch` node name and the switch's original Contact; separate from `Location`, so a client token never resolves a carrier token or the reverse; a lookup treats an expired entry as absent | `registerToCarrier`, the prune ticker | granted lifetime elapsed (30 s prune), a `200` to `Expires: 0`, a wildcard un-REGISTER (`removeNode`); lost on restart, rebuilt by the switch's next refresh under the same token | `carrierRegTable.mu` |
 | **carrier directory** (`carrierSnapshot`) | `carrierDirectory` (`carrierdns.go:116`) | `newCarrierDirectory` in `edge.New`; refreshed by `Run`'s goroutine | resolved set replaced whole on each refresh; a failed refresh keeps the last good set | name → addresses (SRV or A/AAAA, `carrierDNSTTL` 300 s, failed lookup retried after 10 s, 3 s per query: `carrierdns.go:40-47`) plus the carrier source prefixes; read lock-free by every request | the refresh goroutine only | process exit | `atomic.Pointer[carrierSnapshot]` for readers; `carrierDirectory.mu` guards its cache; `refresh` takes it only to read and to record an outcome (`apply`), never across a lookup, and only the refresh goroutine runs lookups, so `rand.Rand` is unshared |
-| **edge dialog** (`*edge.dialog`) | `dialogTable` (`dialog.go:322`) | `begin(req, callerPlane, limit)` (`dialog.go:380`); a second early record with the same Call-ID and caller tag is refused (482, `invite.go:239`) | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) (`dialog.go:20-36`) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record; a carrier dialog also records the carrier name (`setCarrier`, `dialog.go:682`) and its far-end address on the node's carrier port | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end did not refuse, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map, the `closed` flag **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
+| **edge dialog** (`*edge.dialog`) | `dialogTable` (`dialog.go:322`) | `begin(req, callerPlane, limit)` (`dialog.go:380`); a second early record with the same Call-ID and caller tag is refused (482, `invite.go:238`) | `dialogEarly → dialogConfirmed → dialogEnded` (or early → ended) (`dialog.go:20-36`) | matched on Call-ID + both tags; per-fork answers while early; **one media session per record**; `confirm` (before the 2xx is relayed) refuses without media; `end` removes exactly this record; a carrier dialog also records the carrier name (`setCarrier`, `dialog.go:675`) and its far-end address on the node's carrier port | any handler goroutine, via the table's methods; the Timer M hook | tag-matched BYE the far end did not refuse, media watchdog, `endUnlessUp`, `closeAll` | `dialogTable.mu` guards the map, the `closed` flag **and every mutable field of every dialog**; `confirm`/`end` drop the lock before metrics and `sess.Close()` |
 | **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **switch cooldown** | one `cooldownTable` on `Server` (`cooldown.go:19`), which also holds the per-node REGISTER breaker `reg[name]` (closed ⇄ open ⇄ half-open probe) | `edge.New` | absent ⇄ `until[name]` | keyed by the node's `IP:port` name, never by anything a client supplies; all-cooling falls back to dialling everything; `switchCooldown` = 30 s (`edge.go:165`) | handler goroutines only | `Recover` on any final response; lazy expiry otherwise | `cooldownTable.mu` |
 | **media Session** | the dialog that allocated it | `media.AllocateAcross(pubPool, privPool, …)` (`media/session.go:384`) | `sessAllocated → sessRunning → sessClosed` (`session.go:365-367`) | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetRemote`, `SetExpectedRemote`, `SetSignallingSource`, `Relatch` from the signalling goroutine; `Close` from anywhere | `dialog.end()`, the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `lastRx [2]atomic.Int64` (one per sending side), per-latch `mu` |
 | **port allocation** | `PlanePool.inUse` (`media/portpool.go:73`) | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A; the public and private pools share the `rtp` range but bind different IPs, so they never collide | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
 | **SRTP context** | one direction of one browser leg | `newSRTPContextFromKeys` after the DTLS handshake (`media/srtp.go:254`, `webrtcleg.go:607`) | installed once → dropped with the leg | keys come only from DTLS-SRTP key export and are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | the leg's `deriveSRTP`, exactly once | dropped with the leg | `SRTPContext.mu` serialising pion's lockless context; the leg holds the pair under `WebRTCLeg.mu` |
-| **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` or (offerer leg) `allocateOfferedWebRTC` (`edge/media.go:279`, `:365`) | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
+| **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` or (offerer leg) `allocateOfferedWebRTC` (`edge/media.go:276`, `:362`) | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
 | **shield ban entry** | `banList[K]`, two per `Shield`: `bans` (IP) and `socketBans` (UDP IP:port) (`shield/shield.go:32-33`) | `ban(key, dur)` from `CheckScanner`'s scanner branch | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table (`banCap`) with an overflow counter; a socket ban lasts at most 1 min (`socketBanMax`); carrier sources are never scanner-banned | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
 | **rate-limit bucket** | the one `rateLimiter` per `Shield` | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters (`rate_limit` for ordinary sources, `carrier_rate_limit` for carrier sources) are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets (`bucketCap`) the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
-| **config snapshot** | `config.Store` (`config/store.go`) | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; the compiled switch list, carrier list and source prefixes are populated by `validate` before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot; `Store.mu` only for the subscriber slice |
+| **config snapshot** | `config.Store` (`config/store.go`) | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; the compiled switch list, carrier list and source prefixes are populated by `validate` before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot |
 
 ---
 
@@ -3481,7 +3478,6 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | `edge.regGuard.mu` | the REGISTER credential guard's per-source records (`regguard.go`); a leaf lock, taken from the read filter and `pumpRegister` |
 | `admin.authLimiter.mu` | the per-source auth-failure window, including reservations |
 | `admin.verifiedCreds.mu` | the verified-credential digests |
-| `config.Store.mu` | the subscriber slice only |
 
 ### 11.3 Atomics, channels, CAS
 
@@ -3532,7 +3528,7 @@ spin.
   `closeAll` at shutdown. This holds for carrier calls and client calls alike.
 - **A pre-answer INVITE handler holds one goroutine, a dialog record and a
   media session** until a final response, a CANCEL or the 5-minute backstop
-  (`inviteTimeout`, `invite.go:24`).
+  (`inviteTimeout`, `invite.go:23`).
 - **Each INVITE leaves one ACK drainer goroutine** (`drainAcks`, `edge.go`)
   that outlives the handler: after a 2xx it ends at `ack2xxDrainWait` (8 s),
   otherwise when sipgo's server transaction does (Timer H or I, 32 s at
@@ -3652,7 +3648,7 @@ own firewall in front of FreeSBC.
 |---|---|---|---|
 | Edge `tls` and `wss` listeners | top-level `tls.cert`/`tls.key`, loaded when the listener binds (`openListener`); `check` requires `tls` whenever `edge.listen.tls` or `edge.listen.wss` is set | TLS 1.2 | — |
 | Admin HTTPS | the same `tls` identity, served only when `admin.allow_remote` is set (`admin/server.go:282-296`); a loopback admin serves plain HTTP | TLS 1.2 | — |
-| WebRTC DTLS | one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity, `media/dtlscert.go:36-87`), created when `edge.listen.ws` or `wss` is set | — | `RequireAnyClientCert` (`webrtcleg.go:539`), so there is always something to fingerprint |
+| WebRTC DTLS | one per-process self-signed ECDSA P-256 certificate (CN "FreeSBC", 1-year validity, `media/dtlscert.go:33-84`), created when `edge.listen.ws` or `wss` is set | — | `RequireAnyClientCert` (`webrtcleg.go:539`), so there is always something to fingerprint |
 
 The DTLS certificate is never verified as a chain: the browser's identity
 is its `a=fingerprint`, checked inside the handshake (§8.7). A missing or
@@ -3728,11 +3724,11 @@ permanent series per call."
 | `freesbc_registration_failure_total` | Counter | — | edge: series exhaustion, a rejected registration, and a full binding table |
 | `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `guard`, for every request the shield admits (`edge.go:1190`) |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | every response the edge sends or relays |
-| `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end()` (`dialog.go:1197`, `Metrics.MediaEnded`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
+| `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end()` (`dialog.go:1185`, `Metrics.MediaEnded`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Counter | — | Linux only: the kernel's `RcvbufErrors` and `InErrors` from the `Udp:` lines of `/proc/net/snmp` plus `Udp6RcvbufErrors` and `Udp6InErrors` from `/proc/net/snmp6`, IPv4 + IPv6 summed, read at scrape time (`readUDPStats`, `udpstats.go:28`, called from `Collect`, `admin/metrics.go:165`). The kernel keeps them per network namespace, so they cover every UDP socket in it, not only FreeSBC's, and `InErrors` already includes `RcvbufErrors`. A datagram dropped on a full receive buffer never reaches `freesbc_rtp_packets_rx_total`, so rx/tx 1.0 does not exclude kernel loss; these series do. An absent `snmp6` (IPv6 disabled) leaves IPv4 alone; an unreadable or unparsable `/proc/net/snmp`, or any other OS, exports neither series (no error metric, no log) |
 | `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collectUDPSockets`, `admin/metrics.go:304`; `readUDPSockets`, `udpstats.go:138`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go:200`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
-| `freesbc_media_port_allocation_failure_total` | Counter | — | edge `rejectMedia` on `ErrPortsExhausted` (`invite.go:731`) |
+| `freesbc_media_port_allocation_failure_total` | Counter | — | edge `rejectMedia` on `ErrPortsExhausted` (`invite.go:725`) |
 | `freesbc_webrtc_ice_failure_total` | Counter | — | edge `WebRTCFailure`: every leg failure that is not a DTLS one (`ErrICEFailed`, `ErrWebRTCNotReady`, a leg closed before it established) |
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
 | `freesbc_sip_handler_panics_total` | Counter | — | edge `guard`, one per recovered handler panic |
@@ -3744,9 +3740,9 @@ permanent series per call."
 | `freesbc_edge_register_breaker_rejects_total` | Counter | — | edge `RegisterBreakerRejected`: one per client REGISTER answered 503 + `Retry-After: 30` without dialing because every node's REGISTER breaker was open (§7.4) |
 | `freesbc_edge_register_auth_failures_total` | Counter | — | edge `registerStrike` (`regguard.go`): one per failed REGISTER credential attempt struck against its source (§7.4), replays counted in the read filter included. No `source` label: the sources are in `GET /api/shield/offenders` |
 | `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`, `dialogless_not_admitted`, `options_not_admitted`, `register_aor_locked`} | edge `dropSilently` (`admission.go:184`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a), a BYE or INFO naming no dialog from a source that is neither a live registration nor a carrier (answered 481, §7.8a); every reason is always exported |
-| `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go:1144`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
+| `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go:1132`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_ack_missed_total` | Counter | `plane` ∈ {`public`, `private`}: the side that failed to ACK a 2xx | edge `noteAckMiss` (`ack.go`), once per missed ACK (§7.7); both planes are always exported |
-| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `rejectInvite` / `rejectBusy` (`invite.go:148`, `invite.go:187`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
+| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `rejectInvite` / `rejectBusy` (`invite.go:147`, `invite.go:186`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
 | `freesbc_hep_packets_sent_total` | Counter | — | `hep.Stats.Sent` through `Deps.HEP` (`hepStats`, `app.go:190`): SIP messages written to the collector. Exported only when `hep:` is set |
 | `freesbc_hep_packets_dropped_total` | Counter | — | `hep.Stats.Dropped`: copies refused because the send queue was full or closed, and queued ones given up at shutdown |
 | `freesbc_hep_errors_total` | Counter | `kind` ∈ {`write`, `encode`} | `hep.Stats.WriteErrors` (dial or write failure) and `EncodeErrors` (oversize or unaddressable); both kinds always exported while the mirror is on |
@@ -4288,7 +4284,7 @@ SBC exists.
 payload types; REGISTER AoR user parts are capped at 128 characters and hosts
 at 255, with a character allowlist that excludes CR/LF; `fsbc` tokens are
 capped at 64 characters; ICE tokens are sanitised to the ice-char set. At most
-`maxEarlyPerSource` (64, `invite.go:35`) INVITEs per public source IP may hold
+`maxEarlyPerSource` (64, `invite.go:34`) INVITEs per public source IP may hold
 anchored media without an answer; one more is refused 503 (§7.1). Carrier
 sources are exempt from that cap and bounded by `shield.carrier_rate_limit`.
 Globally, `shield.max_sessions` caps the calls holding a slot (default: what
@@ -4479,7 +4475,7 @@ be used to read an environment variable.
 
 | Entity | Cleanup trigger(s) | Bound |
 |---|---|---|
-| Edge dialog + media session + ports | a tag-matched BYE the far end accepted, the media watchdog (then BYE to both ends, `byeBothEnds`, `indialog.go:919`), `endUnlessUp` on a failed INVITE (`dialog.go:1125`), `closeAll` at shutdown (`dialog.go:592`) | early dialogs bounded by `inviteTimeout` (5 min, then CANCEL + 408); confirmed ones by `rtpSilenceTimeout` |
+| Edge dialog + media session + ports | a tag-matched BYE the far end accepted, the media watchdog (then BYE to both ends, `byeBothEnds`, `indialog.go:919`), `endUnlessUp` on a failed INVITE (`dialog.go:1113`), `closeAll` at shutdown (`dialog.go:592`) | early dialogs bounded by `inviteTimeout` (5 min, then CANCEL + 408); confirmed ones by `rtpSilenceTimeout` |
 | Edge in-flight attempt | `untrack` on handler return, or `cancelSeries` on CANCEL / backstop | the series context |
 | Client binding | un-REGISTER, `granted <= 0`, WebSocket close, expiry + the 30 s prune ticker | the registrar's granted lifetime |
 | Subscription record | a terminated NOTIFY, a 481, a non-2xx final to the first SUBSCRIBE, removal of its registration binding (`Location` hook), `subTable.prune` on the 30 s ticker, `closeAll` at shutdown | 32 per binding, 20000 in all (503 + `Retry-After: 30` beyond); deadline granted `Expires` + 32 s |
@@ -4511,10 +4507,10 @@ code constant.
 | `streamMaxConnsPerIP` / `streamMaxConns` / `streamMaxCarrierConns` | 256 / 10000 / 1024 | open stream connections per source (an IPv6 /64), in all for public sources, and in all to and from carriers (dialed, or accepted from a carrier source), which do not count against the 10000 |
 | `registerTimeout` | 32 s (`register.go:17`) | one whole REGISTER series, client or carrier |
 | `ackTimeout` | 32 s (`edge.go:303`; Timer H) | an answer owed in an ACK that never arrived: the call is ended with a BYE to both sides (§7.9a) |
-| `sessionCapRetryAfter` | 5 s (`invite.go:160`) | `Retry-After` of a 503 for a full session cap |
-| `drainRetryAfter` | 30 s (`invite.go:156`) | `Retry-After` of a 503 refused because the edge is draining |
+| `sessionCapRetryAfter` | 5 s (`invite.go:159`) | `Retry-After` of a 503 for a full session cap |
+| `drainRetryAfter` | 30 s (`invite.go:155`) | `Retry-After` of a 503 refused because the edge is draining |
 | `capWarnEvery` | 10 s per reason (`invite.go`) | spacing of the session-cap / invite-rate WARN lines |
-| `inviteTimeout` | 5 min (`invite.go:24`) | one whole call setup (client, carrier and switch-originated paths, and re-INVITE) |
+| `inviteTimeout` | 5 min (`invite.go:23`) | one whole call setup (client, carrier and switch-originated paths, and re-INVITE) |
 | `cancelDrain` | 300 ms (`invite_leg.go:345`) | inline wait of the pump (or the re-INVITE relay) for the far end's final response after a CANCEL |
 | `cancelLinger` | 32 s (`invite_leg.go:356`; `maxCancelLingers` 4096) | how long a cancelled INVITE's client transaction is kept in the background to match a late final (a 2xx is ACKed and BYEd; for an abandoned re-INVITE, ACKed only); a final ends it early |
 | CANCEL / `ackThenBye` BYE / BYE after media end | 5 s each (`invite_leg.go:562`, `invite_leg.go:457`, `indialog.go:980`) | one transaction |

@@ -24,9 +24,6 @@ const PublicIPService = "https://api.ipify.org"
 // adminListen is the loopback address init writes for the admin API.
 const adminListen = "127.0.0.1:8080"
 
-// adminBcryptCost satisfies the admin.password_hash minimum (10).
-const adminBcryptCost = 10
-
 // InitOptions drives Init. Everything environment-dependent is a field, so
 // tests run without a terminal, a network or a local interface.
 type InitOptions struct {
@@ -66,7 +63,7 @@ var ErrInitFileExists = errors.New("already exists; refusing to overwrite")
 // HashAdminPassword returns a bcrypt hash that satisfies the
 // admin.password_hash rule (cost >= 10).
 func HashAdminPassword(password string) (string, error) {
-	h, err := bcrypt.GenerateFromPassword([]byte(password), adminBcryptCost)
+	h, err := bcrypt.GenerateFromPassword([]byte(password), config.MinBcryptCost)
 	if err != nil {
 		return "", err
 	}

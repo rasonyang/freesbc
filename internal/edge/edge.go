@@ -1410,7 +1410,7 @@ func (s *Server) onOptions(req *sip.Request, tx sip.ServerTransaction, in inboun
 			s.reject(req, tx, 404, "Not Found")
 			return
 		case targetClient:
-			if _, ok := s.resolveTarget(req); !ok {
+			if _, ok := s.bindingForRequest(req); !ok {
 				s.reject(req, tx, 404, "Not Found")
 				return
 			}

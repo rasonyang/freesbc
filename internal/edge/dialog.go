@@ -445,7 +445,7 @@ func (t *dialogTable) begin(req *sip.Request, callerPlane plane, limit int) (*di
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed {
-		return nil, beginClosed // shutting down; see isClosed
+		return nil, beginClosed // shutting down (close has run)
 	}
 	for _, o := range t.byCallID[callID] {
 		if o.state == dialogEarly && o.callerTag == callerTag {
@@ -642,13 +642,6 @@ func (t *dialogTable) close() {
 	t.mu.Lock()
 	t.closed = true
 	t.mu.Unlock()
-}
-
-// isClosed reports whether close has run.
-func (t *dialogTable) isClosed() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.closed
 }
 
 // closeAll ends every dialog. Called at shutdown so no socket, port
@@ -1011,11 +1004,6 @@ func (d *dialog) setRelayed2xx(res *sip.Response) {
 	defer d.tab.mu.Unlock()
 	d.ok = res
 }
-
-// reject2xx records a 2xx FreeSBC refuses to relay and reports whether it
-// is the first time: the first sighting is ACKed and BYEd, a
-// retransmission only re-ACKed.
-func (d *dialog) reject2xx(calleeTag string) (first bool) { return d.hook.reject(calleeTag) }
 
 // track points the CANCEL bridge at the INVITE about to be sent. A
 // failover series re-tracks per attempt, deliberately overwriting the

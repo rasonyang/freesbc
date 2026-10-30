@@ -4,14 +4,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"fmt"
 	"math/big"
-	"strings"
 	"sync"
 	"time"
 )
@@ -98,19 +95,6 @@ func identityFrom(cert tls.Certificate) (*DTLSIdentity, error) {
 	return &DTLSIdentity{
 		Certificate:      cert,
 		FingerprintHash:  "sha-256",
-		FingerprintValue: fingerprintHex(cert.Certificate[0]),
+		FingerprintValue: fingerprintWith("sha-256", cert.Certificate[0]),
 	}, nil
-}
-
-// fingerprintHex renders a certificate's SDP a=fingerprint value the way
-// RFC 8122 §5 requires: SHA-256 over the DER, uppercase hex bytes joined
-// by colons.
-func fingerprintHex(der []byte) string {
-	sum := sha256.Sum256(der)
-	hexed := hex.EncodeToString(sum[:])
-	parts := make([]string, 0, len(sum))
-	for i := 0; i < len(hexed); i += 2 {
-		parts = append(parts, strings.ToUpper(hexed[i:i+2]))
-	}
-	return strings.Join(parts, ":")
 }

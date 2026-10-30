@@ -99,7 +99,6 @@ type stats struct {
 	regFail  int
 	started  int64
 	active   int64
-	rtts     []time.Duration
 	errKinds map[string]int
 	skipped  int // call slots dropped because every user was busy (-users too small)
 }
