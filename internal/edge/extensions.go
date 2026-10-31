@@ -21,8 +21,10 @@ import (
 // generates a reliable provisional itself (its own 100 Trying stays
 // unreliable). A PRACK or UPDATE without a body is forwarded like any other
 // in-dialog request (onPrackUpdate). An UPDATE that carries SDP has its
-// body rebuilt like a re-INVITE's (update.go). A PRACK that carries SDP is
-// not yet handled: it is refused rather than forwarded with the far end's
+// body rebuilt like a re-INVITE's (update.go). A PRACK that carries SDP
+// answers the offer of a reliable 18x in an offerless INVITE and has its body
+// rebuilt too (prack.go, offerless.go); a PRACK whose SDP answers no pending
+// offer is refused with 488 rather than forwarded with the far end's
 // addresses in it.
 
 // headerSet is the header access both *sip.Request and *sip.Response have.

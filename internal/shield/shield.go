@@ -36,8 +36,8 @@ type Shield struct {
 	aors       *aorTable                // per-AoR REGISTER strikes (StrikeAOR)
 
 	// Cumulative drop counters by reason, for the admin API's metrics
-	// snapshot (Stats). Incremented in Check at each of its three drop
-	// points; read via Stats' atomic Load.
+	// snapshot (Stats). Incremented where the drop happens (CheckFrom,
+	// AllowRate, CheckScanner, DropBanned); read via Stats' atomic Load.
 	dropsBanned  atomic.Int64
 	dropsScanner atomic.Int64
 	dropsRate    atomic.Int64
@@ -83,7 +83,7 @@ func New(store *config.Store, log *slog.Logger, isCarrier func(netip.Addr) bool)
 	return s
 }
 
-// Check is the per-request gate (spec §3): a banned source and a
+// Check is the per-request gate: a banned source and a
 // rate-limit violation Drop; otherwise a scanner UA is dropped, and instantly
 // banned when it arrived over a connection-oriented transport (see
 // bannableTransport) — but only AFTER the rate limiter has had its say (the
@@ -295,11 +295,11 @@ type BanInfo struct {
 // maxBanPage bounds one Bans page.
 const maxBanPage = 1000
 
-// Bans returns one page of the live (unexpired) bans of both tables, newest
-// first then by source, and the total number of live bans. limit is clamped
-// to 1..maxBanPage and a negative offset is 0. The tables are copied under
-// their own locks; sorting and slicing happen outside them. The page is a
-// non-nil slice.
+// Bans returns one page of the live (unexpired) bans of all three tables,
+// newest first then by source, and the total number of live bans. limit is
+// clamped to 1..maxBanPage and a negative offset is 0. The tables are copied
+// under their own locks; sorting and slicing happen outside them. The page
+// is a non-nil slice.
 func (s *Shield) Bans(limit, offset int) (page []BanInfo, total int) {
 	limit = min(max(limit, 1), maxBanPage)
 	offset = max(offset, 0)

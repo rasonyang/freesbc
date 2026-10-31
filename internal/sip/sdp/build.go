@@ -68,8 +68,8 @@ type Build struct {
 //
 // The result always has exactly one media section — the audio the proxy
 // relays. A multi-section offer is answered by declining the rest, which
-// Decline builds; callers that must preserve the section count use
-// MarshalDeclining instead.
+// MarshalDeclining does; callers that must preserve the section count use it
+// instead.
 func (b Build) Marshal() ([]byte, error) { return b.marshal(nil) }
 
 // MarshalDeclining renders the body as an answer to offer: one m= line per

@@ -25,7 +25,7 @@ import (
 
 // WebRTCLeg is the browser-facing half of a media session: ICE-Lite over
 // one UDP socket, then DTLS on that socket, then SRTP/SRTCP keyed from the
-// DTLS handshake (spec §9).
+// DTLS handshake.
 //
 // It deliberately does NOT use pion/webrtc.PeerConnection. The proxy owns
 // the media session, the SDP and the leg lifecycle; Pion supplies protocol
@@ -41,6 +41,11 @@ import (
 // the browser's answer → Start → Close. Its remote credentials, DTLS role
 // and fingerprint do not exist until the answer arrives, so establishment
 // cannot begin before then.
+//
+// Not supported: re-keying and ICE restart. deriveSRTP sets in/out exactly
+// once, at the end of the single handshake this leg ever runs; a browser
+// that renegotiates gets its DTLS records absorbed (see establish) rather
+// than applied, and a new media path means a new leg.
 type WebRTCLeg struct {
 	pool *PlanePool
 	conn *net.UDPConn
@@ -595,11 +600,6 @@ func (l *WebRTCLeg) establish(ctx context.Context) error {
 	return nil
 }
 
-// Not supported: re-keying and ICE restart. deriveSRTP sets in/out exactly
-// once, at the end of the single handshake this leg ever runs; a browser
-// that renegotiates gets its DTLS records absorbed (see establish) rather
-// than applied, and a new media path means a new leg.
-//
 // deriveSRTP exports the DTLS keying material and splits it into the two
 // SRTP contexts, per RFC 5764 §4.2: the exporter produces
 // client_key ‖ server_key ‖ client_salt ‖ server_salt, and which half is
@@ -852,7 +852,7 @@ func (l *WebRTCLeg) Close() error {
 //
 // These are secrets: an attacker who learns the pwd can answer
 // connectivity checks and hijack the media path. They must never be logged
-// at normal levels (spec §16).
+// at normal levels.
 func newICECredentials() (ufrag, pwd string, err error) {
 	buf := make([]byte, 3+18)
 	if _, err := rand.Read(buf); err != nil {

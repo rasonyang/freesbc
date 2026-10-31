@@ -2,7 +2,7 @@ package media
 
 import "sync/atomic"
 
-// Stats is one media session's packet counters (spec §12/§17), per side
+// Stats is one media session's packet counters, per side
 // of the relay. Counters are named from the SBC's point of view: "rx" is
 // what the SBC received from that side, "tx" what it sent to it.
 //

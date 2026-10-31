@@ -116,7 +116,7 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		proxyRegUnans:   prometheus.NewDesc("freesbc_edge_register_unanswered_total", "REGISTER attempts a switch node answered with nothing.", nil, nil),
 		proxyRegBrk:     prometheus.NewDesc("freesbc_edge_register_breaker_rejects_total", "REGISTERs answered 503 locally because every switch node's REGISTER breaker was open.", nil, nil),
 		// method and transport are bounded sets; a Call-ID label here would
-		// create a permanent series per call (spec §17).
+		// create a permanent series per call.
 		proxyReqIn:      prometheus.NewDesc("freesbc_sip_requests_total", "SIP requests received by the edge proxy.", []string{"method", "transport"}, nil),
 		proxyResOut:     prometheus.NewDesc("freesbc_sip_responses_total", "SIP responses sent by the edge proxy, by status class.", []string{"class"}, nil),
 		proxyRTPPktRx:   prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across all media sessions, finished and live.", nil, nil),

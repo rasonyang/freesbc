@@ -1,8 +1,8 @@
-// Package sdp is FreeSBC's SDP subsystem, shared by both signaling planes:
+// Package sdp is FreeSBC's SDP subsystem, used by the edge:
 // a typed, bounded parse of the parts of an offer/answer an SBC acts on
 // (audio codecs, connection address, direction, ICE and DTLS attributes),
 // codec intersection without transcoding, and construction of the bodies
-// the proxy plane emits — a plain RTP/AVP body toward FreeSWITCH and an
+// the proxy emits — a plain RTP/AVP body toward FreeSWITCH and an
 // RTP/AVP or WebRTC (UDP/TLS/RTP/SAVPF) body toward the public client.
 //
 // It holds no policy. WHICH codecs a deployment relays is the decision of
@@ -18,7 +18,7 @@
 // malicious offer can neither exhaust memory nor make the proxy build an
 // unbounded answer.
 //
-// Scope is audio only and transcoding-free (spec §5): the proxy relays RTP
+// Scope is audio only and transcoding-free: the proxy relays RTP
 // payloads byte-for-byte, so payload-type numbers must survive end to end.
 // What makes that work is offer/answer's own recommendation: an answerer
 // SHOULD use the offerer's payload-type numbers (RFC 3264 §6.1). The proxy
@@ -41,7 +41,7 @@ import (
 	pionsdp "github.com/pion/sdp/v3"
 )
 
-// Input limits (spec §16). They bound both parse work and the size of
+// Input limits. They bound both parse work and the size of
 // anything the proxy derives from a parsed offer.
 const (
 	// MaxSize is the largest SDP body Parse accepts. Real audio offers are
@@ -165,7 +165,7 @@ func lowerASCII(c byte) byte {
 
 // IsTelephoneEvent reports whether this is an RFC 4733 DTMF payload. The
 // proxy must keep it in every negotiated list it builds so DTMF survives
-// the relay (spec §13).
+// the relay.
 func (c Codec) IsTelephoneEvent() bool {
 	return strings.EqualFold(c.Name, "telephone-event")
 }

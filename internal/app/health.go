@@ -32,7 +32,8 @@ const (
 //     and a serve error afterwards makes edge.Server.Run return, which
 //     cancels the errgroup and ends the process, so no running process has
 //     a stopped listener to report.
-//   - TLS certificate near expiry: absent until #119 lands.
+//   - TLS certificate expiry, renewal and disk state: these are admin's
+//     (healthConditions in internal/admin/tlscert.go), not derived here.
 //   - Drain mode is not a condition: it has its own gauge and endpoint.
 
 // healthInputs is everything the conditions are derived from, as plain

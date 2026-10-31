@@ -414,8 +414,9 @@ func (c *Config) validateAdmin(fail failFunc) {
 	if err != nil {
 		fail("admin.listen: %q is not IP:port", c.Admin.Listen)
 	} else if !ap.Addr().IsLoopback() && !c.Admin.AllowRemote {
-		// The admin API exposes the full config guarded only by Basic
-		// auth: a non-loopback bind must be an explicit opt-in.
+		// The admin API exposes the full config guarded only by the
+		// admin password (Basic auth or a login session): a
+		// non-loopback bind must be an explicit opt-in.
 		fail("admin.listen: %q is not loopback; set admin.allow_remote: true (requires tls) to bind it", c.Admin.Listen)
 	}
 	seen := make(map[string]bool, len(c.Admin.AllowedHosts))

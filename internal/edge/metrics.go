@@ -13,7 +13,7 @@ import (
 
 // Metrics are the edge proxy's counters and gauges.
 //
-// Deliberately free of high-cardinality labels (spec §17): a Call-ID
+// Deliberately free of high-cardinality labels: a Call-ID
 // belongs in a log line or a trace, never in a metric, because each
 // distinct value would create a permanent time series. Status classes are a
 // bounded set; request methods and transports come off the wire, so they

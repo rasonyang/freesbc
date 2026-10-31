@@ -114,8 +114,8 @@ func settle() {
 	}
 }
 
-// TestMediaPoolExhaustionRejectsCleanly is spec §7: a full port range must
-// produce a clean 503, not a wedged call or a leaked socket.
+// TestMediaPoolExhaustionRejectsCleanly checks that a full port range
+// produces a clean 503, not a wedged call or a leaked socket.
 func TestMediaPoolExhaustionRejectsCleanly(t *testing.T) {
 	h := startHarness(t, false)
 	// Drain the public pool by allocating every pair it holds.

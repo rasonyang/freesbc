@@ -1,5 +1,9 @@
-// Package admin serves the read-only operator HTTP surface: a Prometheus
-// /metrics endpoint and a JSON status API, behind bcrypt HTTP Basic Auth.
+// Package admin serves the operator HTTP surface: the embedded WebUI with its
+// login form and cookie sessions, a Prometheus /metrics endpoint, a JSON API
+// (status, calls, client and carrier registrations, switch nodes, carriers,
+// shield, drain, TLS, audit, health and read-only config views) and an
+// unauthenticated /healthz. /metrics and the API also accept bcrypt HTTP
+// Basic Auth. Drain is the only plane state it changes.
 // It imports only config; plane-side data arrives via the Deps closures
 // over admin's own DTOs (internal/app adapts edge.Server).
 package admin
@@ -32,7 +36,7 @@ import (
 // no SIP dialog or media session. app converts the planes' own records
 // into these.
 type Call struct {
-	ID            string // admin call ID: admin call ID
+	ID            string // admin call ID, distinct from the SIP Call-ID
 	CallID        string // A-leg SIP Call-ID, for correlating with traces
 	FromPeer      string
 	ToPeer        string

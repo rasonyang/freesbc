@@ -329,7 +329,7 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 }
 
 // logRegister records the outcome. It deliberately never logs the
-// Authorization header, the challenge nonce, or any credential (spec §16):
+// Authorization header, the challenge nonce, or any credential:
 // the AoR, transport, source and status are the whole operational story.
 func (s *Server) logRegister(res *sip.Response, aor, transport string, src netip.AddrPort, unregister bool) {
 	switch {

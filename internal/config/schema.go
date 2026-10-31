@@ -266,8 +266,8 @@ type AdminConfig struct {
 	// server accepts in the Host header, besides listen and, on a loopback
 	// listen, the loopback names. Optional.
 	AllowedHosts []string `yaml:"allowed_hosts"`
-	// Pprof serves net/http/pprof under /debug/pprof/ behind the same Basic
-	// Auth as the rest of the API. Default false.
+	// Pprof serves net/http/pprof under /debug/pprof/ behind the same auth
+	// (Basic or a login session) as the rest of the API. Default false.
 	Pprof bool `yaml:"pprof"`
 }
 

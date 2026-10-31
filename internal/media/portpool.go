@@ -15,7 +15,7 @@ import (
 )
 
 // ErrPortsExhausted is returned when no free port pair is left in the
-// configured range; the signaling plane maps it to 503 (spec §7).
+// configured range; the signaling plane maps it to 503.
 var ErrPortsExhausted = errors.New("media: RTP port range exhausted")
 
 // portPair is one bound socket pair: RTP on an even port, RTCP on RTP+1.

@@ -36,7 +36,7 @@ func (s *Session) Start() bool {
 // from the `to` side's own socket so the remote sees the port it already
 // talks to. rtpKind selects the RTP or RTCP socket/latch of both sides.
 // The loop exits when its socket is closed. A panic kills only this
-// session, never the process (spec §7).
+// session, never the process.
 func (s *Session) forward(from, to Side, rtpKind bool) {
 	in, inLatch := s.pairs[from].RTCP, s.rtcp[from]
 	outSock, outLatch := s.pairs[to].RTCP, s.rtcp[to]
@@ -149,7 +149,7 @@ func watchdog(timeout time.Duration, lastRx *[2]atomic.Int64, done <-chan struct
 }
 
 // recoverRelayPanic is deferred by every relay goroutine: a panic kills
-// only this session, never the process (spec §7), and leaves a forensic
+// only this session, never the process, and leaves a forensic
 // trace instead of a silent call drop. A nil log uses the default logger.
 func recoverRelayPanic(log *slog.Logger, closeFn func() error) {
 	if r := recover(); r != nil {

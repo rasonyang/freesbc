@@ -47,7 +47,7 @@ func classify(b []byte) muxKind {
 // Buffer limits for the demultiplexer's two queues. A queue that fills is
 // a queue whose reader has stalled; dropping the newest packet there is
 // correct for real-time media and bounds the memory one session can pin
-// (spec §16: no memory amplification from untrusted input).
+// (no memory amplification from untrusted input).
 const (
 	dtlsBufferSize = 1 << 16  // handshake flights are small and bursty
 	srtpBufferSize = 1 << 20  // ~1 MB of audio backlog is already far too much
@@ -140,7 +140,7 @@ func (e *muxEndpoint) Write(p []byte) (int, error) { return e.parent.conn.Write(
 
 // WriteTo ignores addr: an ICE connection has exactly one peer — the
 // selected candidate pair — and writing anywhere else would make this a
-// UDP reflector (spec §16).
+// UDP reflector.
 func (e *muxEndpoint) WriteTo(p []byte, _ net.Addr) (int, error) { return e.Write(p) }
 
 func (e *muxEndpoint) Close() error                       { return e.buf.Close() }

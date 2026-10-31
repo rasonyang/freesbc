@@ -17,8 +17,8 @@ import (
 // DTLS handshake, plus the fingerprint that certificate is bound to in
 // SDP.
 //
-// One identity is shared by every session for the life of the process
-// (spec §11): generating a key per session would put an ECDSA keygen on
+// One identity is shared by every session for the life of the process:
+// generating a key per session would put an ECDSA keygen on
 // the call-setup path for no security benefit — WebRTC binds the
 // certificate to the session through the a=fingerprint line carried in
 // signaling, not through the certificate being unique.
