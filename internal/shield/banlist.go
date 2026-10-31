@@ -35,7 +35,7 @@ const (
 	BanReasonMalformed = "malformed"
 )
 
-// Ban kinds: which of the two tables an entry lives in.
+// Ban kinds: which of the three tables an entry lives in.
 const (
 	BanKindIP        = "ip"
 	BanKindUDPSocket = "udp_socket"
@@ -53,10 +53,12 @@ type banEntry struct {
 
 // banList is an in-memory ban table: a source key mapped to the instant
 // its ban expires (plus when and why it started), with lazy expiry on read.
-// The Shield keeps two: source IPs (a verdict on a connection-oriented
-// transport) and UDP source sockets (see Shield.CheckFrom). Separate tables
-// mean a forged-datagram flood that fills the socket table can never keep a
-// real scanner's IP out of the IP table.
+// The Shield keeps three: source IPs banned on every transport (a scanner
+// verdict on a connection-oriented transport, or a strike; see Shield.Strike),
+// UDP source sockets (see Shield.CheckFrom) and source IPs banned on UDP only
+// (a strike that arrived over UDP; see Shield.StrikeOn). Separate tables
+// mean a forged-datagram flood that fills the socket or UDP-only table can
+// never keep a real scanner's IP out of the IP table.
 type banList[K comparable] struct {
 	mu    sync.Mutex
 	until map[K]banEntry

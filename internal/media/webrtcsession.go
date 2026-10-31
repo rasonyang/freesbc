@@ -12,7 +12,7 @@ import (
 
 // WebRTCSession is the media half of a browser call: a WebRTC leg on the
 // public side and a plain RTP/RTCP port pair on the private side, relaying
-// audio between them without decoding a single sample (spec §9).
+// audio between them without decoding a single sample.
 //
 //	Browser ──SRTP/SRTCP (muxed, one socket)──▶ WebRTCLeg
 //	                                              │ decrypt

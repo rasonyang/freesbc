@@ -16,7 +16,7 @@ const (
 )
 
 // LatchMode controls which inbound packet sources a stream accepts before
-// and after it latches (spec §3 decision 5).
+// and after it latches.
 type LatchMode int
 
 const (
@@ -322,8 +322,7 @@ type SessionConfig struct {
 	// Latch is the per-side latching mode (zero value = strict).
 	Latch [2]LatchMode
 	// Timeout tears the session down after this much silence; zero means
-	// the pool's PlaneParams.Timeout, read with
-	// the rest of the allocation's parameters.
+	// the Timeout of side A's pool PlaneParams (see AllocateAcross).
 	Timeout time.Duration
 }
 

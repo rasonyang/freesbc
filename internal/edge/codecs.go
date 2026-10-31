@@ -11,13 +11,13 @@ import (
 // which knows how to parse, negotiate and render codecs but has no opinion
 // about which ones a particular deployment carries.
 
-// supportedCodecs lists the audio codecs the proxy will relay (spec §5).
+// supportedCodecs lists the audio codecs the proxy will relay.
 // The list is deliberately closed: relaying a codec means committing to
 // pass its payload through untouched, and anything not here is more likely
 // a video/data payload smuggled into an audio section than a real offer.
 //
-// telephone-event is included so RFC 4733 DTMF survives the relay
-// (spec §13); it is a payload the proxy carries, never one it interprets.
+// telephone-event is included so RFC 4733 DTMF survives the relay;
+// it is a payload the proxy carries, never one it interprets.
 var supportedCodecs = map[string]bool{
 	"pcmu":            true,
 	"pcma":            true,

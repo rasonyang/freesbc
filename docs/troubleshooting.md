@@ -13,7 +13,7 @@ call ended sip_call_id=... reason=ack_timeout terminated_by=proxy duration=32.1s
 | `reason` | `terminated_by` | Meaning | Go to |
 |---|---|---|---|
 | `ack_timeout` | `callee` or `proxy` | The ACK to the initial 2xx never arrived | [Lost ACK](#lost-ack-reasonack_timeout) |
-| `rtp_silence` | `proxy` | No genuine RTP from one side for 5 minutes | [RTP silence](#rtp-silence-reasonrtp_silence) |
+| `rtp_silence` | `proxy` | No genuine RTP or RTCP from one side for 5 minutes | [RTP silence](#rtp-silence-reasonrtp_silence) |
 | `bye_caller`, `bye_callee` | `caller`, `callee` | A BYE from that side was accepted: a hangup, or that end's own timer | [A BYE you did not expect](#a-bye-you-did-not-expect-reasonbye_caller-or-bye_callee) |
 | `bye_unanswered` | `proxy` | A BYE was relayed, the far side never answered it, FreeSBC ended the dialog and re-sent the BYE | [A BYE you did not expect](#a-bye-you-did-not-expect-reasonbye_caller-or-bye_callee) |
 | `dtls_failure` | `proxy` | A WebRTC leg failed (ICE, DTLS or fingerprint) | `webrtc=true` on the line; see the `webrtc leg failed` WARN and `freesbc_webrtc_dtls_failure_total` |
@@ -49,7 +49,7 @@ To confirm on the wire, capture on the FreeSBC host (`tcpdump -ni any udp port 5
 
 **Fingerprint.** `reason=rtp_silence terminated_by=proxy`, with a `duration` that runs 5 to 6 minutes past the moment the audio stopped (the watchdog polls every quarter of its timeout). FreeSBC BYEs both ends.
 
-**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP packet that fails authentication, never do. RTCP also refreshes it, but RTCP packets are not counted in the RTP packet/byte metrics.
+**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP or SRTCP packet that fails authentication, never do. An accepted RTCP packet refreshes it exactly like RTP (a receive-only side that sends RTCP receiver reports stays alive, as on hold), though RTCP packets are not counted in the RTP packet/byte metrics. A held endpoint that sends neither RTP nor RTCP for the timeout is reclaimed.
 
 The usual causes:
 

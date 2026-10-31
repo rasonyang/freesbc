@@ -50,7 +50,7 @@ func (b *Binding) Expired(now time.Time) bool { return !now.Before(b.ExpiresAt) 
 
 // Location is the runtime table of registration bindings.
 //
-// Bounded on purpose (spec §16): an unauthenticated flood of REGISTERs
+// Bounded on purpose: an unauthenticated flood of REGISTERs
 // that FreeSWITCH happens to accept must not be able to grow this map
 // without limit. Entries are keyed by token and indexed by AoR and by
 // transport source. The three maps always hold the same set of bindings:
