@@ -2647,6 +2647,10 @@ receiving media after an authorised move even if it never sends first (a
 recvonly peer, an IVR waiting to hear audio). An address with no usable
 port only re-arms the source check (`Armed`).
 
+Both session kinds apply these to their RTP/RTCP latch pair through one rule,
+`seedPair` and `relatchPair` (`media/session.go`): RTCP goes to the RTP port
+plus one, and with no such port the RTCP source check is re-armed with port 0.
+
 **What `seed` will send to** (`unicastMediaAddr`, `media/session.go`): the
 unspecified address (RFC 3264 §8.4 hold), multicast, the IPv4 broadcast
 address and link-local addresses are never installed, nor do they change

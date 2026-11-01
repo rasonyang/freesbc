@@ -115,24 +115,16 @@ func (s *WebRTCSession) Leg() *WebRTCLeg { return s.leg }
 // arrives. The first accepted packet still corrects the destination
 // (symmetric RTP) — see latch.seed.
 func (s *WebRTCSession) SetPrivateRemote(addr netip.AddrPort) {
-	s.privRTP.seed(addr)
-	if rtcp, ok := rtcpAddr(addr); ok {
-		s.privRTCP.seed(rtcp)
-	}
+	seedPair(s.privRTP, s.privRTCP, addr)
 }
 
 // RelatchPrivate re-arms the private side's latches to addr, for an
 // authorised change of FreeSWITCH's media address signalled in SDP (a
 // re-INVITE, or an answer from another fork). Once latched, a latch only
-// moves this way. It re-seeds the destinations too (RTCP at port+1), as
-// Session.Relatch does.
+// moves this way. It re-seeds the destinations too (RTCP at port+1), via
+// relatchPair like Session.Relatch.
 func (s *WebRTCSession) RelatchPrivate(addr netip.AddrPort) {
-	s.privRTP.relatch(addr)
-	rtcp, ok := rtcpAddr(addr)
-	if !ok {
-		rtcp = netip.AddrPortFrom(addr.Addr(), 0)
-	}
-	s.privRTCP.relatch(rtcp)
+	relatchPair(s.privRTP, s.privRTCP, addr)
 }
 
 // Done is closed when the session ends (Close or silence timeout).

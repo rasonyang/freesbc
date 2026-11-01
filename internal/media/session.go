@@ -442,10 +442,31 @@ func (s *Session) SetSignallingSource(side Side, ip netip.Addr) {
 // arrives. The first accepted inbound packet still overrides the
 // destination (symmetric RTP) — see latch.seed.
 func (s *Session) SetRemote(side Side, addr netip.AddrPort) {
-	s.rtp[side].seed(addr)
-	if rtcp, ok := rtcpAddr(addr); ok {
-		s.rtcp[side].seed(rtcp)
+	seedPair(s.rtp[side], s.rtcp[side], addr)
+}
+
+// seedPair seeds an RTP/RTCP latch pair from one signalled media address:
+// RTP to addr, RTCP to addr's port+1 (left unseeded when that port does not
+// exist). It is the one seeding rule for Session and WebRTCSession.
+func seedPair(rtp, rtcp *latch, addr netip.AddrPort) {
+	rtp.seed(addr)
+	if r, ok := rtcpAddr(addr); ok {
+		rtcp.seed(r)
 	}
+}
+
+// relatchPair re-arms an RTP/RTCP latch pair to a newly signalled address.
+// When addr has no RTCP port+1 the RTCP source check is still re-armed, with
+// port 0, so a re-INVITE cannot leave the old RTCP latch open to a hijack.
+// It is the one re-latch rule for Session and WebRTCSession; keep them
+// from drifting apart.
+func relatchPair(rtp, rtcp *latch, addr netip.AddrPort) {
+	rtp.relatch(addr)
+	r, ok := rtcpAddr(addr)
+	if !ok {
+		r = netip.AddrPortFrom(addr.Addr(), 0) // re-arm the source check only
+	}
+	rtcp.relatch(r)
 }
 
 // rtcpAddr is the conventional RTCP address for a media address: the RTP
@@ -471,12 +492,7 @@ func (s *Session) SetRTCPRemote(side Side, addr netip.AddrPort) {
 // receiving media even if it never sends first; follow it with
 // SetRTCPRemote for an explicit a=rtcp port.
 func (s *Session) Relatch(side Side, addr netip.AddrPort) {
-	s.rtp[side].relatch(addr)
-	rtcp, ok := rtcpAddr(addr)
-	if !ok {
-		rtcp = netip.AddrPortFrom(addr.Addr(), 0) // re-arm the source check only
-	}
-	s.rtcp[side].relatch(rtcp)
+	relatchPair(s.rtp[side], s.rtcp[side], addr)
 }
 
 // Done is closed when the session ends (Close or silence timeout).
