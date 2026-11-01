@@ -318,9 +318,9 @@ func TestAuditMED011StatsInUseExceedsTotalAfterShrink(t *testing.T) {
 
 // audit: P2-MED-007
 //
-// SRTP protect/unprotect pass nil dst/header to pion (srtp.go:118-139),
-// so each packet allocates. The relay is otherwise allocation-free per
-// packet; this reports the per-packet cost.
+// SRTP protect/unprotect once passed nil dst/header to pion, so each packet
+// allocated. With a caller-supplied destination (the *Into methods) the
+// per-packet cost is zero; this reports it.
 func TestAuditMED007SRTPAllocsPerPacket(t *testing.T) {
 	key := newTestKey()
 	send, err := newTestCtx(key)
@@ -346,21 +346,25 @@ func TestAuditMED007SRTPAllocsPerPacket(t *testing.T) {
 		}
 		prot[i] = p
 	}
+	dsts := make([][]byte, runs+2)
+	for k := range dsts {
+		dsts[k] = make([]byte, 0, len(plain[k])+srtpMaxOverhead)
+	}
 	i := 0
 	protectAllocs := testing.AllocsPerRun(runs, func() {
-		_, _ = send.protectRTP(plain[i])
+		_, _ = send.protectRTPInto(dsts[i], plain[i])
 		i++
 	})
 	j := 0
 	unprotectAllocs := testing.AllocsPerRun(runs, func() {
-		if _, ok := recv.unprotectRTP(prot[j]); !ok {
+		if _, ok := recv.unprotectRTPInto(dsts[j][:0], prot[j]); !ok {
 			panic("unprotect failed")
 		}
 		j++
 	})
-	t.Logf("P2-MED-007: allocs/packet protectRTP=%.1f unprotectRTP=%.1f", protectAllocs, unprotectAllocs)
+	t.Logf("P2-MED-007: allocs/packet protect=%.1f unprotect=%.1f", protectAllocs, unprotectAllocs)
 	if protectAllocs > 0 || unprotectAllocs > 0 {
-		t.Errorf("FACT P2-MED-007: per-packet heap allocations on the SRTP relay path: protectRTP=%.1f unprotectRTP=%.1f", protectAllocs, unprotectAllocs)
+		t.Errorf("FACT P2-MED-007: per-packet heap allocations on the SRTP relay path: protect=%.1f unprotect=%.1f", protectAllocs, unprotectAllocs)
 	}
 }
 

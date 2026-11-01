@@ -427,8 +427,7 @@ func TestAuditP1012RelayBufferMatchesMaxPacketSize(t *testing.T) {
 // audit: P2-MED-007
 //
 // The relays protect and unprotect in place in their own read buffers,
-// which have room for the SRTP overhead: no allocation at all, not even
-// the slab the generic API draws from.
+// which have room for the SRTP overhead: no allocation at all.
 func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
 	key := newTestKey()
 	send, _ := newTestCtx(key)
@@ -462,9 +461,6 @@ func TestAuditMED007RelayPathInPlaceAllocatesNothing(t *testing.T) {
 	})
 	if protectAllocs > 0 || unprotectAllocs > 0 {
 		t.Errorf("P2-MED-007: the in-place relay path allocates per packet: protect=%.0f unprotect=%.0f", protectAllocs, unprotectAllocs)
-	}
-	if send.slab != nil || recv.slab != nil {
-		t.Error("P2-MED-007: the in-place path drew on the slab")
 	}
 }
 

@@ -213,3 +213,22 @@ func newTestCtx(key []byte) (*SRTPContext, error) {
 	}
 	return newSRTPContextFromKeys(srtp.ProtectionProfileAes128CmHmacSha1_80, key[:16], key[16:])
 }
+
+// Test convenience: the allocating, input-preserving forms of the SRTP
+// transforms. Production uses the *Into methods on the packet's own buffer.
+
+func (c *SRTPContext) protectRTP(pkt []byte) ([]byte, bool) {
+	return c.protectRTPInto(make([]byte, 0, len(pkt)+srtpMaxOverhead), pkt)
+}
+
+func (c *SRTPContext) unprotectRTP(pkt []byte) ([]byte, bool) {
+	return c.unprotectRTPInto(make([]byte, 0, len(pkt)), pkt)
+}
+
+func (c *SRTPContext) protectRTCP(pkt []byte) ([]byte, bool) {
+	return c.protectRTCPInto(make([]byte, 0, len(pkt)+srtpMaxOverhead), pkt)
+}
+
+func (c *SRTPContext) unprotectRTCP(pkt []byte) ([]byte, bool) {
+	return c.unprotectRTCPInto(make([]byte, 0, len(pkt)), pkt)
+}
