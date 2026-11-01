@@ -17,22 +17,16 @@ import (
 // of a direction, so every call is serialized by mu.
 //
 // No per-packet heap allocation (P2-MED-007). rtpHdr/rtcpHdr are handed to
-// pion instead of nil, which would make it allocate a header per packet,
-// and the output never comes from pion's own allocation:
-//
-//   - The relays call the *Into variants with a destination buffer they
-//     own, sized for the SRTP overhead — usually the packet's own read
-//     buffer, so the transform runs in place. Nothing is allocated.
-//   - protectRTP/unprotectRTP and the RTCP pair leave their input
-//     untouched and return a slice carved from slab, a chunk that is only
-//     ever appended to: a returned slice is never overwritten by a later
-//     call, and one allocation serves many packets.
+// pion instead of nil, which would make it allocate a header per packet.
+// The methods are the *Into variants: the caller passes a destination
+// buffer it owns, sized for the SRTP overhead (srtpMaxOverhead past the
+// plaintext) and usually the packet's own read buffer, so the transform
+// runs in place and nothing is allocated.
 type SRTPContext struct {
 	mu      sync.Mutex
 	ctx     *srtp.Context
 	rtpHdr  rtp.Header
 	rtcpHdr rtcp.Header
-	slab    []byte
 }
 
 // srtpMaxOverhead is the most SRTP/SRTCP adds to a packet with the
@@ -41,27 +35,6 @@ type SRTPContext struct {
 // to 24 for slack. A destination with this much capacity past the
 // plaintext never makes pion allocate.
 const srtpMaxOverhead = 24
-
-// srtpSlabSize is how much output one slab allocation covers: about 80
-// full-size voice packets.
-const srtpSlabSize = 16 << 10
-
-// fromSlab runs one pion transform whose output is at most max bytes into
-// a fresh stretch of the slab, then marks it used. Callers hold mu.
-func (c *SRTPContext) fromSlab(max int, transform func(dst []byte) ([]byte, error)) ([]byte, bool) {
-	if cap(c.slab)-len(c.slab) < max {
-		c.slab = make([]byte, 0, srtpSlabSize+max)
-	}
-	off := len(c.slab)
-	out, err := transform(c.slab[off : off : off+max])
-	if err != nil {
-		return nil, false
-	}
-	if len(out) <= max {
-		c.slab = c.slab[:off+len(out)]
-	}
-	return out, true
-}
 
 // Cryptex (RFC 9335) header-extension profiles. They are only meaningful
 // on an SRTP packet whose header extension is encrypted, and pion's
@@ -167,25 +140,13 @@ func (d *tokenReplayDetector) commit() bool { return d.inner.Accept(d.tok) }
 
 func rejectReplay() bool { return false }
 
-// protectRTP encrypts a plaintext RTP packet, leaving pkt untouched.
-// ok=false on failure (the caller drops the packet).
+// protectRTPInto encrypts a plaintext RTP packet into dst, which may be
+// pkt itself (in place). dst needs srtpMaxOverhead bytes of capacity past
+// len(pkt), or pion allocates. ok=false on failure (the caller drops the
+// packet).
 //
 // A plaintext packet with a Cryptex header-extension profile is refused:
 // Cryptex is not negotiated, so its SRTP could never be unprotected.
-func (c *SRTPContext) protectRTP(pkt []byte) ([]byte, bool) {
-	if hasCryptexProfile(pkt) {
-		return nil, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.fromSlab(len(pkt)+srtpMaxOverhead, func(dst []byte) ([]byte, error) {
-		return c.ctx.EncryptRTP(dst, pkt, &c.rtpHdr)
-	})
-}
-
-// protectRTPInto is protectRTP writing to dst, which may be pkt itself
-// (in place). dst needs srtpMaxOverhead bytes of capacity past len(pkt),
-// or pion allocates.
 func (c *SRTPContext) protectRTPInto(dst, pkt []byte) ([]byte, bool) {
 	if hasCryptexProfile(pkt) {
 		return nil, false
@@ -196,18 +157,8 @@ func (c *SRTPContext) protectRTPInto(dst, pkt []byte) ([]byte, bool) {
 	return out, err == nil
 }
 
-// unprotectRTP authenticates and decrypts an SRTP packet, leaving pkt
-// untouched.
-func (c *SRTPContext) unprotectRTP(pkt []byte) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.fromSlab(len(pkt), func(dst []byte) ([]byte, error) {
-		return c.ctx.DecryptRTP(dst, pkt, &c.rtpHdr)
-	})
-}
-
-// unprotectRTPInto is unprotectRTP writing to dst, which may be pkt
-// itself (in place).
+// unprotectRTPInto authenticates and decrypts an SRTP packet into dst,
+// which may be pkt itself (in place).
 func (c *SRTPContext) unprotectRTPInto(dst, pkt []byte) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -215,30 +166,12 @@ func (c *SRTPContext) unprotectRTPInto(dst, pkt []byte) ([]byte, bool) {
 	return out, err == nil
 }
 
-// protectRTCP is protectRTP for RTCP compounds.
-func (c *SRTPContext) protectRTCP(pkt []byte) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.fromSlab(len(pkt)+srtpMaxOverhead, func(dst []byte) ([]byte, error) {
-		return c.ctx.EncryptRTCP(dst, pkt, &c.rtcpHdr)
-	})
-}
-
-// protectRTCPInto is protectRTPInto for RTCP compounds.
+// protectRTCPInto is protectRTPInto for RTCP compounds (no Cryptex check).
 func (c *SRTPContext) protectRTCPInto(dst, pkt []byte) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out, err := c.ctx.EncryptRTCP(dst, pkt, &c.rtcpHdr)
 	return out, err == nil
-}
-
-// unprotectRTCP is unprotectRTP for SRTCP.
-func (c *SRTPContext) unprotectRTCP(pkt []byte) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.fromSlab(len(pkt), func(dst []byte) ([]byte, error) {
-		return c.ctx.DecryptRTCP(dst, pkt, &c.rtcpHdr)
-	})
 }
 
 // unprotectRTCPInto is unprotectRTPInto for SRTCP.
@@ -251,7 +184,8 @@ func (c *SRTPContext) unprotectRTCPInto(dst, pkt []byte) ([]byte, bool) {
 
 // newSRTPContextFromKeys builds a context from an explicit protection
 // profile and a raw master key/salt pair — the shape DTLS-SRTP produces
-// (RFC 5764 §4.2), as opposed to NewSRTPContext's SDES inline value.
+// (RFC 5764 §4.2). An SDES inline value (SDESKey) reaches it too, once
+// sdesDir.set has split it into a key and a salt.
 func newSRTPContextFromKeys(profile srtp.ProtectionProfile, masterKey, masterSalt []byte) (*SRTPContext, error) {
 	keyLen, err := profile.KeyLen()
 	if err != nil {

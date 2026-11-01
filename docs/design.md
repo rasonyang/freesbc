@@ -2782,13 +2782,11 @@ a fresh closure per packet.
 
 **No per-packet allocation.** pion is always given a header to reuse and a
 destination buffer. The relays call the `…Into(dst, pkt)` variants on their
-own read buffer, so protect and unprotect run in place. `protectRTP`,
-`unprotectRTP` and the RTCP pair leave their input untouched and return a
-slice of a per-context 16 KiB slab that is only ever appended to, so a
-returned slice is never overwritten and one allocation serves about 80
-packets. **A plaintext RTP packet carrying a Cryptex (RFC 9335)
-header-extension profile, `0xC0DE` or `0xC2DE`, is refused by `protectRTP`
-and `protectRTPInto`** (`hasCryptexProfile`, `srtp.go`): those profiles
+own read buffer, which has `srtpMaxOverhead` spare capacity past the
+packet, so protect and unprotect run in place and nothing is allocated;
+`SRTPContext` has no other API. **A plaintext RTP packet carrying a Cryptex
+(RFC 9335) header-extension profile, `0xC0DE` or `0xC2DE`, is refused by
+`protectRTPInto`** (`hasCryptexProfile`, `srtp.go`): those profiles
 mean "encrypted header extension" to the receiving side, and Cryptex is not
 negotiated, so the SRTP could never be unprotected.
 
@@ -3472,7 +3470,7 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | `edge.Metrics.carrierRegsMu` | the per-carrier registration gauge map |
 | `media.PlanePool.mu` | `inUse` and `cursor`; held to reserve a candidate, never across a bind |
 | `media.latch.mu` (×4 per session) | mode, expected, signalled, sigSource, dst, remote, rank, learnedAt |
-| `media.SRTPContext.mu` | pion's lockless `*srtp.Context` and the output slab |
+| `media.SRTPContext.mu` | pion's lockless `*srtp.Context` |
 | `media.WebRTCLeg.mu` | agent, mux, demux, SRTP contexts, peer-cert getter, err, state |
 | `shield.banList.mu` ×2, `shield.rateLimiter.mu`, `Shield.rlMu` | the IP and UDP-socket ban tables, the limiter's buckets and global bucket, and the cached rate-limit and strike-threshold parses |
 | `shield.offenderTable.mu` | the per-source strike counters (`offenders.go`); released before a ban is recorded |
