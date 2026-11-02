@@ -273,6 +273,37 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 	return d, true
 }
 
+// bridgeCancel registers the CANCEL bridge on the INVITE server transaction
+// tx of the call d: when the caller's CANCEL terminates tx, the INVITE this
+// call sent must be cancelled too, or the far side would keep ringing.
+// inviteToUpstream, inviteToClient and inviteToCarrier each call it once,
+// before their first INVITE goes out, with the cancel that ends the whole
+// call (for inviteToUpstream, the whole series of attempts; see there).
+//
+// The hook runs inside sipgo's transaction lock, and sipgo sends the caller
+// its 487 only after the hook returns, so it does no network I/O: it marks
+// the call cancelled (from now on no 2xx can confirm it) and hands the CANCEL
+// to a goroutine (cancelCall). With no attempt in flight (between attempts,
+// or before the first) there is nothing to CANCEL on the wire, but the call
+// must still stop, so the hook calls cancel.
+//
+// The hook captures d.hook, not d: the transaction outlives the call by its
+// terminate timers, and a closure holding d would retain an ended dialog
+// (issue #228, dialogHook).
+//
+// It returns false when tx is already terminated: the CANCEL beat the
+// registration, the hook will never fire, and nothing has been sent yet.
+// sipgo has already answered the caller, so the caller of bridgeCancel just
+// returns.
+func (s *Server) bridgeCancel(tx sip.ServerTransaction, d *dialog, cancel context.CancelFunc) bool {
+	h := d.hook
+	return tx.OnCancel(func(*sip.Request) {
+		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
+			cancel()
+		}
+	})
+}
+
 // inviteToUpstream handles a call from the public side to the switch. It
 // serves two kinds of caller, told apart by carrier:
 //
@@ -351,23 +382,9 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// attempts still ends the whole series through the stale entry, and the
 	// loop's ctx check stops the next attempt from starting.
 	//
-	// The hook runs inside sipgo's transaction lock, and sipgo sends the
-	// client its 487 only after the hook returns, so it does no network
-	// I/O: it marks the call cancelled (from now on no 2xx can confirm it)
-	// and hands the CANCEL to a goroutine.
-	h := d.hook // not d: the transaction outlives the call (dialogHook)
-	if !tx.OnCancel(func(*sip.Request) {
-		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
-			// No attempt in flight (between attempts, or before the first):
-			// there is nothing to CANCEL on the wire, but the series must
-			// still stop.
-			cancel()
-		}
-	}) {
-		// The CANCEL beat us here: the server transaction is already
-		// terminated, the hook will never fire, and nothing has been sent
-		// upstream yet. sipgo has already answered the client; ending the
-		// series is the whole of the work left.
+	// A false return means the CANCEL beat this registration and nothing has
+	// been sent upstream yet: ending the series is the whole of the work left.
+	if !s.bridgeCancel(tx, d, cancel) {
 		return
 	}
 	defer d.untrack()
@@ -653,15 +670,10 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 
 	// A CANCEL from FreeSWITCH terminates this server transaction; when it
 	// does, the INVITE we sent must be cancelled too or the far side would
-	// keep ringing. A false return means the transaction is ALREADY
-	// terminated — the CANCEL beat this registration — and nothing has
-	// been sent yet: ending here is the whole of the work left.
-	h := d.hook // not d: the transaction outlives the call (dialogHook)
-	if !tx.OnCancel(func(*sip.Request) {
-		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
-			cancel()
-		}
-	}) {
+	// keep ringing. A false return means the CANCEL beat this registration
+	// and nothing has been sent yet: ending here is the whole of the work
+	// left.
+	if !s.bridgeCancel(tx, d, cancel) {
 		return
 	}
 	a := &inviteAttempt{req: out, cancel: cancel}

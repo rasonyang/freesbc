@@ -263,13 +263,8 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		"offerless", offer == nil)
 
 	// A CANCEL from the switch ends this server transaction; the INVITE
-	// sent to the carrier must be cancelled too (see inviteToClient).
-	h := d.hook // not d: the transaction outlives the call (dialogHook)
-	if !tx.OnCancel(func(*sip.Request) {
-		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
-			cancel()
-		}
-	}) {
+	// sent to the carrier must be cancelled too (bridgeCancel, invite.go).
+	if !s.bridgeCancel(tx, d, cancel) {
 		return
 	}
 	a := &inviteAttempt{req: out, cancel: cancel}

@@ -1905,8 +1905,8 @@ and INVITE CSeq (`clearAck`; see "A missing 2xx ACK" in §7.7).
 **CANCEL.** When sipgo matches a CANCEL to a live INVITE server transaction
 it writes 200 to the CANCEL, then feeds it to the INVITE server
 transaction's state machine, whose cancel action fires the `OnCancel` hook
-(registered in `inviteToUpstream` and `inviteToClient` (`invite.go`) and in
-`inviteToCarrier`, `carrier.go`) **while holding
+(registered by `bridgeCancel`, `invite.go`, for `inviteToUpstream`,
+`inviteToClient` and `inviteToCarrier`) **while holding
 the transaction's FSM lock**; only after the hook returns does the FSM send
 the **487** toward the requester itself (sipgo v1.6.0:
 `TransactionLayer.handleRequest`, sipgo `sip/transaction_layer.go`;
