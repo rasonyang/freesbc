@@ -18,9 +18,11 @@ type RegisterHead struct {
 	// "" when the To header is missing or malformed.
 	AOR string
 	// Auth reports whether the request carries an Authorization or
-	// Proxy-Authorization header; Nonce and AuthKey describe the first one
-	// (see DigestAttempt).
+	// Proxy-Authorization header; User, Nonce and AuthKey describe the
+	// first one (see DigestIdentity). User is the digest username as sent,
+	// never the response or a hash.
 	Auth    bool
+	User    string
 	Nonce   string
 	AuthKey uint64
 }
@@ -74,7 +76,7 @@ func ScanRegister(msg []byte) (RegisterHead, bool) {
 		case headerIs(name, "authorization", "") || headerIs(name, "proxy-authorization", ""):
 			if !h.Auth {
 				h.Auth = true
-				h.Nonce, h.AuthKey = DigestAttempt(v)
+				h.User, h.Nonce, h.AuthKey = DigestIdentity(v)
 			}
 		}
 		name, value = nil, nil
@@ -213,12 +215,13 @@ func DigestParam(value, name string) (string, bool) {
 	return out, found
 }
 
-// DigestAttempt identifies one credential attempt: its nonce, and a 64-bit
+// DigestIdentity identifies one credential attempt: its username as sent
+// ("" when absent), its nonce, and a 64-bit
 // FNV-1a key over the fields that make it a distinct attempt (username,
 // realm, nonce, uri, response, cnonce, nc). The same attempt read from raw
 // bytes and from a parsed header yields the same key, whatever the spacing
 // and quoting. A value without a response is keyed by its trimmed text.
-func DigestAttempt(value string) (nonce string, key uint64) {
+func DigestIdentity(value string) (user, nonce string, key uint64) {
 	fields := [...]string{"username", "realm", "nonce", "uri", "response", "cnonce", "nc"}
 	var vals [len(fields)]string
 	eachDigestParam(value, func(k, v string) bool {
@@ -232,13 +235,13 @@ func DigestAttempt(value string) (nonce string, key uint64) {
 	f := fnv.New64a()
 	if vals[4] == "" {
 		_, _ = f.Write([]byte(strings.TrimSpace(value)))
-		return vals[2], f.Sum64()
+		return vals[0], vals[2], f.Sum64()
 	}
 	for _, v := range vals {
 		_, _ = f.Write([]byte(v))
 		_, _ = f.Write([]byte{0})
 	}
-	return vals[2], f.Sum64()
+	return vals[0], vals[2], f.Sum64()
 }
 
 // eachDigestParam calls fn for each k=v auth-param of a challenge or

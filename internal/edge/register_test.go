@@ -212,10 +212,29 @@ func (c *client) buildRegister(user, domain string, expires int, auth string) *s
 		via.Params.Add("rport", "")
 	}
 	req.PrependHeader(via)
-	if auth != "" {
-		req.AppendHeader(sip.NewHeader("Authorization", auth))
+	if auth == "" {
+		// A phone that has registered before: the edge records a binding only
+		// for a request carrying a credential for its AoR (registerproof.go),
+		// so the plain helper carries one. Its empty nonce marks it as not a
+		// reply to a challenge: the fake switch still challenges it
+		// (implicitCredential), and the credential guard never counts it.
+		// A test of the credential-less case removes the header.
+		auth = fmt.Sprintf(`Digest username=%q, realm=%q, nonce="", uri="sip:%s", response=""`, user, domain, domain)
 	}
+	req.AppendHeader(sip.NewHeader("Authorization", auth))
 	return req
+}
+
+// implicitCredential reports whether req's Authorization is the placeholder
+// buildRegister adds when a test passes none: no nonce, so no challenge was
+// answered.
+func implicitCredential(req *sip.Request) bool {
+	h := req.GetHeader("Authorization")
+	if h == nil {
+		return true
+	}
+	nonce, ok := fsip.DigestParam(h.Value(), "nonce")
+	return ok && nonce == ""
 }
 
 // TestCaseA_UDPRegistration is acceptance criterion 1: a SIP/UDP phone

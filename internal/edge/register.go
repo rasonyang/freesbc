@@ -382,6 +382,13 @@ func (s *Server) recordBinding(res *sip.Response, in bindingInput) int {
 		s.metrics.SetRegistrations(s.loc.Count())
 		return 0
 	}
+	if !in.hasContact {
+		// A Contact-less REGISTER is a query (RFC 3261 §10.2.1): it never
+		// adds or removes a binding, whatever Expires it carries or the
+		// registrar grants. Judged before the removal path below.
+		s.rejectBinding(in, rejectBindingNoContact)
+		return int(fsip.GrantedExpires(res, in.requested, func(sip.Uri) bool { return false }) / time.Second)
+	}
 	granted := fsip.GrantedExpires(res, in.requested, func(u sip.Uri) bool {
 		t, ok := u.UriParams.Get(contactTokenParam)
 		return ok && t == in.token
@@ -390,6 +397,14 @@ func (s *Server) recordBinding(res *sip.Response, in bindingInput) int {
 		s.loc.Remove(in.aor, in.callID)
 		s.metrics.SetRegistrations(s.loc.Count())
 		return 0
+	}
+	// The 2xx alone is not proof (registerproof.go): the request must have
+	// had a Contact and a credential for this AoR, or refresh a live binding.
+	// The client still gets the registrar's answer; only the binding is
+	// withheld.
+	if why, ok := s.bindingProof(in); !ok {
+		s.rejectBinding(in, why)
+		return int(granted / time.Second)
 	}
 	b := Binding{
 		Token: in.token, AOR: in.aor, User: in.user,

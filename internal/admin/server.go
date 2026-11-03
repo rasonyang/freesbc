@@ -189,6 +189,10 @@ type ProxyStats struct {
 	// inviteRejectLabels).
 	InviteRejects map[string]uint64 `json:"invite_rejects_total"`
 
+	// RegisterBindingRejects counts 2xx REGISTER answers that recorded no
+	// binding, by reason (a fixed set, edge bindingRejectLabels).
+	RegisterBindingRejects map[string]uint64 `json:"register_binding_rejected_total"`
+
 	// AckMissed counts 2xx ACKs that never arrived, by the plane that owed
 	// them (public or private).
 	AckMissed map[string]uint64 `json:"ack_missed_total"`

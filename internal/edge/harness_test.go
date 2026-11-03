@@ -891,11 +891,11 @@ func (f *fakeSwitch) sendResponse(t *testing.T, res *sip.Response) {
 func (f *fakeSwitch) onRegister(req *sip.Request, tx sip.ServerTransaction) {
 	f.record(req)
 	f.mu.Lock()
-	challenge := f.challenge && req.GetHeader("Authorization") == nil
+	challenge := f.challenge && implicitCredential(req)
 	status := f.registerStatus
 	authStatus := f.authStatus
 	f.mu.Unlock()
-	if authStatus != 0 && req.GetHeader("Authorization") != nil {
+	if authStatus != 0 && !implicitCredential(req) {
 		res := sip.NewResponseFromRequest(req, authStatus, "", nil)
 		if authStatus == 401 {
 			res.AppendHeader(sip.NewHeader("WWW-Authenticate",
