@@ -40,6 +40,7 @@ edge:
   srtp: optional            # SDES-SRTP for registered clients: off (default) | optional | required;
   #                         #   used only over TLS/WSS signaling, unless allow_insecure_sdes: true
   # allow_insecure_sdes: false
+  # allow_register_auth_mismatch: false  # true only if the switch maps an auth user to another AoR
   switch_carrier_port: 5080  # carriers (FreeSWITCH: external profile port);
                              #   default = the switch port above;
                              #   switch-side configs: examples/switch/

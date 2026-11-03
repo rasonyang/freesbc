@@ -33,9 +33,12 @@ func TestScanRegister(t *testing.T) {
 	if !h.Auth || h.Nonce != "n-1" || h.AuthKey == 0 {
 		t.Errorf("auth = %v nonce = %q key = %x", h.Auth, h.Nonce, h.AuthKey)
 	}
+	if h.User != "1001" {
+		t.Errorf("user = %q, want the folded Authorization's username", h.User)
+	}
 	// The folded line belongs to the Authorization header, so the key is
 	// the one a parsed header value gives.
-	_, want := DigestAttempt(`Digest username="1001",realm="example.com",nonce="n-1",uri="sip:example.com",response="0123abcd",algorithm=MD5`)
+	_, _, want := DigestIdentity(`Digest username="1001",realm="example.com",nonce="n-1",uri="sip:example.com",response="0123abcd",algorithm=MD5`)
 	if h.AuthKey != want {
 		t.Errorf("raw and parsed attempt keys differ: %x != %x", h.AuthKey, want)
 	}
@@ -51,8 +54,8 @@ func TestScanRegisterCompactAndNoAuth(t *testing.T) {
 }
 
 func TestScanRegisterProxyAuthorization(t *testing.T) {
-	raw := "REGISTER sip:x SIP/2.0\r\nproxy-authorization: Digest nonce=\"pn\", response=\"r\"\r\n\r\n"
-	if h, ok := ScanRegister([]byte(raw)); !ok || !h.Auth || h.Nonce != "pn" {
+	raw := "REGISTER sip:x SIP/2.0\r\nproxy-authorization: Digest Username=\"Bob\", nonce=\"pn\", response=\"r\"\r\n\r\n"
+	if h, ok := ScanRegister([]byte(raw)); !ok || !h.Auth || h.Nonce != "pn" || h.User != "Bob" {
 		t.Errorf("got %+v, %v", h, ok)
 	}
 }
@@ -108,11 +111,28 @@ func TestDigestParam(t *testing.T) {
 // Two attempts differing only in the response are distinct; spacing and
 // quoting are not.
 func TestDigestAttemptKey(t *testing.T) {
-	n1, a := DigestAttempt(`Digest username="u", nonce="n", response="r1"`)
-	_, b := DigestAttempt(`Digest username="u", nonce="n", response="r2"`)
-	_, c := DigestAttempt(`Digest   username=u,nonce="n" ,  response="r1"`)
+	_, n1, a := DigestIdentity(`Digest username="u", nonce="n", response="r1"`)
+	_, _, b := DigestIdentity(`Digest username="u", nonce="n", response="r2"`)
+	_, _, c := DigestIdentity(`Digest   username=u,nonce="n" ,  response="r1"`)
 	if n1 != "n" || a == b || a != c {
 		t.Errorf("nonce %q keys %x %x %x", n1, a, b, c)
+	}
+}
+
+// DigestIdentity returns the username as sent, quoted or not, "" when
+// absent.
+func TestDigestIdentity(t *testing.T) {
+	for _, tc := range []struct{ in, user string }{
+		{`Digest username="u", nonce="n", response="r"`, "u"},
+		{`Digest   USERNAME=u2,nonce="n"`, "u2"},
+		{`Digest username="a\"b", nonce="n", response="r"`, `a"b`},
+		{`Digest nonce="n", response="r"`, ""},
+		{``, ""},
+	} {
+		user, nonce, key := DigestIdentity(tc.in)
+		if user != tc.user {
+			t.Errorf("%q: user %q (nonce %q key %x), want %q", tc.in, user, nonce, key, tc.user)
+		}
 	}
 }
 
@@ -131,6 +151,6 @@ func FuzzRegisterScan(f *testing.F) {
 			}
 		}
 		DigestParam(string(data), "nonce")
-		DigestAttempt(string(data))
+		DigestIdentity(string(data))
 	})
 }

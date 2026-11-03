@@ -430,6 +430,7 @@ Every top-level section is restart-only except `shield`. The table is
 | | `edge.carriers` (including each carrier's `srtp`) |
 | | `edge.srtp` |
 | | `edge.allow_insecure_sdes` |
+| | `edge.allow_register_auth_mismatch` (read from `boot` by `credentialMatches`, `registerproof.go`) |
 | | `edge.carrier_sources` |
 | | `admin` (`listen`, `password_hash`, `allow_remote`, `allowed_hosts`, `pprof`, and whether the section exists) |
 | | `hep` (every key, and whether the section exists: the sender and the process-wide sipgo tracer are set up once at startup, §7.1b) |
@@ -1230,7 +1231,10 @@ Per REGISTER:
    credential attempts are struck against their source in the shield
    (`Shield.Strike(src, "register")`, threshold `shield.register_ban`,
    default `10/10m`, hot). `pumpRegister` calls `registerOutcome` on every
-   final, before relaying it: a **2xx clears** the source's strikes; a
+   final, before relaying it: a **2xx to a request that carried a matching
+   credential clears** the source's strikes (`credentialMatches`,
+   `registerproof.go`; a credential-less, mismatched or query 2xx clears
+   nothing); a
    **401, 403, 404 or 407** to a REGISTER carrying `Authorization` or
    `Proxy-Authorization` is a strike, unless the new challenge says
    `stale=true`; and the nonces of a 401/407 challenge are remembered for
@@ -1238,7 +1242,7 @@ Per REGISTER:
    only when its nonce is one FreeSBC relayed to that source key within
    15 min (`regNonceTTL`): a forger never sees the challenge sent to the
    address it claims, so forged datagrams can neither strike a victim nor
-   fill the ban table. Each attempt (branch and `fsip.DigestAttempt` key)
+   fill the ban table. Each attempt (branch and `fsip.DigestIdentity` key)
    counts once, so a retransmission is not a second strike. A request from
    the source of a live binding with the same AoR and Call-ID (a refresh),
    and a carrier source, never count. An exchange the registrar never
@@ -1282,7 +1286,7 @@ Per REGISTER:
    `freesbc_edge_admission_drops_total{reason="register_aor_locked"}`,
    unless its source IP key holds a live binding of the AoR (any port) or is
    a carrier source. The drop is not an admission strike. A 2xx for the AoR
-   (`registerOutcome`) clears its count and lifts the lock. Setting the key
+   to a request with a matching credential (`registerOutcome`) clears its count and lifts the lock. Setting the key
    to `off` stops both counting and dropping at once. The AoR entries are
    listed in `GET /api/shield/offenders` with reason `register_aor` and the
    AoR as `source`. Trade-off: an attacker can lock a legitimate AoR by
@@ -1386,6 +1390,29 @@ stateDiagram-v2
     Expired --> Removed: Location.Prune / pruneAORLocked
     Removed --> [*]
 ```
+
+**What a 2xx must prove** (`bindingProof`, `credentialMatches` and
+`rejectBinding`, `internal/edge/registerproof.go`, issue #303). A binding is
+admission state (its source may place INVITEs), so `recordBinding` records or
+refreshes one only when the REGISTER had a Contact (`bindingInput.hasContact`)
+and either (a) carried an `Authorization` or `Proxy-Authorization` whose digest
+username equals the To user, case-insensitive (`fsip.RegisterHead.User`, read
+by `fsip.DigestIdentity` in the same pass that keys the attempt), or (b)
+refreshes a live binding of the same AoR and Call-ID held by the same source
+key (`refreshesBinding`, `regguard.go`). The registrar's 2xx is the proof that
+the digest was valid, so the nonce need not be one FreeSBC relayed. With
+`edge.allow_register_auth_mismatch` (restart-only, default false) any
+credential satisfies (a) regardless of its username; the Contact requirement
+and the no-credential rule still apply. Otherwise the 2xx is relayed to the
+client unchanged but no binding is recorded: the request is counted in
+`freesbc_edge_register_binding_rejected_total{reason}` (`no_contact`,
+`no_auth`, `auth_aor_mismatch`, exported from zero) and logged at WARN
+`registration binding not recorded` (Debug for `no_contact`, a query) with the
+AoR, transport, source, reason and, for a mismatch, the digest username (never the response, the nonce or a
+hash). A Contact-less REGISTER is a query (RFC 3261 §10.2.1): it is judged first and
+neither adds nor removes a binding, whatever Expires it carries. Un-REGISTER,
+`granted <= 0` and the wildcard path are removals and are not judged. Strike clearing in `registerOutcome` follows case (a) only, so a
+credential-less refresh (b) refreshes the binding and clears nothing.
 
 Transitions: `recordBinding` (`internal/edge/register.go`) performs the insert and
 the removals; `Location.Put` (`location.go`) is the refresh-in-place
@@ -3741,6 +3768,7 @@ permanent series per call."
 | `freesbc_edge_stream_closed_total` | Counter | `reason` ∈ {`idle`, `slow`, `oversize`, `malformed`, `handshake`, `rate`} | connections closed by stream policy (§7.1a); every reason is always exported |
 | `freesbc_edge_register_unanswered_total` | Counter | — | edge `Server.registerUnanswered` (`edge/register.go`): one per REGISTER attempt a switch node answered with nothing (a silent node or a transport error); no node label |
 | `freesbc_edge_register_breaker_rejects_total` | Counter | — | edge `RegisterBreakerRejected`: one per client REGISTER answered 503 + `Retry-After: 30` without dialing because every node's REGISTER breaker was open (§7.4) |
+| `freesbc_edge_register_binding_rejected_total` | Counter | `reason` ∈ {`no_contact`, `no_auth`, `auth_aor_mismatch`} | edge `Server.rejectBinding` (`registerproof.go`): one per 2xx REGISTER that recorded no binding because the request did not prove its Contact, credential or AoR (§7.4); every reason is always exported |
 | `freesbc_edge_register_auth_failures_total` | Counter | — | edge `registerStrike` (`regguard.go`): one per failed REGISTER credential attempt struck against its source (§7.4), replays counted in the read filter included. No `source` label: the sources are in `GET /api/shield/offenders` |
 | `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`, `dialogless_not_admitted`, `options_not_admitted`, `register_aor_locked`} | edge `Server.dropSilently` (`admission.go`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a), a BYE or INFO naming no dialog from a source that is neither a live registration nor a carrier (answered 481, §7.8a); every reason is always exported |
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
@@ -3827,7 +3855,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 JSON keys (`redactConfig`, `admin/redact.go`): `public` (`ip`, `bind`), `private`
 (`ip`), `rtp` (`min`, `max`), `edge` (`switch`, `switch_carrier_port`,
 `listen` and `advertise` with `udp`, `tcp`, `tls`, `ws`, `wss`, `carriers`,
-`carrier_sources`, `srtp`, `allow_insecure_sdes`), `shield` (`rate_limit`,
+`carrier_sources`, `srtp`, `allow_insecure_sdes`, `allow_register_auth_mismatch`), `shield` (`rate_limit`,
 `carrier_rate_limit`, `ban` as a duration string, `max_sessions`,
 `invite_rate_limit`, `register_ban`, `register_ban_aor`, `admission_ban`)
 and, when present, `tls` (`cert`, `key` paths), `hep` (`address`,
@@ -4167,7 +4195,7 @@ so a scanner that stays under `shield.rate_limit` and
 rotates its source port is cut off before parsing (issue #180). A carrier
 source and any IP holding a registration binding on any port (`Location.HasIP`, `location.go`,
 a per-IP binding count) are never struck, and a 2xx
-REGISTER clears the source's admission strikes. A WARN once a minute
+REGISTER carrying a matching credential clears the source's admission strikes. A WARN once a minute
 (`dropSummary`, `admission.go`, `admissionSummaryEvery`) summarises the
 drops of that minute: admission drops and the malformed public reads that
 `malformedStrike` struck, kept apart by kind (total with its two parts,

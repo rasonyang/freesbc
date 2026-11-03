@@ -1060,6 +1060,8 @@ func rawRegister(transport string) string {
 		"CSeq: 1 REGISTER\r\n" +
 		"Contact: <sip:1001@127.0.0.1:5999;transport=" + transport + ">\r\n" +
 		"Expires: 600\r\n" +
+		// A credential for the AoR, so the 2xx records a binding (registerproof.go).
+		"Authorization: Digest username=\"1001\", realm=\"example.com\", nonce=\"\", uri=\"sip:example.com\", response=\"\"\r\n" +
 		"Content-Length: 0\r\n\r\n"
 }
 

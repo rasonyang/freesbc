@@ -74,15 +74,19 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 	deps := emptyDeps()
 	deps.Proxy = func() ProxyStats {
 		return ProxyStats{
-			CallsEnded:     map[string]uint64{"bye_caller": 2, "rtp_silence": 0},
-			InviteRejects:  map[string]uint64{"early_cap": 1, "port_exhausted": 0, "session_cap": 3, "invite_rate": 0},
-			ActiveSessions: 4, ActiveSubscriptions: 7,
+			CallsEnded:             map[string]uint64{"bye_caller": 2, "rtp_silence": 0},
+			InviteRejects:          map[string]uint64{"early_cap": 1, "port_exhausted": 0, "session_cap": 3, "invite_rate": 0},
+			RegisterBindingRejects: map[string]uint64{"no_contact": 2, "no_auth": 0, "auth_aor_mismatch": 1},
+			ActiveSessions:         4, ActiveSubscriptions: 7,
 		}
 	}
 	body := string(authGET(t, newTestServer(t, deps), "/metrics"))
 	for _, want := range []string{
 		`freesbc_edge_calls_ended_total{reason="bye_caller"} 2`,
 		`freesbc_edge_calls_ended_total{reason="rtp_silence"} 0`,
+		`freesbc_edge_register_binding_rejected_total{reason="no_contact"} 2`,
+		`freesbc_edge_register_binding_rejected_total{reason="no_auth"} 0`,
+		`freesbc_edge_register_binding_rejected_total{reason="auth_aor_mismatch"} 1`,
 		`freesbc_edge_invite_rejects_total{reason="early_cap"} 1`,
 		`freesbc_edge_invite_rejects_total{reason="port_exhausted"} 0`,
 		`freesbc_edge_invite_rejects_total{reason="session_cap"} 3`,

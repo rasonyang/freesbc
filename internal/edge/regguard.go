@@ -145,7 +145,7 @@ func (g *regGuard) challenged(src netip.Addr, branch string, nonces []string) {
 }
 
 // countable reports whether an attempt from src (Via branch, nonce, and
-// attempt key from fsip.DigestAttempt) is a new strike: its nonce was
+// attempt key from fsip.DigestIdentity) is a new strike: its nonce was
 // relayed to src's key within regNonceTTL, it has not been counted before,
 // and, for a replay, its branch was challenged within regReplayWindow. A
 // countable attempt is remembered as counted.
@@ -204,7 +204,7 @@ func registerHead(req *sip.Request, aor string) fsip.RegisterHead {
 	for _, name := range []string{"Authorization", "Proxy-Authorization"} {
 		if a := req.GetHeader(name); a != nil {
 			h.Auth = true
-			h.Nonce, h.AuthKey = fsip.DigestAttempt(a.Value())
+			h.User, h.Nonce, h.AuthKey = fsip.DigestIdentity(a.Value())
 			break
 		}
 	}
@@ -295,13 +295,17 @@ func (s *Server) refreshesBinding(ip netip.Addr, aor, callID string) bool {
 }
 
 // registerOutcome feeds the registrar's final answer to a public REGISTER
-// into the guard, before it is relayed: a 2xx clears the source's strikes;
+// into the guard, before it is relayed: a 2xx to a request that carried a
+// matching credential clears the source's strikes;
 // a refused credential is a strike; a challenge is remembered, so the
 // source's next attempt with its nonce can be counted.
 func (s *Server) registerOutcome(in bindingInput, res *sip.Response) {
 	code := res.StatusCode
 	if code/100 == 2 {
-		if sh := s.currentShield(); sh != nil {
+		// Only a credential for the AoR proves the source got in; a 2xx to a
+		// credential-less, mismatched or query request clears nothing
+		// (registerproof.go).
+		if sh := s.currentShield(); sh != nil && s.credentialMatches(in) {
 			sh.ClearStrikes(in.source.Addr(), shield.StrikeRegister)
 			sh.ClearStrikes(in.source.Addr(), shield.StrikeAdmission)
 			sh.ClearAOR(in.aor)

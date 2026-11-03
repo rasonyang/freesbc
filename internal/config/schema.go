@@ -122,6 +122,11 @@ type EdgeConfig struct {
 	// AllowInsecureSDES lets SDES be used on a public leg whose signaling
 	// is not TLS or WSS, where the keys travel in the clear.
 	AllowInsecureSDES bool `yaml:"allow_insecure_sdes"`
+	// AllowRegisterAuthMismatch lets a 2xx to a REGISTER whose digest
+	// username differs from the To user record a binding. Off by default: a
+	// binding then needs a credential for the AoR it names (or the refresh
+	// of a binding that already has one).
+	AllowRegisterAuthMismatch bool `yaml:"allow_register_auth_mismatch"`
 
 	// Compiled by validate.
 	switches    []netip.AddrPort

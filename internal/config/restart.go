@@ -27,6 +27,7 @@ var restartOnly = []struct {
 	{"edge.carriers", func(c *Config) any { return c.Edge.Carriers }},
 	{"edge.srtp", func(c *Config) any { return c.Edge.SRTP }},
 	{"edge.allow_insecure_sdes", func(c *Config) any { return c.Edge.AllowInsecureSDES }},
+	{"edge.allow_register_auth_mismatch", func(c *Config) any { return c.Edge.AllowRegisterAuthMismatch }},
 	{"edge.carrier_sources", func(c *Config) any { return c.Edge.CarrierSources }},
 	{"admin", func(c *Config) any { return c.Admin }},
 	{"hep", func(c *Config) any { return c.HEP }},
