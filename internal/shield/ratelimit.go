@@ -19,10 +19,21 @@ const bucketCap = banCap
 // interval is the refill interval the bucket was last used with, so prune
 // can tell when it has refilled to full without knowing the config.
 type bucket struct {
-	key      netip.Addr
+	key      rateKey
 	tokens   float64
 	last     time.Time
 	interval time.Duration
+}
+
+// rateKey names one per-source bucket. A per-IP bucket carries the
+// bucketKey address with port 0; a socket floor carries the exact source
+// socket and socket=true. stream separates the stream transports (tcp, tls,
+// ws, wss) from datagrams, so forged datagrams never touch a stream
+// source's buckets.
+type rateKey struct {
+	src    netip.AddrPort
+	stream bool
+	socket bool
 }
 
 // rateLimiter is a per-source (or single global) token-bucket limiter.
@@ -32,14 +43,14 @@ type bucket struct {
 // /64) and held in an LRU capped at bucketCap. now is injectable for tests.
 type rateLimiter struct {
 	mu      sync.Mutex
-	buckets map[netip.Addr]*list.Element // of *bucket
-	lru     *list.List                   // front = most recently used
+	buckets map[rateKey]*list.Element // of *bucket
+	lru     *list.List                // front = most recently used
 	global  *bucket
 	now     func() time.Time
 }
 
 func newRateLimiter() *rateLimiter {
-	return &rateLimiter{buckets: make(map[netip.Addr]*list.Element), lru: list.New(), now: time.Now}
+	return &rateLimiter{buckets: make(map[rateKey]*list.Element), lru: list.New(), now: time.Now}
 }
 
 // bucketKey is the per-source bucket key: an IPv4 address (4in6 unmapped)
@@ -53,9 +64,15 @@ func bucketKey(src netip.Addr) netip.Addr {
 	return src
 }
 
-// allow consumes one token for src and reports whether it was available.
-// Capacity (burst) = rate; refill = rate tokens per interval.
+// allow consumes one token of src's datagram-class per-IP bucket (or of
+// the global bucket when perIP is false) and reports whether it was
+// available. Capacity (burst) = rate; refill = rate tokens per interval.
 func (r *rateLimiter) allow(src netip.Addr, rate int, interval time.Duration, perIP bool) bool {
+	return r.take(rateKey{src: netip.AddrPortFrom(bucketKey(src), 0)}, rate, interval, perIP)
+}
+
+// take is allow for an explicit bucket key; perIP false ignores key.
+func (r *rateLimiter) take(key rateKey, rate int, interval time.Duration, perIP bool) bool {
 	if rate <= 0 || interval <= 0 {
 		return true // misconfigured → don't throttle
 	}
@@ -64,7 +81,6 @@ func (r *rateLimiter) allow(src netip.Addr, rate int, interval time.Duration, pe
 	now := r.now()
 	var b *bucket
 	if perIP {
-		key := bucketKey(src)
 		if e := r.buckets[key]; e != nil {
 			r.lru.MoveToFront(e)
 			b = e.Value.(*bucket)

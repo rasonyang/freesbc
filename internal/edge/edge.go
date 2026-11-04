@@ -652,7 +652,14 @@ func (s *Server) Run(ctx context.Context) error {
 	defer client.Close()
 	s.client = client
 
-	sh := shield.New(s.store, s.log, func(ip netip.Addr) bool { return s.carriers.snapshot().isSource(ip) })
+	// A rate-limited socket is vouched for (shield.AllowRate's per-socket
+	// floor) when it is a live registration binding's exact transport and
+	// source, or exactly a resolved edge.carriers address on that transport.
+	sh := shield.New(s.store, s.log,
+		func(ip netip.Addr) bool { return s.carriers.snapshot().isSource(ip) },
+		func(transport string, src netip.AddrPort) bool {
+			return s.loc.HasSource(transport, src) || s.carriers.snapshot().isAddress(src, transport)
+		})
 	defer sh.Close()
 	s.shieldMu.Lock()
 	s.shield = sh
@@ -1083,7 +1090,7 @@ func (s *Server) readFilter() sip.TransportReadFilter {
 				// desynchronise the stream, so the connection charges
 				// those per message it sees start instead and closes
 				// when the budget is gone (streamConn.observe).
-				if !fsip.IsByteStream(info.Transport) && !sh.AllowRate(ap.Addr()) {
+				if !fsip.IsByteStream(info.Transport) && !sh.AllowRate(ap, info.Transport) {
 					return false
 				}
 			}

@@ -78,6 +78,26 @@ func (c *carrierSnapshot) isSource(ip netip.Addr) bool {
 	return false
 }
 
+// isAddress reports whether src is exactly a resolved address (IP and port)
+// of an edge.carriers entry whose transport is network (udp, tcp, tls). It
+// is the shield's proof of a carrier socket: edge.carrier_sources match by
+// IP alone, so they never qualify.
+func (c *carrierSnapshot) isAddress(src netip.AddrPort, network string) bool {
+	src = netip.AddrPortFrom(src.Addr().Unmap().WithZone(""), src.Port())
+	network = strings.ToLower(network)
+	for _, n := range c.names {
+		if c.transports[n] != network {
+			continue
+		}
+		for _, a := range c.addrs[n] {
+			if a == src {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // carrierFor names the carrier a public source belongs to, for a request
 // that arrived over network (udp, tcp, tls...). A carrier's resolved
 // address counts only on that carrier's own transport: a tls carrier's IP

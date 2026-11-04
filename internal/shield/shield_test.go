@@ -16,7 +16,7 @@ func testShield(t *testing.T, yaml string) *Shield {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	s := New(config.NewStore(cfg), discard(), nil)
+	s := New(config.NewStore(cfg), discard(), nil, nil)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
@@ -252,7 +252,7 @@ func TestCarrierSourceExemptFromScannerBanAndUsesCarrierLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	carrier := netip.MustParseAddr("198.51.100.9")
-	s := New(config.NewStore(cfg), discard(), func(a netip.Addr) bool { return a == carrier })
+	s := New(config.NewStore(cfg), discard(), func(a netip.Addr) bool { return a == carrier }, nil)
 	t.Cleanup(func() { s.Close() })
 	if s.Check(carrier, "friendly-scanner", "tcp") != Allow {
 		t.Error("carrier source with a scanner UA must not be dropped or banned")
@@ -287,14 +287,14 @@ func TestAllowRateThenCheckScannerChargesOnce(t *testing.T) {
 	s := testShield(t, shieldCfg) // rate_limit 2/s: a bucket of 2
 	src := netip.MustParseAddrPort("198.51.100.9:5060")
 	for i := 0; i < 2; i++ {
-		if !s.AllowRate(src.Addr()) {
+		if !s.AllowRate(src, "udp") {
 			t.Fatalf("token %d refused", i)
 		}
 		if s.CheckScanner(src, "Zoiper", "udp") != Allow {
 			t.Fatalf("request %d: CheckScanner must not charge a token", i)
 		}
 	}
-	if s.AllowRate(src.Addr()) {
+	if s.AllowRate(src, "udp") {
 		t.Fatal("third read allowed: the bucket should be empty after two charges")
 	}
 	if got := s.Stats().DropsByReason["rate"]; got != 1 {

@@ -349,7 +349,7 @@ func (l *streamListener) prepare(raw net.Conn) {
 	}
 	c := &streamConn{Conn: raw, l: l, ap: ap, remote: raw.RemoteAddr().String(), lim: lim, carrier: carrier}
 	s.metrics.StreamConnOpened(l.transport)
-	if sh := s.currentShield(); sh != nil && !sh.AllowRate(ip) {
+	if sh := s.currentShield(); sh != nil && !sh.AllowRate(ap, l.transport) {
 		// A connection costs the token a datagram does, so a flood of
 		// connections or handshakes from one source meets the same budget as
 		// a flood of requests. Silent, like every shield denial.
@@ -503,7 +503,7 @@ func (c *streamConn) observe(data []byte) bool {
 	}
 	if sh := c.l.s.currentShield(); sh != nil {
 		for range charges {
-			if !sh.AllowRate(c.ap.Addr()) {
+			if !sh.AllowRate(c.ap, c.l.transport) {
 				c.closeFor(closeRate)
 				return false
 			}

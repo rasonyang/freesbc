@@ -88,10 +88,10 @@ func TestRateLimiterLRUCap(t *testing.T) {
 	if got := len(r.buckets); got != bucketCap {
 		t.Fatalf("buckets = %d, want the cap %d", got, bucketCap)
 	}
-	if _, ok := r.buckets[capIP(0)]; ok {
+	if _, ok := r.buckets[rateKey{src: netip.AddrPortFrom(capIP(0), 0)}]; ok {
 		t.Error("the least recently used bucket was not the one evicted")
 	}
-	if _, ok := r.buckets[capIP(bucketCap)]; !ok {
+	if _, ok := r.buckets[rateKey{src: netip.AddrPortFrom(capIP(bucketCap), 0)}]; !ok {
 		t.Error("the newest bucket is missing")
 	}
 }
