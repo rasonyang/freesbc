@@ -437,7 +437,7 @@ func FuzzReadFilter(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	srv.shield = shield.New(srv.store, log, func(ip netip.Addr) bool { return ip == netip.MustParseAddr("127.0.0.1") })
+	srv.shield = shield.New(srv.store, log, func(ip netip.Addr) bool { return ip == netip.MustParseAddr("127.0.0.1") }, nil)
 	f.Cleanup(func() { _ = srv.shield.Close() })
 	filter := srv.readFilter()
 

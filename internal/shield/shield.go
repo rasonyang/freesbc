@@ -27,13 +27,14 @@ const (
 type Shield struct {
 	store      *config.Store
 	log        *slog.Logger
-	isCarrier  func(netip.Addr) bool    // carrier-source predicate; never nil
-	limiter    *rateLimiter             // per-source limit (rate_limit / carrier_rate_limit)
-	bans       *banList[netip.Addr]     // source IPs (connection-oriented verdicts)
-	socketBans *banList[netip.AddrPort] // UDP source sockets (see CheckFrom)
-	udpBans    *banList[netip.Addr]     // source IPs banned on UDP only (see StrikeOn)
-	offenders  *offenderTable           // per-source strike counters (Strike)
-	aors       *aorTable                // per-AoR REGISTER strikes (StrikeAOR)
+	isCarrier  func(netip.Addr) bool             // carrier-source predicate; never nil
+	vouched    func(string, netip.AddrPort) bool // socket-floor predicate; never nil (see AllowRate)
+	limiter    *rateLimiter                      // per-source limit (rate_limit / carrier_rate_limit)
+	bans       *banList[netip.Addr]              // source IPs (connection-oriented verdicts)
+	socketBans *banList[netip.AddrPort]          // UDP source sockets (see CheckFrom)
+	udpBans    *banList[netip.Addr]              // source IPs banned on UDP only (see StrikeOn)
+	offenders  *offenderTable                    // per-source strike counters (Strike)
+	aors       *aorTable                         // per-AoR REGISTER strikes (StrikeAOR)
 
 	// Cumulative drop counters by reason, for the admin API's metrics
 	// snapshot (Stats). Incremented where the drop happens (CheckFrom,
@@ -61,15 +62,23 @@ type Shield struct {
 // are limited by shield.carrier_rate_limit instead of shield.rate_limit
 // and are exempt from the scanner ban. nil means no carriers. (The edge's
 // trusted private plane bypasses the shield before calling it.)
-func New(store *config.Store, log *slog.Logger, isCarrier func(netip.Addr) bool) *Shield {
+// vouched reports whether a source socket is proven (a live registration
+// binding or an exact carrier address on that transport); AllowRate gives
+// it a per-socket floor once its IP bucket is empty. nil means no socket is
+// vouched. It is called with no shield lock held and only on a denial.
+func New(store *config.Store, log *slog.Logger, isCarrier func(netip.Addr) bool, vouched func(transport string, src netip.AddrPort) bool) *Shield {
 	if isCarrier == nil {
 		isCarrier = func(netip.Addr) bool { return false }
+	}
+	if vouched == nil {
+		vouched = func(string, netip.AddrPort) bool { return false }
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Shield{
 		store:      store,
 		log:        log,
 		isCarrier:  isCarrier,
+		vouched:    vouched,
 		limiter:    newRateLimiter(),
 		bans:       newBanList(),
 		socketBans: newBanTable[netip.AddrPort](),
@@ -115,7 +124,7 @@ func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport str
 		s.dropsBanned.Add(1)
 		return Drop
 	}
-	if !s.AllowRate(srcAP.Addr()) {
+	if !s.AllowRate(srcAP, transport) {
 		return Drop
 	}
 	return s.CheckScanner(srcAP, userAgent, transport)
@@ -127,15 +136,31 @@ func (s *Shield) CheckFrom(srcAP netip.AddrPort, userAgent string, transport str
 // message, so the edge read filter calls it once per datagram or frame,
 // before the parser; a parsable request is then charged exactly once, there,
 // and its guard calls CheckScanner instead of CheckFrom.
-func (s *Shield) AllowRate(src netip.Addr) bool {
-	src = src.Unmap()
-	rl := s.rateLimit(s.store.Current(), s.isCarrier(src))
-	if !s.limiter.allow(src, rl.Rate, rl.Interval, rl.PerIP) {
-		s.log.Debug("shield rate-limited", "source", src)
-		s.dropsRate.Add(1)
-		return false
+//
+// With a per-IP limit the bucket is per source IP and per transport class
+// (datagram: udp and anything unknown; stream: tcp, tls, ws, wss), so a
+// forged datagram flood cannot drain the bucket a completed stream
+// connection is charged to. When the IP bucket is empty and the vouched
+// predicate proves the exact socket (a live binding, an exact carrier
+// address), a second bucket for that socket and class, at the same rate,
+// still admits it: a proven socket keeps its rate during a flood that names
+// its IP, and an abuser is bounded by the IP bucket plus its floor. A global
+// (per_ip: false) limit is one bucket with no class split or floor.
+func (s *Shield) AllowRate(src netip.AddrPort, transport string) bool {
+	src = netip.AddrPortFrom(src.Addr().Unmap().WithZone(""), src.Port())
+	rl := s.rateLimit(s.store.Current(), s.isCarrier(src.Addr()))
+	stream := bannableTransport(transport)
+	ipKey := rateKey{src: netip.AddrPortFrom(bucketKey(src.Addr()), 0), stream: stream}
+	if s.limiter.take(ipKey, rl.Rate, rl.Interval, rl.PerIP) {
+		return true
 	}
-	return true
+	if rl.PerIP && s.vouched(transport, src) &&
+		s.limiter.take(rateKey{src: src, stream: stream, socket: true}, rl.Rate, rl.Interval, true) {
+		return true
+	}
+	s.log.Debug("shield rate-limited", "source", src)
+	s.dropsRate.Add(1)
+	return false
 }
 
 // CheckScanner is CheckFrom without the rate token: the ban re-check and the

@@ -16,7 +16,7 @@ func aorShield(t *testing.T, lim string) (*Shield, *config.Store) {
 		t.Fatalf("parse: %v", err)
 	}
 	store := config.NewStore(cfg)
-	s := New(store, discard(), nil)
+	s := New(store, discard(), nil, nil)
 	t.Cleanup(func() { s.Close() })
 	return s, store
 }

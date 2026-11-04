@@ -19,7 +19,7 @@ func auditEdgeShield(t *testing.T) *Shield {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	s := New(config.NewStore(cfg), discard(), nil)
+	s := New(config.NewStore(cfg), discard(), nil, nil)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
@@ -137,7 +137,7 @@ func TestAuditShieldCloseReleasesGoroutines(t *testing.T) {
 	runtime.GC()
 	base := runtime.NumGoroutine()
 	for i := 0; i < 20; i++ {
-		s := New(config.NewStore(cfg), discard(), nil)
+		s := New(config.NewStore(cfg), discard(), nil, nil)
 		s.Check(netip.MustParseAddr("198.51.100.50"), "x", "udp")
 		s.Close()
 	}

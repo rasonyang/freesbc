@@ -28,7 +28,7 @@ shield:
 	if err != nil {
 		b.Fatal(err)
 	}
-	s := New(config.NewStore(cfg), discard(), nil)
+	s := New(config.NewStore(cfg), discard(), nil, nil)
 	b.Cleanup(func() { s.Close() })
 	return s
 }
@@ -53,7 +53,7 @@ func BenchmarkAllowRate(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if !s.AllowRate(srcs[i%len(srcs)].Addr()) {
+				if !s.AllowRate(srcs[i%len(srcs)], "udp") {
 					b.Fatal("unexpectedly limited")
 				}
 			}
@@ -70,7 +70,7 @@ func BenchmarkAllowRateParallel(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			i++
-			s.AllowRate(srcs[i%len(srcs)].Addr())
+			s.AllowRate(srcs[i%len(srcs)], "udp")
 		}
 	})
 }

@@ -178,7 +178,7 @@ Created once, alive for the process lifetime:
 | `media.WebRTCLeg` + `media.WebRTCSession` | one browser leg | 1 muxed public socket + 1 private pair |
 | `media.SRTPContext` | one direction of one leg | `atomic.Pointer` slots on the session |
 | port reservation (`PlanePool.inUse`) | one RTP even port | released by `Session.Close` / `WebRTCLeg.Close` |
-| shield ban entry, rate-limit bucket | one source (a UDP socket ban: one IP:port; an IP ban: one IP; a rate-limit bucket: an IPv4 address or an IPv6 /64) | the `Shield` |
+| shield ban entry, rate-limit bucket | one source (a UDP socket ban: one IP:port; an IP ban: one IP; a rate-limit bucket: an IPv4 address or an IPv6 /64, per transport class; its per-socket floor: one IP:port and class) | the `Shield` |
 | `*config.Config` snapshot | one publication | immutable once stored |
 
 ### 3.3 Goroutine inventory
@@ -575,7 +575,7 @@ An out-of-dialog INVITE that arrives on a public listener goes through admission
 2. Its source is a carrier source on the right transport: `srcCarrier`, with the carrier's name. A resolved `edge.carriers` address counts only when the request arrived over that carrier's own transport (`carrierFor(src, network)`), so a tls carrier's IP over UDP is not admitted; an `edge.carrier_sources` entry matches by IP on any public transport.
 3. Otherwise `srcDrop`: silent drop, counted as `freesbc_edge_admission_drops_total{reason="invite_not_admitted"}` (`onInvite`, `internal/edge/invite.go`).
 
-The carrier source set for the shield (`carrierSnapshot.isSource`, `internal/edge/carrierdns.go`, IP only, so a carrier is rate-limited by `carrier_rate_limit` and never banned on any transport) is `edge.carrier_sources` plus the host prefix of every literal-IP carrier plus every resolved address of the DNS-name carriers (§6.4). `carrierFor` (`carrierdns.go`) names the carrier: an exact IP:port match against a resolved address wins; otherwise the first entry (sorted by name) with that IP; otherwise a source inside `carrier_sources` that matches no entry is named `unknown`.
+The carrier source set for the shield (`carrierSnapshot.isSource`, `internal/edge/carrierdns.go`, IP only, so a carrier is rate-limited by `carrier_rate_limit` and never banned on any transport; its per-socket rate floor is `carrierSnapshot.isAddress`, an exact resolved address on the carrier's own transport, never these IP-only prefixes) is `edge.carrier_sources` plus the host prefix of every literal-IP carrier plus every resolved address of the DNS-name carriers (§6.4). `carrierFor` (`carrierdns.go`) names the carrier: an exact IP:port match against a resolved address wins; otherwise the first entry (sorted by name) with that IP; otherwise a source inside `carrier_sources` that matches no entry is named `unknown`.
 
 `inviteToUpstream` (`invite.go`) serves both clients and carriers; a non-empty carrier name selects the carrier behaviour:
 
@@ -790,7 +790,8 @@ private UDP socket):
   which also matches a UDP per-socket ban, plus one
   `freesbc_shield_drops_total{reason="banned"}` per dropped read; a banned
   stream source has its connection closed on that read) or its rate-limit bucket is
-  empty (`shield.Shield.AllowRate`, one token per datagram or WS/WSS frame; a
+  empty (`shield.Shield.AllowRate`, one token per datagram or WS/WSS frame, from a bucket per
+  source IP and transport class with a per-socket floor for a vouched source, §14.1; a
   tcp/tls connection is charged per message it starts, §7.1a, see below). The public plane has no
   source allowlist — phones, browsers and carriers have no single fixed
   address, and the filter cannot tell a request from a response. There is
@@ -892,10 +893,11 @@ connection closed on that read, so a ban also ends connections opened before
 it.
 
 The same filter charges the **rate limit**, before parsing:
-`shield.Shield.AllowRate(ip)` takes one token from the source's bucket
-(`shield.carrier_rate_limit` for a carrier source, else `shield.rate_limit`)
-for every public read, and an empty bucket drops the read silently and counts
-it as `freesbc_shield_drops_total{reason="rate"}`. sipgo calls the filter once
+`shield.Shield.AllowRate(src, transport)` takes one token from the source's
+bucket (`shield.carrier_rate_limit` for a carrier source, else
+`shield.rate_limit`; per source IP and transport class, with a per-socket floor
+for a vouched source, §14.1) for every public read, and a refusal drops the
+read silently and counts it as `freesbc_shield_drops_total{reason="rate"}`. sipgo calls the filter once
 per UDP datagram and once per WS/WSS frame (`Read` returns one frame per call,
 sipgo `sip/transport_ws.go`), so a read costs the same as a message. A tcp or tls read
 is a chunk, and an empty bucket cannot drop one without desynchronising the
@@ -3453,7 +3455,7 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | **SRTP context** | one direction of one browser leg | `newSRTPContextFromKeys` (`media/srtp.go`) after the DTLS handshake (`WebRTCLeg.deriveSRTP`, `webrtcleg.go`) | installed once → dropped with the leg | keys come only from DTLS-SRTP key export and are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | the leg's `deriveSRTP`, exactly once | dropped with the leg | `SRTPContext.mu` serialising pion's lockless context; the leg holds the pair under `WebRTCLeg.mu` |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` (`edge/media.go`) or (offerer leg) `allocateOfferedWebRTC` (`edge/media.go`) | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
 | **shield ban entry** | `banList` (`shield/banlist.go`), three per `Shield`: `Shield.bans` (`shield/shield.go`) (IP, every transport), `Shield.socketBans` (`shield/shield.go`) (UDP IP:port) and `Shield.udpBans` (`shield/shield.go`) (IP, UDP only) | `ban(key, dur, reason)` from `CheckScanner`'s scanner branch (`bans`, or `socketBans` for a UDP verdict), and from `Shield.Strike` and `Shield.StrikeOn` (`shield/offenders.go`), which ban into `bans` or, for a UDP strike, `udpBans` with reason `register`, `admission` or `malformed` | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table (`banCap`) with an overflow counter; a socket ban lasts at most 1 min (`socketBanMax`); carrier sources are never scanner-banned or struck | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
-| **rate-limit bucket** | the one `rateLimiter` per `Shield` | first `allow` for that source | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters (`rate_limit` for ordinary sources, `carrier_rate_limit` for carrier sources) are passed per call so a reload applies immediately | `allow`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets (`bucketCap`) the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
+| **rate-limit bucket** | the one `rateLimiter` per `Shield` | first `allow` or `take` for that key (source IP and class, or a vouched socket's floor) | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters (`rate_limit` for ordinary sources, `carrier_rate_limit` for carrier sources) are passed per call so a reload applies immediately; a datagram flood cannot drain the stream-class bucket, and a vouched socket has its own floor bucket (§14.1) | `allow`, `take`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets (`bucketCap`) the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` (`config/store.go`) | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; the compiled switch list, carrier list and source prefixes are populated by `validate` before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot |
 
 ---
@@ -4154,7 +4156,7 @@ read there is stamped with the arrival marker (below). A public read from a
 source the shield has banned — its IP, or on UDP its exact socket
 (`Shield.DropBanned`, which counts it as a `banned` shield drop) — is dropped, so a ban stays silent even for what sipgo
 would answer before any handler. A public read from a source whose
-rate-limit bucket is empty (`Shield.AllowRate`) is dropped too, before the
+rate budget is spent (`Shield.AllowRate`) is dropped too, before the
 parser, whether or not it would have parsed. The filter never returns an error, because
 sipgo treats a filter error as fatal to the whole read loop.
 
@@ -4242,8 +4244,36 @@ and step 3. The private socket is trusted and bypasses the shield. In order:
    carrier source (the predicate reads the carrier directory snapshot, so it
    follows DNS). Charged per datagram or frame, before parsing, parsable or not.
    A token bucket whose capacity equals the rate, per source: an
-   IPv4 address (4in6 unmapped) or an IPv6 /64. The buckets are an LRU capped
-   at 65536 (`bucketCap`, P2-SHD-002).
+   IPv4 address (4in6 unmapped) or an IPv6 /64, and per transport class
+   (`rateKey`, `ratelimit.go`): datagrams (udp) have one bucket, the stream
+   transports (tcp, tls, ws, wss) another. A datagram source address is
+   forgeable and a stream source has completed a handshake, so a forged
+   datagram flood naming a victim's IP cannot drain the bucket that the
+   victim's connection (its new-connection charge, each message, each WS
+   frame) is charged to. When the IP bucket is empty and the limit is
+   `per_ip`, `Shield.AllowRate` asks the edge's vouched predicate (built in
+   `Server.Run`, `edge.go`): a live registration binding at exactly that
+   transport and IP:port (`Location.HasSource`), or exactly a resolved
+   `edge.carriers` address on that transport (`carrierSnapshot.isAddress`,
+   `carrierdns.go`). A vouched socket is then charged to a second bucket,
+   keyed on the exact socket and the class, with the same rate, so a proven
+   socket keeps its rate during a flood that names its IP, each phone behind
+   one NAT has its own floor, and a registered abuser is bounded by its IP
+   bucket plus its floor (twice the rate). The predicate runs only on a
+   denial and with no limiter lock held. A global (`per_ip` off) limit is one
+   bucket with neither split nor floor. The buckets are an LRU capped at
+   65536 (`bucketCap`, P2-SHD-002); beyond that the least recently used
+   bucket is evicted and restarts full, a lenient reset and never a lockout
+   (a ceiling above this per-source fairness is a separate global-budget
+   concern).
+
+   What this does not protect: a forger that names the exact socket of a
+   vouched source (a UDP carrier on its well-known port, a client with a
+   fixed public port) still shares that socket's floor; a source with no
+   live binding (a first REGISTER, an expired binding, a NAT rebinding to a
+   new port) and the IP-only `edge.carrier_sources` over UDP (any port would
+   match, so they are never vouched) can still be starved by a forged flood
+   of their IP; and a `per_ip`-less limit is one global bucket.
 3. A **scanner User-Agent** is dropped — but only after the rate limiter has
    had its say, because the User-Agent is a client-controlled "ban me" signal
    that must not be allowed to skip the limiter. A carrier source is exempt

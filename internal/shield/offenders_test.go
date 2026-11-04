@@ -16,7 +16,7 @@ func strikeShield(t *testing.T, registerBan string, isCarrier func(netip.Addr) b
 		t.Fatalf("parse: %v", err)
 	}
 	store := config.NewStore(cfg)
-	s := New(store, discard(), isCarrier)
+	s := New(store, discard(), isCarrier, nil)
 	t.Cleanup(func() { s.Close() })
 	return s, store
 }
