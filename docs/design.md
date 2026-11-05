@@ -2696,6 +2696,46 @@ edge derives from its media addresses in `allocateRTP`, `edge/media.go`) loopbac
 with `ErrNotUnicast`, and reports `c=0.0.0.0`/`::` as `Audio.Hold` with no
 `Address`.
 
+**What a `c=` may and may not steer** (issue #290). Until a side latches, the
+relay sends to the seed, so the seed's IP must not be the peer's free choice.
+Two rules apply on the public plane only; the private plane (the switch,
+on its LAN) is unrestricted:
+
+- **A registered client** is *pinned* (`Session.PinSeedToSignallingSource`,
+  `latch.seed`, `media/session.go`): it sends to the IP its signalling came
+  from (`SetSignallingSource`) at the port its SDP gives, whatever address
+  the SDP names; an SDP address equal to the signalling IP changes nothing,
+  and a side whose signalling IP is not yet known sends nothing. The SDP
+  address still arms the source check, so the phone's own packets rank as
+  before. A NAT'd phone that writes its private address therefore still hears
+  early media at its public IP and port, and a `c=` naming the private LAN,
+  the switch or a third party steers nothing. The edge pins every plain
+  public side that is not a carrier: `allocateRTP` and `buildPublicOffer`
+  (`edge/media.go`) set the pin and the source, and `pointMedia` (`edge/media.go`;
+  forks, re-INVITE and UPDATE through `applyReInvite`, the ACK or PRACK
+  answer of a delayed offer) seeds through the same latch. A WebRTC leg is
+  ICE's business and never seeds from SDP.
+- **A carrier** is not pinned: its media server often has another IP than its
+  signalling, so the SDP address and port are kept. The pool's `DestPolicy`
+  (`PlaneParams.Dest`, `media/portpool.go`) refuses, for such a side, the
+  private classes (RFC 1918, IPv6 ULA, CGNAT 100.64.0.0/10) and FreeSBC's own
+  addresses (`public.ip`, `public.bind`, `private.ip`), after unmapping an
+  IPv4-mapped address; loopback stays under `AllowLoopback`, and unspecified,
+  multicast, broadcast and link-local addresses stay refused everywhere. A
+  refused seed arms the source check and sends nothing until the carrier's
+  first packet latches.
+
+Neither rule touches a latched address: a real packet's source is used as it
+is, and `LearnDelay` works against the constrained destination.
+
+The edge builds the public plane's policy in `publicDestPolicy`
+(`edge/mediapool.go`). The private classes are allowed only when the plane's
+**advertised** address (`public.ip`) is itself in one of them: a lab, the test
+suites, the `examples/` setups. It is deliberately not keyed on `public.bind`,
+which differs from `public.ip` only behind a 1:1 NAT (an AWS host binds
+172.31.x.x behind a public address), exactly where the protection must stay.
+There is no config key.
+
 Acceptance rules in `acceptFrom`. Every source is ranked by how well
 signalling vouches for it (`latchRank`, `media/session.go`, `latch.rankOf`, `media/session.go`):
 
@@ -3706,6 +3746,7 @@ self-signed certificate.
 | The process runs non-root with CAP_NET_BIND_SERVICE if a listen port is below 1024 | **Shipped, not enforced**: the linux release tarball carries `packaging/freesbc.service` (`User=freesbc`, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, hardening); a hand-run process is unrestricted |
 | Config file mode 0600 | **Not enforced**; FreeSBC only reads the file. The service setup in `docs/install.md` uses `root:freesbc` mode 0640, so the service cannot rewrite its own config |
 | A single routable media address (no TURN) | **Assumed** |
+| A peer's SDP cannot point FreeSBC's public media socket at the private LAN or a third party before it sends | **Enforced** on the public plane (§8.4): a registered client's early media goes to its signalling IP at its SDP port (`latch.seed`, `media/session.go`); a carrier's SDP address is refused when it is private, CGNAT or FreeSBC's own (`publicDestPolicy`, `edge/mediapool.go`), unless `public.ip` is itself private (a lab) |
 | Public and private media pools do not collide | **Enforced by construction**: different bind IPs |
 | Switch nodes are UDP at literal IPs | **Enforced** by validation (`check` and `run`) and at topology build |
 | Switch pool members share one registration database, and a carrier registration and its calls stay on the registering node | **Assumed** for client registrations: after a failover the new node re-challenges and the phone's answer is valid there too (one extra round trip), and the pool is hashed, so changing the node set reshuffles users. **Enforced** for carrier registrations: a request with a live token goes to the registering node only |
@@ -4521,7 +4562,12 @@ be used to read an environment variable.
   write it controls the SBC. Its permissions are not checked, and the admin
   API only reads it.
 - The media plane has **no application-layer rate limiting**; its security is
-  latch semantics plus SRTP authentication.
+  latch semantics plus SRTP authentication. Before a side latches, the
+  destination IP of the relay is not the peer's choice: a client's is its
+  signalling IP, a carrier's excludes the private classes and FreeSBC's own
+  addresses on a public plane (§8.4). A call still reflects the switch's
+  stream, one packet per packet, at the address the peer is allowed to name,
+  until the silence watchdog fires.
 - A stream connection with a live registration binding, a routed dialog or a
   carrier source is never closed for being idle (§7.1a); a registered client
   that goes silent keeps its connection, a descriptor and a goroutine until its

@@ -370,7 +370,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		}
 	} else {
 		toBrowser := isBrowserTransport(from.transport)
-		offerless = func(b []byte) (*offerResult, error) { return s.buildPublicOffer(d, b, toBrowser) }
+		offerless = func(b []byte) (*offerResult, error) { return s.buildPublicOffer(d, b, toBrowser, src.Addr()) }
 	}
 
 	// The CANCEL bridge is registered ONCE, for the whole series: the server
@@ -636,7 +636,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	var offerless func([]byte) (*offerResult, error)
 	if len(body) > 0 {
 		var err error
-		if offer, err = s.buildPublicOffer(d, body, toBrowser); err != nil {
+		if offer, err = s.buildPublicOffer(d, body, toBrowser, netip.Addr{}); err != nil {
 			s.rejectInviteMedia(req, tx, err)
 			return
 		}

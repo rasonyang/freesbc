@@ -19,7 +19,7 @@ import (
 // restart-only. timeout is read for every new session.
 func newMediaPools(boot *config.Config, topo *topology, timeout func() time.Duration) (public, private *media.PlanePool) {
 	r := boot.RTP
-	plane := func(name string, bind, advertised netip.Addr) *media.PlanePool {
+	plane := func(name string, bind, advertised netip.Addr, dest media.DestPolicy) *media.PlanePool {
 		return media.NewPlanePool(name, func() media.PlaneParams {
 			return media.PlaneParams{
 				MinPort: r.Min,
@@ -29,9 +29,27 @@ func newMediaPools(boot *config.Config, topo *topology, timeout func() time.Dura
 				// A plane that is itself on loopback (a single-host lab)
 				// may send to loopback peers; any other plane never does.
 				AllowLoopback: bind.IsLoopback() || advertised.IsLoopback(),
+				Dest:          dest,
 			}
 		})
 	}
-	return plane("public", boot.PublicBind(), topo.publicMediaIP),
-		plane("private", topo.privateMediaIP, topo.privateMediaIP)
+	return plane("public", boot.PublicBind(), topo.publicMediaIP, publicDestPolicy(boot.PublicBind(), topo)),
+		plane("private", topo.privateMediaIP, topo.privateMediaIP, media.DestPolicy{})
+}
+
+// publicDestPolicy is the destination policy of the public plane, applied
+// to a peer that is not pinned to its signalling source (a carrier): its
+// SDP may not steer the SBC's media socket into the private LAN or at
+// the SBC itself. The private classes are allowed only when the plane's
+// ADVERTISED address (public.ip) is itself in one of them (a lab, the test
+// suites, the examples). It is not keyed on public.bind: a 1:1 NAT host
+// binds a private address behind a public public.ip and must keep the
+// protection. The private plane has no policy: the switch is on the LAN.
+func publicDestPolicy(bind netip.Addr, topo *topology) media.DestPolicy {
+	adv := topo.publicMediaIP.Unmap()
+	return media.DestPolicy{
+		Restrict:     true,
+		AllowPrivate: adv.IsPrivate() || netip.MustParsePrefix("100.64.0.0/10").Contains(adv),
+		Own:          []netip.Addr{adv, bind, topo.privateMediaIP},
+	}
 }

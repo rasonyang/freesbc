@@ -227,7 +227,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	var offerless func([]byte) (*offerResult, error)
 	if len(body) > 0 {
 		var err error
-		if offer, err = s.buildPublicOffer(d, body, false); err != nil {
+		if offer, err = s.buildPublicOffer(d, body, false, netip.Addr{}); err != nil {
 			s.rejectInviteMedia(req, tx, err)
 			return
 		}

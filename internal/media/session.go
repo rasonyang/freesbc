@@ -101,6 +101,12 @@ type latch struct {
 	// from the pool the side was allocated from (PlaneParams.AllowLoopback)
 	// and is fixed for the latch's lifetime.
 	allowLoopback bool
+	// policy is the pool's destination class policy (PlaneParams.Dest),
+	// fixed for the latch's lifetime. The zero value refuses nothing.
+	policy DestPolicy
+	// pinSeed makes seed send to sigSource instead of the SDP address (see
+	// Session.PinSeedToSignallingSource); changed at runtime, under mu.
+	pinSeed bool
 	// now is the clock; nil means time.Now. Tests replace it.
 	now func() time.Time
 }
@@ -122,8 +128,30 @@ func (l *latch) setExpected(ip netip.Addr) {
 // (see rankSignalled and LearnDelay).
 func (l *latch) setSignallingSource(ip netip.Addr) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.sigSource = ip.Unmap()
+	// A pinned side whose SDP is already known (an earlier fork's phone,
+	// or a seed that came before its source) follows the new source until
+	// a packet latches.
+	if l.pinSeed && l.signalled.IsValid() && l.rank == rankNone {
+		l.dst = netip.AddrPort{}
+		if l.pinnedOK(l.sigSource) {
+			l.dst = netip.AddrPortFrom(l.sigSource.WithZone(""), l.signalled.Port())
+		}
+	}
+}
+
+// setPinSeed turns the signalling-source pin on or off for later seeds.
+func (l *latch) setPinSeed(on bool) {
+	l.mu.Lock()
+	l.pinSeed = on
 	l.mu.Unlock()
+}
+
+// pinnedOK reports whether ip may be the destination of a pinned side:
+// a valid unicast address that passes the loopback rule. Callers hold mu.
+func (l *latch) pinnedOK(ip netip.Addr) bool {
+	return ip.IsValid() && unicastMediaAddr(ip) && (!ip.IsLoopback() || l.allowLoopback)
 }
 
 // setMode changes the latch's strict/loose policy at runtime. Used when the
@@ -180,6 +208,15 @@ func (l *latch) relatch(addr netip.AddrPort) {
 // a loopback address only arms the source check unless the pool allows
 // loopback — otherwise a public client's SDP could make the SBC's media
 // socket send to a service on the SBC host itself.
+//
+// Two more rules shape the destination IP (the SDP port is always kept).
+// A pinned side (PinSeedToSignallingSource: a registered client) sends to
+// the IP its signalling came from, whatever its SDP says, and to nothing
+// while that IP is unknown; the SDP address still arms the source check.
+// On any other side the pool's DestPolicy refuses the classes that can
+// never be a peer's media (private, CGNAT, the SBC's own addresses on a
+// public plane): the source check is armed but nothing is sent until the
+// peer's first packet latches.
 func (l *latch) seed(addr netip.AddrPort) {
 	if !addr.IsValid() || addr.Port() == 0 {
 		return
@@ -192,10 +229,19 @@ func (l *latch) seed(addr netip.AddrPort) {
 	defer l.mu.Unlock()
 	l.expected = ip
 	l.signalled = netip.AddrPortFrom(ip, addr.Port())
-	if ip.IsLoopback() && !l.allowLoopback {
+	send := ip
+	if l.pinSeed {
+		send = l.sigSource
+		if !l.pinnedOK(send) {
+			return
+		}
+	} else if l.policy.refuses(ip) {
+		return
+	}
+	if send.IsLoopback() && !l.allowLoopback {
 		return // arm the source check, but never send to it
 	}
-	l.dst = netip.AddrPortFrom(ip.WithZone(""), addr.Port())
+	l.dst = netip.AddrPortFrom(send.WithZone(""), addr.Port())
 }
 
 // unicastMediaAddr reports whether ip can be a unicast RTP peer at all:
@@ -409,10 +455,10 @@ func allocateAcross(poolA *PlanePool, parA PlaneParams, poolB *PlanePool, parB P
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
 	}
-	allowLoopback := [2]bool{parA.AllowLoopback, parB.AllowLoopback}
+	pars := [2]PlaneParams{parA, parB}
 	for side := range s.pairs {
-		s.rtp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}
-		s.rtcp[side] = &latch{mode: cfg.Latch[side], allowLoopback: allowLoopback[side]}
+		s.rtp[side] = &latch{mode: cfg.Latch[side], allowLoopback: pars[side].AllowLoopback, policy: pars[side].Dest}
+		s.rtcp[side] = &latch{mode: cfg.Latch[side], allowLoopback: pars[side].AllowLoopback, policy: pars[side].Dest}
 	}
 	return s, nil
 }
@@ -435,6 +481,18 @@ func (s *Session) SetExpectedRemote(side Side, ip netip.Addr) {
 func (s *Session) SetSignallingSource(side Side, ip netip.Addr) {
 	s.rtp[side].setSignallingSource(ip)
 	s.rtcp[side].setSignallingSource(ip)
+}
+
+// PinSeedToSignallingSource makes later seeds of one side (SetRemote,
+// SetRTCPRemote, Relatch) send to the IP set by SetSignallingSource with
+// the SDP's port, instead of the SDP's own address: a registered client's
+// SDP cannot steer the SBC's media socket to another host. Call it before
+// SetRemote; SetSignallingSource must also be set, or the side sends
+// nothing until its first packet latches. The pin survives Relatch and a
+// packet from the real source still latches as usual.
+func (s *Session) PinSeedToSignallingSource(side Side, on bool) {
+	s.rtp[side].setPinSeed(on)
+	s.rtcp[side].setPinSeed(on)
 }
 
 // SetRemote seeds one side's send-to address AND its expected source IP
@@ -494,6 +552,11 @@ func (s *Session) SetRTCPRemote(side Side, addr netip.AddrPort) {
 func (s *Session) Relatch(side Side, addr netip.AddrPort) {
 	relatchPair(s.rtp[side], s.rtcp[side], addr)
 }
+
+// SendTarget is where one side's RTP is sent right now: the latched
+// remote, the seeded destination before a latch, or the zero value when
+// the side has neither (nothing is sent until its first packet latches).
+func (s *Session) SendTarget(side Side) netip.AddrPort { return s.rtp[side].dest() }
 
 // Done is closed when the session ends (Close or silence timeout).
 func (s *Session) Done() <-chan struct{} { return s.done }

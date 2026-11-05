@@ -56,6 +56,45 @@ type PlaneParams struct {
 	// Unspecified, multicast, broadcast and link-local destinations are
 	// refused regardless.
 	AllowLoopback bool
+	// Dest restricts which SDP-signalled addresses a side of this pool
+	// may be seeded to send to (see DestPolicy). The zero value restricts
+	// nothing, which is right for the private plane.
+	Dest DestPolicy
+}
+
+// DestPolicy is a pool's rule for the destination IP of an SDP seed on a
+// side that is not pinned to its signalling source. It never applies to a
+// latched address (a real packet's source) and leaves loopback to
+// PlaneParams.AllowLoopback.
+type DestPolicy struct {
+	// Restrict turns the policy on.
+	Restrict bool
+	// AllowPrivate lifts the refusal of the private classes (RFC 1918,
+	// IPv6 ULA, CGNAT 100.64.0.0/10) and of Own addresses within them: set
+	// it for a plane whose advertised address is itself in one of those
+	// classes (a lab).
+	AllowPrivate bool
+	// Own lists the SBC's own addresses, refused as destinations unless
+	// AllowPrivate covers them.
+	Own []netip.Addr
+}
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// refuses reports whether ip may not be seeded as a destination.
+func (p DestPolicy) refuses(ip netip.Addr) bool {
+	if !p.Restrict || ip.IsLoopback() {
+		return false
+	}
+	if ip.IsPrivate() || cgnatPrefix.Contains(ip) {
+		return !p.AllowPrivate
+	}
+	for _, o := range p.Own {
+		if o.Unmap() == ip {
+			return true
+		}
+	}
+	return false
 }
 
 // PlanePool allocates RTP/RTCP port pairs from one network plane's range.
