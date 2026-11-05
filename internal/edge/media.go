@@ -192,7 +192,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		}
 		sess, err = s.allocateWebRTC(ctx, offer)
 	} else {
-		sess, err = s.allocateRTP(offer, src, d.publicSRTP())
+		sess, err = s.allocateRTP(offer, src, d.publicSRTP(), d.carrierName() == "")
 	}
 	if err != nil {
 		return nil, err
@@ -233,8 +233,9 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 
 // allocateRTP builds the RTP↔RTP session for a plain SIP phone: side A in
 // the public plane, side B in the private one. src is the IP the phone's
-// SIP came from.
-func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy) (*mediaSession, error) {
+// SIP came from; pin (a registered client, not a carrier) sends its early
+// media to src rather than to the address its SDP names.
+func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy, pin bool) (*mediaSession, error) {
 	if pol == srtpImpossible {
 		return nil, errSDESInsecure
 	}
@@ -256,6 +257,10 @@ func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy)
 		return nil, err
 	}
 	sess.SetSignallingSource(media.SideA, src)
+	// A registered client's media goes to the IP its signalling came from,
+	// at its SDP port; a carrier keeps its SDP address, minus the classes
+	// the public plane refuses (media.DestPolicy).
+	sess.PinSeedToSignallingSource(media.SideA, pin)
 	// Seed the public side from the client's own offer so audio can flow
 	// toward it immediately; its first packet still corrects the port
 	// (symmetric RTP through NAT).
@@ -670,7 +675,12 @@ func (s *Server) pointMedia(sess *mediaSession, p plane, remote, rtcp netip.Addr
 // browser's answer arrives (negotiateFork → startOfferedWebRTC). The
 // caller must not ask for a browser leg while WebRTC is not enabled:
 // there is no DTLS identity to offer (inviteToClient refuses with 488).
-func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (*offerResult, error) {
+//
+// src is the IP the public caller's INVITE came from when this builds the
+// offer for an offerless INVITE from it, else the zero Addr: a public
+// callee's address is recorded with each fork's answer (negotiateFork).
+// The public side is pinned to it when the party is a client, not a carrier.
+func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool, src netip.Addr) (*offerResult, error) {
 	offer, err := s.parseSDP(offerBody)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: upstream offer: %w", err)
@@ -720,6 +730,14 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool) (
 		})
 		if err != nil {
 			return nil, err
+		}
+		// The answering public side is seeded by pointMedia once its answer
+		// arrives (negotiateFork records its signalling source first).
+		sess.PinSeedToSignallingSource(media.SideA, d.carrierName() == "")
+		if src.IsValid() {
+			// An offerless INVITE from the public caller: its own answer,
+			// in the ACK, seeds this side, and its source is known now.
+			sess.SetSignallingSource(media.SideA, src)
 		}
 		sess.SetRemote(media.SideB, remote)
 		if offer.Audio.RTCPPort > 0 {

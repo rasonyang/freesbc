@@ -46,10 +46,20 @@ type updRig struct {
 
 func startUpdRig(t *testing.T) *updRig {
 	t.Helper()
-	h := startHarness(t, false)
+	return startUpdRigOn(t, startHarness(t, false), false)
+}
+
+// startUpdRigOn is startUpdRig on a given harness; register makes the
+// phone a registered client (on a strict harness) instead of a source the
+// harness's carrier_sources admits.
+func startUpdRigOn(t *testing.T, h *harness, register bool) *updRig {
+	t.Helper()
 	tags := make(chan string, 1)
 	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, tags, nil))
 	phone := newUDPClient(t)
+	if register {
+		auditRegisterPhone(t, h, phone, "1001")
+	}
 	invite, res, phoneRTP := auditPhoneCall(t, h, phone)
 	r := &updRig{h: h, phone: phone, invite: invite, res: res, phoneRTP: phoneRTP}
 	r.fsTag = <-tags
