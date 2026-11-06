@@ -27,7 +27,9 @@ func testServerWithMetrics(t *testing.T, activeCalls, portsInUse, portsTotal int
 func TestMetricsExposition(t *testing.T) {
 	// deps with known values
 	s := testServerWithMetrics(t /*activeCalls*/, 3 /*ports*/, 2, 4,
-		ShieldStats{DropsByReason: map[string]int64{"rate": 7, "scanner": 0, "banned": 0}})
+		ShieldStats{DropsByReason: map[string]int64{"rate": 7, "scanner": 0, "banned": 0},
+			BansByKind:            map[string]int{"ip": 4, "udp_ip": 0},
+			BanAddsRejectedByKind: map[string]int64{"udp_socket": 9}})
 	body := authGET(t, s, "/metrics")
 	str := string(body)
 	for _, want := range []string{
@@ -35,6 +37,12 @@ func TestMetricsExposition(t *testing.T) {
 		"freesbc_media_ports_in_use 2",
 		"freesbc_media_ports_total 4",
 		`freesbc_shield_drops_total{reason="rate"} 7`,
+		`freesbc_shield_bans{kind="ip"} 4`,
+		`freesbc_shield_bans{kind="udp_ip"} 0`,
+		`freesbc_shield_bans{kind="udp_socket"} 0`,
+		`freesbc_shield_ban_adds_rejected_total{kind="ip"} 0`,
+		`freesbc_shield_ban_adds_rejected_total{kind="udp_ip"} 0`,
+		`freesbc_shield_ban_adds_rejected_total{kind="udp_socket"} 9`,
 	} {
 		if !strings.Contains(str, want) {
 			t.Errorf("/metrics missing %q\n---\n%s", want, str)

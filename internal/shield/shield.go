@@ -246,13 +246,30 @@ type Stats struct {
 	// cap — an indicator that a source flood is exhausting the table.
 	BanAddsRejected int64
 	DropsByReason   map[string]int64
+	// BansByKind is the live (unexpired) entry count of each ban table and
+	// BanAddsRejectedByKind the cumulative additions each refused at its own
+	// banCap, keyed by BanKindIP, BanKindUDPIP and BanKindUDPSocket. Each
+	// table has its own cap, so a fill level only makes sense per table.
+	BansByKind            map[string]int
+	BanAddsRejectedByKind map[string]int64
 }
 
 // Stats returns a snapshot of current bans and cumulative drops by reason.
+// BansByKind walks each ban table once (at most banCap entries each).
 func (s *Shield) Stats() Stats {
 	return Stats{
 		BannedCurrent:   s.bans.size() + s.socketBans.size() + s.udpBans.size(),
 		BanAddsRejected: s.bans.overflowed() + s.socketBans.overflowed() + s.udpBans.overflowed(),
+		BansByKind: map[string]int{
+			BanKindIP:        s.bans.liveCount(),
+			BanKindUDPIP:     s.udpBans.liveCount(),
+			BanKindUDPSocket: s.socketBans.liveCount(),
+		},
+		BanAddsRejectedByKind: map[string]int64{
+			BanKindIP:        s.bans.overflowed(),
+			BanKindUDPIP:     s.udpBans.overflowed(),
+			BanKindUDPSocket: s.socketBans.overflowed(),
+		},
 		DropsByReason: map[string]int64{
 			"banned":  s.dropsBanned.Load(),
 			"scanner": s.dropsScanner.Load(),

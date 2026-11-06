@@ -24,6 +24,8 @@ type collector struct {
 	portsInUse  *prometheus.Desc
 	portsTotal  *prometheus.Desc
 	dropsTotal  *prometheus.Desc
+	shieldBans  *prometheus.Desc
+	banRejected *prometheus.Desc
 	buildInfo   *prometheus.Desc
 	tlsExpiry   *prometheus.Desc
 	udpRcvbuf   *prometheus.Desc
@@ -91,6 +93,8 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		portsInUse:  prometheus.NewDesc("freesbc_media_ports_in_use", "RTP port pairs in use.", nil, nil),
 		portsTotal:  prometheus.NewDesc("freesbc_media_ports_total", "RTP port pairs the range can hold.", nil, nil),
 		dropsTotal:  prometheus.NewDesc("freesbc_shield_drops_total", "Total shield drops by reason.", []string{"reason"}, nil),
+		shieldBans:  prometheus.NewDesc("freesbc_shield_bans", "Live (unexpired) shield bans per table: ip (every transport), udp_ip (the IP, UDP only), udp_socket. Each table is capped at 65536.", []string{"kind"}, nil),
+		banRejected: prometheus.NewDesc("freesbc_shield_ban_adds_rejected_total", "Bans refused because the table was at its 65536 cap, per table.", []string{"kind"}, nil),
 		udpRcvbuf:   prometheus.NewDesc("freesbc_udp_receive_buffer_errors_total", "Kernel UDP datagrams dropped on a full socket receive buffer (RcvbufErrors, IPv4 + IPv6), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		udpInErrors: prometheus.NewDesc("freesbc_udp_in_errors_total", "Kernel UDP receive errors (InErrors, IPv4 + IPv6; includes the receive buffer drops), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		udpSockDrop: prometheus.NewDesc("freesbc_udp_socket_drops_total", "Datagrams the kernel dropped on one of FreeSBC's UDP SIP sockets (the drops column of /proc/net/udp and udp6: mostly a full receive buffer), by socket (public: the edge.listen.udp listener; private: private.ip:5060). Read at scrape time; Linux only.", []string{"socket"}, nil),
@@ -149,6 +153,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portsInUse
 	ch <- c.portsTotal
 	ch <- c.dropsTotal
+	ch <- c.shieldBans
+	ch <- c.banRejected
 	ch <- c.buildInfo
 	ch <- c.authFail
 	ch <- c.tlsExpiry
@@ -174,6 +180,9 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
+// shieldBanKinds are the three ban tables, as GET /api/shield/bans names them.
+var shieldBanKinds = []string{"ip", "udp_ip", "udp_socket"}
+
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	g := func(d *prometheus.Desc, v float64, lv ...string) {
 		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, lv...)
@@ -185,6 +194,10 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	st := c.deps.Shield()
 	for reason, n := range st.DropsByReason {
 		ch <- prometheus.MustNewConstMetric(c.dropsTotal, prometheus.CounterValue, float64(n), reason)
+	}
+	for _, kind := range shieldBanKinds {
+		g(c.shieldBans, float64(st.BansByKind[kind]), kind)
+		ch <- prometheus.MustNewConstMetric(c.banRejected, prometheus.CounterValue, float64(st.BanAddsRejectedByKind[kind]), kind)
 	}
 	g(c.buildInfo, 1, c.deps.Version)
 	if u, ok := readUDPStats(); ok {

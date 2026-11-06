@@ -3820,6 +3820,8 @@ permanent series per call."
 | `freesbc_hep_packets_sent_total` | Counter | — | `hep.Stats.Sent` through `Deps.HEP` (`hepStats`, `app.go`): SIP messages written to the collector. Exported only when `hep:` is set |
 | `freesbc_hep_packets_dropped_total` | Counter | — | `hep.Stats.Dropped`: copies refused because the send queue was full or closed, and queued ones given up at shutdown |
 | `freesbc_hep_errors_total` | Counter | `kind` ∈ {`write`, `encode`} | `hep.Stats.WriteErrors` (dial or write failure) and `EncodeErrors` (oversize or unaddressable); both kinds always exported while the mirror is on |
+| `freesbc_shield_bans` | Gauge | `kind` ∈ {`ip`, `udp_ip`, `udp_socket`} | live (unexpired) bans in each of the shield's three ban tables (`Shield.Stats`, `shield.go`, which walks each table under its lock on every read: each scrape and the 5 s health evaluation). Each table has its own hard cap of 65536 entries (`banCap`, `banlist.go`), so alert per table: `freesbc_shield_bans > 0.8 * 65536` |
+| `freesbc_shield_ban_adds_rejected_total` | Counter | `kind` ∈ {`ip`, `udp_ip`, `udp_socket`} | bans refused because that table was at its cap (`banList.overflowed`); the sum is `ban_adds_rejected` in `GET /api/shield/bans` and feeds `shield_ban_cap` |
 | `freesbc_edge_carrier_requests_total` | Counter | `carrier` (an `edge.carriers` name or `unknown`), `direction` ∈ {`inbound` (carrier to switch), `outbound` (switch to carrier)}, `method` (folded like `sip_requests_total`) | edge `Metrics.CarrierRequest` (§6) |
 | `freesbc_edge_carrier_registrations` | Gauge | `carrier` | live carrier registrations per `edge.carriers` name, republished from the carrier registration table on every change and every prune tick (`Server.publishCarrierRegistrations`, `carrierreg.go`) |
 
@@ -3829,8 +3831,9 @@ reachable there. `banned` counts public reads (UDP datagrams, WS/WSS frames,
 tcp/tls chunks) the read filter drops for a ban (`Shield.DropBanned`), plus
 requests `CheckScanner` drops because the ban landed after their read passed
 the filter; a connection refused at accept for a ban is
-`freesbc_edge_stream_refused_total{reason="banned"}` instead. Current ban counts and ban-table overflow are kept in
-`shield.Stats` but not exported as metrics, and there is no unban API.
+`freesbc_edge_stream_refused_total{reason="banned"}` instead. Live ban counts and ban-table
+overflow are exported per table as `freesbc_shield_bans{kind}` and
+`freesbc_shield_ban_adds_rejected_total{kind}`, and there is no unban API.
 
 The Go runtime collector (`collectors.NewGoCollector`) and the process collector (`collectors.NewProcessCollector`: `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds` and the like, Linux only apart from `process_start_time_seconds`) are registered too.
 
