@@ -225,7 +225,12 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 		TLSCert: edgeSrv.TLSCert,
 		Health:  newHealthSource(edgeSrv, running, store.ReloadStatus).conditions,
 		Shield: func() admin.ShieldStats {
-			return admin.ShieldStats{DropsByReason: edgeSrv.ShieldStats().DropsByReason}
+			st := edgeSrv.ShieldStats()
+			return admin.ShieldStats{
+				DropsByReason:         st.DropsByReason,
+				BansByKind:            st.BansByKind,
+				BanAddsRejectedByKind: st.BanAddsRejectedByKind,
+			}
 		},
 		Registrations: func(user string, limit, offset int) ([]admin.Registration, int) {
 			page, total := edgeSrv.Registrations(user, limit, offset)

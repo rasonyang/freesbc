@@ -46,6 +46,10 @@ type Call struct {
 // ShieldStats mirrors the shield's activity snapshot for the API/metrics.
 type ShieldStats struct {
 	DropsByReason map[string]int64
+	// BansByKind is the live entries per ban table and BanAddsRejectedByKind
+	// the cumulative bans refused at its cap (kinds ip, udp_ip, udp_socket).
+	BansByKind            map[string]int
+	BanAddsRejectedByKind map[string]int64
 }
 
 // Deps are the live-data closures the admin surface reads. All must be safe

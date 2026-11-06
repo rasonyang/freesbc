@@ -143,6 +143,22 @@ func (b *banList[K]) size() int {
 	return len(b.until)
 }
 
+// liveCount returns the number of unexpired entries, without deleting any.
+// It walks the table under the lock (at most banCap entries), unlike size,
+// which also counts expired entries not yet swept.
+func (b *banList[K]) liveCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	n := 0
+	for _, e := range b.until {
+		if now.Before(e.until) {
+			n++
+		}
+	}
+	return n
+}
+
 // prune drops expired entries.
 func (b *banList[K]) prune() {
 	b.mu.Lock()
