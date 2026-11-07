@@ -1287,7 +1287,8 @@ Per REGISTER:
    is consulted) drops a REGISTER for that AoR silently, counted
    `freesbc_edge_admission_drops_total{reason="register_aor_locked"}`,
    unless its source IP key holds a live binding of the AoR (any port) or is
-   a carrier source. The drop is not an admission strike. A 2xx for the AoR
+   a carrier source. The drop is deliberately not an admission strike (a
+   retrying real user would lose their whole IP, §14.1). A 2xx for the AoR
    to a request with a matching credential (`registerOutcome`) clears its count and lifts the lock. Setting the key
    to `off` stops both counting and dropping at once. The AoR entries are
    listed in `GET /api/shield/offenders` with reason `register_aor` and the
@@ -4231,14 +4232,14 @@ the same registration test (`Server.admitPublicOutOfDialog`, `admission.go`),
 but a carrier source is answered 405 rather than admitted. All are silent
 drops keyed on the transport source only, never on From or any identity
 header, and are counted in `freesbc_edge_admission_drops_total` (§7.4, §7.5,
-§7.8a). Each drop except the enumeration one (a dialog-less BYE or INFO included) is also a strike against its
+§7.8a). Each drop except `register_aor_locked` (a dialog-less BYE or INFO and a `register_enumeration` drop included) is also a strike against its
 source in the shield (`Server.admissionStrike`, `admission.go`, called from
 `Server.dropSilently` (`admission.go`) with the request's transport): over
 `shield.admission_ban` (default `50/5m`, hot) the source IP is banned for
 `shield.ban` with reason `admission` (§14.1); the ban is UDP-only when the
 strikes came over UDP, all-transport when they came over a stream transport,
 so a scanner that stays under `shield.rate_limit` and
-rotates its source port is cut off before parsing (issue #180). A carrier
+rotates its source port is cut off before parsing (issue #180). An enumeration drop is a strike because the `enumWindow` ends and the source starts again, and until then it keeps its whole rate allowance unbanned (`shield.register_ban` counts only REGISTERs carrying `Authorization`, so bare ones never reach it); the scope and exemptions are unchanged, so it opens no forgery path (forged out-of-dialog INVITEs already earn the same `udp_ip` ban). Trade-off: a NAT whose devices all hold stale accounts and none is registered is banned for `shield.ban` (UDP only over UDP) instead of blocked for REGISTER only; one registered device behind the IP exempts it, and there is no unban API. A `register_aor_locked` drop is never a strike: the lock is the accepted trade-off against a distributed brute force, the locked AoR may be a real user whose phone keeps retrying, and striking its source would widen the lockout from the AoR to that user's whole IP (issue #311). A carrier
 source and any IP holding a registration binding on any port (`Location.HasIP`, `location.go`,
 a per-IP binding count) are never struck, and a 2xx
 REGISTER carrying a matching credential clears the source's admission strikes. A WARN once a minute

@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -240,4 +241,182 @@ func waitDialoglessDrops(t *testing.T, h *harness, want uint64) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	time.Sleep(50 * time.Millisecond)
+}
+
+// openEnumLimit trips the REGISTER enumeration limit for 127.0.0.1 without
+// a switch round trip: enumMaxAORs distinct AoRs recorded as rejected.
+func openEnumLimit(h *harness) {
+	for i := 0; i < enumMaxAORs; i++ {
+		h.srv.enumLimit.rejected(guardSrc, fmt.Sprintf("enum%d@example.com", i))
+	}
+}
+
+// sendRegistersUDP fires n bare REGISTERs, each from a new UDP source
+// port, without waiting for an answer.
+func sendRegistersUDP(t *testing.T, h *harness, n int) {
+	t.Helper()
+	pub, err := net.ResolveUDPAddr("udp", h.publicUDP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		conn := auditUDP(t)
+		raw := &client{transport: "udp", local: conn.LocalAddr().String()}
+		req := raw.buildRegister(fmt.Sprintf("scan%d", i), "example.com", 600, "")
+		if _, err := conn.WriteToUDP([]byte(req.String()), pub); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func waitEnumDrops(t *testing.T, h *harness, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for admissionDrops(h, dropRegisterEnumeration) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("register_enumeration drops = %d, want %d", admissionDrops(h, dropRegisterEnumeration), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+}
+
+// A binding-less source that trips the enumeration limit and keeps sending
+// REGISTERs is banned once the drops pass admission_ban (issue #311). Over
+// UDP the ban covers UDP only.
+func TestAdmissionBanRegisterEnumerationUDP(t *testing.T) {
+	h := startHarnessStrict(t, false, false)
+	setAdmissionBan(h, "5/5m")
+	openEnumLimit(h)
+	sendRegistersUDP(t, h, 5)
+	waitEnumDrops(t, h, 5)
+	if bannedLoopbackUDP(h) {
+		t.Fatal("banned at the threshold; want only past it")
+	}
+	sendRegistersUDP(t, h, 1)
+	waitEnumDrops(t, h, 6)
+	if !bannedLoopbackUDP(h) {
+		t.Fatal("enumeration drops past admission_ban did not ban the source")
+	}
+	page, _, _ := h.srv.Bans(10, 0)
+	if len(page) != 1 || page[0].Reason != shield.BanReasonAdmission || page[0].Kind != shield.BanKindUDPIP {
+		t.Errorf("bans = %+v", page)
+	}
+	if bannedLoopback(h) {
+		t.Error("a UDP-sourced strike banned the stream transports")
+	}
+	top, _ := h.srv.currentShield().Offenders(10)
+	if len(top) != 1 || top[0].Reason != shield.StrikeAdmissionUDP {
+		t.Errorf("offenders = %+v", top)
+	}
+}
+
+// Over a stream transport the same sequence bans the IP on every transport.
+func TestAdmissionBanRegisterEnumerationStream(t *testing.T) {
+	h := startStreamHarness(t, streamOpts{tcp: true})
+	setAdmissionBan(h, "5/5m")
+	openEnumLimit(h)
+	conn, err := net.DialTimeout("tcp", h.publicTCP, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	raw := &client{transport: "tcp", local: conn.LocalAddr().String()}
+	for i := 0; i < 6; i++ {
+		req := raw.buildRegister(fmt.Sprintf("scan%d", i), "example.com", 600, "")
+		req.SetTransport("TCP")
+		req.RemoveHeader("Content-Length")
+		req.AppendHeader(sip.NewHeader("Content-Length", "0"))
+		if _, err := conn.Write([]byte(req.String())); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !bannedLoopback(h) {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream enumeration drops = %d did not ban the IP", admissionDrops(h, dropRegisterEnumeration))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	page, _, _ := h.srv.Bans(10, 0)
+	if len(page) != 1 || page[0].Reason != shield.BanReasonAdmission || page[0].Kind != shield.BanKindIP {
+		t.Errorf("bans = %+v", page)
+	}
+}
+
+// A carrier source and an IP with a live binding keep their enumeration
+// drops free of strikes.
+func TestAdmissionBanRegisterEnumerationSparesExempt(t *testing.T) {
+	t.Run("registered", func(t *testing.T) {
+		h := startHarnessStrict(t, false, false)
+		setAdmissionBan(h, "2/5m")
+		auditRegisterPhone(t, h, newUDPClient(t), "1001")
+		openEnumLimit(h)
+		sendRegistersUDP(t, h, 6)
+		waitEnumDrops(t, h, 6)
+		if bannedLoopbackUDP(h) {
+			t.Fatal("an IP with a live registration was banned")
+		}
+		if _, total := h.srv.currentShield().Offenders(10); total != 0 {
+			t.Errorf("offenders = %d, want none", total)
+		}
+	})
+	t.Run("carrier", func(t *testing.T) {
+		h := startHarnessFull(t, false, false, "127.0.0.0/8")
+		setAdmissionBan(h, "2/5m")
+		openEnumLimit(h)
+		sendRegistersUDP(t, h, 6)
+		waitEnumDrops(t, h, 6)
+		if bannedLoopbackUDP(h) {
+			t.Fatal("a carrier source was banned")
+		}
+		if _, total := h.srv.currentShield().Offenders(10); total != 0 {
+			t.Errorf("offenders = %d, want none", total)
+		}
+	})
+}
+
+// register_aor_locked drops are never strikes, however many pass
+// admission_ban: striking would widen the lockout of one AoR to the whole
+// IP of a user whose phone keeps retrying.
+func TestAdmissionBanSparesAORLockedDrops(t *testing.T) {
+	h := startHarnessStrict(t, false, false)
+	setAdmissionBan(h, "2/5m")
+	for i := 1; i <= 12; i++ {
+		strikeFromSource(h, i, "scan0@example.com")
+	}
+	sendRegistersUDP(t, h, 1) // aor scan0 is locked
+	deadline := time.Now().Add(5 * time.Second)
+	for aorDrops(h) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("no register_aor_locked drop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Repeat the same locked AoR well past the threshold.
+	pub, _ := net.ResolveUDPAddr("udp", h.publicUDP)
+	for i := 0; i < 6; i++ {
+		conn := auditUDP(t)
+		raw := &client{transport: "udp", local: conn.LocalAddr().String()}
+		req := raw.buildRegister("scan0", "example.com", 600, "")
+		if _, err := conn.WriteToUDP([]byte(req.String()), pub); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for aorDrops(h) < 7 {
+		if time.Now().After(deadline) {
+			t.Fatalf("register_aor_locked drops = %d, want 7", aorDrops(h))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if bannedLoopbackUDP(h) {
+		t.Fatal("register_aor_locked drops banned the source")
+	}
+	top, _ := h.srv.currentShield().Offenders(100)
+	for _, o := range top {
+		if o.Source == guardSrc.String() {
+			t.Errorf("a locked-AoR drop struck the source: %+v", o)
+		}
+	}
 }
