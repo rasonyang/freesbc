@@ -30,9 +30,9 @@ type Shield struct {
 	isCarrier  func(netip.Addr) bool             // carrier-source predicate; never nil
 	vouched    func(string, netip.AddrPort) bool // socket-floor predicate; never nil (see AllowRate)
 	limiter    *rateLimiter                      // per-source limit (rate_limit / carrier_rate_limit)
-	bans       *banList[netip.Addr]              // source IPs (connection-oriented verdicts)
+	bans       *banList[netip.Addr]              // bucketKey sources (connection-oriented verdicts)
 	socketBans *banList[netip.AddrPort]          // UDP source sockets (see CheckFrom)
-	udpBans    *banList[netip.Addr]              // source IPs banned on UDP only (see StrikeOn)
+	udpBans    *banList[netip.Addr]              // bucketKey sources banned on UDP only (see StrikeOn)
 	offenders  *offenderTable                    // per-source strike counters (Strike)
 	aors       *aorTable                         // per-AoR REGISTER strikes (StrikeAOR)
 
@@ -189,10 +189,11 @@ func (s *Shield) CheckScanner(srcAP netip.AddrPort, userAgent string, transport 
 			s.log.Debug("shield dropped scanner datagram", "source", srcAP, "ua", userAgent)
 			return Drop
 		}
-		if !s.bans.ban(src, cfg.Shield.Ban.Std(), BanReasonScanner) {
-			s.log.Debug("shield ban table at hard cap; scanner ban refused", "source", src, "ua", userAgent)
+		key := bucketKey(src)
+		if !s.bans.ban(key, cfg.Shield.Ban.Std(), BanReasonScanner) {
+			s.log.Debug("shield ban table at hard cap; scanner ban refused", "source", banKeyString(key), "address", src, "ua", userAgent)
 		} else {
-			s.log.Warn("shield banned scanner", "source", src, "ua", userAgent)
+			s.log.Warn("shield banned scanner", "source", banKeyString(key), "address", src, "ua", userAgent)
 		}
 		return Drop
 	}
@@ -213,17 +214,18 @@ func bannableTransport(transport string) bool {
 
 func isUDP(transport string) bool { return strings.EqualFold(transport, "udp") }
 
-// BannedFrom reports whether the source is banned: its IP, or on UDP its
-// exact socket. Like Banned it counts nothing, so a read filter can call it.
+// BannedFrom reports whether the source is banned: its bucketKey (an IPv4
+// address, an IPv6 /64), or on UDP its exact socket. Like Banned it counts
+// nothing, so a read filter can call it. A hit on an IP table is discarded
+// for a carrier source (never banned, even inside a banned /64); the miss
+// path makes no carrier call.
 func (s *Shield) BannedFrom(src netip.AddrPort, transport string) bool {
 	src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
-	if s.bans.banned(src.Addr()) {
-		return true
+	key := bucketKey(src.Addr())
+	if s.bans.banned(key) || (isUDP(transport) && s.udpBans.banned(key)) {
+		return !s.isCarrier(src.Addr())
 	}
-	if !isUDP(transport) {
-		return false
-	}
-	return s.udpBans.banned(src.Addr()) || (src.Port() != 0 && s.socketBans.banned(src))
+	return isUDP(transport) && src.Port() != 0 && s.socketBans.banned(src)
 }
 
 // DropBanned is BannedFrom plus the "banned" drop count. The read filter
@@ -322,7 +324,9 @@ func (s *Shield) pruneLoop(ctx context.Context) {
 
 // BanInfo is one live ban, copied out of a ban table.
 type BanInfo struct {
-	// Source is the banned IP, or IP:port for a UDP socket ban.
+	// Source is the banned IPv4 address, the banned IPv6 /64 prefix (an IP
+	// ban covers the source's whole /64, as the rate limiter and strike
+	// counts do), or IP:port for a UDP socket ban.
 	Source string
 	// Kind is BanKindIP (every transport), BanKindUDPIP (the IP, UDP only)
 	// or BanKindUDPSocket.
@@ -348,10 +352,10 @@ func (s *Shield) Bans(limit, offset int) (page []BanInfo, total int) {
 	ips, socks, udps := s.bans.live(), s.socketBans.live(), s.udpBans.live()
 	all := make([]BanInfo, 0, len(ips)+len(socks)+len(udps))
 	for _, e := range udps {
-		all = append(all, BanInfo{Source: e.key.String(), Kind: BanKindUDPIP, Reason: e.reason, Since: e.since, Until: e.until})
+		all = append(all, BanInfo{Source: banKeyString(e.key), Kind: BanKindUDPIP, Reason: e.reason, Since: e.since, Until: e.until})
 	}
 	for _, e := range ips {
-		all = append(all, BanInfo{Source: e.key.String(), Kind: BanKindIP, Reason: e.reason, Since: e.since, Until: e.until})
+		all = append(all, BanInfo{Source: banKeyString(e.key), Kind: BanKindIP, Reason: e.reason, Since: e.since, Until: e.until})
 	}
 	for _, e := range socks {
 		all = append(all, BanInfo{Source: e.key.String(), Kind: BanKindUDPSocket, Reason: e.reason, Since: e.since, Until: e.until})

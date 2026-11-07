@@ -128,8 +128,8 @@ func TestStrikeUnknownReasonIgnored(t *testing.T) {
 	}
 }
 
-// IPv6 sources share one count per /64; every address struck over the
-// threshold is banned itself.
+// IPv6 sources share one count and one ban per /64: once over the
+// threshold the whole /64 is banned, not only the addresses struck.
 func TestStrikeIPv6By64(t *testing.T) {
 	s, _ := strikeShield(t, "2/10m", nil)
 	for i := 1; i <= 3; i++ {
@@ -138,8 +138,11 @@ func TestStrikeIPv6By64(t *testing.T) {
 	if !s.Banned(netip.MustParseAddr("2001:db8:1:2::3")) {
 		t.Fatal("the third address of the /64 was not banned")
 	}
-	if s.Banned(netip.MustParseAddr("2001:db8:1:2::1")) {
-		t.Error("an address under the threshold was banned")
+	if !s.Banned(netip.MustParseAddr("2001:db8:1:2::1")) {
+		t.Error("an address of the banned /64 was not banned")
+	}
+	if s.Banned(netip.MustParseAddr("2001:db8:1:3::1")) {
+		t.Error("a neighbouring /64 was banned")
 	}
 	top, total := s.Offenders(10)
 	if total != 1 || top[0].Source != "2001:db8:1:2::/64" || top[0].Strikes != 3 {

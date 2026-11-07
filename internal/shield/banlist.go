@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// banCap is the hard ceiling on distinct banned sources: a
+// banCap is the hard ceiling on distinct banned sources (an IPv6 /64 is one): a
 // unique-source flood within one shield.ban window (default 1h) must
 // not grow the table without bound. 64k entries is far beyond any realistic
 // deployment's distinct-source count while bounding memory to ~a few MiB.
@@ -53,9 +53,10 @@ type banEntry struct {
 
 // banList is an in-memory ban table: a source key mapped to the instant
 // its ban expires (plus when and why it started), with lazy expiry on read.
-// The Shield keeps three: source IPs banned on every transport (a scanner
+// The Shield keeps three: sources (an IPv4 address, an IPv6 /64: bucketKey)
+// banned on every transport (a scanner
 // verdict on a connection-oriented transport, or a strike; see Shield.Strike),
-// UDP source sockets (see Shield.CheckFrom) and source IPs banned on UDP only
+// UDP source sockets (see Shield.CheckFrom) and sources banned on UDP only
 // (a strike that arrived over UDP; see Shield.StrikeOn). Separate tables
 // mean a forged-datagram flood that fills the socket or UDP-only table can
 // never keep a real scanner's IP out of the IP table.
