@@ -40,11 +40,15 @@ import (
 // shield.register_ban_aor, from a source with no live binding of it, is
 // dropped the same way (register_aor_locked, regguard.go).
 //
-// Every drop except register_enumeration and register_aor_locked, the
-// dialog-less BYE/INFO one included, is also a strike against its source
+// Every drop except register_aor_locked, the dialog-less BYE/INFO and the
+// register_enumeration one included, is also a strike against its source
 // for shield.admission_ban (admissionStrike); the ban scope follows the
 // transport of the request: UDP strikes ban the IP on UDP only, stream
-// transports ban every one.
+// transports ban every one. register_enumeration strikes because the
+// enumeration window ends and the source starts again, and register_ban
+// never sees its bare REGISTERs. register_aor_locked does not: the AoR may
+// be a real user whose phone keeps retrying, and a strike would widen the
+// lockout from that AoR to the user's whole IP.
 
 // dropReason is why a public request was dropped by admission. The set is
 // fixed, so it is a bounded metric label.
@@ -172,7 +176,7 @@ func (s *Server) admitDialogless(req *sip.Request, src netip.AddrPort) bool {
 		return true
 	}
 	// dropSilently counts, logs and strikes the source (admission_ban,
-	// as for any drop but enumeration); the caller sends the 481.
+	// as for any drop but register_aor_locked); the caller sends the 481.
 	s.dropSilently(dropDialogless, req, src)
 	return false
 }
@@ -186,7 +190,10 @@ func (s *Server) admitDialogless(req *sip.Request, src netip.AddrPort) bool {
 func (s *Server) dropSilently(reason dropReason, req *sip.Request, src netip.AddrPort, attrs ...any) {
 	s.metrics.AdmissionDropped(reason)
 	s.dropSummary.addAdmission(src.Addr())
-	if reason != dropRegisterEnumeration && reason != dropRegisterAORLocked {
+	// register_aor_locked is the one exempt drop: the lock is the accepted
+	// trade-off against a distributed brute force, and striking the source
+	// of a locked real AoR would ban the user's whole IP.
+	if reason != dropRegisterAORLocked {
 		s.admissionStrike(src.Addr(), sip.NetworkToLower(req.Transport()))
 	}
 	args := append([]any{
