@@ -178,7 +178,7 @@ Created once, alive for the process lifetime:
 | `media.WebRTCLeg` + `media.WebRTCSession` | one browser leg | 1 muxed public socket + 1 private pair |
 | `media.SRTPContext` | one direction of one leg | `atomic.Pointer` slots on the session |
 | port reservation (`PlanePool.inUse`) | one RTP even port | released by `Session.Close` / `WebRTCLeg.Close` |
-| shield ban entry, rate-limit bucket | one source (a UDP socket ban: one IP:port; an IP ban: one IP; a rate-limit bucket: an IPv4 address or an IPv6 /64, per transport class; its per-socket floor: one IP:port and class) | the `Shield` |
+| shield ban entry, rate-limit bucket | one source (a UDP socket ban: one IP:port; an IP ban: one IPv4 address or one IPv6 /64; a rate-limit bucket: an IPv4 address or an IPv6 /64, per transport class; its per-socket floor: one IP:port and class) | the `Shield` |
 | `*config.Config` snapshot | one publication | immutable once stored |
 
 ### 3.3 Goroutine inventory
@@ -1254,11 +1254,11 @@ Per REGISTER:
    sipgo's Timer J plus a margin) is absorbed by sipgo's transaction, so the
    read filter counts it (§7.1). Reliable transports end the server
    transaction with its final, so a reused branch there reaches this path.
-   Over the threshold `Strike` bans the struck IP for `shield.ban` (reason
+   Over the threshold `Strike` bans the source key for `shield.ban` (reason
    `register`; WARN `shield banned source for repeated failures` once per
-   window) and every further strike in the window re-bans the address that
-   made it, so an IPv6 attacker rotating inside its /64 (one strike key) is
-   banned address by address. The guard keeps at most 16384 source keys
+   window) and every further strike in the window extends it. An IPv6 source
+   is counted and banned by its /64 (one strike key, one ban entry), so an
+   attacker rotating inside its /64 holds one entry. The guard keeps at most 16384 source keys
    (`regGuardSources`, LRU, 4 nonce and 8 branch hashes and 16 struck
    attempts each); the shield's offender table at most 16384 (source key,
    reason) entries (`offenderCap`, LRU, pruned on the shield tick). Nonces
@@ -3495,7 +3495,7 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | **port allocation** | `PlanePool.inUse` (`media/portpool.go`) | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A; the public and private pools share the `rtp` range but bind different IPs, so they never collide | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
 | **SRTP context** | one direction of one browser leg | `newSRTPContextFromKeys` (`media/srtp.go`) after the DTLS handshake (`WebRTCLeg.deriveSRTP`, `webrtcleg.go`) | installed once → dropped with the leg | keys come only from DTLS-SRTP key export and are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | the leg's `deriveSRTP`, exactly once | dropped with the leg | `SRTPContext.mu` serialising pion's lockless context; the leg holds the pair under `WebRTCLeg.mu` |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` (`edge/media.go`) or (offerer leg) `allocateOfferedWebRTC` (`edge/media.go`) | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
-| **shield ban entry** | `banList` (`shield/banlist.go`), three per `Shield`: `Shield.bans` (`shield/shield.go`) (IP, every transport), `Shield.socketBans` (`shield/shield.go`) (UDP IP:port) and `Shield.udpBans` (`shield/shield.go`) (IP, UDP only) | `ban(key, dur, reason)` from `CheckScanner`'s scanner branch (`bans`, or `socketBans` for a UDP verdict), and from `Shield.Strike` and `Shield.StrikeOn` (`shield/offenders.go`), which ban into `bans` or, for a UDP strike, `udpBans` with reason `register`, `admission` or `malformed` | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table (`banCap`) with an overflow counter; a socket ban lasts at most 1 min (`socketBanMax`); carrier sources are never scanner-banned or struck | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
+| **shield ban entry** | `banList` (`shield/banlist.go`), three per `Shield`: `Shield.bans` (`shield/shield.go`) (bucketKey: IPv4 address or IPv6 /64, every transport), `Shield.socketBans` (`shield/shield.go`) (UDP IP:port) and `Shield.udpBans` (`shield/shield.go`) (bucketKey, UDP only) | `ban(key, dur, reason)` from `CheckScanner`'s scanner branch (`bans`, or `socketBans` for a UDP verdict), and from `Shield.Strike` and `Shield.StrikeOn` (`shield/offenders.go`), which ban into `bans` or, for a UDP strike, `udpBans` with reason `register`, `admission` or `malformed` | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table (`banCap`) with an overflow counter; a socket ban lasts at most 1 min (`socketBanMax`); carrier sources are never scanner-banned or struck | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |
 | **rate-limit bucket** | the one `rateLimiter` per `Shield` | first `allow` or `take` for that key (source IP and class, or a vouched socket's floor) | fresh (full) → drained → refilled | capacity equals rate; a fresh bucket starts full; parameters (`rate_limit` for ordinary sources, `carrier_rate_limit` for carrier sources) are passed per call so a reload applies immediately; a datagram flood cannot drain the stream-class bucket, and a vouched socket has its own floor bucket (§14.1) | `allow`, `take`, `prune` | `prune` drops a bucket once it has been idle for its own refill interval (so it is full); at **65536** buckets (`bucketCap`) the least recently used is evicted; the global bucket is never pruned | `rateLimiter.mu` |
 | **config snapshot** | `config.Store` (`config/store.go`) | `config.Load` → `NewStore` / `Replace` | published → superseded | a published `*Config` is **never mutated**; the compiled switch list, carrier list and source prefixes are populated by `validate` before publication | only `Replace` | garbage collection once no goroutine holds a reference | `atomic.Pointer[Config]` for the snapshot |
 
@@ -3881,7 +3881,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request, so it is always current; the health conditions and the gauge use a separate cache refreshed every 10 minutes (`tlsDiskInterval`). Never the key or PEM |
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`Server.handleRegistrations`, `state.go`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go`) under its read lock. No Contact, token or Call-ID |
 | `/api/carrier-registrations` | GET (else 405) | Basic | array of `{"carrier","user","token","node","expires_in"}`; always an array. The switch's live registrations at carriers (`carrierRegTable.snapshot`, `carrierreg.go`); `token` is the opaque `fsbc` value in the carrier Contact, `node` the registering switch node |
-| `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`Server.handleBans`, `state.go`): `{"items":[{"source","kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. All three ban tables merged, newest first (`Shield.Bans`, `shield.go`); limit and offset as for registrations. `reason` is `scanner`, `register`, `admission` or `malformed`; `udp_ip` is an IP banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
+| `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`Server.handleBans`, `state.go`): `{"items":[{"source" (IPv4 address, IPv6 /64 prefix, or IP:port for `udp_socket`),"kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. All three ban tables merged, newest first (`Shield.Bans`, `shield.go`); limit and offset as for registrations. `reason` is `scanner`, `register`, `admission` or `malformed`; `udp_ip` is an IPv4 address or IPv6 /64 banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
 | `/api/shield/offenders` | GET (else 405) | Basic | `?limit=` (`handleOffenders`, `state.go`): `{"items":[{"source" (IPv4 address or IPv6 /64),"reason" ("register", "admission", "admission_udp", "malformed", "malformed_udp" or "register_aor", whose "source" is then the AoR),"strikes","since" (RFC 3339, the window opened),"remaining" (seconds of the window)}],"total","limit"}`, most strikes first (`Shield.Offenders`, `offenders.go`); limit default 100, at most 1000 |
 | `/api/switch-nodes` | GET (else 405) | Basic | array of `{"address","state" ("healthy" or "cooling_down"),"cooldown_remaining" (seconds),"last_failure" (RFC 3339 or null)}`; always an array, one per `edge.switch` entry, sorted by address (`cooldownTable.snapshot`, `cooldown.go`) |
 | `/api/carriers` | GET (else 405) | Basic | array of `{"name","host","transport","mode" ("literal", "srv", "a" or "" until resolved),"addresses":[{"address","in_use"}],"resolved_at","expires_at" (RFC 3339 or null),"cache_age_seconds" (or null),"failing","last_error"}`; always an array, sorted by name (`carrierDirectory.snapshotInfo`, `carrierdns.go`). `in_use` marks the first address, the one the edge sends to. While `failing`, `expires_at` is the next retry and the addresses are the last good set |
@@ -4198,7 +4198,7 @@ read (`MaxReadSize`, `internal/sip/readfilter.go`, below sipgo's
 32 KiB read buffer so it can fire). A read on the private socket
 (`private.ip:5060`, UDP) is admitted only from a switch node's IP; a request
 read there is stamped with the arrival marker (below). A public read from a
-source the shield has banned — its IP, or on UDP its exact socket
+source the shield has banned — its IPv4 address or IPv6 /64, or on UDP its exact socket
 (`Shield.DropBanned`, which counts it as a `banned` shield drop) — is dropped, so a ban stays silent even for what sipgo
 would answer before any handler. A public read from a source whose
 rate budget is spent (`Shield.AllowRate`) is dropped too, before the
@@ -4235,7 +4235,7 @@ header, and are counted in `freesbc_edge_admission_drops_total` (§7.4, §7.5,
 §7.8a). Each drop except `register_aor_locked` (a dialog-less BYE or INFO and a `register_enumeration` drop included) is also a strike against its
 source in the shield (`Server.admissionStrike`, `admission.go`, called from
 `Server.dropSilently` (`admission.go`) with the request's transport): over
-`shield.admission_ban` (default `50/5m`, hot) the source IP is banned for
+`shield.admission_ban` (default `50/5m`, hot) the source IP (an IPv6 source: its /64) is banned for
 `shield.ban` with reason `admission` (§14.1); the ban is UDP-only when the
 strikes came over UDP, all-transport when they came over a stream transport,
 so a scanner that stays under `shield.rate_limit` and
@@ -4325,8 +4325,8 @@ and step 3. The private socket is trusted and bypasses the shield. In order:
    from the scanner check, so a forged User-Agent cannot get a carrier banned.
    For any other source, what else happens depends on the transport
    (P2-SHD-001):
-   - **tcp, tls, ws, wss**: the source IP is banned for `shield.ban`. A
-     handshake proved the source address.
+   - **tcp, tls, ws, wss**: the source IP (an IPv6 source: its /64) is
+     banned for `shield.ban`. A handshake proved the source address.
    - **udp**: only the exact source socket (IP:port) is banned, in a separate
      table, for at most **1 minute** (`socketBanMax`, `shield.go`). One
      forged datagram therefore cannot lock out a victim's IP, and a forged
@@ -4345,8 +4345,10 @@ only.**
 shield's in-memory table, which is capped at **65536** entries (`banCap`,
 `banlist.go`) with an overflow counter. A re-ban extends an existing ban to
 the later of the two expiries and never shortens it (P2-SHD-008). Ban keys are
-unmapped IPs, and every lookup unmaps its argument, so `::ffff:192.0.2.1` is
-seen as `192.0.2.1` (P2-SHD-009). A ban also closes the banned source's
+`bucketKey`s (an unmapped IPv4 address, an IPv6 /64), and every lookup unmaps
+its argument, so `::ffff:192.0.2.1` is seen as `192.0.2.1` (P2-SHD-009).
+A carrier source is never blocked by a ban hit (`BannedFrom`, `Banned`), so a
+carrier address inside a banned /64 stays reachable. A ban also closes the banned source's
 tcp/tls/ws/wss connection: `guard` closes the one the banning request came on,
 and the read filter closes any other on its next read (`Server.closeStream`,
 `edge.go`, P2-SHD-006). An idle connection opened before the ban stays open
@@ -4354,8 +4356,9 @@ until it next sends. There is no kernel enforcement and no API that lifts a
 ban.
 
 **Strike bans** (`Shield.Strike`, `offenders.go`). A plane may report a
-source's failures as strikes; over the reason's threshold the source IP is
-banned for `shield.ban` with the reason as the ban reason. The only reason
+source's failures as strikes; over the reason's threshold the source key (an
+IPv4 address, an IPv6 /64) is banned for `shield.ban` with the reason as the
+ban reason. The only reason
 are `register` (`shield.register_ban`, default `10/10m`, hot): a failed
 REGISTER credential attempt (§7.4), also counted per AoR
 (`shield.register_ban_aor`, `Shield.StrikeAOR`; a lock, not a ban, §7.4);
@@ -4366,8 +4369,8 @@ strike from UDP is counted under the offender reason `admission_udp` and
 bans the IP in a separate table (`udpBans`, kind `udp_ip`) that only
 `BannedFrom(..., "udp")` consults, so the read filter drops that IP's
 datagrams while its TCP, TLS, WS and WSS accepts and reads go through; a
-strike from tcp, tls, ws or wss is counted under `admission` and bans the IP
-on every transport (`bans`). The counts never add, and a narrower ban never
+strike from tcp, tls, ws or wss is counted under `admission` and bans the
+source on every transport (`bans`). The counts never add, and a narrower ban never
 replaces a wider one (separate tables). A separate table also keeps a forged
 UDP flood from filling the all-transport table. Strikes are counted per source key (IPv4
 address, IPv6 /64) in a fixed window from the first strike, in an LRU of at
@@ -4381,8 +4384,20 @@ strike has no such proof (a dropped request is by definition unanswered),
 so a UDP strike can only ever ban the IP on UDP, and relies on the window
 threshold, the offender cap and the exemptions for carriers and registered
 IPs; a sustained forged flood naming an unregistered, non-carrier address
-can silence it on UDP for `shield.ban`, never on a stream transport. `GET
+can silence it, and for IPv6 its whole /64, on UDP for `shield.ban`, never
+on a stream transport. `GET
 /api/shield/offenders` lists the sources with strikes in an open window.
+
+**An IPv6 ban covers the /64** (#312). Strike counts, rate buckets and
+connection caps already treat a /64 as one source (normally one subscriber
+LAN), and a ban keyed by single /128 let a /64 rotating addresses past a
+threshold get a request through per new address and fill `banCap` alone, after
+which new bans failed open. The ban tables are keyed by `bucketKey`, so one
+entry covers the /64; `GET /api/shield/bans` lists it as the prefix. Trade-off:
+any other host in the same /64, a registered client included, is blocked too
+(carrier sources excepted), and a forged UDP datagram flood naming an address
+can silence that address's /64 on UDP (never its tcp, tls, ws or wss). A UDP
+socket ban stays per IP:port.
 
 **Every denial is a silent drop.** A scanner never gets confirmation that the
 SBC exists.

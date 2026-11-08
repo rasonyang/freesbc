@@ -175,10 +175,10 @@ func (t *offenderTable) live() []offender {
 // Strike records one strike of reason (StrikeRegister) against src and
 // reports whether src is banned as a result. Over the reason's threshold
 // (a hot key, e.g. shield.register_ban) every further strike within the
-// window bans src's IP for shield.ban with reason as the ban reason; the
-// first is logged at WARN. Strikes are counted per source key (an IPv6
-// source by its /64, so an attacker rotating addresses inside its /64
-// shares one count), while the ban names the struck address.
+// window bans src for shield.ban with reason as the ban reason; the first
+// is logged at WARN. Strikes and bans are both keyed by bucketKey: an IPv4
+// address, an IPv6 source by its /64, so an attacker rotating addresses
+// inside its /64 shares one count and one ban entry.
 //
 // A carrier source is never struck, and an unknown reason or a threshold
 // of "off" counts nothing. The caller is responsible for the strike being
@@ -192,8 +192,10 @@ func (s *Shield) Strike(src netip.Addr, reason string) bool {
 // address can be forged, so strikes from UDP are counted apart from stream
 // strikes (offender reason StrikeAdmissionUDP) and ban the IP on UDP only
 // (BanKindUDPIP): a forged datagram flood can silence the victim's UDP,
-// never its TCP, TLS, WS or WSS. A stream source survived a handshake, so
-// its strikes ban the IP on every transport. An unknown transport is
+// never its TCP, TLS, WS or WSS. A ban covers the source's bucketKey, so
+// for IPv6 the whole /64 (a forged flood naming one address silences its
+// /64 on UDP). A stream source survived a handshake, so its strikes ban
+// the source on every transport. An unknown transport is
 // treated as UDP.
 func (s *Shield) StrikeOn(src netip.Addr, reason, transport string) bool {
 	return s.strike(src, reason, !bannableTransport(transport))
@@ -230,15 +232,15 @@ func (s *Shield) strike(src netip.Addr, reason string, udp bool) bool {
 	if !over {
 		return false
 	}
-	if !table.ban(src, cfg.Shield.Ban.Std(), reason) {
-		s.log.Debug("shield ban table at hard cap; strike ban refused", "source", src, "reason", reason)
+	if !table.ban(key.src, cfg.Shield.Ban.Std(), reason) {
+		s.log.Debug("shield ban table at hard cap; strike ban refused", "source", banKeyString(key.src), "address", src, "reason", reason)
 		return false
 	}
 	if crossed {
-		s.log.Warn("shield banned source for repeated failures", "source", src, "reason", reason,
+		s.log.Warn("shield banned source for repeated failures", "source", banKeyString(key.src), "address", src, "reason", reason,
 			"strikes", count, "window", lim.Window.String(), "ban", cfg.Shield.Ban.Std().String())
 	} else {
-		s.log.Debug("shield extended strike ban", "source", src, "reason", reason, "strikes", count)
+		s.log.Debug("shield extended strike ban", "source", banKeyString(key.src), "address", src, "reason", reason, "strikes", count)
 	}
 	return true
 }
@@ -324,11 +326,7 @@ func (s *Shield) Offenders(limit int) (top []OffenderInfo, total int) {
 	total = len(live) + len(aors)
 	top = make([]OffenderInfo, 0, min(limit, total))
 	for _, o := range live {
-		src := o.key.src.String()
-		if o.key.src.Is6() {
-			src = netip.PrefixFrom(o.key.src, 64).String()
-		}
-		top = append(top, OffenderInfo{Source: src, Reason: o.key.reason, Strikes: o.count,
+		top = append(top, OffenderInfo{Source: banKeyString(o.key.src), Reason: o.key.reason, Strikes: o.count,
 			Since: o.start, Until: o.start.Add(o.window)})
 	}
 	for _, e := range aors {
