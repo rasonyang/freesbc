@@ -42,7 +42,7 @@ edge:
   switch_carrier_port: 5080      # carrier port
   carriers:
     carrier-a: sip.carrier-a.com          # = aor contact in pjsip.conf
-    mobile:    223.76.90.4:16060          # = aor contact in pjsip.conf
+    mobile:    198.51.100.10:16060        # = aor contact in pjsip.conf
 ```
 
 The same `edge.switch` and `edge.carriers` go to both nodes (the Request-URI match and the user hash need them identical); only `public.ip` and `private.ip` differ, which one file can take from `${VAR}`.
@@ -55,7 +55,7 @@ Replace the passwords (`CHANGE-ME-*`), the carrier names and the account (`acct`
 |---|---|
 | Carrier requests arrive on `switch_carrier_port`, clients on the switch port | `[transport-clients]` 10.77.0.10:5060, `[transport-carrier]` 10.77.0.10:5080; each carrier object sets `transport=transport-carrier`, each client `transport=transport-clients` |
 | Outbound proxy on every carrier object, with `;lr` | `outbound_proxy=sip:10.77.0.2:5060\;lr` on the carrier `endpoint`, `aor` and `registration` (the backslash keeps the semicolon from starting a comment); the node B objects point at `10.77.0.3` |
-| The `edge.carriers` entry equals the Request-URI host[:port] | carrier `aor` `contact=sip:sip.carrier-a.com` / `sip:223.76.90.4:16060`; the `registration` `server_uri` uses the same host so the REGISTER also matches |
+| The `edge.carriers` entry equals the Request-URI host[:port] | carrier `aor` `contact=sip:sip.carrier-a.com` / `sip:198.51.100.10:16060`; the `registration` `server_uri` uses the same host so the REGISTER also matches |
 | Identify inbound carrier calls | `type=identify` with `match_header=X-FreeSBC-Carrier: /^carrier-a$/` (anchored, so `carrier-a2` does not match); alternative: `line=yes` + `endpoint=` on the registration (commented in `pjsip.conf`) |
 | Never trust or identify by FreeSBC's IP on the client port | no `identify` with `match=`, no `ip` and no `anonymous` in `endpoint_identifier_order=header,username,auth_username`, no `[anonymous]` endpoint |
 | Only the carrier port may skip authentication, restricted to `private.ip` | the carrier endpoints have no `auth=` and carry `acl=freesbc-only` (`acl.conf`); also firewall 5080 (below) |

@@ -61,7 +61,7 @@ The private SIP socket is fixed at `private.ip:5060` (`config.PrivateSIPPort`) a
 When `public.bind` differs from `public.ip`, or `edge.advertise` gives a listener a port other than its own (NAT mode either way), `freesbc check` prints, `freesbc init` prints after writing the file, and `freesbc run` logs at WARN (`NAT: the router must forward ...`) the advertised endpoint and the ports the router must forward to `public.bind`: every configured `edge.listen` port (`udp` over UDP; `tcp`, `tls`, `ws`, `wss` over TCP) and the whole `rtp` range over UDP. Each has the same number on both sides, except a listener with an `edge.advertise` port, which is shown `external->internal` (`udp/16060->5060`). The `rtp` range is never translated: it must be forwarded 1:1, with the same numbers. Nothing else binds `public.bind` (the admin API has its own `admin.listen`, the private socket is `private.ip`). Responses follow Via/rport and work without a forward, but in-dialog requests (the 2xx ACK, BYE) follow Contact and Record-Route to `public.ip:<port>`; a missing forward therefore shows as every call ending at 32 s with `reason=ack_timeout` and the WARN `2xx ACK never arrived` (see [Troubleshooting](troubleshooting.md#lost-ack-reasonack_timeout)). `check` exit codes are unchanged. The `edge proxy listening` line shows `advertised=[...]` and `bind=[...]` side by side, and `GET /api/status` gives each listener's `advertised` address in `listener_info`.
 
 ```
-NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060 tcp/16060 tcp/7443 (wss) udp/16800-16900 (rtp))
+NAT mode: advertised public endpoint = 203.0.113.7 (udp/16060 tcp/16060 tcp/7443 (wss) udp/16800-16900 (rtp))
 REQUIRED forwards -> 172.20.0.4 (same port numbers):
   udp/16060
   tcp/16060
@@ -74,7 +74,7 @@ these ports MUST be reachable from clients.
 With `edge.listen: { udp: 5060, tcp: 5060, wss: 7443 }` and `edge.advertise: { udp: 16060, tcp: 16060 }` the same router needs:
 
 ```
-NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060->5060 tcp/16060->5060 tcp/7443 (wss) udp/16800-16900 (rtp))
+NAT mode: advertised public endpoint = 203.0.113.7 (udp/16060->5060 tcp/16060->5060 tcp/7443 (wss) udp/16800-16900 (rtp))
 REQUIRED forwards -> 172.20.0.4 (external->internal where shown, else the same port number; the rtp range is never translated):
   udp/16060->5060
   tcp/16060->5060

@@ -7,7 +7,7 @@ import (
 
 const natYAML = `
 public:
-  ip: 223.76.90.4
+  ip: 203.0.113.7
   bind: 172.20.0.4
 private:
   ip: 10.77.0.2
@@ -23,7 +23,7 @@ func TestNATChecklist(t *testing.T) {
 	if !c.NATMode() {
 		t.Fatal("NATMode = false, want true")
 	}
-	want := `NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060 tcp/16060 tcp/16061 (tls) tcp/8080 (ws) tcp/7443 (wss) udp/16800-16900 (rtp))
+	want := `NAT mode: advertised public endpoint = 203.0.113.7 (udp/16060 tcp/16060 tcp/16061 (tls) tcp/8080 (ws) tcp/7443 (wss) udp/16800-16900 (rtp))
 REQUIRED forwards -> 172.20.0.4 (same port numbers):
   udp/16060
   tcp/16060
