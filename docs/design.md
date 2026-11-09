@@ -920,6 +920,16 @@ label comes from the `caller=Transport<UDP>` attribute sipgo's per-transport
 logger adds. The wrapper also refuses to forward any `data` attribute added
 through `With`. Matching on the message is a sipgo v1.6.0 workaround
 (`TestSipgoParseFailureLogContract` fails if the string changes).
+sipgo also logs `Fail to upgrade` at Error when an accepted WS or WSS
+connection's request is not a WebSocket upgrade (`TransportWS.Serve`, sipgo
+`sip/transport_ws.go`), which any host that reaches the listener can cause,
+a few bytes per connection. `sipgoHandler` rewrites that record the same way:
+Debug, message `websocket upgrade failed; connection closed`, attributes
+`transport` and the original `error` (gobwas/ws's fixed handshake reason or an
+I/O error; neither holds request bytes, so no reason class is needed),
+`freesbc_sip_upgrade_failures_total{transport}`, and its own Warn per minute,
+apart from the parse-failure one (`TestSipgoUpgradeFailureLogContract` fails
+if the string, level or attributes change).
 
 **Drain mode.** `Server.SetDraining` (`edge.go`) flips a `drainState`
 (`drainState` (`drain.go`): an atomic flag read lock-free on every INVITE, plus a mutex
@@ -3807,6 +3817,7 @@ permanent series per call."
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
 | `freesbc_sip_handler_panics_total` | Counter | — | edge `guard`, one per recovered handler panic |
 | `freesbc_sip_parse_failures_total` | Counter | `transport` ∈ {`UDP`, `TCP`, `TLS`, `WS`, `WSS`, `OTHER`} | edge `sipgoHandler` (`sipgolog.go`), one per read sipgo's parser rejected; every transport is always exported |
+| `freesbc_sip_upgrade_failures_total` | Counter | `transport` ∈ {`UDP`, `TCP`, `TLS`, `WS`, `WSS`, `OTHER`} | edge `sipgoHandler` (`sipgolog.go`), one per accepted WS/WSS connection sipgo closed because its request was not a WebSocket upgrade (only `WS` and `WSS` move); every transport is always exported |
 | `freesbc_edge_stream_connections` | Gauge | `transport` ∈ {`tcp`, `tls`, `ws`, `wss`} | open public stream connections, moved by `streamConn` open and close (§7.1a); every transport is always exported |
 | `freesbc_edge_stream_refused_total` | Counter | `reason` ∈ {`global_cap`, `ip_cap`, `banned`, `rate`} | connections refused at accept (§7.1a); every reason is always exported |
 | `freesbc_edge_stream_closed_total` | Counter | `reason` ∈ {`idle`, `slow`, `oversize`, `malformed`, `handshake`, `rate`} | connections closed by stream policy (§7.1a); every reason is always exported |

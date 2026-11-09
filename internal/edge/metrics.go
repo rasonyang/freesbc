@@ -54,6 +54,10 @@ type Metrics struct {
 	// counter per known transport plus OTHER (sipgolog.go).
 	parseFailures [len(metricTransports) + 1]atomic.Uint64
 
+	// upgradeFailures counts accepted WS/WSS connections whose request
+	// sipgo refused as a WebSocket upgrade, indexed like parseFailures.
+	upgradeFailures [len(metricTransports) + 1]atomic.Uint64
+
 	// admissionDrops counts public requests dropped silently by the
 	// admission policy, one counter per (fixed) reason (admission.go).
 	admissionDrops [numDropReasons]atomic.Uint64
@@ -254,6 +258,12 @@ func (m *Metrics) HandlerPanicked() { m.handlerPanics.Add(1) }
 // into the bounded label set).
 func (m *Metrics) ParseFailed(transport string) { m.parseFailures[transportIndex(transport)].Add(1) }
 
+// UpgradeFailed counts one WS/WSS connection sipgo closed because its
+// request was not a WebSocket upgrade, by transport.
+func (m *Metrics) UpgradeFailed(transport string) {
+	m.upgradeFailures[transportIndex(transport)].Add(1)
+}
+
 // SetSessions publishes the dialog table's session count.
 func (m *Metrics) SetSessions(n int) { m.sessions.Store(int64(n)) }
 
@@ -383,6 +393,9 @@ type Snapshot struct {
 	// ParseFailures is keyed by upper-case transport (or OTHER); every
 	// transport is present, zero or not.
 	ParseFailures map[string]uint64
+	// UpgradeFailures is keyed like ParseFailures; every transport is
+	// present, zero or not.
+	UpgradeFailures map[string]uint64
 
 	// AdmissionDrops is keyed by drop reason (dropReasonLabels); every
 	// reason is present, zero or not.
@@ -448,6 +461,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		RegisterBindingRejects:      map[string]uint64{},
 		AckMissed:                   map[string]uint64{},
 		ParseFailures:               map[string]uint64{},
+		UpgradeFailures:             map[string]uint64{},
 		CarrierRequests:             map[string]uint64{},
 		CarrierRegistrations:        map[string]int64{},
 		StreamConnections:           map[string]int64{},
@@ -478,6 +492,7 @@ func (m *Metrics) Snapshot() Snapshot {
 			label = metricTransports[i]
 		}
 		s.ParseFailures[label] = m.parseFailures[i].Load()
+		s.UpgradeFailures[label] = m.upgradeFailures[i].Load()
 	}
 	for r := range m.admissionDrops {
 		s.AdmissionDrops[dropReasonLabels[r]] = m.admissionDrops[r].Load()

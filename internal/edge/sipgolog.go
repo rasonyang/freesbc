@@ -18,6 +18,15 @@ import (
 // upgrade changes the string, the level or the attribute names.
 const sipgoParseFailMsg = "failed to parse"
 
+// sipgoUpgradeFailMsg is the message sipgo v1.6.0 logs, at Error with the
+// gobwas/ws handshake error as "error", when an accepted WS or WSS
+// connection's request is not a WebSocket upgrade (TransportWS.Serve, sipgo
+// sip/transport_ws.go). Any host that can reach the listener can trigger it,
+// so it is rewritten like a parse failure; TestSipgoUpgradeFailureLogContract
+// fails if a sipgo upgrade changes the string, the level or the attribute
+// names.
+const sipgoUpgradeFailMsg = "Fail to upgrade"
+
 // parseFailWarnEvery is the minimum gap between two WARN lines about parse
 // failures. Every failure is counted and logged at Debug; only the WARN is
 // rate-limited.
@@ -25,7 +34,8 @@ const parseFailWarnEvery = time.Minute
 
 // parseFailState is shared by every derived copy of one sipgoHandler: the
 // WARN dedupe is global, because sipgo's record does not carry the source
-// address.
+// address. A handler holds one for parse failures and one for upgrade
+// failures, so each has its own WARN.
 type parseFailState struct {
 	count func(transport string)
 	now   func() time.Time
@@ -41,20 +51,24 @@ type parseFailState struct {
 // reaches the real handler: the "data" attribute is replaced by its length,
 // the record drops from Error to Debug, the failure is counted
 // (freesbc_sip_parse_failures_total) and at most one WARN per
-// parseFailWarnEvery summarises what was suppressed. Every other record
-// passes through untouched.
+// parseFailWarnEvery summarises what was suppressed. A failed WS/WSS upgrade
+// is treated the same way (Debug, freesbc_sip_upgrade_failures_total, its own
+// WARN). Every other record passes through untouched.
 type sipgoHandler struct {
 	inner     slog.Handler
-	st        *parseFailState
-	transport string // from the "caller" attr sipgo's per-transport logger adds
+	st        *parseFailState // parse failures
+	up        *parseFailState // WS/WSS upgrade failures
+	transport string          // from the "caller" attr sipgo's per-transport logger adds
 }
 
-// newSipgoHandler wraps inner. count is called once per parse failure with
-// the transport label ("UDP", "WS", ...; metricOther when it cannot be told).
-func newSipgoHandler(inner slog.Handler, count func(transport string)) *sipgoHandler {
+// newSipgoHandler wraps inner. parseCount is called once per parse failure
+// and upgradeCount once per failed WS/WSS upgrade, each with the transport
+// label ("UDP", "WS", ...; metricOther when it cannot be told).
+func newSipgoHandler(inner slog.Handler, parseCount, upgradeCount func(transport string)) *sipgoHandler {
 	return &sipgoHandler{
 		inner: inner,
-		st:    &parseFailState{count: count, now: time.Now},
+		st:    &parseFailState{count: parseCount, now: time.Now},
+		up:    &parseFailState{count: upgradeCount, now: time.Now},
 	}
 }
 
@@ -108,9 +122,24 @@ func transportFromCaller(caller string) (string, bool) {
 }
 
 func (h *sipgoHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Message != sipgoParseFailMsg {
-		return h.inner.Handle(ctx, r)
+	switch r.Message {
+	case sipgoParseFailMsg:
+		return h.handleParseFail(ctx, r)
+	case sipgoUpgradeFailMsg:
+		return h.handleUpgradeFail(ctx, r)
 	}
+	return h.inner.Handle(ctx, r)
+}
+
+// recordTransport is the metric label for a record from this logger.
+func (h *sipgoHandler) recordTransport() string {
+	if h.transport == "" {
+		return metricOther
+	}
+	return h.transport
+}
+
+func (h *sipgoHandler) handleParseFail(ctx context.Context, r slog.Record) error {
 	var size int
 	var cause error
 	r.Attrs(func(a slog.Attr) bool {
@@ -124,10 +153,7 @@ func (h *sipgoHandler) Handle(ctx context.Context, r slog.Record) error {
 		}
 		return true
 	})
-	transport := h.transport
-	if transport == "" {
-		transport = metricOther
-	}
+	transport := h.recordTransport()
 	h.st.count(transport)
 	reason := parseFailReason(cause)
 
@@ -147,6 +173,45 @@ func (h *sipgoHandler) Handle(ctx context.Context, r slog.Record) error {
 		w.AddAttrs(slog.String("transport", transport), slog.Int("len", size),
 			slog.String("reason", reason), slog.Int("suppressed", n),
 			slog.Duration("interval", parseFailWarnEvery))
+		if werr := h.inner.Handle(ctx, w); err == nil {
+			err = werr
+		}
+	}
+	return err
+}
+
+// handleUpgradeFail rewrites sipgo's "Fail to upgrade". The error is
+// gobwas/ws's fixed handshake reason or an I/O error from reading the request
+// or writing the 400; neither carries request bytes, so it is kept. Any other
+// attribute (there is none in v1.6.0) is dropped rather than forwarded.
+func (h *sipgoHandler) handleUpgradeFail(ctx context.Context, r slog.Record) error {
+	var cause slog.Value
+	var hasCause bool
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "error" {
+			cause, hasCause = a.Value, true
+		}
+		return true
+	})
+	transport := h.recordTransport()
+	h.up.count(transport)
+
+	attrs := []slog.Attr{slog.String("transport", transport)}
+	if hasCause {
+		attrs = append(attrs, slog.Attr{Key: "error", Value: cause})
+	}
+	rec := slog.NewRecord(r.Time, slog.LevelDebug, "websocket upgrade failed; connection closed", r.PC)
+	rec.AddAttrs(attrs...)
+	var err error
+	if h.inner.Enabled(ctx, slog.LevelDebug) {
+		err = h.inner.Handle(ctx, rec)
+	}
+
+	if n, ok := h.up.takeWarn(); ok && h.inner.Enabled(ctx, slog.LevelWarn) {
+		w := slog.NewRecord(r.Time, slog.LevelWarn,
+			"websocket upgrade failures: non-WebSocket requests closed on a public listener", r.PC)
+		w.AddAttrs(attrs...)
+		w.AddAttrs(slog.Int("suppressed", n), slog.Duration("interval", parseFailWarnEvery))
 		if werr := h.inner.Handle(ctx, w); err == nil {
 			err = werr
 		}

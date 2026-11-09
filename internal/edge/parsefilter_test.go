@@ -346,7 +346,7 @@ func TestSipgoParseFailureLogContract(t *testing.T) {
 		mu.Lock()
 		counts[tr]++
 		mu.Unlock()
-	})).With("caller", "sipgo")
+	}, func(string) {})).With("caller", "sipgo")
 	ua, err := sipgo.NewUA(sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerLogger(log)))
 	if err != nil {
 		t.Fatal(err)
@@ -393,11 +393,80 @@ func TestSipgoParseFailureLogContract(t *testing.T) {
 	}
 }
 
+// If sipgo changes the message, level or attribute names of the log it writes
+// when an accepted WS/WSS connection's request is not a WebSocket upgrade,
+// this fails: the wrapper would stop matching and any host reaching the
+// listener could write ERROR lines again. It drives the edge's real ws and
+// wss listeners; the request line carries the canary, which must reach no
+// record. (Not in a header: with sip.SIPDebug on, which the HEP tracer sets
+// and this package's tests always have, sipgo logs each non-WebSocket header
+// at Debug as "non-websocket header:", independent of the upgrade outcome.)
+func TestSipgoUpgradeFailureLogContract(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		name := "ws"
+		if secure {
+			name = "wss"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := newLogRecorder()
+			h := startShieldHarness(t, "100/s per_ip", "100/s per_ip", "", !secure, secure, rec)
+			label := strings.ToUpper(name)
+			upgradeFailures := func() uint64 { return h.srv.metrics.Snapshot().UpgradeFailures[label] }
+			if _, ok := h.srv.metrics.Snapshot().UpgradeFailures[label]; !ok {
+				t.Fatalf("%s upgrade failures not exported from zero", label)
+			}
+			for i := range 2 {
+				var conn net.Conn
+				var err error
+				if secure {
+					conn, err = tls.Dial("tcp", h.publicWSS, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) // self-signed test listener
+				} else {
+					conn, err = net.Dial("tcp", h.publicWS)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				fmt.Fprintf(conn, "GET /%s HTTP/1.1\r\nHost: x\r\n\r\n", canary)
+				deadline := time.Now().Add(3 * time.Second)
+				for upgradeFailures() < uint64(i+1) && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
+				}
+				conn.Close()
+			}
+			if got := upgradeFailures(); got != 2 {
+				t.Fatalf("%s upgrade failures = %d, want 2: did sipgo change its %q log?", label, got, sipgoUpgradeFailMsg)
+			}
+			assertNoPayloadLogged(t, rec)
+			var debugs, warns int
+			for _, r := range rec.snapshot() {
+				if r.level >= slog.LevelError {
+					t.Errorf("ERROR record %q %v", r.msg, r.attrs)
+				}
+				if strings.Contains(r.msg, "upgrade") && r.attrs["transport"] != label {
+					t.Errorf("record %q transport = %q, want %s", r.msg, r.attrs["transport"], label)
+				}
+				switch {
+				case r.level == slog.LevelDebug && r.msg == "websocket upgrade failed; connection closed":
+					debugs++
+					if r.attrs["error"] == "" {
+						t.Errorf("Debug record has no error attribute: %v", r.attrs)
+					}
+				case r.level == slog.LevelWarn && strings.Contains(r.msg, "upgrade failures"):
+					warns++
+				}
+			}
+			if debugs != 2 || warns != 1 {
+				t.Errorf("upgrade Debug records = %d, WARN records = %d; want 2 and 1", debugs, warns)
+			}
+		})
+	}
+}
+
 // The wrapper's own behaviour: WARN dedupe over the interval, and "data"
 // never forwarded by a derived logger.
 func TestSipgoHandlerWarnDedupeAndWith(t *testing.T) {
 	rec := newLogRecorder()
-	h := newSipgoHandler(rec, func(string) {})
+	h := newSipgoHandler(rec, func(string) {}, func(string) {})
 	now := time.Unix(1000, 0)
 	h.st.now = func() time.Time { return now }
 	log := slog.New(h).With("caller", "sipgo").With("caller", "Transport<WS>").With("data", canary)
