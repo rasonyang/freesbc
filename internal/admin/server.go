@@ -169,6 +169,10 @@ type ProxyStats struct {
 	// (UDP, TCP, TLS, WS, WSS, OTHER).
 	ParseFailures map[string]uint64 `json:"sip_parse_failures_total"`
 
+	// UpgradeFailures counts WebSocket upgrades sipgo rejected, by
+	// transport (same label set as ParseFailures).
+	UpgradeFailures map[string]uint64 `json:"sip_upgrade_failures_total"`
+
 	// StreamConnections is the open stream connections by transport (tcp,
 	// tls, ws, wss); StreamRefused counts connections refused at accept by
 	// reason (global_cap, ip_cap, banned, rate) and StreamClosed connections

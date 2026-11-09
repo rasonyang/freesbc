@@ -319,6 +319,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 				RegisterBindingRejects: s.RegisterBindingRejects,
 				AckMissed:              s.AckMissed,
 				ParseFailures:          s.ParseFailures,
+				UpgradeFailures:        s.UpgradeFailures,
 				StreamConnections:      s.StreamConnections,
 				StreamRefused:          s.StreamRefused,
 				StreamClosed:           s.StreamClosed,
