@@ -12,7 +12,10 @@ import (
 
 // arrival says which local socket a request came in on. It is the trust key
 // of the whole edge plane: "is this FreeSWITCH" is decided by the socket the
-// datagram reached, never by the address it claims to come from.
+// datagram reached, never by the address it claims to come from. The one
+// exception is the shared socket of the single-IP layout (Server.shared),
+// where the socket is also public and the source IP of the datagram decides:
+// the marker is stamped only for an edge.switch source there.
 type arrival uint8
 
 const (
@@ -21,7 +24,8 @@ const (
 	// address can promote it: a spoofed or forged request is public.
 	arrPublic arrival = iota
 	// arrPrivate is a datagram that reached the private bind from an
-	// upstream IP: FreeSWITCH talking to its own edge proxy.
+	// upstream IP: FreeSWITCH talking to its own edge proxy. On the shared
+	// socket it is a datagram from an upstream IP on the one udp socket.
 	arrPrivate
 )
 

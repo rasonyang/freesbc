@@ -34,6 +34,12 @@ type hepMirror struct {
 	// share one key space (protocol 6), where validation keeps their ports
 	// distinct.
 	advPorts map[hepPort]uint16
+	// switchIPs is set only with a shared socket (the single-IP layout),
+	// where one socket faces both the internet and the switch. A message
+	// whose far end is a switch node used the socket as private.ip:5060, so
+	// its local end keeps the shared address instead of being reported as
+	// public.ip. Nil with separate sockets.
+	switchIPs map[netip.Addr]struct{}
 }
 
 // hepPort is a local port under one HEP protocol (17 UDP, 6 TCP).
@@ -178,7 +184,7 @@ func (m *hepMirror) capture(proto uint8, local, remote netip.AddrPort, inbound b
 	if callID == "" {
 		return
 	}
-	if local.Addr().Unmap() == m.bind {
+	if _, toSwitch := m.switchIPs[remote.Addr().Unmap()]; local.Addr().Unmap() == m.bind && !toSwitch {
 		port := local.Port()
 		if adv, ok := m.advPorts[hepPort{proto, port}]; ok {
 			port = adv

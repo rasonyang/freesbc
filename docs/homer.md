@@ -36,7 +36,7 @@ HOMER never replies, so FreeSBC never reads from the collector. Over `tcp` and `
 Every SIP message the edge receives or sends, on every socket:
 
 - Public listeners: `udp`, `tcp`, `tls`, `ws` and `wss`.
-- The private socket `private.ip:5060`, so the switch legs are in the same flow.
+- The private socket `private.ip:5060`, so the switch legs are in the same flow. In the single-IP layout that is the public udp socket; a message exchanged with a switch node shows the shared address as its local end, not `public.ip`.
 - Connections FreeSBC dials to tcp and tls carriers.
 
 Outbound copies include sipgo's retransmissions, locally generated replies and the BYE or CANCEL the edge generates itself.

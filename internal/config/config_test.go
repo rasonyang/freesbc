@@ -178,7 +178,10 @@ func TestValidateErrors(t *testing.T) {
 		{"no private", replace(t, minimalYAML, "private:\n  ip: 10.77.0.2\n", ""), "private.ip: required"},
 		{"private wildcard", replace(t, minimalYAML, "10.77.0.2", "0.0.0.0"), "private.ip"},
 		{"private equals public", replace(t, minimalYAML, "10.77.0.2", "203.0.113.7"), "must differ from public.bind"},
-		{"private equals bind", replace(t, minimalYAML, "  ip: 203.0.113.7", "  ip: 1.1.1.1\n  bind: 10.77.0.2"), "must differ from public.bind"},
+		// private.ip equal to public.bind with a different public.ip is the
+		// single-IP layout (sharedsocket_test.go); with all three equal the
+		// sides need separate sockets.
+		{"private equals bind and public", replace(t, minimalYAML, "  ip: 203.0.113.7", "  ip: 10.77.0.2\n  bind: 10.77.0.2"), "must differ from public.bind"},
 		{"rtp low", with("rtp: 100-200\n"), "1024"},
 		{"rtp no pair", with("rtp: 30001-30002\n"), "no RTP/RTCP pair"},
 		{"rtp bad", with("rtp: nope\n"), "port range"},

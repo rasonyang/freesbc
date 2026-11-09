@@ -39,6 +39,7 @@ func (c *Config) validate() error {
 	c.validateEdge(fail)
 	c.validateAdvertise(fail)
 	c.validateCarriers(fail)
+	c.validateSharedSocket(fail)
 	c.validateShield(fail)
 	c.validateAdmin(fail)
 	c.validateHEP(fail)
@@ -74,8 +75,81 @@ func (c *Config) validateTopology(fail failFunc) {
 	specificIP(fail, "public.ip", c.Public.IP)
 	bind, bindOK := specificIP(fail, "public.bind", c.Public.Bind)
 	priv, privOK := specificIP(fail, "private.ip", c.Private.IP)
+	// private.ip equal to public.bind is the single-IP layout (one socket
+	// for both sides) only behind 1:1 NAT, where public.ip differs from
+	// public.bind. Every other condition of that layout is
+	// validateSharedSocket's, which runs once edge.switch and the carrier
+	// lists are compiled. With public.ip equal to public.bind there is no
+	// NAT and the sides stay separate, as they always were.
 	if bindOK && privOK && bind == priv {
-		fail("private.ip: %q must differ from public.bind; the two sides need separate sockets", c.Private.IP)
+		if pub, err := netip.ParseAddr(c.Public.IP); err != nil || pub.Unmap() == bind {
+			fail("private.ip: %q must differ from public.bind; the two sides need separate sockets", c.Private.IP)
+		}
+	}
+}
+
+// cgnatPrefix is the shared address space (RFC 6598).
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+
+// privateOrCGNAT reports whether ip is in a private class (RFC 1918, IPv6
+// ULA) or in CGNAT space.
+func privateOrCGNAT(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsPrivate() || cgnatPrefix.Contains(ip)
+}
+
+// validateSharedSocket holds the conditions of the single-IP layout, where
+// private.ip equals public.bind and one UDP socket serves both sides. It
+// does nothing for a config with separate addresses. When public.ip equals
+// public.bind validateTopology has already refused the equal addresses and
+// nothing more is said here.
+//
+// The layout trusts the switch by its source IP on a socket the internet can
+// reach, so everything that keeps that source IP unforgeable or unambiguous
+// is checked: the shared address and the switch are private, no carrier
+// source can be the switch, and the udp port is not translated. A carrier
+// named by DNS cannot be checked here; docs/edge.md tells the operator.
+func (c *Config) validateSharedSocket(fail failFunc) {
+	if !c.SharedSocket() {
+		return
+	}
+	pub, err := netip.ParseAddr(c.Public.IP)
+	if err != nil || pub.Unmap() == c.PublicBind() {
+		return
+	}
+	shared := c.PublicBind()
+	if !privateOrCGNAT(shared) {
+		fail("private.ip: %q is shared with public.bind but is not a private or CGNAT address; one socket for both sides is allowed only behind 1:1 NAT on a private address", c.Private.IP)
+	}
+	if c.Edge.Listen.UDP != PrivateSIPPort {
+		fail("edge.listen.udp: must be %d when private.ip equals public.bind (one socket serves both sides), got %d", PrivateSIPPort, c.Edge.Listen.UDP)
+	}
+	if adv := c.Edge.Advertise.Port("udp"); adv != 0 && adv != PrivateSIPPort {
+		fail("edge.advertise.udp: %d translates the udp port, which is not supported when private.ip equals public.bind (the NAT must forward udp/%d unchanged)", adv, PrivateSIPPort)
+	}
+	if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs < 2 {
+		fail("rtp: %d-%d holds %d pair when private.ip equals public.bind; a call takes two pairs from the one range, so it needs at least 2", c.RTP.Min, c.RTP.Max, pairs)
+	}
+	quiet := func(string, ...any) {}
+	for i, s := range c.Edge.Switch {
+		ap, ok := parseIPPort(quiet, "", s)
+		if !ok {
+			continue // already reported by validateEdge
+		}
+		label := fmt.Sprintf("edge.switch[%d]", i)
+		if !privateOrCGNAT(ap.Addr()) {
+			fail("%s: %q is not a private or CGNAT address; the switch is trusted by its source IP when private.ip equals public.bind", label, s)
+		}
+		for _, pfx := range c.Edge.carrierNets {
+			if pfx.Contains(ap.Addr()) {
+				fail("edge.carrier_sources: %s covers %s (%s); the switch is trusted by its source IP when private.ip equals public.bind, so no carrier source may include it", pfx, ap.Addr(), label)
+			}
+		}
+		for _, k := range c.Edge.carriers {
+			if k.Literal() && k.Addr.Unmap() == ap.Addr() {
+				fail("edge.carriers.%s: %s is also %s; the switch is trusted by its source IP when private.ip equals public.bind, so no carrier may be at its address", k.Name, k.Addr, label)
+			}
+		}
 	}
 }
 
@@ -386,6 +460,9 @@ func (c *Config) validateShield(fail failFunc) {
 	} else if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs >= 1 && c.Shield.MaxSessions > pairs {
 		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor (one RTP/RTCP pair per call per plane)",
 			c.Shield.MaxSessions, pairs, c.RTP.Min, c.RTP.Max)
+	} else if c.SharedSocket() && c.RTP.Min >= 1024 && c.Shield.MaxSessions > pairs/2 {
+		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor when private.ip equals public.bind (both planes draw from the one range, two pairs per call)",
+			c.Shield.MaxSessions, pairs/2, c.RTP.Min, c.RTP.Max)
 	}
 	if c.Shield.InviteRateLimit != "" {
 		if rl, err := ParseRateLimit(c.Shield.InviteRateLimit); err != nil {

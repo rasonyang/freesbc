@@ -410,6 +410,16 @@ func (t *topology) fromUpstream(src netip.Addr) bool {
 	return false
 }
 
+// upstreamIPs is the set of switch node IPs, the addresses fromUpstream
+// accepts.
+func (t *topology) upstreamIPs() map[netip.Addr]struct{} {
+	out := make(map[netip.Addr]struct{}, len(t.upstreams))
+	for _, e := range t.upstreams {
+		out[e.addr.Addr().Unmap()] = struct{}{}
+	}
+	return out
+}
+
 // upstreamEntryFor returns the resolved endpoint for a node name. Every
 // name a dial order produces comes from t.upstreamNames, which is exactly
 // this map's key set, so an unknown name is not a case callers have to

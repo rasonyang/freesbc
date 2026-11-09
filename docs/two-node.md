@@ -18,6 +18,8 @@ The concrete configuration is in [`examples/switch/freeswitch/`](../examples/swi
               the switch
 ```
 
+Each node may use the single-IP layout of [edge.md](edge.md#single-ip-host-behind-a-11-nat) (`private.ip` equal to its `public.bind`); the rest of this page reads `private.ip` as that shared address then.
+
 Test setup: node A has `public.ip` 203.0.113.7 and `private.ip` 10.77.0.2; node B has 203.0.113.8 and 10.77.0.3. The switch is 10.77.0.10.
 
 ## FreeSBC nodes

@@ -135,7 +135,7 @@ func auditTaggedAnswerHook(f *fakeSwitch, tags chan<- string,
 		}
 		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(f.answerSDP(req)))
 		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+		res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 		if _, inDialog := req.To().Params.Get("tag"); !inDialog {
 			tag := sip.GenerateTagN(12)
 			res.To().Params.Add("tag", tag)
@@ -296,14 +296,14 @@ func auditInDialogRaw(t *testing.T, f *fakeSwitch, method sip.RequestMethod, inv
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: cseq, MethodName: method})
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	for _, hdr := range invite.GetHeaders("Record-Route") {
 		if rr, ok := hdr.(*sip.RecordRouteHeader); ok {
 			req.AppendHeader(&sip.RouteHeader{Address: rr.Address})
 		}
 	}
 	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
 	if body != "" {
@@ -356,7 +356,7 @@ func auditAckInDialogBody(t *testing.T, f *fakeSwitch, inv *sip.Request, res *si
 		ack.AppendHeader(sip.HeaderClone(hdr))
 	}
 	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	ack.PrependHeader(via)
 	if body != "" {

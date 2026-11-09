@@ -164,7 +164,7 @@ On a terminal it prompts for each value not given by a flag or environment varia
 
 `public.bind` is omitted from the file when it equals `public.ip`. When they differ (1:1 NAT), `init`, `check` and `run` print the ports your router must forward to `public.bind`: every `edge.listen` port and the `rtp` range, with the same numbers (see the [1:1 NAT checklist](config.md#11-nat-checklist)).
 
-`init` fails if `private.ip` equals `public.bind`: the topology needs two addresses, one facing the switch and one facing the internet, so add a second IP or NIC (or a VLAN or loopback alias for the private side).
+`init` fails if `private.ip` equals `public.bind` and `public.ip` equals them too: with no NAT the topology needs two addresses, one facing the switch and one facing the internet, so add a second IP or NIC (or a VLAN or loopback alias for the private side). Behind a 1:1 NAT (`public.ip` differs from `public.bind`) one address can serve both sides: `init` writes that layout when the detected `private.ip` and `public.bind` are the same private address, as it is on a single-NIC cloud host, with `edge.listen.udp` 5060 and a private switch address, and prints the single-IP note. The switch is then identified by its source IP; see [Single-IP host behind a 1:1 NAT](edge.md#single-ip-host-behind-a-11-nat). A second address remains the stronger layout.
 
 ### Without a terminal
 

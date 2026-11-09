@@ -188,8 +188,11 @@ func Init(ctx context.Context, o InitOptions) error {
 			return err
 		}
 	}
-	if priv == bind {
-		return fmt.Errorf("init: private.ip and public.bind are both %s: FreeSBC needs two addresses, one facing the switch and one facing the internet; add a second IP or NIC (or a VLAN or loopback alias for the private side)", priv)
+	// One address for both sides is valid only behind 1:1 NAT (public.ip
+	// differs from public.bind); config.Parse below checks the rest of that
+	// layout (private address, udp 5060, private switch).
+	if priv == bind && pub == bind {
+		return fmt.Errorf("init: private.ip and public.bind are both %s: FreeSBC needs two addresses, one facing the switch and one facing the internet, unless the host is behind a 1:1 NAT (then public.ip differs from public.bind and one address serves both sides); add a second IP or NIC (or a VLAN or loopback alias for the private side)", priv)
 	}
 
 	port := o.UDPPort

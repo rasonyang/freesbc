@@ -336,6 +336,10 @@ func withDefaults(c *Config) {
 	}
 	if c.Shield.MaxSessions == 0 {
 		c.Shield.MaxSessions = c.RTP.Pairs()
+		if c.SharedSocket() {
+			// Both planes draw from the one range: two pairs per call.
+			c.Shield.MaxSessions /= 2
+		}
 	}
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
@@ -402,6 +406,19 @@ func (c *Config) PortTranslated() bool {
 		}
 	}
 	return false
+}
+
+// SharedSocket reports whether private.ip and public.bind are one address,
+// so a single UDP socket, private.ip:5060 and the public udp listener, serves
+// both sides (the single-IP layout behind 1:1 NAT). On a validated Config it
+// implies every other condition of that layout (validateSharedSocket). It
+// reads the two address strings, so the answer does not depend on the order
+// validation runs in, and it is usable while a Config is still being
+// defaulted.
+func (c *Config) SharedSocket() bool {
+	bind, err1 := netip.ParseAddr(c.Public.Bind)
+	priv, err2 := netip.ParseAddr(c.Private.IP)
+	return err1 == nil && err2 == nil && !bind.IsUnspecified() && bind.Unmap() == priv.Unmap()
 }
 
 // PrivateIP is the private bind and advertised address.

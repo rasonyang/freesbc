@@ -199,9 +199,15 @@ func (s *Server) rejectBusy(req *sip.Request, tx sip.ServerTransaction, retryAft
 // sessionLimit is the effective session cap of cfg: shield.max_sessions,
 // never above what the boot rtp range can anchor (rtp is restart-only, so
 // a hot value cannot exceed it after validation, but the clamp keeps the
-// cap honest if a snapshot ever disagrees).
+// cap honest if a snapshot ever disagrees). With the shared socket both
+// planes bind one address over the one range, so a call takes two pairs from
+// it and the range anchors half as many calls: overload must reach the clean
+// 503 here, before the allocator runs out of ports.
 func (s *Server) sessionLimit(cfg *config.Config) int {
 	limit, pairs := cfg.Shield.MaxSessions, s.boot.RTP.Pairs()
+	if s.shared {
+		pairs /= 2
+	}
 	if limit <= 0 || limit > pairs {
 		return pairs
 	}

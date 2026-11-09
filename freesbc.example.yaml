@@ -18,9 +18,12 @@ public:
   # bind: 172.31.5.10        # only behind 1:1 NAT (cloud VM); default = ip
 
 private:
-  ip: 10.77.0.2              # faces the switch; bind = advertised
+  ip: 10.77.0.2              # faces the switch; bind = advertised. It may equal public.bind
+                             # only behind 1:1 NAT (public.ip differs): one UDP socket, edge.listen.udp 5060,
+                             # then serves both sides and the switch is identified by its source IP
+                             # (docs/edge.md, "Single-IP host behind a 1:1 NAT")
 
-rtp: 20000-29999             # one range, allocated independently per bind IP
+rtp: 20000-29999             # one range, allocated independently per bind IP (halved capacity if they are one IP)
 
 # tls:                       # identity for sips:// and wss:// and a remote admin;
 #   cert: /etc/freesbc/cert.pem  # required only by edge.listen.tls, edge.listen.wss
@@ -28,7 +31,8 @@ rtp: 20000-29999             # one range, allocated independently per bind IP
 
 # --- Edge -------------------------------------------------------------------
 #
-# One fixed private socket, not configurable: private.ip:5060.
+# One fixed private socket, not configurable: private.ip:5060 (the public udp socket itself
+# when private.ip equals public.bind).
 # The switch sends everything there:
 #   - proxied REGISTER / calls to clients   (Request-URI carries ;fsbc=<token>)
 #   - carrier REGISTER / INVITE / OPTIONS   (outbound proxy; Request-URI host

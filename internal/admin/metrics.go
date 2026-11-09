@@ -98,8 +98,8 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		banRejected: prometheus.NewDesc("freesbc_shield_ban_adds_rejected_total", "Bans refused because the table was at its 65536 cap, per table.", []string{"kind"}, nil),
 		udpRcvbuf:   prometheus.NewDesc("freesbc_udp_receive_buffer_errors_total", "Kernel UDP datagrams dropped on a full socket receive buffer (RcvbufErrors, IPv4 + IPv6), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
 		udpInErrors: prometheus.NewDesc("freesbc_udp_in_errors_total", "Kernel UDP receive errors (InErrors, IPv4 + IPv6; includes the receive buffer drops), for the whole network namespace: every UDP socket in it, not only FreeSBC's. Read at scrape time; Linux only.", nil, nil),
-		udpSockDrop: prometheus.NewDesc("freesbc_udp_socket_drops_total", "Datagrams the kernel dropped on one of FreeSBC's UDP SIP sockets (the drops column of /proc/net/udp and udp6: mostly a full receive buffer), by socket (public: the edge.listen.udp listener; private: private.ip:5060). Read at scrape time; Linux only.", []string{"socket"}, nil),
-		udpSockRxQ:  prometheus.NewDesc("freesbc_udp_socket_rx_queue_bytes", "Bytes waiting in the kernel receive queue of one of FreeSBC's UDP SIP sockets at scrape time (rx_queue of /proc/net/udp and udp6), by socket (public, private). Linux only.", []string{"socket"}, nil),
+		udpSockDrop: prometheus.NewDesc("freesbc_udp_socket_drops_total", "Datagrams the kernel dropped on one of FreeSBC's UDP SIP sockets (the drops column of /proc/net/udp and udp6: mostly a full receive buffer), by socket (public: the edge.listen.udp listener; private: private.ip:5060; shared: the one socket that is both when private.ip equals public.bind). Read at scrape time; Linux only.", []string{"socket"}, nil),
+		udpSockRxQ:  prometheus.NewDesc("freesbc_udp_socket_rx_queue_bytes", "Bytes waiting in the kernel receive queue of one of FreeSBC's UDP SIP sockets at scrape time (rx_queue of /proc/net/udp and udp6), by socket (public, private, shared). Linux only.", []string{"socket"}, nil),
 		buildInfo:   prometheus.NewDesc("freesbc_build_info", "Build info; always 1.", []string{"version"}, nil),
 
 		hepSent:    prometheus.NewDesc("freesbc_hep_packets_sent_total", "SIP messages written to the HOMER collector as HEP packets; absent when the hep section is off.", nil, nil),
@@ -320,17 +320,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// collectUDPSockets exports the kernel drop count and receive queue of the
-// UDP SIP sockets the edge bound (Deps.ListenerInfos: the public udp
-// listener and the private socket). A socket missing from /proc/net/udp{,6}
-// exports nothing, and so does every socket off Linux.
-func (c *collector) collectUDPSockets(ch chan<- prometheus.Metric) {
-	if c.deps.ListenerInfos == nil {
-		return
-	}
+// udpSocketLabels lists the udp sockets to read and the socket label of each:
+// "private" for a separate switch-facing socket, "shared" for the one socket
+// that serves both sides (private.ip equal to public.bind), else "public".
+func udpSocketLabels(infos []Listener) ([]netip.AddrPort, map[netip.AddrPort]string) {
 	var want []netip.AddrPort
 	label := map[netip.AddrPort]string{}
-	for _, l := range c.deps.ListenerInfos() {
+	for _, l := range infos {
 		if l.Transport != "udp" {
 			continue
 		}
@@ -343,12 +339,27 @@ func (c *collector) collectUDPSockets(ch chan<- prometheus.Metric) {
 			continue // one series per address; a duplicate would fail the scrape
 		}
 		socket := "public"
-		if l.Private {
+		switch {
+		case l.Private:
 			socket = "private"
+		case l.Shared:
+			socket = "shared"
 		}
 		want = append(want, ap)
 		label[ap] = socket
 	}
+	return want, label
+}
+
+// collectUDPSockets exports the kernel drop count and receive queue of the
+// UDP SIP sockets the edge bound (Deps.ListenerInfos: the public udp
+// listener and the private socket). A socket missing from /proc/net/udp{,6}
+// exports nothing, and so does every socket off Linux.
+func (c *collector) collectUDPSockets(ch chan<- prometheus.Metric) {
+	if c.deps.ListenerInfos == nil {
+		return
+	}
+	want, label := udpSocketLabels(c.deps.ListenerInfos())
 	stats, ok := readUDPSockets(want)
 	if !ok {
 		return

@@ -25,7 +25,7 @@ It is a **stateful SIP proxy**, not a B2BUA, implemented in one package
 |---|---|---|
 | Registered clients: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS (WebRTC) browsers | the public sockets (`edge.listen`, bound on `public.bind`) | REGISTER is proxied to the switch; a public INVITE is admitted only from a live registration |
 | Carriers | the public socket of their transport (UDP, or TCP/TLS: `edge.listen`, or a connection FreeSBC opens to them) | named in `edge.carriers` (directory resolved by `carrierdns.go`) or listed in `edge.carrier_sources`; the switch holds the carrier accounts and uses FreeSBC as its outbound proxy |
-| The switch (FreeSWITCH or Asterisk) | the fixed private socket `private.ip:5060` | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
+| The switch (FreeSWITCH or Asterisk) | the fixed private socket `private.ip:5060`; in the single-IP layout (`private.ip` equal to `public.bind`, behind a 1:1 NAT) that is the public udp listener itself, and the switch is told apart by its source IP | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
 
 If the config has no `edge` section that validates, `config.Parse` fails
 before anything starts; there is no mode in which the process runs without the
@@ -313,11 +313,13 @@ snapshot:
 | `tls` | `public.bind:edge.listen.tls`, certificate from the top-level `tls` | `edge.listen.tls` set |
 | `ws` | `public.bind:edge.listen.ws` | `edge.listen.ws` set |
 | `wss` | `public.bind:edge.listen.wss`, certificate from the top-level `tls` | `edge.listen.wss` set |
-| `udp-private` | `private.ip:5060` (`config.PrivateSIPPort`; not configurable) | always |
+| `udp-private` | `private.ip:5060` (`config.PrivateSIPPort`; not configurable) | always, except in the single-IP layout, where the `udp` socket is the private socket and `udp-private` is not bound |
 
 There are no wildcard binds: validation rejects `0.0.0.0` and `::` for
 `public.ip`, `public.bind` and `private.ip`. Public and private are separate
-sockets on separate addresses, so they have separate port namespaces.
+sockets on separate addresses, so they have separate port namespaces, unless
+`private.ip` equals `public.bind` (single-IP layout, §12.1): then `udp` is the one
+socket and `Server.Run` binds only it, with no private BPF filter.
 
 Both UDP SIP sockets (`udp` and `udp-private`) are opened in `Server.openListener`
 (`edge.go`) and sized right after the bind (`sizeUDPSocket`,
@@ -417,7 +419,7 @@ Every top-level section is restart-only except `shield`. The table is
 
 | Hot (re-read per use) | Restart-only (`config.RestartOnlyChanges` key) |
 |---|---|
-| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`Server.beginDialog`, `invite.go`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs (`Server.sessionLimit`, `invite.go`) | |
+| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`Server.beginDialog`, `invite.go`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs, or half of them in the single-IP layout (`Server.sessionLimit`, `invite.go`) | |
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`Shield.AllowRate`, `shield.go`), re-parsing a rate-limit string only when it changes (`Shield.rateLimit`, `shield.go`) | `public` (`ip`, `bind`) |
 | `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing only when the string changes (`strikeLimit`, `offenders.go`) | |
 | | `private` (`ip`) |
@@ -736,7 +738,7 @@ a carrier (§6).
 | Side | Transports | Trust |
 |---|---|---|
 | Public | `udp`, `tcp`, `tls`, `ws`, `wss`, each on `public.bind` and the port set by `edge.listen` | untrusted; full shield treatment |
-| Private | `udp` only, the one fixed socket `private.ip:5060` (`config.PrivateSIPPort`) | trusted; exempt from the shield |
+| Private | `udp` only, the one fixed socket `private.ip:5060` (`config.PrivateSIPPort`); in the single-IP layout that is the public `udp` socket, and only an `edge.switch` source IP is private | trusted; exempt from the shield |
 
 `side` (`internal/edge/topology.go`) carries `plane`, `transport`, advertised
 IP and port, and `laddr` —
@@ -785,6 +787,21 @@ private UDP socket):
   with a spoofed switch source (issue #90). The filter is a no-op off Linux
   and reads `skb->dev->ifindex`, so VRF, asymmetric routing, tunnels and a
   runtime interface change are dropped (docs/edge.md).
+- The **shared socket** (single-IP layout, `Server.shared`: the private
+  socket address equals the public udp listener's, i.e. `private.ip` equals
+  `public.bind` and `edge.listen.udp` is 5060). One socket serves both
+  sides, so the local address cannot tell them apart and `trusted` adds the
+  source: a UDP read there is `arrPrivate` only if its source IP is an
+  `edge.switch` IP (`fromSwitch`, `topology.fromUpstream`), and every other
+  source is a **public read** in the full sense of the next item (banned
+  check, rate token, malformed scan, admission), not a drop. `trusted`
+  is the only place that returns `arrPrivate`, `accept` checks the source
+  for any non-public arrival again, and a stream read on the same port stays
+  public. No BPF ingress filter is attached (`openListener` applies it to
+  `udp-private` only), because public traffic arrives on the same NIC. This
+  is a trust model change: it rests on the source IP, which a forged
+  datagram reaching the socket carries. The deployment text is
+  [edge.md, "Single-IP host behind a 1:1 NAT"](edge.md#single-ip-host-behind-a-11-nat).
 - Every **public listener** (UDP, TCP, TLS, WS, WSS): accepted unless the source is
   banned (`shield.Shield.DropBanned(addr:port, transport)`: `BannedFrom`,
   which also matches a UDP per-socket ban, plus one
@@ -843,7 +860,8 @@ goroutine, so editing it in place is a data race. The handler receives
 `inbound{src, arr}` (`arr` is `arrPublic` or `arrPrivate`) as its
 third argument, so no handler re-derives the plane.
 
-Trust is therefore keyed on the **local socket alone**. There is no table
+Trust is therefore keyed on the **local socket alone** (with one separate
+private socket; the single-IP layout adds the source IP, see §7.1). There is no table
 of "known switch source addresses": a datagram that reaches a public
 listener from the switch's own address and port — spoofed or not — is a
 public datagram and gets no exemption (issue #10, audit P2-EDG-003 and
@@ -851,7 +869,8 @@ P2-EDG-021). `topology.fromUpstream` (source IP in the switch pool) is
 only the source-IP gate the filter applies on the private socket; it
 decides nothing on its own. The marker's secret is the trust anchor: it
 lives in process memory, is never logged or sent, and a leaked secret would
-let a public sender claim the private socket.
+let a public sender claim the private socket. On the shared socket the
+marker is stamped only for a switch source IP.
 
 The private direction switch every handler uses is `inbound.private` (`edge.go`),
 `arr == arrPrivate`: the request reached the private
@@ -3646,7 +3665,7 @@ spin.
 
 ### 12.1 Bind vs advertised addresses
 
-The topology is two addresses, each written once (`docs/config.md`).
+The topology is two addresses, each written once (`docs/config.md`). They may be one address, `private.ip` equal to `public.bind`, behind a 1:1 NAT: `config.Config.SharedSocket`, `validateSharedSocket` (`validate.go`) and `Server.shared` (`edge.go`) define that single-IP layout. Both sides then use one UDP socket, the two media pools bind the same address over the one `rtp` range (a call takes two pairs, so `sessionLimit` counts half the range), and `Listeners`, `ListenerInfos` and `PortStats` describe one socket.
 
 - **Public side.** Every public socket binds `public.bind` (default
   `public.ip`; it differs only behind 1:1 NAT, where `public.ip` is not a
@@ -3665,6 +3684,12 @@ The topology is two addresses, each written once (`docs/config.md`).
   (`config.PrivateSIPPort`), is both the bind and the advertised address.
   Via, Contact and Record-Route toward the switch name it
   (`buildTopology`, `topology.go`). Private media binds `private.ip` and advertises it.
+  When `private.ip` equals `public.bind` (single-IP layout) this is the same
+  socket as the public udp listener. The sides are still told apart in
+  every comparison that matters, because the advertised IPs differ on the
+  same port: `isSelf`, `isSelfVia`, `sideMatches` (`isPrivateURI`,
+  `isPublicURI`), `isSwitchHost` and the Record-Route pair name `private.ip`
+  toward the switch and `public.ip` toward everyone else.
 - **Startup checks.** `run` fails if `public.bind` or `private.ip` is not
   assigned to a local interface (`CheckLocalAddr`, `edge.go`;
   `localInterface`, `edge.go`, also accepts an IPv4 loopback address the
@@ -3675,7 +3700,10 @@ The topology is two addresses, each written once (`docs/config.md`).
 - **Media.** Two `PlanePool`s share the one `rtp` range: public bound to
   `public.bind`, private bound to `private.ip` (`newMediaPools`, `mediapool.go`). Each
   bind IP has its own port namespace, so they never hand out the same
-  socket. Addresses and range come from the startup snapshot, so `rtp`,
+  socket. With `private.ip` equal to `public.bind` they are one namespace: a
+  bind that fails because the other pool holds the port releases the
+  reservation and the sweep moves on, so a call takes two distinct pairs and
+  the range anchors half as many calls (`sessionLimit` halves). Addresses and range come from the startup snapshot, so `rtp`,
   `public` and `private` are restart-only.
 - **Carriers.** `edge.carriers` names are resolved on the public side only
   (§6). The switch is reached by literal IP only; the edge does no DNS on the
@@ -3754,8 +3782,8 @@ self-signed certificate.
 
 | Assumption | Status |
 |---|---|
-| `public.ip` is the address phones, browsers and carriers reach; `public.bind` and `private.ip` are local addresses | **Enforced at `run`** (`CheckLocalAddr`, `edge.go`; a loopback address passes when the kernel binds it: any 127/8 address on Linux, an `ifconfig lo0 alias` on macOS); validation requires specific IPs (no wildcard) and `private.ip` ≠ `public.bind` |
-| Only the switch speaks on the private socket | **Enforced by the read filter**: the private UDP socket admits only `edge.switch` node IPs and stamps the arrival marker; a datagram from any other source is dropped before parsing (`Server.readFilter`, `edge.go`). A LAN host that is itself a node address is trusted |
+| `public.ip` is the address phones, browsers and carriers reach; `public.bind` and `private.ip` are local addresses | **Enforced at `run`** (`CheckLocalAddr`, `edge.go`; a loopback address passes when the kernel binds it: any 127/8 address on Linux, an `ifconfig lo0 alias` on macOS); validation requires specific IPs (no wildcard) and `private.ip` ≠ `public.bind`, except in the single-IP layout (`public.ip` ≠ `public.bind`, private shared address, udp 5060, private switch, no carrier source over a switch address) |
+| Only the switch speaks on the private socket | **Enforced by the read filter**; in the single-IP layout the shared socket instead treats an `edge.switch` source IP as the switch and every other source as public: the private UDP socket admits only `edge.switch` node IPs and stamps the arrival marker; a datagram from any other source is dropped before parsing (`Server.readFilter`, `edge.go`). A LAN host that is itself a node address is trusted |
 | The private LAN between FreeSBC and the switch is trusted | **Assumed.** SIP to the switch is plain UDP and carries per-call Via/Contact data |
 | Every inbound carrier's signalling IPs are an `edge.carriers` address (literal IP or resolved DNS name) or listed in `edge.carrier_sources` | **Assumed.** An INVITE from any other unregistered public source is dropped silently (§7.5); `edge.carrier_sources` has a width cap (no wider than IPv4 /8 or IPv6 /32) |
 | A carrier name's DNS answer is honest | **Assumed.** The resolved addresses become carrier sources and send targets; there is no DNSSEC |
@@ -3821,7 +3849,7 @@ permanent series per call."
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end` (`dialog.go`; `Metrics.MediaEnded` in `edge/metrics.go`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Counter | — | Linux only: the kernel's `RcvbufErrors` and `InErrors` from the `Udp:` lines of `/proc/net/snmp` plus `Udp6RcvbufErrors` and `Udp6InErrors` from `/proc/net/snmp6`, IPv4 + IPv6 summed, read at scrape time (`readUDPStats`, `udpstats.go`, called from `collector.Collect`, `admin/metrics.go`). The kernel keeps them per network namespace, so they cover every UDP socket in it, not only FreeSBC's, and `InErrors` already includes `RcvbufErrors`. A datagram dropped on a full receive buffer never reaches `freesbc_rtp_packets_rx_total`, so rx/tx 1.0 does not exclude kernel loss; these series do. An absent `snmp6` (IPv6 disabled) leaves IPv4 alone; an unreadable or unparsable `/proc/net/snmp`, or any other OS, exports neither series (no error metric, no log) |
-| `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collector.collectUDPSockets`, `admin/metrics.go`; `readUDPSockets`, `udpstats.go`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
+| `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`, `shared`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collector.collectUDPSockets`, `admin/metrics.go`; `readUDPSockets`, `udpstats.go`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket, or the one `shared` socket in the single-IP layout), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
 | `freesbc_media_port_allocation_failure_total` | Counter | — | edge `Server.rejectMedia` (`invite.go`) on `ErrPortsExhausted` |
 | `freesbc_webrtc_ice_failure_total` | Counter | — | edge `WebRTCFailure`: every leg failure that is not a DTLS one (`ErrICEFailed`, `ErrWebRTCNotReady`, a leg closed before it established) |
 | `freesbc_webrtc_dtls_failure_total` | Counter | — | edge, `ErrDTLSHandshake` and `ErrFingerprintMismatch` |
@@ -3897,7 +3925,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/login` | POST (else 405 + `Allow: POST`) | **none** (it is the sign-in) | JSON `{"password"}`, at most 4 KiB; the user is always `admin`. Behind `guardMW` (Host and Origin), not `requireAuth` (`Server.handleLogin`, `admin/session.go`). Success is **204** with `Set-Cookie: freesbc_session` (§13.4); a wrong password is a generic 401 with no `WWW-Authenticate`; over the limiter's budget is 429; a malformed or oversized body is 400 and is not counted as a failure |
 | `/api/logout` | POST (else 405 + `Allow: POST`) | **none** (idempotent) | behind `guardMW`; deletes the session the cookie names, if any, and always clears the cookie (`Max-Age=0`); always **204** (`Server.handleLogout`, `admin/session.go`). A live session dropped is a `logout` event (§13.5) |
 | `/metrics` | any | Basic | Prometheus text |
-| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…],"listener_info":[{"transport","bind","advertised","private"}]}`; `listener_info` pairs each bound socket with the address FreeSBC advertises for it (`public.ip` and the `edge.advertise` port, else the bound port, on a public listener, equal to `bind` outside NAT; `Deps.ListenerInfos`); `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
+| `/api/status` | any | Basic | `{"version","uptime_seconds","active_calls","ports":{"in_use","total"},"listeners":[…],"listener_info":[{"transport","bind","advertised","private","shared"}]}`; `listener_info` pairs each bound socket with the address FreeSBC advertises for it (`public.ip` and the `edge.advertise` port, else the bound port, on a public listener, equal to `bind` outside NAT; `Deps.ListenerInfos`); `listeners` are the sockets the edge bound, from its startup snapshot (`Deps.Listeners`): `udp://`, `tcp://`, `tls://`, `ws://`, `wss://` on `public.bind`, then `udp://<private.ip>:5060 (private)`. In the single-IP layout there is no separate private entry: the udp listener reads `(public and private)` and its `listener_info` row has `shared: true`, `private: false`. It also carries `"reload":{"last_ok","restart_required","last_error","last_error_at"}` (`Deps.Reload`, §4.4): the times are RFC 3339 UTC and null until they apply (`last_ok` before the first reload; `last_error` and `last_error_at` while the last reload has not failed), `restart_required` is always an array |
 | `/api/calls` | any | Basic | array of `{"id","call_id","from","to","started" (RFC 3339),"duration_seconds"}`; always an array. Confirmed edge dialogs only, the set `active_calls` counts: `id` is `edge:<Call-ID>;<caller tag>`; `from`/`to` are `edge:public` / `edge:private` for a client call, and `carrier:<name>` / `switch:<ip:port>` for a carrier call, caller first (`dialogTable.calls`, `dialog.go`) |
 | `/api/tls` | GET (else 405 + `Allow: GET`) | Basic | `{"loaded": false}` when no listener loaded the top-level `tls` pair; else `{"loaded": true, "subject" (CN), "sans", "issuer", "not_before", "not_after" (RFC 3339 UTC), "key_type", "key_size", "key_curve", "fingerprint_sha256", "cert_file", "key_file", "loaded_at", "listeners" (`tls`/`wss` from the edge, `admin`), "days_to_expiry" (whole days, truncated toward zero, negative once expired, 0 within a day), "expired", "expiring_soon" (under 30 days, not expired), "disk_differs", "disk_error"}` (`handleTLS`, `tlscert.go`). The leaf is `Certificate[0]`, kept at load by `edge.noteTLSLeaf` (`Server.TLSCert`, wired as `Deps.TLSCert`) and by `Run` for remote admin HTTPS; the edge's wins, as both read the same pair. `disk_differs` re-reads the first certificate of the cert file on each request, so it is always current; the health conditions and the gauge use a separate cache refreshed every 10 minutes (`tlsDiskInterval`). Never the key or PEM |
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`Server.handleRegistrations`, `state.go`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go`) under its read lock. No Contact, token or Call-ID |
@@ -4227,7 +4255,8 @@ parser, whether or not it would have parsed. The filter never returns an error, 
 sipgo treats a filter error as fatal to the whole read loop.
 
 **Arrival marker.** Trust is keyed on the local socket alone, never on a
-source address. The filter stamps each request that reached the private socket
+source address (except on the single-IP layout's shared socket, where the
+source IP of a datagram that reached the socket decides, §7.1). The filter stamps each request that reached the private socket
 from a switch IP with `X-FreeSBC-Arrival: <per-process 128-bit secret>;private`
 in a new byte slice (`arrivalMarker.stamp`, `arrival.go`). `Server.guard` (`edge.go`) calls
 `arrivalMarker.take` (`arrival.go`) first, for every request on every transport: the
@@ -4544,6 +4573,11 @@ be used to read an environment variable.
 
 ### 14.2 Deployment assumptions (not all enforced by the code)
 
+- **In the single-IP layout the switch is identified by its source IP.** A
+  forged switch source reaching udp/5060 takes the trusted path and skips the
+  shield, and FreeSBC does not defend against this; ingress filtering is out
+  of scope. The private-plane media ports are on the forwarded range too,
+  latched strictly on the switch's signalled IP.
 - **The private socket is trusted.** The switch is exempt from the shield
   entirely on `private.ip:5060`, and its requests are not rate limited. The
   socket must not be reachable from anywhere else. Trust is decided by the
