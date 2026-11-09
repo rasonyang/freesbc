@@ -61,8 +61,8 @@ edge:
 
   carriers:                  # where the switch may send requests (allowlist);
     carrier-a: sip.carrier-a.com      # must equal the switch gateway's host[:port]
-    mobile:    223.76.90.4:16060      # name is stamped as X-FreeSBC-Carrier
-    fixed:     223.76.90.5:16060      #   on inbound calls from that carrier
+    mobile:    198.51.100.10:16060    # name is stamped as X-FreeSBC-Carrier
+    fixed:     198.51.100.11:16060    #   on inbound calls from that carrier
     secure:                           # mapping form: transport udp (default) | tcp | tls
       host: sip.secure-carrier.com    # tls: SRV _sips._tcp, port 5061; the certificate must name this host
       transport: tls

@@ -89,7 +89,7 @@ edge:
   listen: { udp: 5060, ws: 8080, wss: 443 }
   carriers:
     carrier-a: sip.carrier-a.com
-    mobile: 223.76.90.4:16060
+    mobile: 198.51.100.10:16060
     v6: "[2001:db8::1]:5070"
   carrier_sources: [198.51.100.20, 203.0.113.0/28]
 shield: { rate_limit: 5/m per_ip, carrier_rate_limit: 9/s per_ip, ban: 30m }

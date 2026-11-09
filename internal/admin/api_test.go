@@ -49,7 +49,7 @@ func TestAPIStatusListenerInfo(t *testing.T) {
 	deps := emptyDeps()
 	deps.Listeners = func() []string { return []string{"udp://172.20.0.4:5060"} }
 	deps.ListenerInfos = func() []Listener {
-		return []Listener{{Transport: "udp", Bind: "172.20.0.4:5060", Advertised: "223.76.90.4:5060"}}
+		return []Listener{{Transport: "udp", Bind: "172.20.0.4:5060", Advertised: "203.0.113.7:5060"}}
 	}
 	var st struct {
 		Listeners []string `json:"listeners"`
@@ -61,7 +61,7 @@ func TestAPIStatusListenerInfo(t *testing.T) {
 	if err := json.Unmarshal(authGET(t, newTestServer(t, deps), "/api/status"), &st); err != nil {
 		t.Fatal(err)
 	}
-	if len(st.Listeners) != 1 || len(st.Info) != 1 || st.Info[0].Advertised != "223.76.90.4:5060" || st.Info[0].Bind != "172.20.0.4:5060" {
+	if len(st.Listeners) != 1 || len(st.Info) != 1 || st.Info[0].Advertised != "203.0.113.7:5060" || st.Info[0].Bind != "172.20.0.4:5060" {
 		t.Errorf("status = %+v", st)
 	}
 	var none struct {

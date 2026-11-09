@@ -101,7 +101,7 @@ func TestAdvertiseValidateAccepts(t *testing.T) {
 func TestNATChecklistWithAdvertise(t *testing.T) {
 	c := mustParse(t, replace(t, natYAML, "listen: { udp: 16060, tcp: 16060, tls: 16061, ws: 8080, wss: 7443 }",
 		"listen: { udp: 5060, tcp: 5060, tls: 5061, ws: 8080, wss: 7443 }\n  advertise: { udp: 16060, tcp: 16060, tls: 16061 }"))
-	want := `NAT mode: advertised public endpoint = 223.76.90.4 (udp/16060->5060 tcp/16060->5060 tcp/16061->5061 (tls) tcp/8080 (ws) tcp/7443 (wss) udp/16800-16900 (rtp))
+	want := `NAT mode: advertised public endpoint = 203.0.113.7 (udp/16060->5060 tcp/16060->5060 tcp/16061->5061 (tls) tcp/8080 (ws) tcp/7443 (wss) udp/16800-16900 (rtp))
 REQUIRED forwards -> 172.20.0.4 (external->internal where shown, else the same port number; the rtp range is never translated):
   udp/16060->5060
   tcp/16060->5060
