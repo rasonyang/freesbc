@@ -30,6 +30,11 @@ import (
 // address lives on the slave, so switch traffic over a VRF is dropped.
 // Switch traffic must arrive on the interface that owns private.ip, or on
 // loopback; docs/edge.md states the requirement and the known limitations.
+//
+// The filter belongs to a private socket of its own and is NOT attached in the
+// single-IP layout (Server.shared): there the one socket also receives public
+// traffic on the same NIC, so an ingress-interface rule could not separate the
+// sides, and the switch is told apart by its source IP in readFilter instead.
 
 // privateSocketFilter is a variable so the wiring test can observe that
 // openListener asks for the filter on udp-private and nowhere else; see the

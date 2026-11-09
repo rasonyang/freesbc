@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 )
 
@@ -30,14 +31,19 @@ func (f NATForward) String() string {
 
 // NATMode reports whether FreeSBC sits behind NAT: the advertised public.ip is
 // not the address public sockets bind (1:1 NAT), or edge.advertise names a
-// port other than a listener's own (port translation).
+// port other than a listener's own (port translation). The single-IP layout
+// (SharedSocket) is always NAT mode: it requires public.ip to differ from
+// public.bind. NATMode alone does not say it: it is also true for port
+// translation by itself.
 func (c *Config) NATMode() bool { return c.PublicBind() != c.PublicIP() || c.PortTranslated() }
 
 // NATForwards lists every public port that must be reachable from clients:
 // each configured edge.listen socket (by its advertised port, with the
 // listen port as To when edge.advertise translates it), then the rtp range
 // over UDP, which is never translated. It is nil outside NAT mode. The admin
-// API and the private socket are not here: neither binds on public.bind.
+// API and a separate private socket are not here: neither binds on
+// public.bind. With a shared socket (SharedSocket) the udp entry is that
+// socket, which the switch uses too.
 func (c *Config) NATForwards() []NATForward {
 	if !c.NATMode() {
 		return nil
@@ -86,5 +92,32 @@ func (c *Config) NATChecklist() string {
 	}
 	b.WriteString("in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:\n")
 	b.WriteString("these ports MUST be reachable from clients.\n")
+	b.WriteString(c.SharedSocketNote())
+	return b.String()
+}
+
+// SharedSocketNote is the text `check`, `run` and `init` add when one UDP
+// socket serves both sides (SharedSocket). It is empty otherwise, and ends
+// with a newline when not. It states facts only: one socket, the switch
+// identified by its source IP, the forwards.
+func (c *Config) SharedSocketNote() string {
+	if !c.SharedSocket() {
+		return ""
+	}
+	var sw []string
+	seen := map[netip.Addr]bool{}
+	for _, ap := range c.Switches() {
+		if !seen[ap.Addr()] {
+			seen[ap.Addr()] = true
+			sw = append(sw, ap.Addr().String())
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "single-IP layout: private.ip and public.bind are both %s, so one UDP socket (%s) serves both sides.\n",
+		c.Public.Bind, c.PrivateAddr())
+	fmt.Fprintf(&b, "the switch is identified by its source IP (%s), not by the socket it reaches: a datagram from that address is trusted and skips the shield.\n",
+		strings.Join(sw, ", "))
+	fmt.Fprintf(&b, "REQUIRED forwards: udp/%d and the rtp range %d-%d to %s (listed above).\n",
+		PrivateSIPPort, c.RTP.Min, c.RTP.Max, c.Public.Bind)
 	return b.String()
 }

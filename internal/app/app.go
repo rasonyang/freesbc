@@ -74,6 +74,19 @@ func Run(ctx context.Context, opts Options) error {
 			"advertised", cfg.Public.IP, "forward_to", cfg.Public.Bind, "ports", ports)
 	}
 
+	if cfg.SharedSocket() {
+		// Said once, at startup: private.ip equals public.bind, so one UDP
+		// socket serves both sides and the switch is identified by its
+		// source IP (docs/edge.md, "Single-IP host behind a 1:1 NAT").
+		sw := make([]string, 0, len(cfg.Switches()))
+		for _, ap := range cfg.Switches() {
+			sw = append(sw, ap.Addr().String())
+		}
+		log.Warn("single-IP layout: one UDP socket serves both sides, and the switch is identified by its source IP, so a datagram from that address is trusted and skips the shield",
+			"socket", cfg.PrivateAddr().String(), "switch_sources", sw,
+			"forward", fmt.Sprintf("udp/%d and rtp %d-%d", config.PrivateSIPPort, cfg.RTP.Min, cfg.RTP.Max))
+	}
+
 	// The edge: public SIP/UDP + WS/WSS toward phones, browsers and
 	// carriers, the switch behind it, media anchored through the SBC.
 	edgeOpts := append([]edge.Option(nil), testHookEdgeOptions...)
@@ -218,7 +231,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 		ListenerInfos: func() []admin.Listener {
 			out := []admin.Listener{}
 			for _, l := range edgeSrv.ListenerInfos() {
-				out = append(out, admin.Listener{Transport: l.Transport, Bind: l.Bind, Advertised: l.Advertised, Private: l.Private})
+				out = append(out, admin.Listener{Transport: l.Transport, Bind: l.Bind, Advertised: l.Advertised, Private: l.Private, Shared: l.Shared})
 			}
 			return out
 		},

@@ -167,6 +167,11 @@ type harness struct {
 // non-local address, because the real private socket is overridden to a
 // loopback port by WithPrivateAddr (the test seam), while validation still
 // wants private.ip distinct from public.bind.
+//
+// The single-IP layout is reached by the other direction of the same seam:
+// WithPrivateAddr set to the public udp listener makes Server.shared true
+// (startHarnessShared, sharedsocket_test.go), with the fake switch on
+// 127.0.0.2 so its datagrams have a source IP of their own.
 const harnessPrivatePlaceholder = "192.0.2.250"
 
 // harnessCarrierSources is the carrier_sources of the shared fixtures (see
@@ -402,10 +407,10 @@ func (f *fakeSwitch) callAsync(t *testing.T, ruri sip.Uri, dest, body string) (*
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
 	req.SetBody([]byte(body))
@@ -562,6 +567,11 @@ type fakeSwitch struct {
 	// registerExtra are headers added to every REGISTER response the
 	// switch sends (Server, Path...). Guarded by mu.
 	registerExtra []sip.Header
+
+	// routeDest, when set, replaces the destination inDialog takes from the
+	// top Route. The shared-socket carrier test needs it: public.ip is not a
+	// local address there, so the carrier's route to it cannot be sent to.
+	routeDest string
 
 	conn   *net.UDPConn
 	cancel context.CancelFunc
@@ -811,7 +821,7 @@ func (f *fakeSwitch) onUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	}
 	res := sip.NewResponseFromRequest(req, 200, "OK", []byte(f.answerSDP(req)))
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	_ = tx.Respond(res)
 }
 
@@ -948,7 +958,7 @@ func (f *fakeSwitch) onInvite(req *sip.Request, tx sip.ServerTransaction) {
 	_ = tx.Respond(sip.NewResponseFromRequest(req, 180, "Ringing", nil))
 	res := sip.NewResponseFromRequest(req, 200, "OK", []byte(f.answerSDP(req)))
 	res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
-	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	_ = tx.Respond(res)
 }
 
@@ -971,8 +981,9 @@ func (f *fakeSwitch) answerSDP(req *sip.Request) string {
 		fmts += " " + dtmf
 		attrs += fmt.Sprintf("a=rtpmap:%s telephone-event/8000\r\na=fmtp:%s 0-15\r\n", dtmf, dtmf)
 	}
-	return fmt.Sprintf("v=0\r\no=FreeSWITCH 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
-		"m=audio %d RTP/AVP %s\r\n%sa=sendrecv\r\n", f.rtpPort, fmts, attrs)
+	host := hostOf(f.addr)
+	return fmt.Sprintf("v=0\r\no=FreeSWITCH 1 1 IN IP4 %s\r\ns=-\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
+		"m=audio %d RTP/AVP %s\r\n%sa=sendrecv\r\n", host, host, f.rtpPort, fmts, attrs)
 }
 
 func portOf(addr string) int {
@@ -1035,10 +1046,10 @@ func (f *fakeSwitch) callRequest(ruri sip.Uri, dest, body string, extra ...sip.H
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
 	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
 	for _, h := range extra {
@@ -1081,7 +1092,7 @@ func (f *fakeSwitch) inDialog(t *testing.T, method sip.RequestMethod, invite *si
 	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: method})
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: "127.0.0.1", Port: portOf(f.addr)}})
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "fs", Host: hostOf(f.addr), Port: portOf(f.addr)}})
 	for _, h := range invite.GetHeaders("Record-Route") {
 		rr, ok := h.(*sip.RecordRouteHeader)
 		if !ok {
@@ -1090,12 +1101,15 @@ func (f *fakeSwitch) inDialog(t *testing.T, method sip.RequestMethod, invite *si
 		req.AppendHeader(&sip.RouteHeader{Address: rr.Address})
 	}
 	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
-		Host: "127.0.0.1", Port: portOf(f.addr), Params: sip.NewParams()}
+		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
 	via.Params.Add("branch", sip.GenerateBranchN(16))
 	req.PrependHeader(via)
 
 	// Route to the topmost Route value, as a loose router does.
 	dest := f.topRouteDest(t, req)
+	if f.routeDest != "" {
+		dest = f.routeDest
+	}
 	req.SetTransport("UDP")
 	req.SetDestination(dest)
 	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}

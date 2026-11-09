@@ -38,11 +38,15 @@ func reloadResponse(st config.ReloadStatus) reloadBody {
 }
 
 // Listener is one bound SIP socket and the address advertised for it.
+// Private marks the separate switch-facing socket; Shared marks the one udp
+// socket that serves both sides when private.ip equals public.bind, in which
+// case no Private listener exists.
 type Listener struct {
 	Transport  string `json:"transport"`
 	Bind       string `json:"bind"`
 	Advertised string `json:"advertised"`
 	Private    bool   `json:"private"`
+	Shared     bool   `json:"shared"`
 }
 
 // handleStatus reports process/service-level status: version, uptime, active

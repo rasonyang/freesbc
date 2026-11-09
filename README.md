@@ -67,7 +67,7 @@ Method, all results, sizing and which figures are lower bounds: [docs/performanc
 - **Carriers.** The switch owns carrier accounts and failover and uses FreeSBC as its outbound proxy to carriers listed by IP or DNS (SRV/A/AAAA, cached), with deterministic carrier registration tokens; inbound carrier calls reach the switch's carrier port tagged `X-FreeSBC-Carrier`.
 - **Media.** Every stream is anchored on FreeSBC ports, with hardened first-packet latching, a silence watchdog and no transcoding; browser legs (ICE-Lite, DTLS-SRTP) are relayed to plain RTP.
 - **Topology hiding.** FreeSBC builds every SDP itself and hides the switch from every public leg, but the Call-ID and NOTIFY and MESSAGE bodies are the switch's own text: see the [switch-side requirements](docs/edge.md#switch-side-requirements).
-- **Trust.** Only the private socket is trusted and exempt from the shield, so keep it unreachable from anywhere else; bans live in memory and FreeSBC touches no kernel firewall state.
+- **Trust.** Only the private socket is trusted and exempt from the shield, so keep it unreachable from anywhere else; bans live in memory and FreeSBC touches no kernel firewall state. A host with a single address behind a 1:1 NAT can use one UDP socket for both sides: the switch is then identified by its source IP, a forged switch source reaching udp/5060 takes the trusted path and skips the shield, and FreeSBC does not defend against this ([Single-IP host behind a 1:1 NAT](docs/edge.md#single-ip-host-behind-a-11-nat)). A second address for the switch side remains the stronger layout.
 
 Details: [`docs/edge.md`](docs/edge.md) (behaviour, switch-side requirements, limitations) and [`docs/design.md`](docs/design.md).
 

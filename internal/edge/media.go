@@ -232,9 +232,16 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 }
 
 // allocateRTP builds the RTP↔RTP session for a plain SIP phone: side A in
-// the public plane, side B in the private one. src is the IP the phone's
-// SIP came from; pin (a registered client, not a carrier) sends its early
-// media to src rather than to the address its SDP names.
+// the public plane, side B in the private one.
+//
+// With the shared socket (single-IP layout) both pools bind one address over
+// the one range, so a call takes two pairs from it and each pool's sweep moves
+// on past a port the other holds; sessionLimit counts half the range so
+// overload is refused before ports run out.
+//
+// src is the IP the phone's SIP came from; pin (a registered client, not a
+// carrier) sends its early media to src rather than to the address its SDP
+// names.
 func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy, pin bool) (*mediaSession, error) {
 	if pol == srtpImpossible {
 		return nil, errSDESInsecure

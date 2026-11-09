@@ -49,6 +49,14 @@ type Server struct {
 	// privAddr is the private SIP socket: private.ip:5060, unless a test
 	// overrode it with WithPrivateAddr. Written once in New.
 	privAddr netip.AddrPort
+	// shared is true when the private socket IS the public udp listener
+	// (the single-IP layout: private.ip equals public.bind, one socket at
+	// private.ip:5060). Run then binds that one socket, with no private
+	// BPF filter, and the read filter tells the two sides apart by the
+	// source IP alone (trusted). It is derived from the bound addresses, so
+	// a test that points the private socket at the public one gets the mode
+	// too. Written once in New.
+	shared bool
 
 	topo *topology
 
@@ -252,6 +260,8 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		priv = o.privateAddr
 	}
 	topo := buildTopology(cfg, priv)
+	shared := cfg.Edge.Listen.UDP != 0 &&
+		netip.AddrPortFrom(cfg.PublicBind().Unmap(), uint16(cfg.Edge.Listen.UDP)) == netip.AddrPortFrom(priv.Addr().Unmap(), priv.Port())
 	marker, err := newArrivalMarker()
 	if err != nil {
 		return nil, err
@@ -261,6 +271,9 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 	if o.hep != nil {
 		mirror = &hepMirror{sender: o.hep, redact: cfg.HEPRedact(), bind: cfg.PublicBind(), pub: cfg.PublicIP(),
 			advPorts: hepAdvPorts(cfg)}
+		if shared {
+			mirror.switchIPs = topo.upstreamIPs()
+		}
 		installHEPTracer()
 	}
 	s := &Server{
@@ -268,6 +281,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		store:            store,
 		boot:             cfg,
 		privAddr:         priv,
+		shared:           shared,
 		log:              slog.New(newRedactHandler(log.Handler())).With("component", "proxy"),
 		topo:             topo,
 		carriers:         newCarrierDirectory(cfg, log.With("component", "carriers")),
@@ -393,10 +407,16 @@ func (s *Server) DrainState() (draining bool, since time.Time) { return s.drain.
 func (s *Server) Calls() []CallRecord { return s.dialogs.calls() }
 
 // PortStats is the RTP port usage of the public and private media pools
-// together: pairs allocated and pairs the two ranges hold.
+// together: pairs allocated and pairs the two ranges hold. With a shared
+// socket both pools bind the one address over the one range, so the range
+// is counted once: a call still holds two pairs, but the total is the
+// range's own pair count.
 func (s *Server) PortStats() (inUse, total int) {
 	pu, pt := s.pubPool.Stats()
 	qu, qt := s.privPool.Stats()
+	if s.shared {
+		return pu + qu, pt
+	}
 	return pu + qu, pt + qt
 }
 
@@ -441,9 +461,16 @@ func (s *Server) Offenders(limit int) (top []shield.OffenderInfo, total int) {
 func (s *Server) Listeners() []string {
 	var out []string
 	for _, l := range s.publicListeners() {
-		out = append(out, l.transport+"://"+l.addr)
+		name := l.transport + "://" + l.addr
+		if s.shared && l.transport == "udp" {
+			// The private socket is this listener: one socket, listed once.
+			name += " (public and private)"
+		}
+		out = append(out, name)
 	}
-	out = append(out, "udp://"+s.privAddr.String()+" (private)")
+	if !s.shared {
+		out = append(out, "udp://"+s.privAddr.String()+" (private)")
+	}
 	return out
 }
 
@@ -484,20 +511,28 @@ func (s *Server) TLSCert() (leaf *x509.Certificate, loadedAt time.Time, users []
 // ListenerInfo is one bound socket and the address FreeSBC advertises for
 // it. They differ on a public listener behind NAT (public.bind against
 // public.ip, the edge.listen port against edge.advertise's); the private
-// socket advertises its bind.
+// socket advertises its bind. Shared marks the one udp socket that serves
+// both sides in the single-IP layout: it is not Private (it is a public
+// listener, and the only udp socket), and it advertises the public address.
 type ListenerInfo struct {
 	Transport  string
 	Bind       string
 	Advertised string
 	Private    bool
+	Shared     bool
 }
 
 // ListenerInfos is Listeners with the advertised address beside each bound
-// one, from the startup snapshot.
+// one, from the startup snapshot. With a shared socket there is no separate
+// private entry: the udp listener carries Shared instead.
 func (s *Server) ListenerInfos() []ListenerInfo {
 	var out []ListenerInfo
 	for _, l := range s.publicListeners() {
-		out = append(out, ListenerInfo{Transport: l.transport, Bind: l.addr, Advertised: s.advertisedAddr(l)})
+		out = append(out, ListenerInfo{Transport: l.transport, Bind: l.addr, Advertised: s.advertisedAddr(l),
+			Shared: s.shared && l.transport == "udp"})
+	}
+	if s.shared {
+		return out
 	}
 	return append(out, ListenerInfo{Transport: "udp", Bind: s.privAddr.String(), Advertised: s.privAddr.String(), Private: true})
 }
@@ -688,7 +723,13 @@ func (s *Server) Run(ctx context.Context) error {
 	listenCtx, listenCancel := context.WithCancel(context.Background())
 	defer listenCancel()
 
-	listeners := append(s.publicListeners(), bound{"udp-private", s.privAddr.String()})
+	// With a shared socket the public udp listener is the private socket
+	// too: one bind, and no private BPF filter (openListener), because
+	// public traffic arrives on the same NIC.
+	listeners := s.publicListeners()
+	if !s.shared {
+		listeners = append(listeners, bound{"udp-private", s.privAddr.String()})
+	}
 
 	// The tracer finds this server's outbound sockets by local address. Every
 	// bound socket is registered before it can send, and removed when Run
@@ -758,6 +799,9 @@ func (s *Server) Run(ctx context.Context) error {
 		"advertised", advertised,
 		"bind", binds,
 		"private", s.privAddr.String(),
+		// True when the private socket is the public udp listener: the
+		// switch is then told apart by its source IP (readFilter).
+		"shared_socket", s.shared,
 		"switches", len(s.topo.upstreamNames),
 		"switch_nodes", strings.Join(s.topo.upstreamNames, ","),
 		// The INVITE admission posture (admission.go): edge.carrier_sources
@@ -944,6 +988,11 @@ func (s *Server) openListener(transport, addr string) (listener, error) {
 			return l, err
 		}
 		lc := net.ListenConfig{}
+		// Only a separate private socket gets the ingress filter. The shared
+		// socket (transport "udp") never does: public traffic arrives on the
+		// same NIC, so filtering to the interface that owns the address
+		// would filter nothing, and a switch on another interface or on
+		// loopback would be dropped.
 		if transport == "udp-private" {
 			// Filter the trusted socket's receive path down to the
 			// interface that owns private.ip. Linux's weak host model
@@ -1027,39 +1076,64 @@ const maxMessageSize = fsip.MaxReadSize
 // Trust is keyed on the local socket alone: there is no table of "known
 // FreeSWITCH source addresses", so a datagram that reaches a public
 // listener from FreeSWITCH's own address and port is a public datagram.
+//
+// The one exception is the shared socket (Server.shared, the single-IP
+// layout), where the private socket is the public udp listener and the local
+// socket cannot tell the sides apart. A datagram there is trusted if and only
+// if its source IP is an edge.switch address; every other source is a public
+// read in full: banned-source check, rate token, malformed scan and
+// admission, exactly as on any public listener. trusted is the only place
+// that returns arrPrivate, and in shared mode it does so only after that
+// source check, so no path, including the string fallback, trusts a
+// non-switch source. A forged switch source IP that reaches the socket is
+// believed, and FreeSBC does not defend against it (docs/edge.md,
+// "Single-IP host behind a 1:1 NAT").
 func (s *Server) readFilter() sip.TransportReadFilter {
 	privateAddr := s.privAddr.String()
-	// trusted names the trusted socket a read arrived on, or arrPublic. The
-	// trusted socket is UDP only; a stream read on the same port number
-	// is a public client in a different port space. It is
-	// fsip.SameListener against the private bind, without the string round
-	// trip for the *net.UDPAddr every UDP read carries.
-	trusted := func(info sip.TransportReadProps) arrival {
+	// onPrivateSocket reports whether a read arrived on the private bind.
+	// That socket is UDP only; a stream read on the same port number is a
+	// public client in a different port space. It is fsip.SameListener
+	// against the private bind, without the string round trip for the
+	// *net.UDPAddr every UDP read carries. It says nothing about the source.
+	onPrivateSocket := func(info sip.TransportReadProps) bool {
 		if info.LocalAddr == nil || !strings.EqualFold(info.Transport, "udp") {
-			return arrPublic
+			return false
 		}
 		if ap, ok := udpAddrPort(info.LocalAddr); ok && s.privAddr.IsValid() {
-			if sameListenerAddr(ap, s.privAddr) {
-				return arrPrivate
-			}
+			return sameListenerAddr(ap, s.privAddr)
+		}
+		return fsip.SameListener(info.Transport, info.LocalAddr.String(), "udp", privateAddr)
+	}
+	// fromSwitch reports whether the read's source IP is an edge.switch node.
+	fromSwitch := func(info sip.TransportReadProps) bool {
+		if ap, ok := udpAddrPort(info.RemoteAddr); ok {
+			return s.topo.fromUpstream(ap.Addr())
+		}
+		ip, ok := fsip.AddrOf(info.RemoteAddr)
+		return ok && s.topo.fromUpstream(ip)
+	}
+	// trusted names the trusted socket a read arrived on, or arrPublic.
+	// With a separate private socket the socket decides, and accept then
+	// drops a non-switch source on it. With the shared socket the socket is
+	// not enough: the source must be a switch too, else the read is public.
+	trusted := func(info sip.TransportReadProps) arrival {
+		if !onPrivateSocket(info) {
 			return arrPublic
 		}
-		if fsip.SameListener(info.Transport, info.LocalAddr.String(), "udp", privateAddr) {
-			return arrPrivate
+		if s.shared && !fromSwitch(info) {
+			return arrPublic
 		}
-		return arrPublic
+		return arrPrivate
 	}
 	// accept is the trust decision for a read under the size cap; a is
 	// trusted(info).
 	accept := func(info sip.TransportReadProps, a arrival) bool {
 		if a != arrPublic {
 			// Only an upstream IP may speak on a trusted socket. Anything
-			// else is misrouted or hostile.
-			if ap, ok := udpAddrPort(info.RemoteAddr); ok {
-				return s.topo.fromUpstream(ap.Addr())
-			}
-			ip, ok := fsip.AddrOf(info.RemoteAddr)
-			return ok && s.topo.fromUpstream(ip)
+			// else is misrouted or hostile. (On the shared socket trusted
+			// has checked this already; it is asked again here so that no
+			// arrival other than arrPublic can pass without it.)
+			return fromSwitch(info)
 		}
 		// A public read. A source the shield has banned gets nothing back
 		// at all: guard would drop its requests silently, but sipgo answers
