@@ -36,39 +36,40 @@ type collector struct {
 
 	// Edge-proxy plane (nil-safe: Deps.Proxy is nil when no stats
 	// source is wired, and Collect skips the whole block then).
-	proxyRegs       *prometheus.Desc
-	proxySubs       *prometheus.Desc
-	proxyDialogs    *prometheus.Desc
-	proxyMedia      *prometheus.Desc
-	proxyWebRTC     *prometheus.Desc
-	proxyRegTotal   *prometheus.Desc
-	proxyRegFailure *prometheus.Desc
-	proxyRegAuth    *prometheus.Desc
-	proxyRegUnans   *prometheus.Desc
-	proxyRegBrk     *prometheus.Desc
-	proxyReqIn      *prometheus.Desc
-	proxyResOut     *prometheus.Desc
-	proxyRTPPktRx   *prometheus.Desc
-	proxyRTPPktTx   *prometheus.Desc
-	proxyRTPByteRx  *prometheus.Desc
-	proxyRTPByteTx  *prometheus.Desc
-	proxyPortFail   *prometheus.Desc
-	proxyICEFail    *prometheus.Desc
-	proxyDTLSFail   *prometheus.Desc
-	proxyPanics     *prometheus.Desc
-	proxySessions   *prometheus.Desc
-	proxyDraining   *prometheus.Desc
-	proxyAdmission  *prometheus.Desc
-	proxyCallsEnded *prometheus.Desc
-	proxyAckMissed  *prometheus.Desc
-	proxyRejects    *prometheus.Desc
-	proxyBindRej    *prometheus.Desc
-	proxyParseFail  *prometheus.Desc
-	proxyStreams    *prometheus.Desc
-	proxyStreamRef  *prometheus.Desc
-	proxyStreamCls  *prometheus.Desc
-	proxyCarrierReq *prometheus.Desc
-	proxyCarrierReg *prometheus.Desc
+	proxyRegs        *prometheus.Desc
+	proxySubs        *prometheus.Desc
+	proxyDialogs     *prometheus.Desc
+	proxyMedia       *prometheus.Desc
+	proxyWebRTC      *prometheus.Desc
+	proxyRegTotal    *prometheus.Desc
+	proxyRegFailure  *prometheus.Desc
+	proxyRegAuth     *prometheus.Desc
+	proxyRegUnans    *prometheus.Desc
+	proxyRegBrk      *prometheus.Desc
+	proxyReqIn       *prometheus.Desc
+	proxyResOut      *prometheus.Desc
+	proxyRTPPktRx    *prometheus.Desc
+	proxyRTPPktTx    *prometheus.Desc
+	proxyRTPByteRx   *prometheus.Desc
+	proxyRTPByteTx   *prometheus.Desc
+	proxyPortFail    *prometheus.Desc
+	proxyICEFail     *prometheus.Desc
+	proxyDTLSFail    *prometheus.Desc
+	proxyPanics      *prometheus.Desc
+	proxySessions    *prometheus.Desc
+	proxyDraining    *prometheus.Desc
+	proxyAdmission   *prometheus.Desc
+	proxyCallsEnded  *prometheus.Desc
+	proxyAckMissed   *prometheus.Desc
+	proxyRejects     *prometheus.Desc
+	proxyBindRej     *prometheus.Desc
+	proxyParseFail   *prometheus.Desc
+	proxyUpgradeFail *prometheus.Desc
+	proxyStreams     *prometheus.Desc
+	proxyStreamRef   *prometheus.Desc
+	proxyStreamCls   *prometheus.Desc
+	proxyCarrierReq  *prometheus.Desc
+	proxyCarrierReg  *prometheus.Desc
 
 	hepSent    *prometheus.Desc
 	hepDropped *prometheus.Desc
@@ -122,25 +123,26 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		proxyRegBrk:     prometheus.NewDesc("freesbc_edge_register_breaker_rejects_total", "REGISTERs answered 503 locally because every switch node's REGISTER breaker was open.", nil, nil),
 		// method and transport are bounded sets; a Call-ID label here would
 		// create a permanent series per call.
-		proxyReqIn:      prometheus.NewDesc("freesbc_sip_requests_total", "SIP requests received by the edge proxy.", []string{"method", "transport"}, nil),
-		proxyResOut:     prometheus.NewDesc("freesbc_sip_responses_total", "SIP responses sent by the edge proxy, by status class.", []string{"class"}, nil),
-		proxyRTPPktRx:   prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across all media sessions, finished and live.", nil, nil),
-		proxyRTPPktTx:   prometheus.NewDesc("freesbc_rtp_packets_tx_total", "RTP packets sent across all media sessions, finished and live.", nil, nil),
-		proxyRTPByteRx:  prometheus.NewDesc("freesbc_rtp_bytes_rx_total", "RTP bytes received across all media sessions, finished and live.", nil, nil),
-		proxyRTPByteTx:  prometheus.NewDesc("freesbc_rtp_bytes_tx_total", "RTP bytes sent across all media sessions, finished and live.", nil, nil),
-		proxyPortFail:   prometheus.NewDesc("freesbc_media_port_allocation_failure_total", "Calls rejected because a media port pool was exhausted.", nil, nil),
-		proxyICEFail:    prometheus.NewDesc("freesbc_webrtc_ice_failure_total", "WebRTC legs that never completed ICE.", nil, nil),
-		proxyDTLSFail:   prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
-		proxyPanics:     prometheus.NewDesc("freesbc_sip_handler_panics_total", "Edge SIP handler panics recovered (each one lost a request).", nil, nil),
-		proxyParseFail:  prometheus.NewDesc("freesbc_sip_parse_failures_total", "Reads the SIP parser rejected (malformed messages), by transport; the payload is never logged.", []string{"transport"}, nil),
-		proxyAdmission:  prometheus.NewDesc("freesbc_edge_admission_drops_total", "Public requests the edge proxy dropped silently by admission, by reason.", []string{"reason"}, nil),
-		proxyCallsEnded: prometheus.NewDesc("freesbc_edge_calls_ended_total", "Confirmed calls that ended, by reason.", []string{"reason"}, nil),
-		proxyAckMissed:  prometheus.NewDesc("freesbc_edge_ack_missed_total", "2xx ACKs that never arrived, by the plane that owed them.", []string{"plane"}, nil),
-		proxyStreams:    prometheus.NewDesc("freesbc_edge_stream_connections", "Open public stream connections (tcp, tls, ws, wss), by transport.", []string{"transport"}, nil),
-		proxyStreamRef:  prometheus.NewDesc("freesbc_edge_stream_refused_total", "Stream connections refused at accept, by reason (global_cap, ip_cap, banned, rate).", []string{"reason"}, nil),
-		proxyStreamCls:  prometheus.NewDesc("freesbc_edge_stream_closed_total", "Stream connections closed by policy, by reason (idle, slow, oversize, malformed, handshake, rate).", []string{"reason"}, nil),
-		proxyRejects:    prometheus.NewDesc("freesbc_edge_invite_rejects_total", "Out-of-dialog INVITEs the edge answered with a final response itself, by reason.", []string{"reason"}, nil),
-		proxyBindRej:    prometheus.NewDesc("freesbc_edge_register_binding_rejected_total", "2xx REGISTER answers that recorded no binding because the request did not prove its Contact, credential or AoR, by reason.", []string{"reason"}, nil),
+		proxyReqIn:       prometheus.NewDesc("freesbc_sip_requests_total", "SIP requests received by the edge proxy.", []string{"method", "transport"}, nil),
+		proxyResOut:      prometheus.NewDesc("freesbc_sip_responses_total", "SIP responses sent by the edge proxy, by status class.", []string{"class"}, nil),
+		proxyRTPPktRx:    prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across all media sessions, finished and live.", nil, nil),
+		proxyRTPPktTx:    prometheus.NewDesc("freesbc_rtp_packets_tx_total", "RTP packets sent across all media sessions, finished and live.", nil, nil),
+		proxyRTPByteRx:   prometheus.NewDesc("freesbc_rtp_bytes_rx_total", "RTP bytes received across all media sessions, finished and live.", nil, nil),
+		proxyRTPByteTx:   prometheus.NewDesc("freesbc_rtp_bytes_tx_total", "RTP bytes sent across all media sessions, finished and live.", nil, nil),
+		proxyPortFail:    prometheus.NewDesc("freesbc_media_port_allocation_failure_total", "Calls rejected because a media port pool was exhausted.", nil, nil),
+		proxyICEFail:     prometheus.NewDesc("freesbc_webrtc_ice_failure_total", "WebRTC legs that never completed ICE.", nil, nil),
+		proxyDTLSFail:    prometheus.NewDesc("freesbc_webrtc_dtls_failure_total", "WebRTC legs that failed the DTLS handshake or fingerprint check.", nil, nil),
+		proxyPanics:      prometheus.NewDesc("freesbc_sip_handler_panics_total", "Edge SIP handler panics recovered (each one lost a request).", nil, nil),
+		proxyParseFail:   prometheus.NewDesc("freesbc_sip_parse_failures_total", "Reads the SIP parser rejected (malformed messages), by transport; the payload is never logged.", []string{"transport"}, nil),
+		proxyUpgradeFail: prometheus.NewDesc("freesbc_sip_upgrade_failures_total", "WebSocket connections closed because the request was not a valid upgrade, by transport (WS, WSS); the request is never logged.", []string{"transport"}, nil),
+		proxyAdmission:   prometheus.NewDesc("freesbc_edge_admission_drops_total", "Public requests the edge proxy dropped silently by admission, by reason.", []string{"reason"}, nil),
+		proxyCallsEnded:  prometheus.NewDesc("freesbc_edge_calls_ended_total", "Confirmed calls that ended, by reason.", []string{"reason"}, nil),
+		proxyAckMissed:   prometheus.NewDesc("freesbc_edge_ack_missed_total", "2xx ACKs that never arrived, by the plane that owed them.", []string{"plane"}, nil),
+		proxyStreams:     prometheus.NewDesc("freesbc_edge_stream_connections", "Open public stream connections (tcp, tls, ws, wss), by transport.", []string{"transport"}, nil),
+		proxyStreamRef:   prometheus.NewDesc("freesbc_edge_stream_refused_total", "Stream connections refused at accept, by reason (global_cap, ip_cap, banned, rate).", []string{"reason"}, nil),
+		proxyStreamCls:   prometheus.NewDesc("freesbc_edge_stream_closed_total", "Stream connections closed by policy, by reason (idle, slow, oversize, malformed, handshake, rate).", []string{"reason"}, nil),
+		proxyRejects:     prometheus.NewDesc("freesbc_edge_invite_rejects_total", "Out-of-dialog INVITEs the edge answered with a final response itself, by reason.", []string{"reason"}, nil),
+		proxyBindRej:     prometheus.NewDesc("freesbc_edge_register_binding_rejected_total", "2xx REGISTER answers that recorded no binding because the request did not prove its Contact, credential or AoR, by reason.", []string{"reason"}, nil),
 		// carrier is a configured name or "unknown"; direction and method
 		// are bounded sets.
 		proxyCarrierReq: prometheus.NewDesc("freesbc_edge_carrier_requests_total", "SIP requests of the carrier path, by carrier, direction (inbound: carrier to switch, outbound: switch to carrier) and method.", []string{"carrier", "direction", "method"}, nil),
@@ -174,7 +176,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyRegAuth, c.proxyRegUnans, c.proxyRegBrk, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
-		c.proxyAdmission, c.proxyCallsEnded, c.proxyAckMissed, c.proxyRejects, c.proxyBindRej, c.proxyParseFail, c.proxyStreams, c.proxyStreamRef, c.proxyStreamCls, c.proxyCarrierReq, c.proxyCarrierReg,
+		c.proxyAdmission, c.proxyCallsEnded, c.proxyAckMissed, c.proxyRejects, c.proxyBindRej, c.proxyParseFail, c.proxyUpgradeFail, c.proxyStreams, c.proxyStreamRef, c.proxyStreamCls, c.proxyCarrierReq, c.proxyCarrierReg,
 	} {
 		ch <- d
 	}
@@ -279,6 +281,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.proxyPanics, float64(p.HandlerPanics))
 	for transport, v := range p.ParseFailures {
 		counter(c.proxyParseFail, float64(v), transport)
+	}
+	for transport, v := range p.UpgradeFailures {
+		counter(c.proxyUpgradeFail, float64(v), transport)
 	}
 	for transport, v := range p.StreamConnections {
 		g(c.proxyStreams, float64(v), transport)

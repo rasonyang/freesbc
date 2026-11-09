@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -346,7 +347,7 @@ func TestSipgoParseFailureLogContract(t *testing.T) {
 		mu.Lock()
 		counts[tr]++
 		mu.Unlock()
-	})).With("caller", "sipgo")
+	}, func(string) {})).With("caller", "sipgo")
 	ua, err := sipgo.NewUA(sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerLogger(log)))
 	if err != nil {
 		t.Fatal(err)
@@ -393,11 +394,190 @@ func TestSipgoParseFailureLogContract(t *testing.T) {
 	}
 }
 
+// If sipgo changes the message, level or attribute names of its WebSocket
+// upgrade failure log, this fails: the wrapper would stop matching and every
+// scanner request that is not an upgrade would be an ERROR line again. It
+// drives the real sipgo ws and wss transports through the edge's own
+// listeners.
+func TestSipgoUpgradeFailureLogContract(t *testing.T) {
+	const upMarker = "UPGRADE-MARKER-9c1e"
+	// Several rejection classes of gobwas/ws; each carries the marker in the
+	// request line or a header.
+	probes := []string{
+		"\r\n\r\n",
+		"OPTIONS /" + upMarker + " RTSP/1.0\r\n\r\n",
+		"GET /" + upMarker + " HTTP/1.1\r\nHost: a b\r\nX-Marker: " + upMarker + "\r\n\r\n",
+		"POST /" + upMarker + " HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Marker: " + upMarker + "\r\n\r\n",
+		"GET /" + upMarker + " HTTP/1.1\r\nHost: x\r\nX-Marker: " + upMarker + "\r\n\r\n",
+		"GET /" + upMarker + " HTTP/1.0\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + upMarker + "\r\nSec-WebSocket-Version: 13\r\n\r\n",
+	}
+	rec := newLogRecorder()
+	h := startShieldHarness(t, "1000/s per_ip", "1000/s per_ip", "", true, true, rec)
+	for _, secure := range []bool{false, true} {
+		label, addr := "WS", h.publicWS
+		if secure {
+			label, addr = "WSS", h.publicWSS
+		}
+		for _, probe := range probes {
+			var conn net.Conn
+			var err error
+			if secure {
+				conn, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) // self-signed test listener
+			} else {
+				conn, err = net.Dial("tcp", addr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(conn, probe); err != nil {
+				t.Fatal(err)
+			}
+			// sipgo closes the connection after logging.
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, _ = io.Copy(io.Discard, conn)
+			conn.Close()
+		}
+		want := uint64(len(probes))
+		deadline := time.Now().Add(3 * time.Second)
+		for h.srv.metrics.Snapshot().UpgradeFailures[label] < want && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := h.srv.metrics.Snapshot().UpgradeFailures[label]; got != want {
+			t.Errorf("%s upgrade failures = %d, want %d: did sipgo change its \"Fail to upgrade\" log?", label, got, want)
+		}
+	}
+	var debugs, warns int
+	for _, r := range rec.snapshot() {
+		if r.level >= slog.LevelError {
+			t.Errorf("ERROR record %q %v", r.msg, r.attrs)
+		}
+		if strings.Contains(r.msg, upMarker) {
+			t.Errorf("record message leaks the request: %q", r.msg)
+		}
+		for k, v := range r.attrs {
+			if strings.Contains(v, upMarker) || strings.Contains(k, upMarker) {
+				t.Errorf("record %q leaks the request in attribute %s", r.msg, k)
+			}
+		}
+		if r.msg == "websocket upgrade failed; connection closed" {
+			if r.level != slog.LevelDebug || r.attrs["error"] == "" || (r.attrs["transport"] != "WS" && r.attrs["transport"] != "WSS") {
+				t.Errorf("upgrade Debug record = %v at %v", r.attrs, r.level)
+			}
+			debugs++
+		}
+		if r.level == slog.LevelWarn && strings.Contains(r.msg, "upgrade") {
+			warns++
+		}
+	}
+	if debugs != 2*len(probes) {
+		t.Errorf("upgrade Debug records = %d, want %d", debugs, 2*len(probes))
+	}
+	if warns != 1 {
+		t.Errorf("upgrade WARN records = %d, want exactly 1 inside one window", warns)
+	}
+	snap := h.srv.metrics.Snapshot()
+	for _, label := range append(append([]string{}, metricTransports[:]...), metricOther) {
+		if _, ok := snap.UpgradeFailures[label]; !ok {
+			t.Errorf("upgrade failures not exported for %s", label)
+		}
+	}
+}
+
+// failCloseConn closes the real connection, then reports a fixed error.
+type failCloseConn struct{ net.Conn }
+
+func (c failCloseConn) Close() error {
+	_ = c.Conn.Close()
+	return errors.New("close boom")
+}
+
+type failCloseListener struct{ net.Listener }
+
+func (l failCloseListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return failCloseConn{c}, nil
+}
+
+// sipgo logs "Closing connection failed" at Error right after a failed
+// upgrade when Close errors; on wss a reset peer makes that happen for real,
+// but the race is not reliable, so this forces it through sipgo's own ws
+// Serve with a listener whose connections fail to close.
+func TestSipgoUpgradeCloseFailureLogContract(t *testing.T) {
+	rec := newLogRecorder()
+	var mu sync.Mutex
+	counts := map[string]int{}
+	log := slog.New(newSipgoHandler(rec, func(string) {}, func(tr string) {
+		mu.Lock()
+		counts[tr]++
+		mu.Unlock()
+	})).With("caller", "sipgo")
+	ua, err := sipgo.NewUA(sipgo.WithUserAgentTransportLayerOptions(sip.WithTransportLayerLogger(log)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ua.Close()
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", nextPort(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { _ = ua.TransportLayer().ServeWS(failCloseListener{ln}) }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	closeDebug := func() (n int) {
+		for _, r := range rec.snapshot() {
+			if r.msg == "websocket upgrade failed; closing the connection also failed" {
+				n++
+			}
+		}
+		return n
+	}
+	for closeDebug() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	var warns int
+	for _, r := range rec.snapshot() {
+		if r.level >= slog.LevelError {
+			t.Errorf("ERROR record %q %v", r.msg, r.attrs)
+		}
+		if r.level == slog.LevelWarn && strings.Contains(r.msg, "upgrade") {
+			warns++
+		}
+		if r.msg == "websocket upgrade failed; closing the connection also failed" &&
+			(r.level != slog.LevelDebug || r.attrs["transport"] != "WS" || r.attrs["error"] != "close boom") {
+			t.Errorf("close failure record = %v at %v", r.attrs, r.level)
+		}
+	}
+	if n := closeDebug(); n != 1 {
+		t.Fatalf("close failure Debug records = %d, want 1: did sipgo change its \"Closing connection failed\" log?", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if counts["WS"] != 1 {
+		t.Errorf("upgrade failures counted = %v, want WS=1", counts)
+	}
+	if warns != 1 {
+		t.Errorf("upgrade WARN records = %d, want 1 (from the failed upgrade only)", warns)
+	}
+}
+
 // The wrapper's own behaviour: WARN dedupe over the interval, and "data"
 // never forwarded by a derived logger.
 func TestSipgoHandlerWarnDedupeAndWith(t *testing.T) {
 	rec := newLogRecorder()
-	h := newSipgoHandler(rec, func(string) {})
+	h := newSipgoHandler(rec, func(string) {}, func(string) {})
 	now := time.Unix(1000, 0)
 	h.st.now = func() time.Time { return now }
 	log := slog.New(h).With("caller", "sipgo").With("caller", "Transport<WS>").With("data", canary)

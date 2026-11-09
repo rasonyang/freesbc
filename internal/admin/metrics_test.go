@@ -253,3 +253,21 @@ func TestMetricsHEP(t *testing.T) {
 		}
 	}
 }
+
+// The WebSocket upgrade failure counter is exported per transport from
+// ProxyStats.
+func TestMetricsUpgradeFailures(t *testing.T) {
+	deps := emptyDeps()
+	deps.Proxy = func() ProxyStats {
+		return ProxyStats{UpgradeFailures: map[string]uint64{"WS": 0, "WSS": 3}}
+	}
+	body := string(authGET(t, newTestServer(t, deps), "/metrics"))
+	for _, want := range []string{
+		`freesbc_sip_upgrade_failures_total{transport="WS"} 0`,
+		`freesbc_sip_upgrade_failures_total{transport="WSS"} 3`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q", want)
+		}
+	}
+}

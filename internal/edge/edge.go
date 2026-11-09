@@ -611,7 +611,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	// Every sipgo record goes through sipgoHandler: a failed parse would
 	// otherwise log the raw message at Error (sipgolog.go).
-	sipgoLog := slog.New(newSipgoHandler(s.log.Handler(), s.metrics.ParseFailed)).With("caller", "sipgo")
+	sipgoLog := slog.New(newSipgoHandler(s.log.Handler(), s.metrics.ParseFailed, s.metrics.UpgradeFailed)).With("caller", "sipgo")
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgentTransportLayerOptions(
 			sip.WithTransportLayerLogger(sipgoLog),
