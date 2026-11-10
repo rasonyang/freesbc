@@ -124,7 +124,7 @@ func TestMediaPoolExhaustionRejectsCleanly(t *testing.T) {
 	for i := 0; i < total; i++ {
 		sess, err := h.srv.allocateRTP(&sdp.Session{Audio: &sdp.Audio{
 			Address: mustAddr("127.0.0.1"), Port: 40000,
-		}}, mustAddr("127.0.0.1"), srtpOff, true)
+		}}, mustAddr("127.0.0.1"), srtpOff, true, h.srv.log)
 		if err != nil {
 			break
 		}

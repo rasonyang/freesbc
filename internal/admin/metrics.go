@@ -50,6 +50,7 @@ type collector struct {
 	proxyResOut      *prometheus.Desc
 	proxyRTPPktRx    *prometheus.Desc
 	proxyRTPPktTx    *prometheus.Desc
+	proxyRTPRejected *prometheus.Desc
 	proxyRTPByteRx   *prometheus.Desc
 	proxyRTPByteTx   *prometheus.Desc
 	proxyPortFail    *prometheus.Desc
@@ -127,6 +128,7 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		proxyResOut:      prometheus.NewDesc("freesbc_sip_responses_total", "SIP responses sent by the edge proxy, by status class.", []string{"class"}, nil),
 		proxyRTPPktRx:    prometheus.NewDesc("freesbc_rtp_packets_rx_total", "RTP packets received across all media sessions, finished and live.", nil, nil),
 		proxyRTPPktTx:    prometheus.NewDesc("freesbc_rtp_packets_tx_total", "RTP packets sent across all media sessions, finished and live.", nil, nil),
+		proxyRTPRejected: prometheus.NewDesc("freesbc_rtp_packets_rejected_total", "RTP packets the media latch refused, by plane (public: the client or carrier; private: the switch), finished and live sessions.", []string{"plane"}, nil),
 		proxyRTPByteRx:   prometheus.NewDesc("freesbc_rtp_bytes_rx_total", "RTP bytes received across all media sessions, finished and live.", nil, nil),
 		proxyRTPByteTx:   prometheus.NewDesc("freesbc_rtp_bytes_tx_total", "RTP bytes sent across all media sessions, finished and live.", nil, nil),
 		proxyPortFail:    prometheus.NewDesc("freesbc_media_port_allocation_failure_total", "Calls rejected because a media port pool was exhausted.", nil, nil),
@@ -174,7 +176,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.proxyRegs, c.proxySubs, c.proxyDialogs, c.proxySessions, c.proxyDraining, c.proxyMedia, c.proxyWebRTC,
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyRegAuth, c.proxyRegUnans, c.proxyRegBrk, c.proxyReqIn, c.proxyResOut,
-		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPByteRx, c.proxyRTPByteTx,
+		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPRejected, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
 		c.proxyAdmission, c.proxyCallsEnded, c.proxyAckMissed, c.proxyRejects, c.proxyBindRej, c.proxyParseFail, c.proxyUpgradeFail, c.proxyStreams, c.proxyStreamRef, c.proxyStreamCls, c.proxyCarrierReq, c.proxyCarrierReg,
 	} {
@@ -273,6 +275,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	counter(c.proxyRTPPktRx, float64(p.RTPPacketsRx))
 	counter(c.proxyRTPPktTx, float64(p.RTPPacketsTx))
+	counter(c.proxyRTPRejected, float64(p.RTPRejectedPublic), "public")
+	counter(c.proxyRTPRejected, float64(p.RTPRejectedPrivate), "private")
 	counter(c.proxyRTPByteRx, float64(p.RTPBytesRx))
 	counter(c.proxyRTPByteTx, float64(p.RTPBytesTx))
 	counter(c.proxyPortFail, float64(p.PortAllocationFailures))

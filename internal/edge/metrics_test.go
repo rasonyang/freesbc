@@ -102,3 +102,22 @@ func TestRTPTotalsIncludeLiveSessions(t *testing.T) {
 		t.Fatalf("second session: got %d want 17", got)
 	}
 }
+
+// Rejected RTP packets are kept per plane (A public, B private), live and
+// finished.
+func TestRTPRejectedPerPlane(t *testing.T) {
+	m := NewMetrics()
+	var live media.Stats
+	live.A.RTPRejected, live.B.RTPRejected = 7, 2
+	live.A.RTCPRejected = 99 // RTCP is not in the metric
+	stats := func() media.Stats { return live }
+	key := new(int)
+	m.MediaStarted(false, key, stats)
+	if s := m.Snapshot(); s.RTPRejectedPublic != 7 || s.RTPRejectedPrivate != 2 {
+		t.Fatalf("live: %+v", s)
+	}
+	m.MediaEnded(false, key, stats)
+	if s := m.Snapshot(); s.RTPRejectedPublic != 7 || s.RTPRejectedPrivate != 2 {
+		t.Fatalf("finished: %+v", s)
+	}
+}

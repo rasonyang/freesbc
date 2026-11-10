@@ -271,3 +271,27 @@ func TestMetricsUpgradeFailures(t *testing.T) {
 		}
 	}
 }
+
+// freesbc_rtp_packets_rejected_total exports both planes, including from zero.
+func TestMetricsRTPRejectedCounters(t *testing.T) {
+	for name, st := range map[string]ProxyStats{
+		"zero":  {},
+		"fills": {RTPRejectedPublic: 290, RTPRejectedPrivate: 3},
+	} {
+		deps := emptyDeps()
+		deps.Proxy = func() ProxyStats { return st }
+		body := string(authGET(t, newTestServer(t, deps), "/metrics"))
+		pub, priv := "0", "0"
+		if name == "fills" {
+			pub, priv = "290", "3"
+		}
+		for _, want := range []string{
+			`freesbc_rtp_packets_rejected_total{plane="public"} ` + pub,
+			`freesbc_rtp_packets_rejected_total{plane="private"} ` + priv,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s: /metrics missing %q", name, want)
+			}
+		}
+	}
+}

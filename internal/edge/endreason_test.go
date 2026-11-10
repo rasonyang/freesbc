@@ -11,6 +11,7 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 
+	"github.com/freesbc/freesbc/internal/media"
 	fsip "github.com/freesbc/freesbc/internal/sip"
 	"github.com/freesbc/freesbc/internal/sip/sdp"
 )
@@ -522,7 +523,7 @@ func TestInviteRejectPortExhausted(t *testing.T) {
 	_, total := h.srv.pubPool.Stats()
 	var held []interface{ Close() error }
 	for i := 0; i < total; i++ {
-		sess, err := h.srv.allocateRTP(&sdp.Session{Audio: &sdp.Audio{Address: mustAddr("127.0.0.1"), Port: 40000}}, netip.MustParseAddr("127.0.0.1"), srtpOff, true)
+		sess, err := h.srv.allocateRTP(&sdp.Session{Audio: &sdp.Audio{Address: mustAddr("127.0.0.1"), Port: 40000}}, netip.MustParseAddr("127.0.0.1"), srtpOff, true, h.srv.log)
 		if err != nil {
 			break
 		}
@@ -633,4 +634,53 @@ func TestInviteRejectUpstreamFailed(t *testing.T) {
 		t.Fatalf("got %d, want 503", res.StatusCode)
 	}
 	assertRejects(t, h, map[inviteReject]uint64{rejectUpstreamFailed: 1})
+}
+
+// Packets the media latch refuses show up in the call-ended statistics and
+// in freesbc_rtp_packets_rejected_total on the public plane. The phone's
+// own SDP socket latches the public side exactly; a second socket on the
+// same IP ranks below it and is refused.
+func TestRejectedMediaCountedInStatsAndMetrics(t *testing.T) {
+	h, rec := startHarnessRecorded(t, false)
+	h.fs.setInviteHook(auditTaggedAnswerHook(h.fs, nil, nil))
+	phone := newUDPClient(t)
+	invite, res, phoneRTP := auditPhoneCall(t, h, phone)
+	d := waitForDialog(t, h, fsip.CallID(invite))
+	pub := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: d.session().rtp.RTPPort(media.SideA)}
+
+	if _, err := phoneRTP.WriteToUDP([]byte("latch"), pub); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "phone latched", func() bool { return d.session().rtp.Stats().A.RTPPacketsRx == 1 })
+	intruder := auditUDP(t)
+	for i := 0; i < 5; i++ {
+		_, _ = intruder.WriteToUDP([]byte("intruder"), pub)
+	}
+	waitFor(t, 3*time.Second, "rejections counted", func() bool { return d.session().rtp.Stats().A.RTPRejected == 5 })
+	var warned bool
+	for _, r := range rec.snapshot() {
+		if r.msg == "media packets rejected by latch" {
+			warned = true
+			if r.attrs["sip_call_id"] != fsip.CallID(invite) || r.attrs["plane"] != "public" {
+				t.Errorf("WARN attrs: %v", r.attrs)
+			}
+		}
+	}
+	if !warned {
+		t.Error("no rejected-by-latch WARN")
+	}
+	if s := h.srv.metrics.Snapshot(); s.RTPRejectedPublic != 5 || s.RTPRejectedPrivate != 0 {
+		t.Errorf("live metrics: public %d private %d, want 5 and 0", s.RTPRejectedPublic, s.RTPRejectedPrivate)
+	}
+
+	if r := phone.do(t, buildBye(phone, invite, res), h.publicUDP); r.StatusCode != 200 {
+		t.Fatalf("BYE: %d", r.StatusCode)
+	}
+	line := callEndedLine(t, rec, fsip.CallID(invite))
+	if !strings.Contains(line.attrs["stats"], "RTPRejected:5") {
+		t.Errorf("call ended stats lack RTPRejected:5: %q", line.attrs["stats"])
+	}
+	if s := h.srv.metrics.Snapshot(); s.RTPRejectedPublic != 5 || s.RTPRejectedPrivate != 0 {
+		t.Errorf("finished metrics: public %d private %d, want 5 and 0", s.RTPRejectedPublic, s.RTPRejectedPrivate)
+	}
 }

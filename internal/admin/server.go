@@ -159,6 +159,10 @@ type ProxyStats struct {
 	RTPPacketsTx uint64 `json:"rtp_packets_tx_total"`
 	RTPBytesRx   uint64 `json:"rtp_bytes_rx_total"`
 	RTPBytesTx   uint64 `json:"rtp_bytes_tx_total"`
+	// RTPRejectedPublic and RTPRejectedPrivate are the RTP packets the media
+	// latch refused on the public and the private plane.
+	RTPRejectedPublic  uint64 `json:"rtp_packets_rejected_public_total"`
+	RTPRejectedPrivate uint64 `json:"rtp_packets_rejected_private_total"`
 
 	PortAllocationFailures uint64 `json:"media_port_allocation_failure_total"`
 	ICEFailures            uint64 `json:"webrtc_ice_failure_total"`
