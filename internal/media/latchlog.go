@@ -159,7 +159,8 @@ func (r *latchReporter) slow(side Side, rtp bool, src netip.AddrPort, v latchVer
 		r.log.Info("media latch moved",
 			"plane", r.planes[side], "kind", kindName(rtp),
 			"from", v.held.String(), "to", unmapped(src).String(),
-			"from_rank", v.heldRank.String(), "to_rank", v.rank.String())
+			"from_rank", v.heldRank.String(), "to_rank", v.rank.String(),
+			"fallback", v.fallback)
 	case evSet:
 		r.log.Debug("media latch set",
 			"plane", r.planes[side], "kind", kindName(rtp),

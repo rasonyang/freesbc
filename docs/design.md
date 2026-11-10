@@ -2728,19 +2728,19 @@ recvonly peer, an IVR waiting to hear audio). An address with no usable
 port only re-arms the source check (`Armed`).
 
 **What the latch reports.** `latch.decide` (`media/session.go`) is `acceptFrom`
-returning a `latchVerdict`: same source, first latch (`evSet`), move to a
-better-ranked source (`evMoved`) or refusal (`evRefused`). The latch logs
+at the caller's clock reading, returning a `latchVerdict`: same source, first latch (`evSet`), move to a
+better-ranked source or, after `LatchFallback` of silence, to a vouched one of no higher rank (`evMoved`, with `fallback` set for the latter) or refusal (`evRefused`). The latch logs
 nothing itself, because it holds `latch.mu`; `latchReporter.observe`
 (`media/latchlog.go`) acts on the verdict after the lock is released, and the
 accepted, already-latched path returns before touching anything. A first latch
 logs at Debug (`media latch set`), a move at Info (`media latch moved`, with
-`plane`, `kind`, `from`, `to` and both ranks; a move needs a strictly higher
-rank, so a latch moves at most three times between relatches). Every refusal
+`plane`, `kind`, `from`, `to`, both ranks and `fallback`, true for a move that is
+not a rank upgrade). Every refusal
 is counted in `LegStats.RTPRejected` or `RTCPRejected` (by `Session.forward`,
 `relay.go`, and `WebRTCSession.privateToPublic`, `webrtcsession.go`), and one
 that finds a source already latched logs a Warn, `media packets rejected by
 latch`, at most once a second per session and ten a second per plane (`logLimiter`, `planeBudget` on `PlanePool`, `media/latchlog.go`; a line the plane cap holds back is counted into the next one as `lines_suppressed`):
-`plane`, `kind`, `reason` (`latched`: no better ranked than the held source;
+`plane`, `kind`, `reason` (`latched`: no better ranked than the held source, or the held source is still live;
 `source`: strict mode, or the IP is not the expected one), `latched` and
 `source` with their ranks, and `count` (refusals since the previous line).
 No payload or user part is logged. `plane` is the pool's name
@@ -2823,7 +2823,19 @@ A packet from the latched source is always accepted. Any other packet is
 accepted only if it ranks **strictly above** the latched source (or, before
 latching, above nothing), and then it re-latches. So the first acceptable
 packet latches as before, an equally ranked newcomer is dropped (the
-post-latch hijack rejection), and an **exact** latch is final. What this
+post-latch hijack rejection) while the latched source keeps sending. The
+exception is the **silence fallback** (`LatchFallback` = 1 s,
+`latch.takes`, `media/session.go`): once the latched source has sent
+nothing for `LatchFallback`, a vouched source (*signalled* or *exact*, never
+*any*) of no higher rank takes the latch, so a few stray packets from the
+exact address cannot end a live stream from another port of the same IP for
+the rest of the call, and a NAT port change heals. Exact still pre-empts a
+lower latch at once; a same-IP source cannot take over a stream that still
+flows. When the latch falls back away from an exact source, the exact SDP
+address is proven to be a live socket of the peer, so `latch.dest` sends to
+it (the seeded destination, if it is that address) until `relatch` or a seed of a
+different address (a refresh re-INVITE repeating the address keeps it), which stops a peer that echoes from the SDP address from making the
+two sources alternate. What this
 buys (P2-EDG-001): an off-path source that sprays the loose public port
 before the phone speaks wins at most an *any* latch, which the phone's first
 packet from its SDP address or its SIP IP takes back.
@@ -3882,7 +3894,7 @@ permanent series per call."
 | `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `Server.guard` (`edge.go`), for every request the shield admits |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | every response the edge sends or relays |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end` (`dialog.go`; `Metrics.MediaEnded` in `edge/metrics.go`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
-| `freesbc_rtp_packets_rejected_total` | Counter | `plane` (`public`: media side A, `private`: side B; both exported from zero) | RTP packets the media latch refused, finished plus live sessions exactly as the rx/tx totals (`Metrics.MediaEnded`, `Metrics.rtpTotals`, `edge/metrics.go`). RTCP refusals are in the per-call `RTCPRejected` only. A rate that tracks the packet rate while rx stands still is the latch lock-out in [troubleshooting](troubleshooting.md#rtp-silence-reasonrtp_silence) |
+| `freesbc_rtp_packets_rejected_total` | Counter | `plane` (`public`: media side A, `private`: side B; both exported from zero) | RTP packets the media latch refused, finished plus live sessions exactly as the rx/tx totals (`Metrics.MediaEnded`, `Metrics.rtpTotals`, `edge/metrics.go`). RTCP refusals are in the per-call `RTCPRejected` only. A rate that tracks the packet rate while rx stands still is a latch refusing a live stream in [troubleshooting](troubleshooting.md#rtp-silence-reasonrtp_silence) |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Counter | — | Linux only: the kernel's `RcvbufErrors` and `InErrors` from the `Udp:` lines of `/proc/net/snmp` plus `Udp6RcvbufErrors` and `Udp6InErrors` from `/proc/net/snmp6`, IPv4 + IPv6 summed, read at scrape time (`readUDPStats`, `udpstats.go`, called from `collector.Collect`, `admin/metrics.go`). The kernel keeps them per network namespace, so they cover every UDP socket in it, not only FreeSBC's, and `InErrors` already includes `RcvbufErrors`. A datagram dropped on a full receive buffer never reaches `freesbc_rtp_packets_rx_total`, so rx/tx 1.0 does not exclude kernel loss; these series do. An absent `snmp6` (IPv6 disabled) leaves IPv4 alone; an unreadable or unparsable `/proc/net/snmp`, or any other OS, exports neither series (no error metric, no log) |
 | `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`, `shared`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collector.collectUDPSockets`, `admin/metrics.go`; `readUDPSockets`, `udpstats.go`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket, or the one `shared` socket in the single-IP layout), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
@@ -4766,6 +4778,7 @@ code constant.
 | `regNonceTTL` | 15 min (`regguard.go`) | how long a challenge nonce relayed to a source keeps its attempts countable |
 | `regReplayWindow` | 40 s (`regguard.go`) | how long after a challenge a UDP credential retry on the challenged branch counts as a replay sipgo absorbs |
 | `media.LearnDelay` (`media/session.go`) | 3 s | a loose latch keeps sending to a plausible SDP address before switching to another learned port (§8.4) |
+| `media.LatchFallback` (`media/session.go`) | 1 s | a latched source silent this long yields to a vouched source of equal or lower rank (§8.4) |
 | WebRTC establishment | 30 s (`WebRTCLeg.Start`'s default (`webrtcleg.go`); the edge passes none) | ICE **and** DTLS together, including the fingerprint check inside the handshake |
 | config reload debounce `reloadDebounce` (`reload.go`) | 200 ms | fsnotify coalescing |
 | admin read-header / read / write / idle | 5 / 30 / 30 / 30 s | HTTP |

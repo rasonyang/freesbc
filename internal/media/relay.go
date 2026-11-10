@@ -56,12 +56,13 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				continue // oversize: forwarding it would forward a truncation
 			}
 			pkt := buf[:n]
+			now := time.Now() // the one clock read: latch and watchdog
 			if leg := s.sdes[from].Load(); leg != nil {
 				// SDES side: authenticate and decrypt BEFORE the latch may
 				// move, so a forged packet from a vouched address cannot
 				// latch the stream. permits only spares a decrypt for a
 				// source the latch would refuse anyway.
-				if !s.rep.observe(from, rtpKind, src, inLatch.permit(src)) {
+				if !s.rep.observe(from, rtpKind, src, inLatch.permit(src, now)) {
 					continue
 				}
 				ctx := leg.in.ctx.Load()
@@ -75,10 +76,10 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 					s.counters.srtpRxDrops[from].Add(1)
 					continue
 				}
-				if !s.rep.observe(from, rtpKind, src, inLatch.decide(src)) {
+				if !s.rep.observe(from, rtpKind, src, inLatch.decide(src, now)) {
 					continue
 				}
-			} else if !s.rep.observe(from, rtpKind, src, inLatch.decide(src)) {
+			} else if !s.rep.observe(from, rtpKind, src, inLatch.decide(src, now)) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
 			// Only NOW is the packet proven genuine: the latch accepted it
@@ -87,7 +88,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 			// A party who knows the latched source address could
 			// feed garbage that failed auth yet renewed rtp_timeout
 			// indefinitely, keeping a dead call alive forever.
-			s.lastRx[from].Store(time.Now().UnixNano())
+			s.lastRx[from].Store(now.UnixNano())
 			s.counters.recordRx(from, rtpKind, len(pkt))
 			if dst := outLatch.dest(); dst.IsValid() {
 				if leg := s.sdes[to].Load(); leg != nil {

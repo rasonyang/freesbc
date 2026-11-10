@@ -162,7 +162,7 @@ func TestLatchRefusalCountedWebRTCPrivate(t *testing.T) {
 	s.SetPrivateRemote(netip.AddrPortFrom(lo, 24999))
 	// Latch a stand-in for FreeSWITCH directly (accepting through the relay
 	// would need a verified DTLS leg).
-	if v := s.privRTP.decide(netip.AddrPortFrom(lo, 24998)); v.ev != evSet {
+	if v := s.privRTP.decide(netip.AddrPortFrom(lo, 24998), time.Now()); v.ev != evSet {
 		t.Fatalf("setup latch: %+v", v)
 	}
 	go s.privateToPublic(nil, nil, true)
@@ -228,7 +228,7 @@ func TestLatchMoveLogged(t *testing.T) {
 	l.seed(netip.AddrPortFrom(lo, 30000))
 	first, exact := netip.AddrPortFrom(lo, 29998), netip.AddrPortFrom(lo, 30000)
 
-	if !rep.observe(SideA, true, first, l.decide(first)) {
+	if !rep.observe(SideA, true, first, l.decide(first, time.Now())) {
 		t.Fatal("first source refused")
 	}
 	if n := len(log.find(msgMoved)); n != 0 {
@@ -237,7 +237,7 @@ func TestLatchMoveLogged(t *testing.T) {
 	if sets := log.find(msgSet); len(sets) != 1 || sets[0].level != slog.LevelDebug {
 		t.Fatalf("first latch: %+v", sets)
 	}
-	if !rep.observe(SideA, true, exact, l.decide(exact)) {
+	if !rep.observe(SideA, true, exact, l.decide(exact, time.Now())) {
 		t.Fatal("exact source refused")
 	}
 	moves := log.find(msgMoved)
@@ -250,7 +250,7 @@ func TestLatchMoveLogged(t *testing.T) {
 		t.Errorf("move line: %+v", m)
 	}
 	// The same source again is silent.
-	rep.observe(SideA, true, exact, l.decide(exact))
+	rep.observe(SideA, true, exact, l.decide(exact, time.Now()))
 	if len(log.find(msgMoved)) != 1 || len(log.find(msgSet)) != 1 {
 		t.Error("steady state logged")
 	}
@@ -258,11 +258,14 @@ func TestLatchMoveLogged(t *testing.T) {
 
 // The #324 shape on a loose public side seeded with an exact SDP address P:
 // a stream from P-2 latches and is relayed, three packets from P move the
-// latch, and the live stream on P-2 is then refused.
+// latch, and the live stream on P-2 is refused until P has been silent for
+// LatchFallback, when the latch follows the live stream back (a fallback
+// move). The lock-out is bounded at about LatchFallback of packets (~50 at
+// 20 ms), not the rest of the call.
 //
-// The expected 290 is today's latch rule (a latch never moves down). The
-// #324 fix will bound it; update the assertion with that change.
-func TestLatchMoveLocksOutLiveStream(t *testing.T) {
+// Timing-based over real UDP loopback: re-run once before treating a flake
+// as failure.
+func TestLatchMoveLockOutIsBounded(t *testing.T) {
 	const P = 24102
 	log := &capLog{}
 	p := testPool(24200, 24215)
@@ -292,18 +295,33 @@ func TestLatchMoveLocksOutLiveStream(t *testing.T) {
 		_, _ = exact.Write([]byte("x"))
 	}
 	eventually(t, "latch moved", func() bool { return s.Stats().A.RTPPacketsRx == 4 })
-	for i := 0; i < 290; i++ {
+	// The live stream at 20 ms until the fallback hands the latch back.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(log.find(msgMoved)) < 2 {
 		_, _ = live.Write([]byte("x"))
-		time.Sleep(time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	eventually(t, "290 rejected", func() bool { return s.Stats().A.RTPRejected >= 290 })
 	st := s.Stats().A
-	if st.RTPRejected != 290 || st.RTPPacketsRx != 4 {
-		t.Errorf("A = %+v, want 290 rejected and 4 relayed", st)
+	if st.RTPRejected < 20 || st.RTPRejected > 70 {
+		t.Errorf("RTPRejected = %d, want about LatchFallback of packets (~50)", st.RTPRejected)
+	}
+	before := st.RTPPacketsRx
+	for i := 0; i < 5; i++ {
+		_, _ = live.Write([]byte("x"))
+		time.Sleep(20 * time.Millisecond)
+	}
+	eventually(t, "live stream relayed again", func() bool { return s.Stats().A.RTPPacketsRx >= before+5 })
+	if got := s.Stats().A.RTPRejected; got != st.RTPRejected {
+		t.Errorf("RTPRejected grew from %d to %d after the fallback", st.RTPRejected, got)
 	}
 	moves := log.find(msgMoved)
-	if len(moves) != 1 || moves[0].attrs["from"] != "127.0.0.1:"+strconv.Itoa(P-2) ||
-		moves[0].attrs["to"] != "127.0.0.1:"+strconv.Itoa(P) {
+	if len(moves) != 2 ||
+		moves[0].attrs["from"] != "127.0.0.1:"+strconv.Itoa(P-2) ||
+		moves[0].attrs["to"] != "127.0.0.1:"+strconv.Itoa(P) ||
+		moves[0].attrs["fallback"] != "false" ||
+		moves[1].attrs["from"] != "127.0.0.1:"+strconv.Itoa(P) ||
+		moves[1].attrs["to"] != "127.0.0.1:"+strconv.Itoa(P-2) ||
+		moves[1].attrs["fallback"] != "true" {
 		t.Errorf("moves: %+v", moves)
 	}
 	warns := log.find(msgRejected)

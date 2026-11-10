@@ -265,7 +265,8 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 		if n > maxPacketSize {
 			continue // oversize: forwarding it would forward a truncation
 		}
-		if !s.rep.observe(SideB, rtpKind, src, lat.decide(src)) {
+		now := time.Now()
+		if !s.rep.observe(SideB, rtpKind, src, lat.decide(src, now)) {
 			continue // pre-latch source mismatch, or post-latch hijack
 		}
 		if !s.leg.mediaVerified() {
@@ -277,7 +278,7 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 		}
 		pkt := buf[:n]
 		rtcp := !rtpKind
-		s.lastRx[SideB].Store(time.Now().UnixNano())
+		s.lastRx[SideB].Store(now.UnixNano())
 		s.counters.recordRx(SideB, !rtcp, n)
 
 		// In place: buf has room for the SRTP overhead.
