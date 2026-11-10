@@ -480,6 +480,17 @@ func (c *Config) validateShield(fail failFunc) {
 	if _, err := ParseStrikeLimit(c.Shield.AdmissionBan); err != nil {
 		fail("shield.admission_ban: %v", c.envRedact.detail(c.Shield.AdmissionBan, err))
 	}
+	// The long stages are validated alone: no relation to the short value is
+	// required (an existing register_ban: 10/1h must still load).
+	if _, err := ParseStrikeLimit(c.Shield.RegisterBanLong); err != nil {
+		fail("shield.register_ban_long: %v", c.envRedact.detail(c.Shield.RegisterBanLong, err))
+	}
+	if _, err := ParseStrikeLimit(c.Shield.RegisterBanAORLong); err != nil {
+		fail("shield.register_ban_aor_long: %v", c.envRedact.detail(c.Shield.RegisterBanAORLong, err))
+	}
+	if _, err := ParseStrikeLimit(c.Shield.AdmissionBanLong); err != nil {
+		fail("shield.admission_ban_long: %v", c.envRedact.detail(c.Shield.AdmissionBanLong, err))
+	}
 }
 
 // validateAdmin checks the optional admin section.

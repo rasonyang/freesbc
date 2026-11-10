@@ -258,6 +258,16 @@ type ShieldConfig struct {
 	// is neither a carrier nor registered) past a threshold ("<n>/<window>",
 	// e.g. "50/5m"), or "off". Default "50/5m". Hot.
 	AdmissionBan string `yaml:"admission_ban"`
+	// RegisterBanLong, RegisterBanAORLong and AdmissionBanLong are a second,
+	// long-window stage of the three thresholds above (same syntax, or
+	// "off"), counted in the same entries and producing the same bans and
+	// locks. They catch a source that stays under the short window's N for
+	// as long as it likes. The short key stays the master switch of its
+	// class: while it is "off" nothing is counted at either stage. Defaults
+	// "20/1h", "20/1h" and "30/1h". Hot.
+	RegisterBanLong    string `yaml:"register_ban_long"`
+	RegisterBanAORLong string `yaml:"register_ban_aor_long"`
+	AdmissionBanLong   string `yaml:"admission_ban_long"`
 }
 
 type AdminConfig struct {
@@ -358,6 +368,15 @@ func withDefaults(c *Config) {
 	}
 	if c.Shield.AdmissionBan == "" {
 		c.Shield.AdmissionBan = DefaultAdmissionBan
+	}
+	if c.Shield.RegisterBanLong == "" {
+		c.Shield.RegisterBanLong = DefaultRegisterBanLong
+	}
+	if c.Shield.RegisterBanAORLong == "" {
+		c.Shield.RegisterBanAORLong = DefaultRegisterBanAORLong
+	}
+	if c.Shield.AdmissionBanLong == "" {
+		c.Shield.AdmissionBanLong = DefaultAdmissionBanLong
 	}
 	if h := c.HEP; h != nil {
 		if h.Transport == "" {

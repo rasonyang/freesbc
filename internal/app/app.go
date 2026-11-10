@@ -276,7 +276,8 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 			out := make([]admin.Offender, 0, len(top))
 			for _, o := range top {
 				out = append(out, admin.Offender{Source: o.Source, Reason: o.Reason,
-					Strikes: o.Strikes, Since: o.Since, Until: o.Until})
+					Strikes: o.Strikes, Since: o.Since, Until: o.Until,
+					LongStrikes: o.LongStrikes, LongSince: o.LongSince, LongUntil: o.LongUntil})
 			}
 			return out, total
 		},

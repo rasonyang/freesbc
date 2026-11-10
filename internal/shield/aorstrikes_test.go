@@ -11,7 +11,9 @@ import (
 
 func aorShield(t *testing.T, lim string) (*Shield, *config.Store) {
 	t.Helper()
-	cfg, err := config.Parse([]byte(shieldCfg + "  register_ban_aor: \"" + lim + "\"\n"))
+	// The long stage is off: these tests exercise the short window alone
+	// (the long stage has its own tests in longstage_test.go).
+	cfg, err := config.Parse([]byte(shieldCfg + "  register_ban_aor: \"" + lim + "\"\n  register_ban_aor_long: off\n"))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

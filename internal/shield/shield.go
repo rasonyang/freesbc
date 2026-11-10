@@ -332,7 +332,7 @@ type BanInfo struct {
 	// or BanKindUDPSocket.
 	Kind string
 	// Reason is why the ban was recorded (BanReasonScanner,
-	// BanReasonRegister).
+	// BanReasonRegister, BanReasonAdmission, BanReasonMalformed).
 	Reason string
 	// Since is when the ban was first recorded; Until when it lapses.
 	Since, Until time.Time

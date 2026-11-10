@@ -813,6 +813,9 @@ func (s *Server) Run(ctx context.Context) error {
 		"register_ban", s.store.Current().Shield.RegisterBan,
 		"register_ban_aor", s.store.Current().Shield.RegisterBanAOR,
 		"admission_ban", s.store.Current().Shield.AdmissionBan,
+		"register_ban_long", s.store.Current().Shield.RegisterBanLong,
+		"register_ban_aor_long", s.store.Current().Shield.RegisterBanAORLong,
+		"admission_ban_long", s.store.Current().Shield.AdmissionBanLong,
 		"webrtc", s.webrtcEnabled)
 
 	close(s.ready)

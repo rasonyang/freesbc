@@ -32,14 +32,13 @@ const (
 	aorKeyMax = 384
 )
 
-// aorEntry is one AoR's strikes in a fixed window that opens at its first
-// strike, and the end of its lock once the threshold was crossed.
+// aorEntry is one AoR's strikes in a short and a long fixed window, each
+// opening at its first strike, and the end of its lock once either stage's
+// threshold was crossed.
 type aorEntry struct {
-	key    string
-	start  time.Time
-	window time.Duration
-	count  int
-	locked time.Time // zero, or when the limit closes again
+	key         string
+	short, long strikeStage
+	locked      time.Time // zero, or when the limit closes again
 }
 
 type aorTable struct {
@@ -61,10 +60,12 @@ func aorKey(aor string) string {
 	return aor
 }
 
-// strike adds one strike under lim. When the strike crosses lim.N the AoR
-// is locked until now+ban. It returns the count, whether the AoR is locked
-// and whether this strike opened the lock.
-func (t *aorTable) strike(aor string, lim config.StrikeLimit, ban time.Duration) (count int, locked, opened bool) {
+// strike adds one strike to every enabled stage (the short stage under
+// short, which the caller has checked is usable, and the long stage under
+// long when that is usable). When either crosses its N the AoR is locked
+// until now+ban; the lock is not extended. It returns the verdict (over =
+// the AoR is locked, crossed = this strike opened the lock).
+func (t *aorTable) strike(aor string, short, long config.StrikeLimit, ban time.Duration) strikeVerdict {
 	key := aorKey(aor)
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -73,10 +74,8 @@ func (t *aorTable) strike(aor string, lim config.StrikeLimit, ban time.Duration)
 	if el, ok := t.entries[key]; ok {
 		e = el.Value.(*aorEntry)
 		t.lru.MoveToFront(el)
-		if e.locked.IsZero() && now.Sub(e.start) >= lim.Window {
-			e.start, e.count = now, 0
-		} else if !e.locked.IsZero() && !now.Before(e.locked) {
-			e.start, e.count, e.locked = now, 0, time.Time{}
+		if !e.locked.IsZero() && !now.Before(e.locked) {
+			e.short, e.long, e.locked = strikeStage{}, strikeStage{}, time.Time{}
 		}
 	} else {
 		if t.lru.Len() >= t.max {
@@ -84,19 +83,26 @@ func (t *aorTable) strike(aor string, lim config.StrikeLimit, ban time.Duration)
 			delete(t.entries, victim.Value.(*aorEntry).key)
 			t.lru.Remove(victim)
 		}
-		e = &aorEntry{key: key, start: now}
+		e = &aorEntry{key: key}
 		t.entries[key] = t.lru.PushFront(e)
 	}
-	e.window = lim.Window
-	e.count++
-	if !e.locked.IsZero() {
-		return e.count, true, false
+	// A stage keeps its window while the lock is open, as it always has.
+	keep := !e.locked.IsZero()
+	sOver, sCross := e.short.add(now, "", short, keep)
+	var lOver, lCross bool
+	if usableLimit(long) {
+		lOver, lCross = e.long.add(now, "", long, keep)
 	}
-	if e.count > lim.N {
+	v := verdict(&e.short, &e.long, sOver, sCross, lOver, lCross)
+	if keep {
+		v.over, v.crossed = true, false
+		return v
+	}
+	if v.over {
 		e.locked = now.Add(ban)
-		return e.count, true, true
+		v.crossed = true
 	}
-	return e.count, false, false
+	return v
 }
 
 // evictable picks the entry a full table drops: the least recently struck
@@ -140,7 +146,7 @@ func (e *aorEntry) expired(now time.Time) bool {
 	if !e.locked.IsZero() {
 		return !now.Before(e.locked)
 	}
-	return now.Sub(e.start) >= e.window
+	return !e.short.open(now) && !e.long.open(now)
 }
 
 func (t *aorTable) prune() {
@@ -161,17 +167,29 @@ func (t *aorTable) size() int {
 	return len(t.entries)
 }
 
-// live copies the entries still counting or locked, with their window end
-// (the lock end for a locked one).
+// live copies the entries still counting or locked. A locked entry reports
+// its stages as stored (they stop resetting while the lock is open); an
+// unlocked one reports only the stages whose window is open.
 func (t *aorTable) live() []aorEntry {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
 	out := make([]aorEntry, 0, len(t.entries))
 	for _, el := range t.entries {
-		if e := el.Value.(*aorEntry); !e.expired(now) {
-			out = append(out, *e)
+		e := el.Value.(*aorEntry)
+		if e.expired(now) {
+			continue
 		}
+		row := *e
+		if e.locked.IsZero() {
+			if !row.short.open(now) {
+				row.short = strikeStage{}
+			}
+			if !row.long.open(now) {
+				row.long = strikeStage{}
+			}
+		}
+		out = append(out, row)
 	}
 	return out
 }
@@ -187,16 +205,16 @@ func (s *Shield) StrikeAOR(aor string) bool {
 		return false
 	}
 	cfg := s.store.Current()
-	lim := s.strikeLimit(cfg, StrikeRegisterAOR)
-	if lim.Off || lim.N <= 0 || lim.Window <= 0 {
+	lim, long := s.strikeLimits(cfg, StrikeRegisterAOR)
+	if !usableLimit(lim) {
 		return false
 	}
-	count, locked, opened := s.aors.strike(aor, lim, cfg.Shield.Ban.Std())
-	if opened {
+	v := s.aors.strike(aor, lim, long, cfg.Shield.Ban.Std())
+	if v.crossed {
 		s.log.Warn("shield locked AoR for repeated failed REGISTER credentials; REGISTERs for it from sources without a live binding are dropped",
-			"aor", aor, "strikes", count, "window", lim.Window.String(), "lock", cfg.Shield.Ban.Std().String())
+			"aor", aor, "stage", v.stage, "strikes", v.count, "window", v.window.String(), "lock", cfg.Shield.Ban.Std().String())
 	}
-	return locked
+	return v.over
 }
 
 // AORLocked reports whether aor's limit is open: a REGISTER for it from a
@@ -207,7 +225,7 @@ func (s *Shield) AORLocked(aor string) bool {
 	if aor == "" {
 		return false
 	}
-	if lim := s.strikeLimit(s.store.Current(), StrikeRegisterAOR); lim.Off || lim.N <= 0 || lim.Window <= 0 {
+	if lim := s.strikeLimit(s.store.Current(), StrikeRegisterAOR); !usableLimit(lim) {
 		return false
 	}
 	return s.aors.isLocked(aor)

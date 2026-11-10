@@ -34,18 +34,25 @@ type CarrierRegistration struct {
 type Ban struct {
 	Source string // IP, or IP:port for a UDP socket ban
 	Kind   string // "ip", "udp_ip" or "udp_socket"
-	Reason string // "scanner" or "register"
+	Reason string // "scanner", "register", "admission" or "malformed"
 	Since  time.Time
 	Until  time.Time
 }
 
 // Offender is one source with shield strikes in an open window.
 type Offender struct {
-	Source  string // IPv4 address, or IPv6 /64 prefix
-	Reason  string // "register"
-	Strikes int
-	Since   time.Time // the window opened
-	Until   time.Time // the window closes
+	Source string // IPv4 address, or IPv6 /64 prefix
+	// Reason is "register", "register_aor", "admission", "admission_udp",
+	// "malformed" or "malformed_udp".
+	Reason  string
+	Strikes int       // the short stage's count
+	Since   time.Time // the short window opened (zero when closed)
+	Until   time.Time // the short window closes (the lock end for a locked AoR)
+	// LongStrikes, LongSince and LongUntil are the long stage's (zero when
+	// its window is closed).
+	LongStrikes int
+	LongSince   time.Time
+	LongUntil   time.Time
 }
 
 // SwitchNode is the passive health of one switch node.
@@ -231,13 +238,22 @@ func (s *Server) handleOffenders(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	items := make([]map[string]any, 0, len(top))
 	for _, o := range top {
-		items = append(items, map[string]any{
-			"source":    o.Source,
-			"reason":    o.Reason,
-			"strikes":   o.Strikes,
-			"since":     rfc3339(o.Since),
-			"remaining": secondsUntil(o.Until, now),
-		})
+		item := map[string]any{
+			"source":         o.Source,
+			"reason":         o.Reason,
+			"strikes":        o.Strikes,
+			"remaining":      secondsUntil(o.Until, now),
+			"long_strikes":   o.LongStrikes,
+			"long_remaining": secondsUntil(o.LongUntil, now),
+		}
+		// A closed window has no start: the key is omitted.
+		if since := rfc3339(o.Since); since != nil {
+			item["since"] = since
+		}
+		if since := rfc3339(o.LongSince); since != nil {
+			item["long_since"] = since
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, map[string]any{"items": items, "total": total, "limit": limit})
 }
