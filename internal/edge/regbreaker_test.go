@@ -236,10 +236,25 @@ func TestRegisterBreakerPoolFailoverAndRecovery(t *testing.T) {
 	if got := len(fsA.waitFor(sip.REGISTER, 1, 3*time.Second)); got != 1 {
 		t.Fatalf("fs-a saw %d REGISTERs, want the one probe", got)
 	}
-	if !allowed(h.srv.upstreamCooldown, addrA, registerTimeout) {
-		t.Fatal("a 401 did not close the breaker")
+	// The server relays the final response first and closes the breaker
+	// after, so the phone having the 401 does not mean it is closed yet.
+	// Poll the state under the lock; RegisterAllow would take the half-open
+	// probe slot.
+	var open bool
+	var fails int
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		h.srv.upstreamCooldown.mu.Lock()
+		b := h.srv.upstreamCooldown.reg[addrA]
+		open, fails = b.open, b.fails
+		h.srv.upstreamCooldown.mu.Unlock()
+		if !open || time.Now().After(deadline) {
+			break
+		}
 	}
-	if b := h.srv.upstreamCooldown.reg[addrA]; b.open || b.fails != 0 {
-		t.Fatalf("breaker after the answer: %+v", b)
+	if open || fails != 0 {
+		t.Fatalf("a 401 did not close the breaker: open=%v fails=%d", open, fails)
+	}
+	if !allowed(h.srv.upstreamCooldown, addrA, registerTimeout) {
+		t.Fatal("a closed breaker did not allow a REGISTER")
 	}
 }
