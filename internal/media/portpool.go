@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 )
@@ -113,6 +114,11 @@ type PlanePool struct {
 	// rejectBudget caps the pool's "rejected by latch" WARNs (latchlog.go).
 	rejectBudget planeBudget
 
+	// excluded holds the even RTP port of every pair left out of the pool
+	// for good: the pair containing a UDP port FreeSBC's own SIP socket
+	// holds on this pool's bind address. Fixed at construction.
+	excluded map[int]struct{}
+
 	mu     sync.Mutex
 	inUse  map[int]struct{} // RTP (even) ports currently allocated
 	cursor int              // next candidate RTP port
@@ -120,8 +126,41 @@ type PlanePool struct {
 
 // NewPlanePool builds a pool whose range and bind address come from params
 // on every allocation. name appears in exhaustion errors and metrics.
-func NewPlanePool(name string, params func() PlaneParams) *PlanePool {
-	return &PlanePool{name: name, params: params, inUse: make(map[int]struct{})}
+//
+// reserved lists UDP ports the process itself holds on the pool's bind
+// address (its SIP sockets). The pair containing each one, whether it is the
+// even or the odd port of the pair, is never reserved, bound or retried, and
+// does not count in Stats; ports outside the range are ignored.
+func NewPlanePool(name string, params func() PlaneParams, reserved ...int) *PlanePool {
+	ex := make(map[int]struct{}, len(reserved))
+	for _, port := range reserved {
+		if port > 0 {
+			ex[port&^1] = struct{}{}
+		}
+	}
+	return &PlanePool{name: name, params: params, excluded: ex, inUse: make(map[int]struct{})}
+}
+
+// ExcludedPairs returns the even RTP port of every pair inside [lo, hi]
+// that the pool leaves out, in ascending order.
+func (p *PlanePool) ExcludedPairs(lo, hi int) []int {
+	if lo%2 != 0 {
+		lo++
+	}
+	var out []int
+	for port := range p.excluded {
+		if port >= lo && port+1 <= hi {
+			out = append(out, port)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// isExcluded reports whether the pair at the even port is left out.
+func (p *PlanePool) isExcluded(port int) bool {
+	_, ok := p.excluded[port]
+	return ok
 }
 
 // allocatePair binds the next free RTP/RTCP pair. Ports occupied by other
@@ -172,7 +211,7 @@ func sweep[T any](p *PlanePool, par PlaneParams, bind func(port int) (T, error))
 	if lo%2 != 0 {
 		lo++ // RTP ports are even by convention
 	}
-	pairs := (hi - lo + 1) / 2
+	pairs := (hi-lo+1)/2 - len(p.ExcludedPairs(lo, hi))
 	var zero T
 	for tried := 0; tried < pairs; tried++ {
 		port, ok := p.reserveNext(lo, hi)
@@ -198,10 +237,15 @@ func (p *PlanePool) reserveNext(lo, hi int) (port int, ok bool) {
 	if p.cursor < lo || p.cursor+1 > hi {
 		p.cursor = lo
 	}
-	port = p.cursor
-	p.cursor += 2
-	if p.cursor+1 > hi {
-		p.cursor = lo
+	for {
+		port = p.cursor
+		p.cursor += 2
+		if p.cursor+1 > hi {
+			p.cursor = lo
+		}
+		if !p.isExcluded(port) {
+			break
+		}
 	}
 	if _, used := p.inUse[port]; used {
 		return port, false
@@ -218,7 +262,7 @@ func (p *PlanePool) Stats() (inUse, total int) {
 	if lo%2 != 0 {
 		lo++
 	}
-	total = (hi - lo + 1) / 2
+	total = (hi-lo+1)/2 - len(p.ExcludedPairs(lo, hi))
 	// the rtp port range is not validated for max > min, so an
 	// inverted range is reachable and would report a negative capacity.
 	if total < 0 {

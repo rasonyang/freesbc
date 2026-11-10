@@ -163,3 +163,44 @@ func TestSharedSocketMovedPort(t *testing.T) {
 		t.Errorf("two-address layout: shared=%v private=%v, want port %d", sep.SharedSocket(), sep.PrivateAddr(), PrivateSIPPort)
 	}
 }
+
+// A SIP port inside the rtp range is allowed; its pair is left out of the
+// capacity math.
+func TestSIPPortInsideRTPRange(t *testing.T) {
+	// Single-IP: one socket, one range, two pairs per call. 5000 pairs less the
+	// 16060-16061 pair is 4999; a call takes two, so 2499 calls.
+	moved := strings.Replace(sharedYAML, "udp: 5060", "udp: 16060", 1)
+	c := mustParse(t, moved)
+	if c.PublicPairs() != 4999 || c.SessionPairs() != 2499 || c.Shield.MaxSessions != 2499 {
+		t.Errorf("single-IP: public pairs %d, session pairs %d, max_sessions %d; want 4999, 2499, 2499", c.PublicPairs(), c.SessionPairs(), c.Shield.MaxSessions)
+	}
+	// An odd port excludes the same pair.
+	if got := (PortRange{Min: 10000, Max: 19999}).PairsExcluding(16061, 16060); got != 4999 {
+		t.Errorf("PairsExcluding(16061, 16060) = %d, want 4999 (one pair counted once)", got)
+	}
+	// 2500 calls no longer fit.
+	parseErr(t, moved+"shield: { max_sessions: 2500 }\n")
+	mustParse(t, moved+"shield: { max_sessions: 2499 }\n")
+
+	// Two-address layout: the private plane loses 5060 only when the range holds it.
+	sep := mustParse(t, strings.Replace(minimalYAML, "{ udp: 5060 }", "{ udp: 16060 }", 1)+"rtp: 5000-5999\n")
+	if sep.PrivatePairs() != 499 || sep.PublicPairs() != 500 || sep.SessionPairs() != 499 || sep.Shield.MaxSessions != 499 {
+		t.Errorf("private 5060 in range: private %d public %d session %d max_sessions %d; want 499, 500, 499, 499",
+			sep.PrivatePairs(), sep.PublicPairs(), sep.SessionPairs(), sep.Shield.MaxSessions)
+	}
+	pub := mustParse(t, strings.Replace(minimalYAML, "{ udp: 5060 }", "{ udp: 16060 }", 1)+"rtp: 16000-16999\n")
+	if pub.PublicPairs() != 499 || pub.PrivatePairs() != 500 || pub.SessionPairs() != 499 {
+		t.Errorf("public udp in range: public %d private %d session %d; want 499, 500, 499", pub.PublicPairs(), pub.PrivatePairs(), pub.SessionPairs())
+	}
+
+	// A range whose only pair holds the SIP socket fails.
+	if msg := parseErr(t, strings.Replace(minimalYAML, "{ udp: 5060 }", "{ udp: 16060 }", 1)+"rtp: 16060-16061\n"); !strings.Contains(msg, "usable") {
+		t.Errorf("only-pair error does not say so: %s", msg)
+	}
+	if msg := parseErr(t, strings.Replace(moved, "rtp: 10000-19999", "rtp: 16060-16061", 1)); !strings.Contains(msg, "at least 2") {
+		t.Errorf("single-IP error: %s", msg)
+	}
+	if msg := parseErr(t, strings.Replace(moved, "rtp: 10000-19999", "rtp: 16060-16063", 1)); !strings.Contains(msg, "at least 2") {
+		t.Errorf("single-IP with one usable pair: %s", msg)
+	}
+}

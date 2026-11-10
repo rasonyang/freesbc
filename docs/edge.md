@@ -193,7 +193,7 @@ edge:
     udp: 5060
 ```
 
-The switch sends to `10.77.0.2:5060`, FreeSBC sends to carriers from the same socket, and the NAT makes that `203.0.113.7:5060`. The provider forwards udp/5060 and the `rtp` range to the host, unchanged. The port is `edge.listen.udp`: set it to `16060` and the socket is `10.77.0.2:16060`, the switch's outbound proxy follows it, and Via, Record-Route and Contact carry it on both sides. Do this when a SIP ALG on the path rewrites UDP 5060 ([Troubleshooting](troubleshooting.md#a-sip-alg-rewrites-sip-on-udp-5060)). The NAT must forward the new port unchanged. `freesbc check` prints the forwards and states that one socket serves both sides.
+The switch sends to `10.77.0.2:5060`, FreeSBC sends to carriers from the same socket, and the NAT makes that `203.0.113.7:5060`. The provider forwards udp/5060 and the `rtp` range to the host, unchanged. The port is `edge.listen.udp`: set it to `16060` and the socket is `10.77.0.2:16060`, the switch's outbound proxy follows it, and Via, Record-Route and Contact carry it on both sides. Do this when a SIP ALG on the path rewrites UDP 5060 ([Troubleshooting](troubleshooting.md#a-sip-alg-rewrites-sip-on-udp-5060)). The NAT must forward the new port unchanged. With `rtp: 10000-19999` the pair 16060-16061 is left out of the media range, so capacity is one pair lower. `freesbc check` prints the forwards and states that one socket serves both sides.
 
 **Validation.** `private.ip` may equal `public.bind` only when all of these hold; each failure is its own error:
 

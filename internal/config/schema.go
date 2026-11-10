@@ -347,11 +347,7 @@ func withDefaults(c *Config) {
 		c.Edge.SRTP = SRTPOff
 	}
 	if c.Shield.MaxSessions == 0 {
-		c.Shield.MaxSessions = c.RTP.Pairs()
-		if c.SharedSocket() {
-			// Both planes draw from the one range: two pairs per call.
-			c.Shield.MaxSessions /= 2
-		}
+		c.Shield.MaxSessions = c.SessionPairs()
 	}
 	if c.Shield.RateLimit == "" {
 		c.Shield.RateLimit = "20/s per_ip"
@@ -455,6 +451,34 @@ func (c *Config) PrivateAddr() netip.AddrPort {
 		port = c.Edge.Listen.UDP
 	}
 	return netip.AddrPortFrom(c.PrivateIP(), uint16(port))
+}
+
+// PublicPairs is how many RTP/RTCP pairs the public plane can hand out: the
+// rtp range less the pair holding the public udp listener (edge.listen.udp),
+// which binds the same address.
+func (c *Config) PublicPairs() int { return c.RTP.PairsExcluding(c.Edge.Listen.UDP) }
+
+// PrivatePairs is the same for the private plane: the rtp range less the pair
+// holding the private SIP socket (PrivateAddr).
+func (c *Config) PrivatePairs() int { return c.RTP.PairsExcluding(int(c.PrivateAddr().Port())) }
+
+// SessionPairs is how many calls the rtp range can anchor: a call takes one
+// pair per plane, so it is the smaller of PublicPairs and PrivatePairs, and in
+// the single-IP layout (one address, one range for both planes, two pairs per
+// call) half the pairs left once the one SIP socket's pair is out.
+func (c *Config) SessionPairs() int {
+	return SessionPairs(c.RTP, c.Edge.Listen.UDP, int(c.PrivateAddr().Port()), c.SharedSocket())
+}
+
+// SessionPairs is Config.SessionPairs for explicit inputs: the range, the
+// public udp port (0 if none), the private SIP socket's port and whether both
+// planes share one address. The edge calls it with its actual private socket
+// so a test seam that moves that socket is honoured.
+func SessionPairs(r PortRange, publicUDP, privatePort int, shared bool) int {
+	if shared {
+		return r.PairsExcluding(publicUDP, privatePort) / 2
+	}
+	return min(r.PairsExcluding(publicUDP), r.PairsExcluding(privatePort))
 }
 
 // Switches returns the edge.switch nodes in file order.
