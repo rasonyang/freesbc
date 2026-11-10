@@ -228,6 +228,12 @@ func TestValidateErrors(t *testing.T) {
 		{"register ban long window", with("shield: { register_ban: 10/48h }\n"), "shield.register_ban"},
 		{"admission ban junk", with("shield: { admission_ban: nope }\n"), "shield.admission_ban"},
 		{"admission ban zero", with("shield: { admission_ban: 0/5m }\n"), "shield.admission_ban"},
+		{"admission ban long junk", with("shield: { admission_ban_long: nope }\n"), "shield.admission_ban_long"},
+		{"admission ban long zero", with("shield: { admission_ban_long: 0/1h }\n"), "shield.admission_ban_long"},
+		{"register ban long junk", with("shield: { register_ban_long: nope }\n"), "shield.register_ban_long"},
+		{"register ban long zero", with("shield: { register_ban_long: 0/1h }\n"), "shield.register_ban_long"},
+		{"register ban aor long junk", with("shield: { register_ban_aor_long: nope }\n"), "shield.register_ban_aor_long"},
+		{"register ban aor long zero", with("shield: { register_ban_aor_long: 0/1h }\n"), "shield.register_ban_aor_long"},
 		{"admin listen", with("admin: { listen: nope, password_hash: " + good + " }\n"), "admin.listen"},
 		{"admin remote without opt-in", with("admin: { listen: 0.0.0.0:8080, password_hash: " + good + " }\n"), "allow_remote"},
 		{"admin no hash", with("admin: { listen: 127.0.0.1:8080 }\n"), "admin.password_hash"},
@@ -460,6 +466,29 @@ func TestShieldAdmissionBan(t *testing.T) {
 	}
 	if c := mustParse(t, with("shield: { admission_ban: \"off\" }\n")); c.Shield.AdmissionBan != "off" {
 		t.Errorf("admission_ban = %q, want off", c.Shield.AdmissionBan)
+	}
+}
+
+// The long stages default on, take any valid threshold ("off" included) and
+// are not checked against the short key: an existing register_ban: 10/1h
+// still loads with the default long stage.
+func TestShieldLongStages(t *testing.T) {
+	c := mustParse(t, with(""))
+	for _, tc := range []struct{ name, got, want string }{
+		{"register_ban_long", c.Shield.RegisterBanLong, DefaultRegisterBanLong},
+		{"register_ban_aor_long", c.Shield.RegisterBanAORLong, DefaultRegisterBanAORLong},
+		{"admission_ban_long", c.Shield.AdmissionBanLong, DefaultAdmissionBanLong},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s default = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+	if DefaultRegisterBanLong != "20/1h" || DefaultRegisterBanAORLong != "20/1h" || DefaultAdmissionBanLong != "30/1h" {
+		t.Error("long defaults changed")
+	}
+	c = mustParse(t, with("shield: { register_ban_long: 5/2h, register_ban_aor_long: \"off\", admission_ban_long: 7/30m, register_ban: 10/1h, admission_ban: \"off\" }\n"))
+	if c.Shield.RegisterBanLong != "5/2h" || c.Shield.RegisterBanAORLong != "off" || c.Shield.AdmissionBanLong != "7/30m" {
+		t.Errorf("long keys = %q %q %q", c.Shield.RegisterBanLong, c.Shield.RegisterBanAORLong, c.Shield.AdmissionBanLong)
 	}
 }
 

@@ -421,7 +421,7 @@ Every top-level section is restart-only except `shield`. The table is
 |---|---|
 | `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`Server.beginDialog`, `invite.go`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs, or half of them in the single-IP layout (`Server.sessionLimit`, `invite.go`) | |
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`Shield.AllowRate`, `shield.go`), re-parsing a rate-limit string only when it changes (`Shield.rateLimit`, `shield.go`) | `public` (`ip`, `bind`) |
-| `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing only when the string changes (`strikeLimit`, `offenders.go`) | |
+| `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban` and their long stages `shield.register_ban_long`, `shield.register_ban_aor_long`, `shield.admission_ban_long`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing each string only when it changes (`strikeLimits`, `cachedStrikeLimit`, `offenders.go`) | |
 | | `private` (`ip`) |
 | | `rtp` (the media pools read the range from `boot` in `newMediaPools`, `mediapool.go`) |
 | | `tls` (certificates are loaded at bind: TLS and WSS in `openListener`; the admin in `admin.Server.Run`) |
@@ -1271,7 +1271,8 @@ Per REGISTER:
    limit never sees a registrar that challenges (401) every guess, so failed
    credential attempts are struck against their source in the shield
    (`Shield.Strike(src, "register")`, threshold `shield.register_ban`,
-   default `10/10m`, hot). `pumpRegister` calls `registerOutcome` on every
+   default `10/10m`, hot, and its long stage `shield.register_ban_long`,
+   default `20/1h`). `pumpRegister` calls `registerOutcome` on every
    final, before relaying it: a **2xx to a request that carried a matching
    credential clears** the source's strikes (`credentialMatches`,
    `registerproof.go`; a credential-less, mismatched or query 2xx clears
@@ -1293,18 +1294,26 @@ Per REGISTER:
    sipgo's Timer J plus a margin) is absorbed by sipgo's transaction, so the
    read filter counts it (§7.1). Reliable transports end the server
    transaction with its final, so a reused branch there reaches this path.
-   Over the threshold `Strike` bans the source key for `shield.ban` (reason
-   `register`; WARN `shield banned source for repeated failures` once per
-   window) and every further strike in the window extends it. An IPv6 source
+   Over either stage's threshold `Strike` bans the source key for `shield.ban` (reason
+   `register`; WARN `shield banned source for repeated failures`, with the
+   crossing `stage`, once per stage window) and every further strike while a stage is over
+   extends it. An IPv6 source
    is counted and banned by its /64 (one strike key, one ban entry), so an
    attacker rotating inside its /64 holds one entry. The guard keeps at most 16384 source keys
    (`regGuardSources`, LRU, 4 nonce and 8 branch hashes and 16 struck
    attempts each); the shield's offender table at most 16384 (source key,
-   reason) entries (`offenderCap`, LRU, pruned on the shield tick). Nonces
+   reason) entries (`offenderCap`, LRU, pruned on the shield tick). Each
+   entry holds two `strikeStage`s, a short and a long fixed window that each
+   open at their own first strike and reset independently; every strike
+   counts in both enabled stages (`strikeLimits` returns the pair, a long
+   `off` leaves only the short stage, the short key is the master switch: a
+   short `off` counts nothing at either stage). No relation between the two
+   values is validated. Nonces
    are stored as FNV-1a hashes and never logged.
 
    **Per-AoR strikes** (issue #187, `shield.register_ban_aor`, default
-   `10/10m`, hot, `off` disables). A distributed low-and-slow brute force
+   `10/10m`, hot, `off` disables, plus its long stage
+   `shield.register_ban_aor_long`, default `20/1h`). A distributed low-and-slow brute force
    spreads refused credentials for one AoR over many source IPs, each under
    `register_ban`. `registerStrike` therefore also calls `Shield.StrikeAOR`
    with the request's normalised AoR (`user@host`, lower case, the To
@@ -1312,15 +1321,17 @@ Per REGISTER:
    strike, so exactly the same counting rules apply (nonce relayed to that
    source key, no refresh of a live binding, no carrier source, never an
    unanswered exchange). The table (`aorTable`, `shield/aorstrikes.go`) is an
-   LRU of at most 16384 AoRs (`aorCap`), keys cut at 384 bytes, fixed
-   window from the first strike, pruned on the shield tick. When it is
+   LRU of at most 16384 AoRs (`aorCap`), keys cut at 384 bytes, two fixed
+   windows (a short and a long `strikeStage`) from the first strike,
+   each resetting on its own, pruned on the shield tick. When it is
    full, a new AoR evicts the least recently struck unlocked entry among
    the last 64 (`aorEvictScan`), so a flood of distinct AoRs cannot push
    a lock out early, and falls back to the least recently struck entry
    when all of those are locked, so the cap always holds. The strike that
-   crosses the threshold locks the AoR for `shield.ban` (one WARN
-   `shield locked AoR ...` naming the AoR and the count); a lock is not
-   extended by later strikes and ends by itself. While locked,
+   crosses either stage's threshold locks the AoR for `shield.ban` (one WARN
+   `shield locked AoR ...` naming the AoR, the crossing `stage`, its count
+   and window); a lock is not extended by later strikes, stages stop resetting
+   while it is open, and it ends by itself, resetting both stages. While locked,
    `onRegister` (`aorLockedFor`, after the enumeration check and the AoR
    derivation, before the Contact is read and any switch node or breaker
    is consulted) drops a REGISTER for that AoR silently, counted
@@ -1328,10 +1339,10 @@ Per REGISTER:
    unless its source IP key holds a live binding of the AoR (any port) or is
    a carrier source. The drop is deliberately not an admission strike (a
    retrying real user would lose their whole IP, §14.1). A 2xx for the AoR
-   to a request with a matching credential (`registerOutcome`) clears its count and lifts the lock. Setting the key
+   to a request with a matching credential (`registerOutcome`) clears both counts and lifts the lock. Setting the key
    to `off` stops both counting and dropping at once. The AoR entries are
    listed in `GET /api/shield/offenders` with reason `register_aor` and the
-   AoR as `source`. Trade-off: an attacker can lock a legitimate AoR by
+   AoR as `source` (a locked entry reports its lock end as `remaining`). Trade-off: an attacker can lock a legitimate AoR by
    failing on purpose from many addresses (a new device or a re-register
    after expiry is dropped until the lock ends); the exemption for a live
    binding and the 2xx clear limit the damage, `off` removes it.
@@ -3895,7 +3906,7 @@ There is no carrier DNS metric.
 | Level | Examples |
 |---|---|
 | `Error` | `"proxy handler panic"` (+ stack); `"registration binding rejected"`; `"rejecting call: media ports exhausted"`; media relay panic (`"media relay panic; killing session"`); `"admin handler panic"` (+ stack); `"config watcher error"`, `"config reload failed, keeping previous config"`; `"config watcher exited"`, `"edge proxy exited"`, `"admin server exited"` |
-| `Warn` | `"config reload changes restart-only settings; …"`; `shield banned scanner`; `shield banned source for repeated failures` (once per source key and window, §14.1); `shield locked AoR for repeated failed REGISTER credentials; …` (once per lock, §7.4); `"public request dropped by admission; …"` (the first drop per source IP and reason, remembered in a FIFO set capped at 4096, `maxWarnedSources`, `admission.go`); `"REGISTER enumeration limit reached; …"`; `"rejecting call: too many unanswered calls from one source"`; `"upstream INVITE unanswered; entering cooldown"` / `"upstream REGISTER unanswered; entering cooldown"` / `"upstream REGISTER unanswered; breaker open, REGISTERs not dialed"` (at most one per node per 30 s, plus one at each breaker opening); `"forward INVITE upstream"` / `"forward INVITE to client"` / `"forward INVITE to carrier"` / `"forward carrier REGISTER"` failures; `"carrier has no resolved address"`; `"carrier DNS lookup failed; keeping the last good addresses"`; `"carrier request names an unknown or expired registration token; …"`; `"2xx ACK never arrived; …"` (the first miss per plane, then at most one per minute, with `suppressed`); `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"rejecting call to WebSocket client: …"` (a WebSocket client with no ws/wss listener cannot be offered DTLS-SRTP) |
+| `Warn` | `"config reload changes restart-only settings; …"`; `shield banned scanner`; `shield banned source for repeated failures` (once per source key and stage window, attribute `stage` `short` or `long`, §14.1); `shield locked AoR for repeated failed REGISTER credentials; …` (once per lock, attribute `stage`, §7.4); `"public request dropped by admission; …"` (the first drop per source IP and reason, remembered in a FIFO set capped at 4096, `maxWarnedSources`, `admission.go`); `"REGISTER enumeration limit reached; …"`; `"rejecting call: too many unanswered calls from one source"`; `"upstream INVITE unanswered; entering cooldown"` / `"upstream REGISTER unanswered; entering cooldown"` / `"upstream REGISTER unanswered; breaker open, REGISTERs not dialed"` (at most one per node per 30 s, plus one at each breaker opening); `"forward INVITE upstream"` / `"forward INVITE to client"` / `"forward INVITE to carrier"` / `"forward carrier REGISTER"` failures; `"carrier has no resolved address"`; `"carrier DNS lookup failed; keeping the last good addresses"`; `"carrier request names an unknown or expired registration token; …"`; `"2xx ACK never arrived; …"` (the first miss per plane, then at most one per minute, with `suppressed`); `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"rejecting call to WebSocket client: …"` (a WebSocket client with no ws/wss listener cannot be offered DTLS-SRTP) |
 | `Info` | `"edge proxy listening"`, `"media planes ready"`, `"freesbc started"`, `"shutting down"`, `"admin server listening"`, `"config reloaded"`; `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"proxying INVITE to carrier"`; `"carrier registration"` with the granted expiry; `"carrier resolved"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"rejecting call: media not negotiable"`; `"ending the call; sending BYE to both ends"` with the `reason`; `"call ended"` with `reason`, `terminated_by`, `duration`, `webrtc`, `carrier` and media stats |
 | `Debug` | dialog ACK/BYE bookkeeping; `"2xx ACK never arrived"` for every miss; shield rate-limit drops and scanner-datagram drops; edge `"public request dropped by admission"` after the first per source; `"in-dialog request without a dialog record; hashing upstream"` and its carrier variant; `"pruned expired registration bindings"` / `"pruned expired carrier registrations"`; `"carrier DNS lookup still failing"`; `"forward carrier OPTIONS"`; dropped unroutable responses |
 
@@ -3931,7 +3942,7 @@ Host and Origin checks (§14, Admin) before any auth work, on every route but
 | `/api/registrations` | GET (else 405 + `Allow: GET`) | Basic | `?user=&limit=&offset=` (`Server.handleRegistrations`, `state.go`): `{"items":[{"aor","user","transport","source" (IP:port),"expires_in" (seconds)}],"total","limit","offset"}`. `user` is a case-insensitive substring of the user part (at most 256 bytes); `limit` defaults to 100 and is clamped to 1000; a `limit` below 1 or non-numeric, a negative or non-numeric `offset` or an over-long `user` is 400. `total` counts the matches. Sorted by AoR, source, transport. Read from `Location.Registrations` (`location.go`) under its read lock. No Contact, token or Call-ID |
 | `/api/carrier-registrations` | GET (else 405) | Basic | array of `{"carrier","user","token","node","expires_in"}`; always an array. The switch's live registrations at carriers (`carrierRegTable.snapshot`, `carrierreg.go`); `token` is the opaque `fsbc` value in the carrier Contact, `node` the registering switch node |
 | `/api/shield/bans` | GET (else 405) | Basic | `?limit=&offset=` (`Server.handleBans`, `state.go`): `{"items":[{"source" (IPv4 address, IPv6 /64 prefix, or IP:port for `udp_socket`),"kind" ("ip", "udp_ip" or "udp_socket"),"reason","since" (RFC 3339),"remaining" (seconds)}],"total","limit","offset","ban_adds_rejected"}`. All three ban tables merged, newest first (`Shield.Bans`, `shield.go`); limit and offset as for registrations. `reason` is `scanner`, `register`, `admission` or `malformed`; `udp_ip` is an IPv4 address or IPv6 /64 banned on UDP only (rate limiting and enumeration only drop). `ban_adds_rejected` is the cumulative additions refused at the 65536 cap |
-| `/api/shield/offenders` | GET (else 405) | Basic | `?limit=` (`handleOffenders`, `state.go`): `{"items":[{"source" (IPv4 address or IPv6 /64),"reason" ("register", "admission", "admission_udp", "malformed", "malformed_udp" or "register_aor", whose "source" is then the AoR),"strikes","since" (RFC 3339, the window opened),"remaining" (seconds of the window)}],"total","limit"}`, most strikes first (`Shield.Offenders`, `offenders.go`); limit default 100, at most 1000 |
+| `/api/shield/offenders` | GET (else 405) | Basic | `?limit=` (`handleOffenders`, `state.go`): `{"items":[{"source" (IPv4 address or IPv6 /64),"reason" ("register", "admission", "admission_udp", "malformed", "malformed_udp" or "register_aor", whose "source" is then the AoR),"strikes","remaining" (seconds of the short stage's window, or of the lock for a locked AoR),"long_strikes","long_remaining" (the long stage), and "since" and "long_since" (RFC 3339, when that window opened; omitted while it is closed)}],"total","limit"}`, most short strikes first, then long (`Shield.Offenders`, `offenders.go`); a row stays listed while either window is open (an AoR: or locked); limit default 100, at most 1000 |
 | `/api/switch-nodes` | GET (else 405) | Basic | array of `{"address","state" ("healthy" or "cooling_down"),"cooldown_remaining" (seconds),"last_failure" (RFC 3339 or null)}`; always an array, one per `edge.switch` entry, sorted by address (`cooldownTable.snapshot`, `cooldown.go`) |
 | `/api/carriers` | GET (else 405) | Basic | array of `{"name","host","transport","mode" ("literal", "srv", "a" or "" until resolved),"addresses":[{"address","in_use"}],"resolved_at","expires_at" (RFC 3339 or null),"cache_age_seconds" (or null),"failing","last_error"}`; always an array, sorted by name (`carrierDirectory.snapshotInfo`, `carrierdns.go`). `in_use` marks the first address, the one the edge sends to. While `failing`, `expires_at` is the next retry and the addresses are the last good set |
 | `/api/drain` | GET, POST, DELETE (else 405 + `Allow: GET, POST, DELETE`) | Basic | `{"draining": bool, "since": RFC 3339 or null, "active_calls": int}` (`Server.handleDrain`, `api.go`). POST enters drain mode, DELETE leaves it; both are idempotent (a repeated POST keeps the original `since`) and answer with the same body as GET. POST and DELETE need the Origin check below. 404 when `Deps.DrainState` or `Deps.SetDraining` is nil. Each actual change is logged at Info with the remote address and `active_calls`; each actual change is also recorded as `drain_on` / `drain_off` (§13.5) |
@@ -3953,7 +3964,8 @@ JSON keys (`redactConfig`, `admin/redact.go`): `public` (`ip`, `bind`), `private
 `listen` and `advertise` with `udp`, `tcp`, `tls`, `ws`, `wss`, `carriers`,
 `carrier_sources`, `srtp`, `allow_insecure_sdes`, `allow_register_auth_mismatch`), `shield` (`rate_limit`,
 `carrier_rate_limit`, `ban` as a duration string, `max_sessions`,
-`invite_rate_limit`, `register_ban`, `register_ban_aor`, `admission_ban`)
+`invite_rate_limit`, `register_ban`, `register_ban_aor`, `admission_ban`,
+`register_ban_long`, `register_ban_aor_long`, `admission_ban_long`)
 and, when present, `tls` (`cert`, `key` paths), `hep` (`address`,
 `transport`, `capture_id`, `node_name`, `redact_auth`, and `tls` with `ca`,
 `cert`, `key` paths when set) and `admin` (`listen`, `allow_remote`,
@@ -4285,11 +4297,12 @@ header, and are counted in `freesbc_edge_admission_drops_total` (§7.4, §7.5,
 §7.8a). Each drop except `register_aor_locked` (a dialog-less BYE or INFO and a `register_enumeration` drop included) is also a strike against its
 source in the shield (`Server.admissionStrike`, `admission.go`, called from
 `Server.dropSilently` (`admission.go`) with the request's transport): over
-`shield.admission_ban` (default `50/5m`, hot) the source IP (an IPv6 source: its /64) is banned for
+`shield.admission_ban` (default `50/5m`, hot) or its long stage `shield.admission_ban_long`
+(default `30/1h`, the same strikes in a second fixed window of the same entry) the source IP (an IPv6 source: its /64) is banned for
 `shield.ban` with reason `admission` (§14.1); the ban is UDP-only when the
 strikes came over UDP, all-transport when they came over a stream transport,
 so a scanner that stays under `shield.rate_limit` and
-rotates its source port is cut off before parsing (issue #180). An enumeration drop is a strike because the `enumWindow` ends and the source starts again, and until then it keeps its whole rate allowance unbanned (`shield.register_ban` counts only REGISTERs carrying `Authorization`, so bare ones never reach it); the scope and exemptions are unchanged, so it opens no forgery path (forged out-of-dialog INVITEs already earn the same `udp_ip` ban). Trade-off: a NAT whose devices all hold stale accounts and none is registered is banned for `shield.ban` (UDP only over UDP) instead of blocked for REGISTER only; one registered device behind the IP exempts it, and there is no unban API. A `register_aor_locked` drop is never a strike: the lock is the accepted trade-off against a distributed brute force, the locked AoR may be a real user whose phone keeps retrying, and striking its source would widen the lockout from the AoR to that user's whole IP (issue #311). A carrier
+rotates its source port is cut off before parsing (issue #180). The long stage closes the fixed-window gap (issue #305): a source that stays under `n` per short window is still banned over `n` per hour. The remaining blind spot is a source under both thresholds (by default fewer than 31 drops in any hour), and a longer `admission_ban_long` window lowers that floor while raising false positives (a UDP phone with a lost binding sending OPTIONS keep-alives more often than every ~2 minutes) and the time an entry lives in the 16384-entry LRU. An enumeration drop is a strike because the `enumWindow` ends and the source starts again, and until then it keeps its whole rate allowance unbanned (`shield.register_ban` counts only REGISTERs carrying `Authorization`, so bare ones never reach it); the scope and exemptions are unchanged, so it opens no forgery path (forged out-of-dialog INVITEs already earn the same `udp_ip` ban). Trade-off: a NAT whose devices all hold stale accounts and none is registered is banned for `shield.ban` (UDP only over UDP) instead of blocked for REGISTER only; one registered device behind the IP exempts it, and there is no unban API. A `register_aor_locked` drop is never a strike: the lock is the accepted trade-off against a distributed brute force, the locked AoR may be a real user whose phone keeps retrying, and striking its source would widen the lockout from the AoR to that user's whole IP (issue #311). A carrier
 source and any IP holding a registration binding on any port (`Location.HasIP`, `location.go`,
 a per-IP binding count) are never struck, and a 2xx
 REGISTER carrying a matching credential clears the source's admission strikes. A WARN once a minute
@@ -4408,12 +4421,13 @@ ban.
 **Strike bans** (`Shield.Strike`, `offenders.go`). A plane may report a
 source's failures as strikes; over the reason's threshold the source key (an
 IPv4 address, an IPv6 /64) is banned for `shield.ban` with the reason as the
-ban reason. The only reason
-are `register` (`shield.register_ban`, default `10/10m`, hot): a failed
+ban reason. The reasons
+are `register` (`shield.register_ban`, default `10/10m`, hot, long stage
+`shield.register_ban_long`, default `20/1h`): a failed
 REGISTER credential attempt (§7.4), also counted per AoR
-(`shield.register_ban_aor`, `Shield.StrikeAOR`; a lock, not a ban, §7.4);
+(`shield.register_ban_aor` and `shield.register_ban_aor_long`, `Shield.StrikeAOR`; a lock, not a ban, §7.4);
 and `admission` (`shield.admission_ban`,
-default `50/5m`, hot): a public request dropped by edge admission (§7.5), a dialog-less BYE or INFO included.
+default `50/5m`, hot, long stage `shield.admission_ban_long`, default `30/1h`; malformed reads share its budget): a public request dropped by edge admission (§7.5), a dialog-less BYE or INFO included.
 `Shield.StrikeOn(src, reason, transport)` scopes the ban by transport: a
 strike from UDP is counted under the offender reason `admission_udp` and
 bans the IP in a separate table (`udpBans`, kind `udp_ip`) that only
@@ -4423,9 +4437,10 @@ strike from tcp, tls, ws or wss is counted under `admission` and bans the
 source on every transport (`bans`). The counts never add, and a narrower ban never
 replaces a wider one (separate tables). A separate table also keeps a forged
 UDP flood from filling the all-transport table. Strikes are counted per source key (IPv4
-address, IPv6 /64) in a fixed window from the first strike, in an LRU of at
+address, IPv6 /64) in two fixed windows (`strikeStage`, a short and a long one)
+from their own first strike, over either of which the source is banned, in an LRU of at
 most 16384 entries (`offenderCap`), so a flood of sources only forgets the
-oldest; a carrier source is never struck; a success clears the count
+oldest; a carrier source is never struck; a success clears the counts of both stages
 (`ClearStrikes`). Strikes on a forgeable transport are the caller's to make
 safe: the REGISTER guard counts only an attempt whose nonce FreeSBC relayed
 to that source in a challenge, so a forged UDP datagram can neither ban a
@@ -4436,7 +4451,7 @@ threshold, the offender cap and the exemptions for carriers and registered
 IPs; a sustained forged flood naming an unregistered, non-carrier address
 can silence it, and for IPv6 its whole /64, on UDP for `shield.ban`, never
 on a stream transport. `GET
-/api/shield/offenders` lists the sources with strikes in an open window.
+/api/shield/offenders` lists the sources with strikes in an open window of either stage.
 
 **An IPv6 ban covers the /64** (#312). Strike counts, rate buckets and
 connection caps already treat a /64 as one source (normally one subscriber
@@ -4714,12 +4729,15 @@ code constant.
 | `ackTimeout` (`ackBudget`) | 32 s (`edge.go`) | also the wait for a 2xx ACK before `ack_timeout` ends the call (`ack.go`) |
 | `banCapQuiet` (`app/health.go`) | 60 s | how long `BanAddsRejected` must stand still before `shield_ban_cap` clears |
 | `shield.ban` | 1 h (config); a UDP socket ban at most 1 min (`socketBanMax`) | a scanner ban, a `register_ban` ban and an `admission_ban` ban |
-| shield prune tick `Shield.pruneLoop` (`shield.go`) | 1 min | expired bans and idle rate-limit buckets |
+| shield prune tick `Shield.pruneLoop` (`shield.go`) | 1 min | expired bans, idle rate-limit buckets, and offender and AoR entries whose stages have all ended (an unexpired lock stays) |
 | binding / carrier-registration / subscription prune tick | 30 s (`Server.Run`, `edge.go`) | expired bindings (memory only; lookups already hide them) and expired subscription records |
 | `enumWindow` | 10 min, from a source's first counted rejection | the REGISTER enumeration limit (§7.4) |
 | `shield.register_ban` window | 10 min (config), from a source's first strike | the REGISTER credential guard (§7.4) |
 | `shield.register_ban_aor` window and lock | 10 min (config) from an AoR's first strike; a lock lasts `shield.ban` | the per-AoR REGISTER drop (§7.4) |
 | `shield.admission_ban` window | 5 min (config), from a source's first admission drop | the admission-drop ban (§7.5, §14.1) |
+| `shield.register_ban_long` window | 1 h (config), from a source's first strike | the long stage of the REGISTER credential guard (§7.4) |
+| `shield.register_ban_aor_long` window | 1 h (config) from an AoR's first strike | the long stage of the per-AoR REGISTER drop (§7.4) |
+| `shield.admission_ban_long` window | 1 h (config), from a source's first admission drop | the long stage of the admission-drop ban (§7.5, §14.1) |
 | `regNonceTTL` | 15 min (`regguard.go`) | how long a challenge nonce relayed to a source keeps its attempts countable |
 | `regReplayWindow` | 40 s (`regguard.go`) | how long after a challenge a UDP credential retry on the challenged branch counts as a replay sipgo absorbs |
 | `media.LearnDelay` (`media/session.go`) | 3 s | a loose latch keeps sending to a plausible SDP address before switching to another learned port (§8.4) |

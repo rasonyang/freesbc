@@ -34,6 +34,10 @@ func redactConfig(cfg *config.Config) any {
 			"register_ban":       cfg.Shield.RegisterBan,
 			"register_ban_aor":   cfg.Shield.RegisterBanAOR,
 			"admission_ban":      cfg.Shield.AdmissionBan,
+
+			"register_ban_long":     cfg.Shield.RegisterBanLong,
+			"register_ban_aor_long": cfg.Shield.RegisterBanAORLong,
+			"admission_ban_long":    cfg.Shield.AdmissionBanLong,
 		},
 	}
 	if cfg.TLS != nil {

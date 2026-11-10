@@ -26,6 +26,7 @@ func TestRestartOnlyChanges(t *testing.T) {
 	}{
 		{"identical", base, nil},
 		{"hot only: shield", base + "shield: { ban: 2h, rate_limit: 1/s per_ip, carrier_rate_limit: 1/s per_ip, max_sessions: 7, invite_rate_limit: 3/s }\n", nil},
+		{"hot only: long strike stages", base + "shield: { register_ban_long: 5/2h, register_ban_aor_long: off, admission_ban_long: 7/30m }\n", nil},
 		{"public", strings.Replace(base, "203.0.113.7", "203.0.113.8", 1), []string{"public"}},
 		{"private", strings.Replace(base, "10.77.0.2", "10.77.0.3", 1), []string{"private"}},
 		{"rtp", base + "rtp: 30000-30999\n", []string{"rtp"}},

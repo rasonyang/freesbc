@@ -11,7 +11,9 @@ import (
 
 func strikeShield(t *testing.T, registerBan string, isCarrier func(netip.Addr) bool) (*Shield, *config.Store) {
 	t.Helper()
-	cfg, err := config.Parse([]byte(shieldCfg + "  register_ban: \"" + registerBan + "\"\n"))
+	// The long stage is off: these tests exercise the short window alone
+	// (the long stage has its own tests in longstage_test.go).
+	cfg, err := config.Parse([]byte(shieldCfg + "  register_ban: \"" + registerBan + "\"\n  register_ban_long: off\n  admission_ban_long: off\n"))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

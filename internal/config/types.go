@@ -143,6 +143,16 @@ const DefaultRegisterBanAOR = "10/10m"
 // DefaultAdmissionBan is shield.admission_ban when the key is unset.
 const DefaultAdmissionBan = "50/5m"
 
+// DefaultRegisterBanLong is shield.register_ban_long when the key is unset.
+const DefaultRegisterBanLong = "20/1h"
+
+// DefaultRegisterBanAORLong is shield.register_ban_aor_long when the key is
+// unset.
+const DefaultRegisterBanAORLong = "20/1h"
+
+// DefaultAdmissionBanLong is shield.admission_ban_long when the key is unset.
+const DefaultAdmissionBanLong = "30/1h"
+
 // Bounds of a strike threshold: a window longer than a day, or a count
 // beyond maxStrikeN, is a typo rather than a policy.
 const (

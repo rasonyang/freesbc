@@ -27,7 +27,14 @@ func stateDeps() Deps {
 	}
 	d.Offenders = func(limit int) ([]Offender, int) {
 		return []Offender{{Source: "198.51.100.77", Reason: "register", Strikes: 9,
-			Since: now.Add(-time.Minute), Until: now.Add(9 * time.Minute)}}, 4
+			Since: now.Add(-time.Minute), Until: now.Add(9 * time.Minute),
+			LongStrikes: 14, LongSince: now.Add(-30 * time.Minute), LongUntil: now.Add(30 * time.Minute)},
+			// A source whose short window has closed: since is omitted.
+			{Source: "198.51.100.78", Reason: "admission", LongStrikes: 3,
+				LongSince: now.Add(-10 * time.Minute), LongUntil: now.Add(50 * time.Minute)},
+			// A source whose long stage is closed: long_since is omitted.
+			{Source: "198.51.100.79", Reason: "register", Strikes: 1,
+				Since: now.Add(-time.Minute), Until: now.Add(9 * time.Minute)}}, 4
 	}
 	d.SwitchNodes = func() []SwitchNode {
 		return []SwitchNode{
@@ -133,6 +140,18 @@ func TestStateEndpointsData(t *testing.T) {
 	if o["source"] != "198.51.100.77" || o["reason"] != "register" || o["strikes"] != float64(9) ||
 		o["remaining"].(float64) < 538 || o["since"] == nil || offs["total"] != float64(4) {
 		t.Errorf("offenders = %v", offs)
+	}
+	if o["long_strikes"] != float64(14) || o["long_since"] == nil || o["long_remaining"].(float64) < 1798 {
+		t.Errorf("long stage = %v", o)
+	}
+	closed := offs["items"].([]any)[1].(map[string]any)
+	if _, has := closed["since"]; has || closed["strikes"] != float64(0) || closed["remaining"] != float64(0) ||
+		closed["long_strikes"] != float64(3) || closed["long_since"] == nil {
+		t.Errorf("closed short stage = %v", closed)
+	}
+	noLong := offs["items"].([]any)[2].(map[string]any)
+	if _, has := noLong["long_since"]; has || noLong["long_strikes"] != float64(0) || noLong["long_remaining"] != float64(0) || noLong["since"] == nil {
+		t.Errorf("closed long stage = %v", noLong)
 	}
 
 	nodes := get("/api/switch-nodes").([]any)

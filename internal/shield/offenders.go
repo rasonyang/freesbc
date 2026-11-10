@@ -47,19 +47,98 @@ type offenderKey struct {
 	reason string
 }
 
-// offender is one source's strikes of one reason within a fixed window
-// that opens at its first strike.
-type offender struct {
-	key    offenderKey
+// strikeStage is one fixed window of strikes that opens at its first strike:
+// the short stage (shield.*_ban) or the long stage (shield.*_ban_long) of an
+// entry. The zero value is a closed stage with no strikes.
+type strikeStage struct {
 	start  time.Time
 	window time.Duration
-	count  int  // all strikes of the budget in this window
-	over   bool // the threshold was crossed in this window (WARN once)
+	count  int
+	over   bool // count crossed the stage's N in this window (WARN once)
 	// parts breaks count down by the reason each strike was reported
 	// under. It is nil until a strike names a part, so a single-reason
 	// budget (register) allocates nothing. At most one entry per reason
 	// sharing the budget, so it stays tiny.
 	parts map[string]int
+}
+
+// open reports whether the stage's window is still running at now.
+func (g *strikeStage) open(now time.Time) bool {
+	return g.window > 0 && now.Sub(g.start) < g.window
+}
+
+// end is when the stage's window closes (zero for a stage never used).
+func (g *strikeStage) end() time.Time {
+	if g.window <= 0 {
+		return time.Time{}
+	}
+	return g.start.Add(g.window)
+}
+
+// add counts one strike under lim, first starting a new window if the
+// current one ended (or never began). A stage never resets when keep is
+// set (an AoR whose lock is open).
+func (g *strikeStage) add(now time.Time, part string, lim config.StrikeLimit, keep bool) (over, crossed bool) {
+	if g.window <= 0 {
+		g.start = now
+	} else if !keep && now.Sub(g.start) >= lim.Window {
+		*g = strikeStage{start: now}
+	}
+	g.window = lim.Window
+	g.count++
+	if part != "" {
+		if g.parts == nil {
+			g.parts = map[string]int{}
+		}
+		g.parts[part]++
+	}
+	if g.count <= lim.N {
+		return false, false
+	}
+	crossed = !g.over
+	g.over = true
+	return true, crossed
+}
+
+// usableLimit reports whether lim counts anything.
+func usableLimit(lim config.StrikeLimit) bool {
+	return !lim.Off && lim.N > 0 && lim.Window > 0
+}
+
+// strikeVerdict is the outcome of one strike across both stages.
+type strikeVerdict struct {
+	over    bool // either stage is over its N
+	crossed bool // this strike made a stage cross its N
+	// stage, count and window describe the crossing stage ("short" wins when
+	// both cross), else the first stage that is over.
+	stage  string
+	count  int
+	window time.Duration
+}
+
+const (
+	stageShort = "short"
+	stageLong  = "long"
+)
+
+// verdict combines the two stages' results of one strike.
+func verdict(short, long *strikeStage, sOver, sCross, lOver, lCross bool) strikeVerdict {
+	v := strikeVerdict{over: sOver || lOver, crossed: sCross || lCross}
+	switch {
+	case sCross || (!lCross && sOver):
+		v.stage, v.count, v.window = stageShort, short.count, short.window
+	case lOver:
+		v.stage, v.count, v.window = stageLong, long.count, long.window
+	default:
+		v.stage, v.count, v.window = stageShort, short.count, short.window
+	}
+	return v
+}
+
+// offender is one source's strikes of one budget: a short and a long stage.
+type offender struct {
+	key         offenderKey
+	short, long strikeStage
 }
 
 // offenderTable is an LRU-capped table of per-source strike counters.
@@ -75,12 +154,13 @@ func newOffenderTable() *offenderTable {
 	return &offenderTable{entries: map[offenderKey]*list.Element{}, lru: list.New(), max: offenderCap, now: time.Now}
 }
 
-// strike adds one strike under lim and returns the window's count, whether
-// it is over lim.N, and whether this strike is the one that crossed it.
+// strike adds one strike to every enabled stage: the short stage under
+// short (which the caller has checked is usable) and the long stage under
+// long when that is usable. Each stage resets on its own window.
 //
 // part is the reason the strike is tallied under in the offender view when
 // it must be told apart from the rest of the budget, else "".
-func (t *offenderTable) strike(key offenderKey, part string, lim config.StrikeLimit) (count int, over, crossed bool) {
+func (t *offenderTable) strike(key offenderKey, part string, short, long config.StrikeLimit) strikeVerdict {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
@@ -88,35 +168,24 @@ func (t *offenderTable) strike(key offenderKey, part string, lim config.StrikeLi
 	if el, ok := t.entries[key]; ok {
 		o = el.Value.(*offender)
 		t.lru.MoveToFront(el)
-		if now.Sub(o.start) >= lim.Window {
-			o.start, o.count, o.over, o.parts = now, 0, false, nil
-		}
 	} else {
 		if t.lru.Len() >= t.max {
 			oldest := t.lru.Back()
 			delete(t.entries, oldest.Value.(*offender).key)
 			t.lru.Remove(oldest)
 		}
-		o = &offender{key: key, start: now}
+		o = &offender{key: key}
 		t.entries[key] = t.lru.PushFront(o)
 	}
-	o.window = lim.Window
-	o.count++
-	if part != "" {
-		if o.parts == nil {
-			o.parts = map[string]int{}
-		}
-		o.parts[part]++
+	sOver, sCross := o.short.add(now, part, short, false)
+	var lOver, lCross bool
+	if usableLimit(long) {
+		lOver, lCross = o.long.add(now, part, long, false)
 	}
-	if o.count <= lim.N {
-		return o.count, false, false
-	}
-	crossed = !o.over
-	o.over = true
-	return o.count, true, crossed
+	return verdict(&o.short, &o.long, sOver, sCross, lOver, lCross)
 }
 
-// clear forgets key's strikes.
+// clear forgets key's strikes (both stages).
 func (t *offenderTable) clear(key offenderKey) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -126,13 +195,13 @@ func (t *offenderTable) clear(key offenderKey) {
 	}
 }
 
-// prune drops the entries whose window has ended.
+// prune drops the entries whose stages have both ended.
 func (t *offenderTable) prune() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
 	for k, el := range t.entries {
-		if o := el.Value.(*offender); now.Sub(o.start) >= o.window {
+		if o := el.Value.(*offender); !o.short.open(now) && !o.long.open(now) {
 			delete(t.entries, k)
 			t.lru.Remove(el)
 		}
@@ -145,8 +214,9 @@ func (t *offenderTable) size() int {
 	return len(t.entries)
 }
 
-// live copies the entries whose window is still open, one row per reason a
-// budget was struck under (a single-reason budget is one row).
+// live copies the entries with an open stage, one row per reason a budget
+// was struck under in either open stage (a single-reason budget is one row).
+// A row's stages carry that reason's own counts; a closed stage is zero.
 func (t *offenderTable) live() []offender {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -154,18 +224,33 @@ func (t *offenderTable) live() []offender {
 	out := make([]offender, 0, len(t.entries))
 	for _, el := range t.entries {
 		o := el.Value.(*offender)
-		if now.Sub(o.start) >= o.window {
+		sh, lg := o.short, o.long
+		if !sh.open(now) {
+			sh = strikeStage{}
+		}
+		if !lg.open(now) {
+			lg = strikeStage{}
+		}
+		if sh.window == 0 && lg.window == 0 {
 			continue
 		}
-		if len(o.parts) == 0 {
-			row := *o
-			row.parts = nil
-			out = append(out, row)
+		if len(sh.parts) == 0 && len(lg.parts) == 0 {
+			sh.parts, lg.parts = nil, nil
+			out = append(out, offender{key: o.key, short: sh, long: lg})
 			continue
 		}
-		for reason, n := range o.parts {
-			row := *o
-			row.key.reason, row.count, row.parts = reason, n, nil
+		reasons := map[string]bool{}
+		for r := range sh.parts {
+			reasons[r] = true
+		}
+		for r := range lg.parts {
+			reasons[r] = true
+		}
+		for reason := range reasons {
+			row := offender{key: o.key, short: sh, long: lg}
+			row.key.reason = reason
+			row.short.count, row.short.parts = sh.parts[reason], nil
+			row.long.count, row.long.parts = lg.parts[reason], nil
 			out = append(out, row)
 		}
 	}
@@ -207,8 +292,8 @@ func (s *Shield) strike(src netip.Addr, reason string, udp bool) bool {
 		return false
 	}
 	cfg := s.store.Current()
-	lim := s.strikeLimit(cfg, reason)
-	if lim.Off || lim.N <= 0 || lim.Window <= 0 {
+	lim, long := s.strikeLimits(cfg, reason)
+	if !usableLimit(lim) {
 		return false
 	}
 	// A reason that shares another's threshold shares its budget too: the
@@ -228,19 +313,19 @@ func (s *Shield) strike(src netip.Addr, reason string, udp bool) bool {
 			part += "_udp"
 		}
 	}
-	count, over, crossed := s.offenders.strike(key, part, lim)
-	if !over {
+	v := s.offenders.strike(key, part, lim, long)
+	if !v.over {
 		return false
 	}
 	if !table.ban(key.src, cfg.Shield.Ban.Std(), reason) {
 		s.log.Debug("shield ban table at hard cap; strike ban refused", "source", banKeyString(key.src), "address", src, "reason", reason)
 		return false
 	}
-	if crossed {
+	if v.crossed {
 		s.log.Warn("shield banned source for repeated failures", "source", banKeyString(key.src), "address", src, "reason", reason,
-			"strikes", count, "window", lim.Window.String(), "ban", cfg.Shield.Ban.Std().String())
+			"stage", v.stage, "strikes", v.count, "window", v.window.String(), "ban", cfg.Shield.Ban.Std().String())
 	} else {
-		s.log.Debug("shield extended strike ban", "source", banKeyString(key.src), "address", src, "reason", reason, "strikes", count)
+		s.log.Debug("shield extended strike ban", "source", banKeyString(key.src), "address", src, "reason", reason, "stage", v.stage, "strikes", v.count)
 	}
 	return true
 }
@@ -256,36 +341,51 @@ func (s *Shield) ClearStrikes(src netip.Addr, reason string) {
 	}
 }
 
-// strikeLimit parses reason's threshold from cfg, cached until the string
-// changes.
+// strikeLimit parses reason's short-stage threshold from cfg, cached until
+// the string changes.
 func (s *Shield) strikeLimit(cfg *config.Config, reason string) config.StrikeLimit {
-	var str string
+	short, _ := s.strikeLimits(cfg, reason)
+	return short
+}
+
+// strikeLimits parses reason's short and long stage thresholds from cfg.
+// Each is cached under its own key until its string changes. The long
+// limit is returned even while the short one is off; the short key is the
+// master switch and the caller checks it first.
+func (s *Shield) strikeLimits(cfg *config.Config, reason string) (short, long config.StrikeLimit) {
+	var shortStr, longStr string
 	switch reason {
 	case StrikeRegister:
-		str = cfg.Shield.RegisterBan
+		shortStr, longStr = cfg.Shield.RegisterBan, cfg.Shield.RegisterBanLong
 	case StrikeAdmission, StrikeMalformed:
-		str = cfg.Shield.AdmissionBan
+		shortStr, longStr = cfg.Shield.AdmissionBan, cfg.Shield.AdmissionBanLong
 		reason = StrikeAdmission
 	case StrikeRegisterAOR:
-		str = cfg.Shield.RegisterBanAOR
+		shortStr, longStr = cfg.Shield.RegisterBanAOR, cfg.Shield.RegisterBanAORLong
 	default:
-		return config.StrikeLimit{Off: true}
+		return config.StrikeLimit{Off: true}, config.StrikeLimit{Off: true}
 	}
 	s.rlMu.Lock()
 	defer s.rlMu.Unlock()
+	return s.cachedStrikeLimit(reason, shortStr), s.cachedStrikeLimit(reason+"_long", longStr)
+}
+
+// cachedStrikeLimit parses str, cached under key until str changes. The
+// caller holds rlMu.
+func (s *Shield) cachedStrikeLimit(key, str string) config.StrikeLimit {
 	if s.strikeStr == nil {
 		s.strikeStr = map[string]string{}
 		s.strikeOpts = map[string]config.StrikeLimit{}
 	}
-	if s.strikeStr[reason] != str {
+	if cur, ok := s.strikeStr[key]; !ok || cur != str {
 		lim, err := config.ParseStrikeLimit(str)
 		if err != nil {
 			lim = config.StrikeLimit{Off: true}
 		}
-		s.strikeOpts[reason] = lim
-		s.strikeStr[reason] = str
+		s.strikeOpts[key] = lim
+		s.strikeStr[key] = str
 	}
-	return s.strikeOpts[reason]
+	return s.strikeOpts[key]
 }
 
 // OffenderInfo is one source with strikes in an open window.
@@ -298,10 +398,15 @@ type OffenderInfo struct {
 	// StrikeRegisterAOR). Strikes is that reason's own count, though reasons
 	// sharing a budget (admission and malformed) are banned on their sum.
 	Reason string
-	// Strikes is the count in the current window, which opened at Since
-	// and closes at Until.
+	// Strikes is the count in the short stage's current window, which
+	// opened at Since and closes at Until (for an AoR, Until is the lock
+	// end while locked). All zero while that window is closed.
 	Strikes      int
 	Since, Until time.Time
+	// LongStrikes, LongSince and LongUntil are the same for the long stage
+	// (shield.*_ban_long); zero while its window is closed.
+	LongStrikes          int
+	LongSince, LongUntil time.Time
 }
 
 // maxOffenders bounds one Offenders list.
@@ -315,29 +420,39 @@ func (s *Shield) Offenders(limit int) (top []OffenderInfo, total int) {
 	live := s.offenders.live()
 	aors := s.aors.live()
 	sort.Slice(live, func(i, j int) bool {
-		if live[i].count != live[j].count {
-			return live[i].count > live[j].count
+		if live[i].short.count != live[j].short.count {
+			return live[i].short.count > live[j].short.count
 		}
-		if !live[i].start.Equal(live[j].start) {
-			return live[i].start.Before(live[j].start)
+		if live[i].long.count != live[j].long.count {
+			return live[i].long.count > live[j].long.count
+		}
+		if !live[i].short.start.Equal(live[j].short.start) {
+			return live[i].short.start.Before(live[j].short.start)
 		}
 		return live[i].key.src.Less(live[j].key.src)
 	})
 	total = len(live) + len(aors)
 	top = make([]OffenderInfo, 0, min(limit, total))
 	for _, o := range live {
-		top = append(top, OffenderInfo{Source: banKeyString(o.key.src), Reason: o.key.reason, Strikes: o.count,
-			Since: o.start, Until: o.start.Add(o.window)})
+		top = append(top, OffenderInfo{Source: banKeyString(o.key.src), Reason: o.key.reason,
+			Strikes: o.short.count, Since: o.short.start, Until: o.short.end(),
+			LongStrikes: o.long.count, LongSince: o.long.start, LongUntil: o.long.end()})
 	}
 	for _, e := range aors {
-		until := e.start.Add(e.window)
+		info := OffenderInfo{Source: e.key, Reason: StrikeRegisterAOR,
+			Strikes: e.short.count, Since: e.short.start, Until: e.short.end(),
+			LongStrikes: e.long.count, LongSince: e.long.start, LongUntil: e.long.end()}
 		if !e.locked.IsZero() {
-			until = e.locked
+			info.Until = e.locked
 		}
-		top = append(top, OffenderInfo{Source: e.key, Reason: StrikeRegisterAOR, Strikes: e.count,
-			Since: e.start, Until: until})
+		top = append(top, info)
 	}
-	sort.SliceStable(top, func(i, j int) bool { return top[i].Strikes > top[j].Strikes })
+	sort.SliceStable(top, func(i, j int) bool {
+		if top[i].Strikes != top[j].Strikes {
+			return top[i].Strikes > top[j].Strikes
+		}
+		return top[i].LongStrikes > top[j].LongStrikes
+	})
 	if len(top) > limit {
 		top = top[:limit]
 	}
