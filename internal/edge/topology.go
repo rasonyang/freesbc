@@ -118,6 +118,10 @@ func (s side) recordRoute() *sip.RecordRouteHeader {
 		params.Add("transport", s.transport)
 	}
 	params.Add("lr", "")
+	if s.plane == planePublic {
+		// Recognisable whatever host a NAT SIP ALG writes over ours (isSelfRoute).
+		params.Add(recordRouteMarker, "")
+	}
 	return &sip.RecordRouteHeader{
 		Address: sip.Uri{Host: s.host(), Port: s.advPort, UriParams: params},
 	}
@@ -314,6 +318,27 @@ func (t *topology) publicSide(transport string) (side, bool) {
 		return s, true
 	}
 	return side{}, false
+}
+
+// recordRouteMarker is the flag URI parameter on FreeSBC's public
+// Record-Route entry. A NAT SIP ALG may rewrite the host (and port) of that
+// entry in a message crossing it; the marker lets isSelfRoute and
+// restoreOwnRecordRoutes still recognise it. It is not the "fsbc" routing
+// token (contactTokenParam): tokenOf looks up that exact key only.
+const recordRouteMarker = "fsbc-rr"
+
+// hasRecordRouteMarker reports whether u carries recordRouteMarker.
+func hasRecordRouteMarker(u sip.Uri) bool {
+	return u.UriParams != nil && u.UriParams.Has(recordRouteMarker)
+}
+
+// isSelfRoute is isSelf for a Route or Record-Route value: it also accepts
+// an entry carrying recordRouteMarker, whatever its host and port. Every use
+// only strips or cuts such an entry from a route set, so a marker forged by
+// a public party can drop that party's own hop and nothing more. Never use
+// it for a Request-URI or a Via.
+func (t *topology) isSelfRoute(u sip.Uri) bool {
+	return hasRecordRouteMarker(u) || t.isSelf(u)
 }
 
 // isSelf reports whether a URI names one of FreeSBC's own signaling

@@ -160,7 +160,7 @@ var errDialogGone = errors.New("proxy: dialog already ended")
 // for the caller's final to be decided by the pump.
 func (s *Server) relayInviteResponse(l *inviteLeg, res *sip.Response) error {
 	is2xx := res.StatusCode/100 == 2
-	err := s.relayResponseHide(l.req, l.tx, res, l.resp, func(out *sip.Response) error {
+	err := s.relayResponseHide(l.req, l.out, l.tx, res, l.resp, func(out *sip.Response) error {
 		if tag := fsip.ToTag(res); tag != "" && res.StatusCode < 300 {
 			// Recorded before the response goes out, so a PRACK or UPDATE
 			// the caller sends the moment it sees this 18x finds its route.
@@ -484,7 +484,7 @@ func (s *Server) ack2xx(res *sip.Response, from side) bool {
 // request, and along the route set beyond FreeSBC's own Record-Route
 // entries (the INVITE carried them, so the 2xx lists them too).
 func (s *Server) teardownOpts(from side) []fsip.TeardownOption {
-	return []fsip.TeardownOption{fsip.FromListener(from.laddr), fsip.OwnRecordRoute(s.topo.isSelf)}
+	return []fsip.TeardownOption{fsip.FromListener(from.laddr), fsip.OwnRecordRoute(s.topo.isSelfRoute)}
 }
 
 // commit confirms the dialog an answered INVITE established and hands its

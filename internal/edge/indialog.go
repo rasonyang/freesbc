@@ -146,7 +146,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 				continue
 			}
 			is2xx := res.StatusCode/100 == 2
-			err := s.relayResponseHide(req, tx, res, resp, func(relayed *sip.Response) error {
+			err := s.relayResponseHide(req, out, tx, res, resp, func(relayed *sip.Response) error {
 				fsip.SetContact(relayed, from.uri())
 				if offerless {
 					// The far end's offer in the 2xx is rebuilt for the

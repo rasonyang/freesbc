@@ -573,6 +573,11 @@ type fakeSwitch struct {
 	// local address there, so the carrier's route to it cannot be sent to.
 	routeDest string
 
+	// requestHook, when set, may rewrite a request inDialog built, before it
+	// is sent: the SIP ALG tests use it to put a NAT address where the peer
+	// would have written FreeSBC's own.
+	requestHook func(*sip.Request)
+
 	conn   *net.UDPConn
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -1107,6 +1112,9 @@ func (f *fakeSwitch) inDialog(t *testing.T, method sip.RequestMethod, invite *si
 
 	// Route to the topmost Route value, as a loose router does.
 	dest := f.topRouteDest(t, req)
+	if f.requestHook != nil {
+		f.requestHook(req)
+	}
 	if f.routeDest != "" {
 		dest = f.routeDest
 	}

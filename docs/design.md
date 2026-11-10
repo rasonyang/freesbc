@@ -1193,7 +1193,28 @@ missing port to **5060** (`topology.isSelf`, `topology.go`); `isSelfVia` default
 `fsip.DefaultPort(transport)`: 5060 for UDP/TCP, 5061 for TLS, and the
 RFC 7118 §5 HTTP ports for WebSocket, 80 for `ws` and 443 for `wss`.
 `firstForeignRoute` (`carrier.go`) is the topmost Route that is not
-`isSelf`.
+`isSelfRoute`.
+
+A NAT SIP ALG may rewrite FreeSBC's own address inside a message on a flow to
+port 5060 (`docs/troubleshooting.md`), so the address alone is not enough to
+recognise a Route, a Record-Route or a Via as FreeSBC's. A public side's
+Record-Route carries the flag parameter `fsbc-rr` (`recordRouteMarker`,
+`side.recordRoute`, `topology.go`), a name that is not the `fsbc` routing
+token, which `tokenOf` looks up by exact key. `isSelfRoute` (`topology.go`) is
+`isSelf` or a URI carrying the marker, whatever its host and port; it is used
+for Route stripping (`stripOwnRoutes`, `firstForeignRoute`), the teardown cut
+(`OwnRecordRoute`) and `isPublicURI`, never for a Request-URI (`classifySwitchRequest`
+keeps `isSelf`) or a Via. A public party can forge the marker, but each use
+only strips or cuts an entry from a route set or, in `restoreOwnRecordRoutes`
+(`hide.go`, run for `respToSwitch` before the switch's Vias are put back),
+replaces the entry with FreeSBC's own advertised one: it can drop that
+party's own hop and never makes FreeSBC follow a foreign route. A marked
+entry naming a transport with no public side is removed. A Via is recognised
+by `isSelfVia` or by the branch FreeSBC put on the forwarded request
+(`popOwnVia`, `topBranch`, `forward.go`), so a rewritten sent-by is accepted
+only on a response to a request FreeSBC sent; a caller that has no forwarded
+request would pass an empty branch and keep the exact check, and none does.
+A dropped response is logged at WARN once a minute (`logUnroutable`, `forward.go`), from the response as received: the top Via's sent-by and branch, whether that branch is the forwarded request's, and a `reason` of `not_ours` or `no_via_below`.
 
 ### 7.3 Method dispatch
 
@@ -1897,7 +1918,7 @@ implements RFC 3261 §16.6 in order:
    host differs from the real source, and fill `rport=<port>` **only when the
    client asked for it** by sending an empty `rport` parameter.
 3. `stripOwnRoutes` (`forward.go`): remove **leading** Route values
-   naming FreeSBC, in a loop — after a transport change there are two of
+   naming FreeSBC (`isSelfRoute`: its address, or the `fsbc-rr` marker), in a loop — after a transport change there are two of
    them (the double Record-Route pair); then `sanitizeExtensions` trims
    `Allow` (§7.3) and `stripInternalHeaders` removes any
    `X-FreeSBC-*` header (§6). Whatever FreeSBC itself stamps for the switch
@@ -1942,7 +1963,8 @@ assembled.
 
 **Response relay** (`relayResponseHide`,
 `forward.go`): clone the response, pop our own Via (failing the relay
-if the top Via is not ours or popping would leave none; a response to the
+if the top Via is neither FreeSBC's advertised address nor carries the branch
+of the request FreeSBC forwarded (`topBranch`), or popping would leave none; a response to the
 switch on a carrier leg may be left with none, because its own Vias are put
 back, `popOwnVia`, `forward.go`), run `sanitizeExtensions`, strip
 `X-FreeSBC-*`, apply the carrier-leg rewrite for the mode, run the caller's
@@ -2040,7 +2062,7 @@ caller cancelled is never relayed or confirmed: it is ACKed and BYEd.
 **FreeSBC's own ACK/BYE.** `ackThenBye` (`invite_leg.go`) builds both with
 `TeardownRequest` (`sip/request.go`), which follows the dialog's
 route set: the 2xx's `Record-Route` list reversed (RFC 3261 §12.1.2), cut by
-`OwnRecordRoute(topo.isSelf)` at FreeSBC's own entries, since the INVITE
+`OwnRecordRoute(topo.isSelfRoute)` at FreeSBC's own entries, since the INVITE
 carried them. A loose router first means `Route` headers and the
 Request-URI is the remote target; a strict router first becomes the
 Request-URI with the target appended as the last `Route` (§12.2.1.1). The

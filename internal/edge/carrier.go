@@ -124,7 +124,7 @@ func (s *Server) classifySwitchRequest(req *sip.Request) (switchTarget, string) 
 // anything else looks at it.
 func (s *Server) firstForeignRoute(req *sip.Request) *sip.RouteHeader {
 	for _, h := range req.GetHeaders("Route") {
-		if r, ok := h.(*sip.RouteHeader); ok && !s.topo.isSelf(r.Address) {
+		if r, ok := h.(*sip.RouteHeader); ok && !s.topo.isSelfRoute(r.Address) {
 			return r
 		}
 	}
