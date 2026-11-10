@@ -16,7 +16,7 @@ FreeSBC is a stateful SIP and media edge proxy. It provides SIP registration pro
 ```
 
 - **Public side**: SIP over UDP, TCP, TLS, WS and WSS on `public.bind`; RTP, optionally SDES-SRTP; WebRTC (ICE-Lite + DTLS-SRTP). Everything FreeSBC advertises there uses `public.ip`. Behind 1:1 NAT (`public.bind` != `public.ip`) the router must forward every `edge.listen` port and the `rtp` range to `public.bind` with the same port numbers. A router that translates a signaling port (external 16060 to 5060) is declared with `edge.advertise`, so Via, Contact and Record-Route name the external port; the `rtp` range has no such setting and must always be forwarded 1:1, same numbers, because SDP names the real media ports. `freesbc check`, `init` and `run` print the forwards (docs/config.md, "1:1 NAT checklist"). A forgotten port shows as calls that end at 32 s with `reason=ack_timeout` (see [Troubleshooting](troubleshooting.md#lost-ack-reasonack_timeout)).
-- **Private side**: one fixed UDP socket, `private.ip:5060`, for all SIP to and from the switch, plus plain RTP/RTCP.
+- **Private side**: one UDP socket, `private.ip:5060` (in the single-IP layout, `private.ip:<edge.listen.udp>`), for all SIP to and from the switch, plus plain RTP/RTCP.
 - **All signaling and media stay anchored through FreeSBC.** In SDP, Contact and the Request-URI, the switch is never given a public client's address and a public client is never given the switch's. On every public leg, client or carrier, the headers are hidden too: a public party sees FreeSBC's public Via, Record-Route and Contact alone, never the switch's Via, `private.ip`, a switch address in From, To or the identity headers, or the switch's product string (see [Topology hiding](#topology-hiding-on-public-legs)). The switch does see a client's address in the Via FreeSBC annotates with `received=`, because that Via is on the private side.
 
 It is a **proxy, not a B2BUA**: Call-ID, From/To tags and CSeq pass through, and FreeSBC stays on the path via Record-Route: the RFC 5658 pair toward the switch, FreeSBC's public entry alone toward a client or carrier. The switch is the authoritative registrar and owns all call logic. REGISTER and its digest challenge are forwarded verbatim, and FreeSBC never holds a credential, for clients or for carriers. Carrier accounts, line selection and failover live on the switch; FreeSBC is its outbound proxy.
@@ -81,7 +81,7 @@ See [`freesbc.example.yaml`](../freesbc.example.yaml) for a complete annotated c
 
 ## Carrier path
 
-Carrier accounts live on the switch. The switch uses FreeSBC as its **outbound proxy**: it addresses requests to the carrier as usual (Request-URI = the carrier's `host[:port]`) and sends them to `private.ip:5060`. FreeSBC checks the Request-URI against `edge.carriers`, forwards the request to the carrier from its public address, and keeps the switch's address out of everything the carrier sees.
+Carrier accounts live on the switch. The switch uses FreeSBC as its **outbound proxy**: it addresses requests to the carrier as usual (Request-URI = the carrier's `host[:port]`) and sends them to the private socket, `private.ip:5060` (in the single-IP layout `private.ip:<edge.listen.udp>`). FreeSBC checks the Request-URI against `edge.carriers`, forwards the request to the carrier from its public address, and keeps the switch's address out of everything the carrier sees.
 
 ### Classification of switch requests
 
@@ -147,7 +147,7 @@ FreeSBC enforces an allowlist and rewrites addresses; the switch must be set up 
 
 - **Point every carrier gateway, endpoint and registration at FreeSBC as outbound proxy.**
   - FreeSWITCH, standard two-profile layout: the `internal` profile (5060, `auth-calls=true`) is the `edge.switch` port, for phones and browsers. The `external` profile (5080, `auth-calls=false`) is `edge.switch_carrier_port`; its gateways set `proxy=<carrier host[:port]>`, `outbound-proxy=<private.ip>:5060` and `register-proxy=<private.ip>:5060`. Without `register-proxy` the REGISTER goes straight to the carrier, around FreeSBC.
-  - Asterisk: `outbound_proxy = sip:<private.ip>:5060\;lr` on the endpoint, aor and registration. `;lr` is required. The aor `contact` must equal the `edge.carriers` entry.
+  - Asterisk: `outbound_proxy = sip:<private.ip>:5060\;lr` on the endpoint, aor and registration (in the single-IP layout the port is `edge.listen.udp`). `;lr` is required. The aor `contact` must equal the `edge.carriers` entry.
 - **The `edge.carriers` entry must equal the host[:port] the switch puts in the Request-URI** (FreeSWITCH gateway `proxy`, Asterisk aor `contact`); that equality is what routes the request to a carrier.
 - **Identify inbound carrier calls** by `X-FreeSBC-Carrier` (Asterisk `identify` with `match_header`, FreeSWITCH `${sip_h_X-FreeSBC-Carrier}`), by registration line (Asterisk `line=yes`, FreeSWITCH `${sip_gateway}`), or by DID.
   - FreeSWITCH: for a registered line `destination_number` is the gateway's `extension` (by default its username), not `gw+<name>`; match `${sip_gateway}` instead.
@@ -178,7 +178,7 @@ On Linux the private socket installs a BPF receive filter: a datagram is deliver
 
 ## Single-IP host behind a 1:1 NAT
 
-The common cloud layout is a host with one address on its NIC, behind a provider's 1:1 NAT that forwards a set of UDP ports without translating them. FreeSBC runs there with one UDP SIP socket, `<host address>:5060`, for both sides. A second address for the switch side (the usual layout, a separate `private.ip`) remains supported and is the stronger one: its private socket has no NAT mapping and is trusted by the socket it reaches. This section describes the single-IP layout.
+The common cloud layout is a host with one address on its NIC, behind a provider's 1:1 NAT that forwards a set of UDP ports without translating them. FreeSBC runs there with one UDP SIP socket, `<host address>:<edge.listen.udp>` (5060 by default), for both sides. A second address for the switch side (the usual layout, a separate `private.ip`) remains supported and is the stronger one: its private socket has no NAT mapping and is trusted by the socket it reaches. This section describes the single-IP layout.
 
 ```yaml
 public:
@@ -193,21 +193,21 @@ edge:
     udp: 5060
 ```
 
-The switch sends to `10.77.0.2:5060`, FreeSBC sends to carriers from the same socket, and the NAT makes that `203.0.113.7:5060`. The provider forwards udp/5060 and the `rtp` range to the host, unchanged. `freesbc check` prints the forwards and states that one socket serves both sides.
+The switch sends to `10.77.0.2:5060`, FreeSBC sends to carriers from the same socket, and the NAT makes that `203.0.113.7:5060`. The provider forwards udp/5060 and the `rtp` range to the host, unchanged. The port is `edge.listen.udp`: set it to `16060` and the socket is `10.77.0.2:16060`, the switch's outbound proxy follows it, and Via, Record-Route and Contact carry it on both sides. Do this when a SIP ALG on the path rewrites UDP 5060 ([Troubleshooting](troubleshooting.md#a-sip-alg-rewrites-sip-on-udp-5060)). The NAT must forward the new port unchanged. `freesbc check` prints the forwards and states that one socket serves both sides.
 
 **Validation.** `private.ip` may equal `public.bind` only when all of these hold; each failure is its own error:
 
 - `public.ip` differs from `public.bind`. Port translation (`edge.advertise`) alone is not enough: that is also NAT mode, but the addresses would still be one.
 - The shared address is a private or CGNAT address.
-- `edge.listen.udp` is 5060.
-- `edge.advertise.udp` is unset or 5060: a translated udp port is refused.
+- `edge.listen.udp` is set; any port.
+- `edge.advertise.udp` is unset or equal to `edge.listen.udp`: a translated udp port is refused.
 - Every `edge.switch` address is private or CGNAT.
 - No `edge.carrier_sources` prefix and no literal-IP `edge.carriers` address covers an `edge.switch` address. A carrier named by DNS cannot be checked at startup; do not point one at a switch address.
 - `rtp` holds at least two pairs.
 
 **How the switch is told apart.** On this socket a datagram whose source IP is an `edge.switch` address is the switch: it takes the private path and the arrival marker is stamped, as on a private socket. Any other source is public in full: banned-source check, rate token, malformed scan and admission, exactly as on any public listener. A tcp, tls, ws or wss listener on the same address and port stays public whatever the source IP, because only the UDP socket carries the rule. The switch's source IP is the only thing that distinguishes it; its port is not compared.
 
-**Trust.** In this layout the switch is identified by source IP, a forged switch source reaching udp/5060 takes the trusted path and skips the shield, and FreeSBC does not defend against this; ingress filtering is out of scope.
+**Trust.** In this layout the switch is identified by source IP, a forged switch source reaching the shared udp socket takes the trusted path and skips the shield, and FreeSBC does not defend against this; ingress filtering is out of scope.
 
 Further consequences of one address:
 
@@ -217,7 +217,7 @@ Further consequences of one address:
 - **One socket in the listings.** `/api/status` lists a single udp listener with `shared: true` and `private: false`, the log line `edge proxy listening` carries `shared_socket=true`, and `freesbc_udp_socket_drops_total{socket="shared"}` names it. A HEP capture shows the shared address, not `public.ip`, as the local end of a message exchanged with the switch.
 - **Records and routing.** `isSelf` and the Via and Record-Route checks tell the two sides apart by the advertised address: `private.ip` against `public.ip`, on the same port. Draining, the stream limits and the carrier path are unchanged.
 
-**FreeSWITCH.** The switch uses the shared address as its outbound proxy, on the carrier gateways' `outbound-proxy` and `register-proxy`:
+**FreeSWITCH.** The switch uses the shared socket (`private.ip:<edge.listen.udp>`) as its outbound proxy, on the carrier gateways' `outbound-proxy` and `register-proxy`:
 
 ```xml
 <param name="outbound-proxy" value="10.77.0.2:5060"/>
@@ -364,7 +364,7 @@ These are structural rather than scheduled, except those that link an issue.
 - **A locked AoR can be abused (`shield.register_ban_aor`).** An attacker can lock a legitimate AoR by failing on purpose from many IPs. The AoR's live bindings keep refreshing and a 2xx clears the count, but a new device, or a re-register after the binding expired, is silently dropped until the limit ends (`shield.ban`, default 1 h). This is accepted in exchange for stopping a distributed brute force; set `shield.register_ban_aor: "off"` if it bites. The long stage (`register_ban_aor_long`, default `20/1h`) widens this: a device with a stale password that retries more often than every 3 minutes locks its own AoR, and its source IP gets the `register_ban_long` ban.
 - **A carrier's early media is not sent to a private, CGNAT or FreeSBC address.** Before a carrier's first packet latches the side, FreeSBC sends to the media address in the carrier's SDP only if it is not RFC 1918, IPv6 ULA, 100.64.0.0/10, loopback, link-local, or one of `public.ip`, `public.bind` and `private.ip`. A carrier that reaches the switch over a private interconnect and names a private media IP gets no ringback or announcement until it sends RTP first (its packet latches the side as usual, so a call that has audio both ways is unaffected). A registered client's early media always goes to its signalling IP at its SDP port, so a client whose media server is a different host than its signalling IP gets nothing before that host sends. The restriction is lifted only when `public.ip` is itself in a private class (a lab); it does not follow `public.bind`, so a 1:1 NAT host keeps it.
 - **A public call must come from a registered transport address or a carrier source.** An out-of-dialog INVITE on a public listener is relayed only when its transport, source IP and port match a live registration, or its source IP is a carrier source; anything else is dropped with no response. A device that calls without registering through FreeSBC, or that sends its INVITE from a different socket than its REGISTER (a NAT mapping that changed since the last refresh, a new WebSocket connection), is refused until it registers again from that address. Inbound carrier calls from addresses that are neither resolved carriers nor listed in `edge.carrier_sources` are dropped the same way (look for `invite_not_admitted` in `freesbc_edge_admission_drops_total`).
-- **In the single-IP layout the switch is identified by its source IP.** A forged switch source reaching udp/5060 takes the trusted path and skips the shield, and FreeSBC does not defend against this; ingress filtering is out of scope ([Single-IP host behind a 1:1 NAT](#single-ip-host-behind-a-11-nat)).
+- **In the single-IP layout the switch is identified by its source IP.** A forged switch source reaching the shared udp socket takes the trusted path and skips the shield, and FreeSBC does not defend against this; ingress filtering is out of scope ([Single-IP host behind a 1:1 NAT](#single-ip-host-behind-a-11-nat)).
 - **A datagram that misses the private socket's ingress rule is dropped silently.** (Not applicable in the single-IP layout, which has no such rule.) On Linux, switch traffic that does not arrive on the interface owning `private.ip` (or loopback) is discarded in the kernel: no log, no metric, only upstream timeouts. VRF, asymmetric routing, tunnels and an interface recreated at runtime all hit this (see [The private socket's ingress rule](#the-private-sockets-ingress-rule)).
 - **Topology hiding on public legs has two limits.** The digest realm in a 401/407 challenge passes verbatim, because the client's digest covers it: if the realm is the switch's IP address, the client sees it, so configure a domain name as the realm. A header value that names the switch outside a SIP URI (free text in `Subject` or a `Reason` text, an `X-` header's value on a carrier leg) is not rewritten. On a client leg every header outside the allowlist is dropped (Server, User-Agent, Warning, Organization, `X-`, `P-` other than the identity ones, Path, Service-Route, P-Associated-URI); a carrier leg keeps the switch's other headers, since carriers act on `P-Charge-Info` and account headers.
 - **Call-ID passes through.** FreeSBC does not rewrite it, so a carrier or client sees the Call-ID the switch generated, host and all. FreeSWITCH and pjsip generate host-free ones; the legacy chan_sip driver appends its own name and has no setting that removes it. What the switch can do about it is under [Switch-side requirements](#switch-side-requirements).

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -64,10 +65,10 @@ func TestSharedSocketRefusals(t *testing.T) {
 			"private.ip: \"10.77.0.2\" must differ from public.bind; the two sides need separate sockets"},
 		{"public address shared", strings.NewReplacer("10.77.0.2", "198.51.100.9", "203.0.113.7", "203.0.113.8").Replace(sharedYAML),
 			"is shared with public.bind but is not a private or CGNAT address"},
-		{"udp port not 5060", strings.Replace(sharedYAML, "udp: 5060", "udp: 5070", 1),
-			"edge.listen.udp: must be 5060 when private.ip equals public.bind"},
 		{"no udp listener", strings.Replace(sharedYAML, "listen: { udp: 5060 }", "listen: { tcp: 5060 }", 1),
-			"edge.listen.udp: must be 5060 when private.ip equals public.bind"},
+			"edge.listen.udp: required when private.ip equals public.bind"},
+		{"udp advertise translates a moved port", strings.Replace(sharedYAML, "listen: { udp: 5060 }", "listen: { udp: 16060 }\n  advertise: { udp: 5060 }", 1),
+			"edge.advertise.udp: 5060 translates the udp port 16060"},
 		{"udp advertise translated", strings.Replace(sharedYAML, "listen: { udp: 5060 }", "listen: { udp: 5060 }\n  advertise: { udp: 16060 }", 1),
 			"edge.advertise.udp: 16060 translates the udp port"},
 		{"switch is public", strings.Replace(sharedYAML, "10.77.0.3:5080", "198.51.100.20:5080", 1),
@@ -135,5 +136,30 @@ func TestRestartOnlyChangesSharedLayout(t *testing.T) {
 	got := RestartOnlyChanges(mustParse(t, sharedYAML), mustParse(t, sep))
 	if !slices.Contains(got, "private") {
 		t.Errorf("RestartOnlyChanges = %q, want private", got)
+	}
+}
+
+// The shared socket follows edge.listen.udp (issue #328); the two-address
+// layout keeps its private socket on 5060 whatever the listen port.
+func TestSharedSocketMovedPort(t *testing.T) {
+	moved := strings.Replace(sharedYAML, "udp: 5060", "udp: 16060", 1)
+	c := mustParse(t, moved)
+	if got, want := c.PrivateAddr(), netip.MustParseAddrPort("10.77.0.2:16060"); got != want {
+		t.Errorf("PrivateAddr = %v, want %v", got, want)
+	}
+	mustParse(t, strings.Replace(moved, "listen: { udp: 16060 }", "listen: { udp: 16060 }\n  advertise: { udp: 16060 }", 1))
+	got := c.NATChecklist()
+	for _, w := range []string{"  udp/16060\n", "one UDP socket (10.77.0.2:16060) serves both sides", "REQUIRED forwards: udp/16060 and the rtp range"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("checklist lacks %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "5060") {
+		t.Errorf("checklist still names 5060:\n%s", got)
+	}
+
+	sep := mustParse(t, strings.Replace(minimalYAML, "{ udp: 5060 }", "{ udp: 16060 }", 1))
+	if sep.SharedSocket() || sep.PrivateAddr().Port() != PrivateSIPPort {
+		t.Errorf("two-address layout: shared=%v private=%v, want port %d", sep.SharedSocket(), sep.PrivateAddr(), PrivateSIPPort)
 	}
 }

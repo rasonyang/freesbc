@@ -89,7 +89,7 @@ func run(args []string) int {
 		fs.StringVar(&initOpts.PrivateIP, "private-ip", os.Getenv("FREESBC_PRIVATE_IP"), "private.ip (default: detected)")
 		fs.StringVar(&initOpts.PublicIP, "public-ip", os.Getenv("FREESBC_PUBLIC_IP"), "public.ip (default: looked up)")
 		fs.StringVar(&initOpts.PublicBind, "public-bind", os.Getenv("FREESBC_PUBLIC_BIND"), "public.bind (default: detected)")
-		fs.StringVar(&udpPort, "udp-port", os.Getenv("FREESBC_UDP_PORT"), "edge.listen.udp (default 5060)")
+		fs.StringVar(&udpPort, "udp-port", os.Getenv("FREESBC_UDP_PORT"), "edge.listen.udp (default 5060; in the single-IP layout also the switch-facing port)")
 		fs.BoolVar(&initOpts.NoPublicLookup, "no-public-lookup", false, "do not ask a public service for public.ip")
 	}
 	if err := fs.Parse(args[1:]); err != nil {

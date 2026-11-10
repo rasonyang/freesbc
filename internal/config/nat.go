@@ -118,6 +118,6 @@ func (c *Config) SharedSocketNote() string {
 	fmt.Fprintf(&b, "the switch is identified by its source IP (%s), not by the socket it reaches: a datagram from that address is trusted and skips the shield.\n",
 		strings.Join(sw, ", "))
 	fmt.Fprintf(&b, "REQUIRED forwards: udp/%d and the rtp range %d-%d to %s (listed above).\n",
-		PrivateSIPPort, c.RTP.Min, c.RTP.Max, c.Public.Bind)
+		c.PrivateAddr().Port(), c.RTP.Min, c.RTP.Max, c.Public.Bind)
 	return b.String()
 }

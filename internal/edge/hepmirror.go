@@ -36,7 +36,7 @@ type hepMirror struct {
 	advPorts map[hepPort]uint16
 	// switchIPs is set only with a shared socket (the single-IP layout),
 	// where one socket faces both the internet and the switch. A message
-	// whose far end is a switch node used the socket as private.ip:5060, so
+	// whose far end is a switch node used the socket as the private socket, so
 	// its local end keeps the shared address instead of being reported as
 	// public.ip. Nil with separate sockets.
 	switchIPs map[netip.Addr]struct{}

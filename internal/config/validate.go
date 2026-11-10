@@ -121,11 +121,11 @@ func (c *Config) validateSharedSocket(fail failFunc) {
 	if !privateOrCGNAT(shared) {
 		fail("private.ip: %q is shared with public.bind but is not a private or CGNAT address; one socket for both sides is allowed only behind 1:1 NAT on a private address", c.Private.IP)
 	}
-	if c.Edge.Listen.UDP != PrivateSIPPort {
-		fail("edge.listen.udp: must be %d when private.ip equals public.bind (one socket serves both sides), got %d", PrivateSIPPort, c.Edge.Listen.UDP)
+	if c.Edge.Listen.UDP == 0 {
+		fail("edge.listen.udp: required when private.ip equals public.bind (the one socket that serves both sides is the udp listener)")
 	}
-	if adv := c.Edge.Advertise.Port("udp"); adv != 0 && adv != PrivateSIPPort {
-		fail("edge.advertise.udp: %d translates the udp port, which is not supported when private.ip equals public.bind (the NAT must forward udp/%d unchanged)", adv, PrivateSIPPort)
+	if adv := c.Edge.Advertise.Port("udp"); adv != 0 && adv != c.Edge.Listen.UDP {
+		fail("edge.advertise.udp: %d translates the udp port %d, which is not supported when private.ip equals public.bind (the NAT must forward udp/%d unchanged)", adv, c.Edge.Listen.UDP, c.Edge.Listen.UDP)
 	}
 	if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs < 2 {
 		fail("rtp: %d-%d holds %d pair when private.ip equals public.bind; a call takes two pairs from the one range, so it needs at least 2", c.RTP.Min, c.RTP.Max, pairs)

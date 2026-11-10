@@ -25,7 +25,7 @@ It is a **stateful SIP proxy**, not a B2BUA, implemented in one package
 |---|---|---|
 | Registered clients: SIP/UDP, SIP/TCP and SIP/TLS phones, WS/WSS (WebRTC) browsers | the public sockets (`edge.listen`, bound on `public.bind`) | REGISTER is proxied to the switch; a public INVITE is admitted only from a live registration |
 | Carriers | the public socket of their transport (UDP, or TCP/TLS: `edge.listen`, or a connection FreeSBC opens to them) | named in `edge.carriers` (directory resolved by `carrierdns.go`) or listed in `edge.carrier_sources`; the switch holds the carrier accounts and uses FreeSBC as its outbound proxy |
-| The switch (FreeSWITCH or Asterisk) | the fixed private socket `private.ip:5060`; in the single-IP layout (`private.ip` equal to `public.bind`, behind a 1:1 NAT) that is the public udp listener itself, and the switch is told apart by its source IP | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
+| The switch (FreeSWITCH or Asterisk) | the private socket `private.ip:5060`; in the single-IP layout (`private.ip` equal to `public.bind`, behind a 1:1 NAT) that is the public udp listener itself, `private.ip:<edge.listen.udp>` (`Config.PrivateAddr`), and the switch is told apart by its source IP | UDP only; the switch is addressed by literal `IP:port` (`edge.switch`), never by name |
 
 If the config has no `edge` section that validates, `config.Parse` fails
 before anything starts; there is no mode in which the process runs without the
@@ -280,7 +280,7 @@ fsnotify-driven exclusively.
    the dialog table and the two media pools, and the DTLS identity when
    WebRTC is on. **Binds nothing.** Failure → `edge: %w` before any goroutine
    starts. `testHookEdgeOptions` is empty in production; tests use it to pass
-   `edge.WithPrivateAddr`, which replaces the fixed `private.ip:5060`.
+   `edge.WithPrivateAddr`, which replaces `Config.PrivateAddr` (`private.ip:5060`, or the shared socket).
 4. Log `"media planes ready"` with the `rtp` range, `public.bind` and
    `private.ip`, in `Run` (`app.go`).
 5. `errgroup.WithContext(ctx)`, in `Run` (`app.go`).
@@ -313,7 +313,7 @@ snapshot:
 | `tls` | `public.bind:edge.listen.tls`, certificate from the top-level `tls` | `edge.listen.tls` set |
 | `ws` | `public.bind:edge.listen.ws` | `edge.listen.ws` set |
 | `wss` | `public.bind:edge.listen.wss`, certificate from the top-level `tls` | `edge.listen.wss` set |
-| `udp-private` | `private.ip:5060` (`config.PrivateSIPPort`; not configurable) | always, except in the single-IP layout, where the `udp` socket is the private socket and `udp-private` is not bound |
+| `udp-private` | `private.ip:5060` (`config.PrivateSIPPort`; no key of its own) | always, except in the single-IP layout, where the `udp` socket is the private socket and `udp-private` is not bound |
 
 There are no wildcard binds: validation rejects `0.0.0.0` and `::` for
 `public.ip`, `public.bind` and `private.ip`. Public and private are separate
@@ -738,7 +738,7 @@ a carrier (§6).
 | Side | Transports | Trust |
 |---|---|---|
 | Public | `udp`, `tcp`, `tls`, `ws`, `wss`, each on `public.bind` and the port set by `edge.listen` | untrusted; full shield treatment |
-| Private | `udp` only, the one fixed socket `private.ip:5060` (`config.PrivateSIPPort`); in the single-IP layout that is the public `udp` socket, and only an `edge.switch` source IP is private | trusted; exempt from the shield |
+| Private | `udp` only, the one socket `private.ip:5060` (`config.PrivateSIPPort`); in the single-IP layout that is the public `udp` socket at `private.ip:<edge.listen.udp>` (`Config.PrivateAddr`), and only an `edge.switch` source IP is private | trusted; exempt from the shield |
 
 `side` (`internal/edge/topology.go`) carries `plane`, `transport`, advertised
 IP and port, and `laddr` —

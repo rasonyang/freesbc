@@ -84,7 +84,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		log.Warn("single-IP layout: one UDP socket serves both sides, and the switch is identified by its source IP, so a datagram from that address is trusted and skips the shield",
 			"socket", cfg.PrivateAddr().String(), "switch_sources", sw,
-			"forward", fmt.Sprintf("udp/%d and rtp %d-%d", config.PrivateSIPPort, cfg.RTP.Min, cfg.RTP.Max))
+			"forward", fmt.Sprintf("udp/%d and rtp %d-%d", cfg.PrivateAddr().Port(), cfg.RTP.Min, cfg.RTP.Max))
 	}
 
 	// The edge: public SIP/UDP + WS/WSS toward phones, browsers and
