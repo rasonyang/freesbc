@@ -52,9 +52,9 @@ The side facing the switch.
 
 | Key | Default | Rules |
 |---|---|---|
-| `ip` | required | A literal IP, not `0.0.0.0` / `::`. Both the bind and the advertised address. It must differ from the effective `public.bind`, except in the single-IP layout: `private.ip` may equal `public.bind` when `public.ip` differs from `public.bind` (1:1 NAT), the shared address is private or CGNAT, `edge.listen.udp` is 5060, `edge.advertise.udp` is unset or 5060, every `edge.switch` address is private or CGNAT, and no static `edge.carriers` address or `edge.carrier_sources` entry covers an `edge.switch` address (a carrier named by DNS is not checked). One UDP socket then serves both sides and the switch is identified by its source IP; see [Single-IP host behind a 1:1 NAT](edge.md#single-ip-host-behind-a-11-nat). A second address stays the stronger layout. |
+| `ip` | required | A literal IP, not `0.0.0.0` / `::`. Both the bind and the advertised address. It must differ from the effective `public.bind`, except in the single-IP layout: `private.ip` may equal `public.bind` when `public.ip` differs from `public.bind` (1:1 NAT), the shared address is private or CGNAT, `edge.listen.udp` is set (any port, it becomes the shared socket's port), `edge.advertise.udp` is unset or equal to it, every `edge.switch` address is private or CGNAT, and no static `edge.carriers` address or `edge.carrier_sources` entry covers an `edge.switch` address (a carrier named by DNS is not checked). One UDP socket then serves both sides and the switch is identified by its source IP; see [Single-IP host behind a 1:1 NAT](edge.md#single-ip-host-behind-a-11-nat). A second address stays the stronger layout. |
 
-The private SIP socket is fixed at `private.ip:5060` (`config.PrivateSIPPort`) and cannot be configured. With `private.ip` equal to `public.bind` it is the public udp listener itself (`Config.SharedSocket`).
+The private SIP socket has no key of its own. In the two-address layout it is `private.ip:5060` (`config.PrivateSIPPort`) whatever `edge.listen.udp` is. With `private.ip` equal to `public.bind` it is the public udp listener itself (`Config.SharedSocket`), so its port is `edge.listen.udp` and the switch's outbound proxy is `private.ip:<edge.listen.udp>` (`Config.PrivateAddr`).
 
 #### 1:1 NAT checklist
 
@@ -84,7 +84,7 @@ in-dialog requests (2xx ACK, BYE) use Contact/Record-Route, not Via:
 these ports MUST be reachable from clients.
 ```
 
-With `private.ip` equal to `public.bind` (single-IP layout) the checklist ends with three more lines, and `run` logs a WARN in the same terms: that one UDP socket serves both sides, that the switch is identified by its source IP, and the forwards (`udp/5060` and the `rtp` range). Other configs print nothing extra.
+With `private.ip` equal to `public.bind` (single-IP layout) the checklist ends with three more lines, and `run` logs a WARN in the same terms: that one UDP socket serves both sides, that the switch is identified by its source IP, and the forwards (`udp/<edge.listen.udp>` and the `rtp` range). Other configs print nothing extra.
 
 At startup `run` fails if `public.bind` or `private.ip` is not assigned to a local interface (`CheckLocalAddr`, `internal/edge/edge.go`). An IPv4 loopback address counts when the kernel binds it: on Linux any 127/8 address works without an alias (for example `private.ip: 127.0.0.3` beside a switch on `127.0.0.2`), while on macOS a loopback address other than `127.0.0.1` needs `sudo ifconfig lo0 alias <ip> up`. `check` does not test this.
 
@@ -129,7 +129,7 @@ The DTLS identity for WebRTC media is a per-process self-signed certificate gene
 
 #### `edge.switch`
 
-The switch nodes, as literal `IP:port` over UDP (no DNS: a host name is a validation error). Rules: each entry is a valid IP with port 1-65535, not unspecified, not repeated, and not FreeSBC's own private socket `private.ip:5060`. In the single-IP layout every entry must also be a private or CGNAT address, because the switch is trusted by its source IP there.
+The switch nodes, as literal `IP:port` over UDP (no DNS: a host name is a validation error). Rules: each entry is a valid IP with port 1-65535, not unspecified, not repeated, and not FreeSBC's own private socket (`Config.PrivateAddr`: `private.ip:5060`, or the shared socket). In the single-IP layout every entry must also be a private or CGNAT address, because the switch is trusted by its source IP there.
 
 One entry is a single upstream. More than one is a pool: a request is hashed to a node by FNV-1a 64 over the lower-cased user part, and a node that answered nothing is skipped for 30 s (passive cooldown), and after 3 unanswered REGISTERs in a row it is not dialed for REGISTER at all (30 s, 1 m, then 5 m; constants, see `docs/edge.md`). The nodes must share a registration store. A node is named by its `IP:port` in logs and in `GET /api/switch-nodes`.
 

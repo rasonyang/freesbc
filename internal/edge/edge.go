@@ -46,12 +46,12 @@ type Server struct {
 	tlsLoaded time.Time
 	tlsUsers  []string
 
-	// privAddr is the private SIP socket: private.ip:5060, unless a test
+	// privAddr is the private SIP socket: Config.PrivateAddr, unless a test
 	// overrode it with WithPrivateAddr. Written once in New.
 	privAddr netip.AddrPort
 	// shared is true when the private socket IS the public udp listener
 	// (the single-IP layout: private.ip equals public.bind, one socket at
-	// private.ip:5060). Run then binds that one socket, with no private
+	// private.ip:<edge.listen.udp>). Run then binds that one socket, with no private
 	// BPF filter, and the read filter tells the two sides apart by the
 	// source IP alone (trusted). It is derived from the bound addresses, so
 	// a test that points the private socket at the public one gets the mode
@@ -205,8 +205,8 @@ type options struct {
 }
 
 // WithPrivateAddr overrides the private SIP socket, which is otherwise the
-// fixed private.ip:5060. It is a TEST SEAM: the private socket's port is
-// not configurable in production, but tests run the whole topology on one
+// Config.PrivateAddr (private.ip:5060, or private.ip:<edge.listen.udp> in the
+// single-IP layout). It is a TEST SEAM: tests run the whole topology on one
 // host and need to separate the private socket from the switch and the
 // public side by port. The address is used for both the bind and the
 // advertised side, and its IP replaces private.ip for media.

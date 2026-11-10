@@ -9,8 +9,10 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
-// PrivateSIPPort is the port of the one fixed private SIP socket,
-// private.ip:5060. It is not configurable.
+// PrivateSIPPort is the port of the private SIP socket in the two-address
+// layout, private.ip:5060. It is not configurable. In the single-IP layout
+// the socket is the public udp listener and its port is edge.listen.udp
+// (Config.PrivateAddr).
 const PrivateSIPPort = 5060
 
 // DefaultCarrierPort is the port assumed for an edge.carriers entry that
@@ -428,7 +430,7 @@ func (c *Config) PortTranslated() bool {
 }
 
 // SharedSocket reports whether private.ip and public.bind are one address,
-// so a single UDP socket, private.ip:5060 and the public udp listener, serves
+// so a single UDP socket, private.ip:<edge.listen.udp> and the public udp listener, serves
 // both sides (the single-IP layout behind 1:1 NAT). On a validated Config it
 // implies every other condition of that layout (validateSharedSocket). It
 // reads the two address strings, so the answer does not depend on the order
@@ -443,9 +445,16 @@ func (c *Config) SharedSocket() bool {
 // PrivateIP is the private bind and advertised address.
 func (c *Config) PrivateIP() netip.Addr { return mustAddr(c.Private.IP) }
 
-// PrivateAddr is the fixed private SIP socket, private.ip:5060.
+// PrivateAddr is the private SIP socket: private.ip:5060 (PrivateSIPPort),
+// except in the single-IP layout (SharedSocket), where it is the public udp
+// listener, private.ip:<edge.listen.udp>. It is the one place the private
+// socket's port is decided.
 func (c *Config) PrivateAddr() netip.AddrPort {
-	return netip.AddrPortFrom(c.PrivateIP(), PrivateSIPPort)
+	port := PrivateSIPPort
+	if c.SharedSocket() && c.Edge.Listen.UDP != 0 {
+		port = c.Edge.Listen.UDP
+	}
+	return netip.AddrPortFrom(c.PrivateIP(), uint16(port))
 }
 
 // Switches returns the edge.switch nodes in file order.

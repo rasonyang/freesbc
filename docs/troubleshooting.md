@@ -88,6 +88,23 @@ Asterisk (`pjsip set logger on`, or `sip set debug on` for chan_sip):
 - Media timeouts: `rtp_timeout` and `rtp_timeout_hold` on the PJSIP endpoint (chan_sip: `rtptimeout`, `rtpholdtimeout`); a channel with no media for that long gets a BYE.
 - `external_media_address` and `external_signaling_address` on the transport must not be set to an address that is not FreeSBC's: media and signaling are anchored on FreeSBC either way.
 
+## A SIP ALG rewrites SIP on UDP 5060
+
+A SIP ALG (application-layer gateway) in a NAT or firewall on the path edits SIP and SDP content on the port it watches, usually UDP 5060, and leaves other ports alone.
+
+Symptoms, all on flows to or from UDP 5060 only:
+
+- The public address in a Request-URI, the top Via of a response or the To header arrives replaced by an internal address of the NAT, so responses do not match their transactions or requests are refused.
+- The `m=` port of an SDP answer arrives rewritten, so media goes to the wrong socket (`reason=rtp_silence`, or the `freesbc_rtp_packets_rejected_total{plane}` counter rising with the latch Warn lines).
+- Registrations and calls work from some networks and not others.
+
+Confirm it by sending the same payload to 5060 and to another port and comparing what arrives. On the FreeSBC host, capture with `tcpdump -n -i any -A udp port 5060 or udp port 16060` or `sngrep`, then send one OPTIONS or INVITE from outside to `public.ip:5060` and the same bytes to `public.ip:16060` (a second listener, or a throwaway `nc -u` sender towards a test port). If the copy that arrives on 5060 differs and the other is intact, an ALG is rewriting it.
+
+Fix it, in this order of preference:
+
+1. Disable the SIP ALG on the device.
+2. Move SIP off the watched port with `edge.listen.udp` (and `edge.listen.tcp` or `tls` if those are affected). This works in both layouts. The NAT must forward the new port unchanged (`freesbc check` prints the forwards), and in the single-IP layout the shared socket is `private.ip:<edge.listen.udp>`, so the switch's outbound proxy (FreeSWITCH `outbound-proxy` and `register-proxy`, Asterisk `outbound_proxy`) must follow it ([Single-IP host behind a 1:1 NAT](edge.md#single-ip-host-behind-a-11-nat)). In the two-address layout the switch side stays on `private.ip:5060`. Peers must be given the new port: carriers and phones registering to `public.ip:<port>`.
+
 ## SIP datagrams lost under bursts
 
 Symptom: calls or REGISTERs fail at high rates with no FreeSBC log line, and `nstat -az UdpRcvbufErrors` (or `RcvbufErrors` in `/proc/net/snmp`) keeps rising. Check the startup log for `udp socket receive buffer below request`: the kernel capped the 8 MiB request FreeSBC makes on its UDP SIP sockets. Raise `net.core.rmem_max` to at least 8 MiB (and `net.core.wmem_max` to at least 1 MiB) and restart FreeSBC; see [UDP socket buffers](edge.md#udp-socket-buffers). `freesbc_udp_socket_drops_total{socket="public|private|shared"}` on `/metrics` (Linux) names which SIP socket drops, and `freesbc_udp_socket_rx_queue_bytes{socket}` shows its queue at the scrape. Drops with the full buffer granted, at carrier-in rates above about 3500 CPS on 4 vCPU, are GC mark phases keeping the socket's reader waiting for a CPU ([performance.md](performance.md), #235); in a local test more CPUs, or a higher `GOGC` at a large cost in memory, moved the onset up.

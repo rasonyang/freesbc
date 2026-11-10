@@ -228,7 +228,7 @@ func parseIPHost(host string) (netip.Addr, bool) {
 }
 
 // buildTopology resolves the config into the runtime model. priv is the
-// private socket (private.ip:5060 unless a test overrides it). It performs
+// private socket (Config.PrivateAddr unless a test overrides it). It performs
 // no DNS: every switch node is a literal address, so a poisoned resolver
 // can never redirect the private leg.
 func buildTopology(cfg *config.Config, priv netip.AddrPort) *topology {

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,14 +32,40 @@ func TestInitSingleIPLayout(t *testing.T) {
 		t.Errorf("output asks about provider filtering:\n%s", out.String())
 	}
 
-	// The layout's own rules still apply: udp 5060 only.
+	// The shared socket follows --udp-port (issue #328).
 	o, _ = fakeInit(t, "10.0.0.2", "10.0.0.2", "203.0.113.7")
-	o.Switch, o.UDPPort = "10.0.0.5:5080", 5070
-	if err := Init(context.Background(), o); err == nil || !strings.Contains(err.Error(), "must be 5060") {
-		t.Fatalf("err = %v, want the udp 5060 rule", err)
+	o.Switch, o.UDPPort = "10.0.0.5:5080", 16060
+	out.Reset()
+	o.Out = &out
+	if err := Init(context.Background(), o); err != nil {
+		t.Fatal(err)
 	}
-	if _, serr := os.Stat(o.Path); !errors.Is(serr, os.ErrNotExist) {
-		t.Error("file written despite error")
+	c = parseFile(t, o.Path)
+	if !c.SharedSocket() || c.PrivateAddr().String() != "10.0.0.2:16060" {
+		t.Errorf("shared=%v private=%v, want 10.0.0.2:16060", c.SharedSocket(), c.PrivateAddr())
+	}
+	for _, w := range []string{"udp/16060", "one UDP socket (10.0.0.2:16060)", "REQUIRED forwards: udp/16060"} {
+		if !strings.Contains(out.String(), w) {
+			t.Errorf("output lacks %q:\n%s", w, out.String())
+		}
+	}
+}
+
+// check names the moved shared socket, and the 5060 rule is gone.
+func TestCheckSharedSocketMovedPort(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	src := "public: { ip: 203.0.113.7, bind: 10.77.0.2 }\nprivate: { ip: 10.77.0.2 }\nedge:\n  switch: [10.77.0.3:5080]\n  listen: { udp: 16060 }\n"
+	if err := os.WriteFile(p, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	note, err := Check(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{"udp/16060", "one UDP socket (10.77.0.2:16060) serves both sides", "REQUIRED forwards: udp/16060 and the rtp range"} {
+		if !strings.Contains(note, w) {
+			t.Errorf("note lacks %q:\n%s", w, note)
+		}
 	}
 }
 

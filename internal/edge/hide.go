@@ -63,7 +63,7 @@ import (
 // original From and To addresses are restored (the tags stay as answered). An
 // INVITE's 1xx/2xx additionally gets FreeSBC's private Record-Route
 // inserted right after the public one (addPrivateRecordRoute): the switch,
-// as UAC, reverses the list, so its route set starts at private.ip:5060 and
+// as UAC, reverses the list, so its route set starts at the private socket and
 // its in-dialog requests reach the private socket.
 //
 // Response to a carrier (respToCarrier, a carrier-originated request that

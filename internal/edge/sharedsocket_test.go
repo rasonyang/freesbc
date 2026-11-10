@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -618,5 +620,51 @@ func TestSharedSocketConfigFlagFalseForSeparateAddresses(t *testing.T) {
 	if h.store.Current().SharedSocket() {
 		t.Error("a separate-address config reports a shared socket")
 	}
-	_ = config.PrivateSIPPort
+}
+
+// Issue #328: in the single-IP layout the shared socket is
+// private.ip:<edge.listen.udp>, derived by New from the config alone. No
+// WithPrivateAddr here (the harness uses it as a seam), so a Server that took
+// the 5060 constant instead of Config.PrivateAddr fails this. New binds
+// nothing, so the private address need not be local.
+func TestSharedSocketPortFollowsListenUDPInNew(t *testing.T) {
+	const src = `
+public: {ip: 203.0.113.7, bind: 10.77.0.2}
+private: {ip: 10.77.0.2}
+rtp: "10000-19999"
+edge:
+  switch: ["10.77.0.3:5080"]
+  listen: {udp: 16060}
+`
+	cfg, err := config.Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(config.NewStore(cfg), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := netip.MustParseAddrPort("10.77.0.2:16060"); srv.privAddr != want {
+		t.Errorf("privAddr = %v, want %v", srv.privAddr, want)
+	}
+	if !srv.shared {
+		t.Fatal("the shared socket was not recognised")
+	}
+	pub, ok := srv.topo.publicSide("udp")
+	if !ok || pub.advIP.String() != "203.0.113.7" || pub.advPort != 16060 {
+		t.Errorf("public side = %+v, want 203.0.113.7:16060", pub)
+	}
+	if p := srv.topo.private; p.advIP.String() != "10.77.0.2" || p.advPort != 16060 {
+		t.Errorf("private side = %v:%d, want 10.77.0.2:16060", p.advIP, p.advPort)
+	}
+	self := func(host string, port int) bool { return srv.topo.isSelf(sip.Uri{Host: host, Port: port}) }
+	if !self("10.77.0.2", 16060) || !self("203.0.113.7", 16060) {
+		t.Error("isSelf misses a FreeSBC address on the moved port")
+	}
+	if self("10.77.0.2", 5060) || self("203.0.113.7", 5060) {
+		t.Error("isSelf still matches port 5060")
+	}
+	if got := srv.Listeners(); len(got) != 1 || !strings.Contains(got[0], "10.77.0.2:16060") {
+		t.Errorf("Listeners = %v", got)
+	}
 }

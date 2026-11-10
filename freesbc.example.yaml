@@ -31,8 +31,8 @@ rtp: 20000-29999             # one range, allocated independently per bind IP (h
 
 # --- Edge -------------------------------------------------------------------
 #
-# One fixed private socket, not configurable: private.ip:5060 (the public udp socket itself
-# when private.ip equals public.bind).
+# One private socket, no key of its own: private.ip:5060 (the public udp socket itself,
+# private.ip:<listen.udp>, when private.ip equals public.bind).
 # The switch sends everything there:
 #   - proxied REGISTER / calls to clients   (Request-URI carries ;fsbc=<token>)
 #   - carrier REGISTER / INVITE / OPTIONS   (outbound proxy; Request-URI host
