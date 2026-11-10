@@ -226,7 +226,7 @@ func TestLatchLooseExactSourceRetakesFromIntruder(t *testing.T) {
 		t.Fatal("the displaced source must be dropped")
 	}
 	if l.accept(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 7), Port: 4002}) {
-		t.Fatal("a latch at the exact signalled address is final")
+		t.Fatal("a live latch at the exact signalled address must not be taken by a stray")
 	}
 }
 
@@ -300,11 +300,183 @@ func TestLatchLooseDelayedLearning(t *testing.T) {
 		t.Fatalf("destination = %v, want %s", got, sdpAddr)
 	}
 
-	// The endpoint speaks from its SDP address during the window: final.
+	// The endpoint speaks from its SDP address during the window: it latches
+	// at once and, while it keeps flowing, locks out the other port. Only
+	// after it has been silent for LatchFallback does the other port return
+	// (#324).
 	l = newLatch()
 	_ = l.accept(other)
 	if !l.accept(exact) || l.accept(other) {
-		t.Fatal("the exact source must latch at once and lock out the other port")
+		t.Fatal("the exact source must latch at once and lock out the other port while it flows")
+	}
+	now = now.Add(LatchFallback - time.Millisecond)
+	if l.accept(other) {
+		t.Fatal("the other port must stay locked out before LatchFallback")
+	}
+	now = now.Add(time.Millisecond)
+	if !l.accept(other) {
+		t.Fatal("the other port must return once the exact source has been silent for LatchFallback")
+	}
+}
+
+func fbAddr(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
+
+// #324: three stray packets from the SDP address must not end a live
+// stream from another port of the same IP.
+func TestLatchFallbackAfterExactStrays(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := &latch{mode: LatchLoose, now: func() time.Time { return now }}
+	sdp, live := fbAddr("198.51.100.20:20004"), fbAddr("198.51.100.20:20002")
+	l.seed(sdp)
+	l.setSignallingSource(sdp.Addr())
+	step := 20 * time.Millisecond
+	for end := now.Add(LearnDelay + step); now.Before(end); now = now.Add(step) {
+		if !l.acceptFrom(live) {
+			t.Fatal("live stream must be accepted")
+		}
+	}
+	if l.dest() != live {
+		t.Fatalf("dest = %v, want the learned %v", l.dest(), live)
+	}
+	var lastExact time.Time
+	for i := 0; i < 3; i++ {
+		if !l.acceptFrom(sdp) {
+			t.Fatal("the exact source must pre-empt at once")
+		}
+		lastExact = now
+		now = now.Add(step)
+	}
+	var back time.Time
+	for ; now.Sub(lastExact) < 3*LatchFallback; now = now.Add(step) {
+		p := l.permitsFrom(live)
+		if ok := l.acceptFrom(live); ok != p {
+			t.Fatalf("permitsFrom %v != acceptFrom %v at +%v", p, ok, now.Sub(lastExact))
+		}
+		if p {
+			back = now
+			break
+		}
+	}
+	if back.IsZero() {
+		t.Fatal("the live stream was never accepted again")
+	}
+	if gap := back.Sub(lastExact); gap < LatchFallback || gap >= LatchFallback+step {
+		t.Fatalf("live stream back after %v, want [%v, %v)", gap, LatchFallback, LatchFallback+step)
+	}
+	if l.dest() != sdp {
+		t.Fatalf("dest after fallback = %v, want the SDP address %v (no oscillation)", l.dest(), sdp)
+	}
+	// A later exact packet still pre-empts (rank), but dest stays at the SDP
+	// address, and the live port returns after the silence again.
+	if !l.acceptFrom(sdp) || l.dest() != sdp {
+		t.Fatal("a later exact packet must be accepted and dest stay at the SDP address")
+	}
+	now = now.Add(LatchFallback)
+	if !l.acceptFrom(live) {
+		t.Fatal("live stream must fall back again after another silence")
+	}
+	// A same-IP source cannot redirect the reverse direction any more.
+	_ = l.acceptFrom(fbAddr("198.51.100.20:30000"))
+	if l.dest() != sdp {
+		t.Fatalf("dest = %v, want %v", l.dest(), sdp)
+	}
+	// A seed of the same address (a refresh re-INVITE) keeps it; a different
+	// address resets it.
+	l.seed(sdp)
+	if !l.exactLost || l.dest() != sdp {
+		t.Fatal("seeding the same address must keep the fallback state")
+	}
+	l.seed(fbAddr("198.51.100.20:20006"))
+	if l.exactLost {
+		t.Fatal("seeding a different address must reset the fallback state")
+	}
+	l.seed(sdp)
+	l.exactLost = true // restore for the relatch check
+	// Relatch resets the fallback state.
+	l.relatch(sdp)
+	if l.exactLost || l.rank != rankNone || l.dest() != sdp {
+		t.Fatal("relatch must reset the fallback state")
+	}
+	if !l.acceptFrom(live) || l.dest() != sdp {
+		t.Fatal("after relatch the first packet latches, learning delayed")
+	}
+	now = now.Add(LearnDelay)
+	if l.dest() != live {
+		t.Fatalf("after relatch dest = %v, want learned %v", l.dest(), live)
+	}
+}
+
+// A same-IP source on another port never takes over a stream that still
+// flows from the exact address (the hijack case stays closed).
+func TestLatchSteadyExactKeepsOtherPortOut(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := &latch{mode: LatchLoose, now: func() time.Time { return now }}
+	sdp, other := fbAddr("198.51.100.20:20004"), fbAddr("198.51.100.20:20002")
+	l.seed(sdp)
+	l.setSignallingSource(sdp.Addr())
+	for i := 0; i < 1000; i++ { // 20 s at 20 ms
+		if !l.acceptFrom(sdp) {
+			t.Fatal("exact must flow")
+		}
+		now = now.Add(10 * time.Millisecond)
+		if l.acceptFrom(other) || l.permitsFrom(other) {
+			t.Fatalf("other port accepted while exact flows (i=%d)", i)
+		}
+		now = now.Add(10 * time.Millisecond)
+	}
+	if l.dest() != sdp {
+		t.Fatalf("dest = %v", l.dest())
+	}
+}
+
+func TestLatchFallbackRanks(t *testing.T) {
+	now := time.Unix(1000, 0)
+	clock := func() time.Time { return now }
+	// Loose: rankAny never takes over a silent vouched latch, nor another
+	// silent rankAny source.
+	l := &latch{mode: LatchLoose, now: clock}
+	l.seed(fbAddr("198.51.100.20:20004"))
+	vouched, stranger := fbAddr("198.51.100.20:20002"), fbAddr("203.0.113.9:4000")
+	if !l.acceptFrom(vouched) {
+		t.Fatal("vouched source")
+	}
+	now = now.Add(10 * LatchFallback)
+	if l.permitsFrom(stranger) || l.acceptFrom(stranger) {
+		t.Fatal("rankAny must not take over a silent vouched latch")
+	}
+	l = &latch{mode: LatchLoose, now: clock}
+	l.seed(fbAddr("198.51.100.20:20004"))
+	if !l.acceptFrom(stranger) {
+		t.Fatal("rankAny latches first")
+	}
+	now = now.Add(10 * LatchFallback)
+	if l.permitsFrom(fbAddr("203.0.113.10:4000")) || l.acceptFrom(fbAddr("203.0.113.10:4000")) {
+		t.Fatal("a silent rankAny latch is not taken over by another rankAny source")
+	}
+	if !l.permitsFrom(vouched) || !l.acceptFrom(vouched) {
+		t.Fatal("a vouched source still takes a rankAny latch")
+	}
+
+	// Strict: a same-IP port change heals after the silence, not before.
+	l = &latch{mode: LatchStrict, now: clock}
+	l.seed(fbAddr("10.0.0.1:4000"))
+	a, b := fbAddr("10.0.0.1:5000"), fbAddr("10.0.0.1:5002")
+	if !l.acceptFrom(a) {
+		t.Fatal("strict first")
+	}
+	now = now.Add(LatchFallback - time.Millisecond)
+	if l.permitsFrom(b) || l.acceptFrom(b) {
+		t.Fatal("port change before the fallback must be refused")
+	}
+	now = now.Add(time.Millisecond)
+	if !l.permitsFrom(b) || !l.acceptFrom(b) || l.dest() != b {
+		t.Fatal("port change after the silence must heal")
+	}
+	if l.permitsFrom(fbAddr("10.0.0.2:5000")) || l.acceptFrom(fbAddr("10.0.0.2:5000")) {
+		t.Fatal("strict mode's IP rule is unchanged")
+	}
+	if l.exactLost {
+		t.Fatal("falling back from a below-exact latch must not set exactLost")
 	}
 }
 

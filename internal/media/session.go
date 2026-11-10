@@ -33,8 +33,9 @@ const (
 )
 
 // latchRank is how well signalling vouches for a packet source. A latch
-// only ever moves UP this ranking (or through an authorised relatch), and
-// a latch at rankExact is final.
+// moves UP this ranking at once, sideways or down only onto a vouched
+// source (rankSignalled or better) once the latched one has been silent for
+// LatchFallback, or through an authorised relatch.
 //
 //   - rankExact: the exact IP:port the side's SDP signalled.
 //   - rankSignalled: the SDP's IP from another port (a NAT that rewrote
@@ -68,6 +69,16 @@ const (
 // IP does not redirect the call's audio to its sender.
 const LearnDelay = 3 * time.Second
 
+// LatchFallback is how long a latched source must be silent before a vouched
+// source (rankSignalled or better, never rankAny) of no higher rank than the
+// latch may take it over. Without it a few stray packets from the exact SDP
+// address would replace a live stream from another port of the same IP for
+// the rest of the call (#324). A stream that is still flowing is never
+// taken over by a same-IP source. Once the latch fell back away from a
+// rankExact source, dest sends to the SDP address (the peer proved it
+// listens there) so an echoing peer cannot make the two sources alternate.
+const LatchFallback = time.Second
+
 // latch tracks the remote endpoint of one UDP stream. An inbound packet
 // that latches fixes where the stream's reverse direction is sent; after
 // that only a better-vouched source (see latchRank) or an authorised
@@ -98,6 +109,12 @@ type latch struct {
 	remote    netip.AddrPort
 	rank      latchRank
 	learnedAt time.Time
+	// lastSeen is when remote last had a packet accepted (the silence
+	// fallback). exactLost is set when the latch fell back away from a
+	// rankExact remote: dest then sends to dst (the exact signalled
+	// address) until relatch or a seed of a different address resets it.
+	lastSeen  time.Time
+	exactLost bool
 	// allowLoopback lets seed install a loopback destination. It comes
 	// from the pool the side was allocated from (PlaneParams.AllowLoopback)
 	// and is fixed for the latch's lifetime.
@@ -183,6 +200,7 @@ func (l *latch) relatch(addr netip.AddrPort) {
 	l.dst = netip.AddrPort{}
 	l.remote = netip.AddrPort{}
 	l.rank = rankNone
+	l.exactLost = false
 	l.mu.Unlock()
 	l.seed(addr)
 }
@@ -229,7 +247,10 @@ func (l *latch) seed(addr netip.AddrPort) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.expected = ip
-	l.signalled = netip.AddrPortFrom(ip, addr.Port())
+	if sig := netip.AddrPortFrom(ip, addr.Port()); sig != l.signalled {
+		l.exactLost = false // a refresh of the same address keeps it
+		l.signalled = sig
+	}
 	send := ip
 	if l.pinSeed {
 		send = l.sigSource
@@ -297,25 +318,27 @@ type latchEvent uint8
 const (
 	evSame    latchEvent = iota // accepted without a latch change (or, for permits, would be accepted)
 	evSet                       // first latch (from rankNone)
-	evMoved                     // replaced a latched source with a better-vouched one
+	evMoved                     // replaced a latched source with a better-vouched or live one
 	evRefused                   // not accepted
 )
 
 // latchVerdict is the value-typed result of a latch decision. held and
 // heldRank describe the source latched BEFORE the decision (rankNone when
-// none); rank is how well src is vouched for.
+// none); rank is how well src is vouched for. fallback marks a move that
+// was not a rank upgrade: the held source had been silent for LatchFallback.
 type latchVerdict struct {
 	ev       latchEvent
 	held     netip.AddrPort
 	heldRank latchRank
 	rank     latchRank
+	fallback bool
 }
 
 func (v latchVerdict) ok() bool { return v.ev != evRefused }
 
 // reason names why a refusal happened: "source" when the mode or the
 // armed expectation rejects src outright, "latched" when src is no better
-// vouched than the source already held.
+// vouched than the source already held, or the held source is still live.
 func (v latchVerdict) reason() string {
 	if v.rank == rankNone {
 		return "source"
@@ -323,32 +346,55 @@ func (v latchVerdict) reason() string {
 	return "latched"
 }
 
-// acceptFrom reports whether a packet from src may be processed, latching
-// the stream to src when it is the first acceptable source or a
-// better-vouched one than the source already latched.
-func (l *latch) acceptFrom(src netip.AddrPort) bool { return l.decide(src).ok() }
+// takes decides whether a packet from src (not the latched remote) may move
+// the latch at now, and to which rank. fallback reports a move that is not a
+// rank upgrade. Callers hold mu.
+func (l *latch) takes(src netip.AddrPort, now time.Time) (r latchRank, ok, fallback bool) {
+	r = l.rankOf(src)
+	switch {
+	case r > l.rank:
+		return r, true, false
+	case r >= rankSignalled && r <= l.rank && now.Sub(l.lastSeen) >= LatchFallback:
+		return r, true, true // the latched source went silent: follow the live one
+	}
+	return r, false, false
+}
 
-// decide is acceptFrom reporting what happened, so the caller can count
-// and log it outside the latch mutex. The already-latched path allocates
-// nothing and takes the mutex once.
-func (l *latch) decide(src netip.AddrPort) latchVerdict {
+// acceptFrom reports whether a packet from src may be processed, latching
+// the stream to src when it is the first acceptable source, a better-vouched
+// one than the source already latched, or a vouched one while the latched
+// source has been silent for LatchFallback.
+func (l *latch) acceptFrom(src netip.AddrPort) bool {
+	return l.decide(src, l.clock()).ok()
+}
+
+// decide is acceptFrom at a clock reading the caller already took (so the
+// relay's per-packet path reads the clock once), reporting what happened so
+// the caller can count and log it outside the latch mutex. The
+// already-latched path allocates nothing and takes the mutex once.
+func (l *latch) decide(src netip.AddrPort, now time.Time) latchVerdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.sameSource(src) {
+		l.lastSeen = now
 		return latchVerdict{ev: evSame}
 	}
-	r := l.rankOf(src)
-	if r <= l.rank {
-		// unacceptable, or no better than the latched source
+	r, ok, fb := l.takes(src, now)
+	if !ok {
+		// unacceptable, or no better than the live latched source
 		return latchVerdict{ev: evRefused, held: l.remote, heldRank: l.rank, rank: r}
 	}
-	v := latchVerdict{ev: evSet, held: l.remote, heldRank: l.rank, rank: r}
+	v := latchVerdict{ev: evSet, held: l.remote, heldRank: l.rank, rank: r, fallback: fb}
 	if l.rank != rankNone {
 		v.ev = evMoved
 	}
+	if l.rank == rankExact {
+		l.exactLost = true
+	}
 	l.remote = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 	l.rank = r
-	l.learnedAt = l.clock()
+	l.learnedAt = now
+	l.lastSeen = now
 	return v
 }
 
@@ -357,17 +403,18 @@ func (l *latch) decide(src netip.AddrPort) latchVerdict {
 // decrypt on a source the latch refuses anyway, and calls acceptFrom only
 // once the packet has authenticated, so a forged packet never moves the
 // latch.
-func (l *latch) permitsFrom(src netip.AddrPort) bool { return l.permit(src).ok() }
+func (l *latch) permitsFrom(src netip.AddrPort) bool { return l.permit(src, l.clock()).ok() }
 
-// permit is permitsFrom reporting the verdict (never evSet or evMoved).
-func (l *latch) permit(src netip.AddrPort) latchVerdict {
+// permit is permitsFrom at the caller's clock reading, reporting the
+// verdict (never evSet or evMoved).
+func (l *latch) permit(src netip.AddrPort, now time.Time) latchVerdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.sameSource(src) {
 		return latchVerdict{ev: evSame}
 	}
-	r := l.rankOf(src)
-	if r <= l.rank {
+	r, ok, _ := l.takes(src, now)
+	if !ok {
 		return latchVerdict{ev: evRefused, held: l.remote, heldRank: l.rank, rank: r}
 	}
 	return latchVerdict{ev: evSame, rank: r} // would be accepted; nothing latched
@@ -388,6 +435,9 @@ func (l *latch) dest() netip.AddrPort {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.rank == rankNone {
+		return l.dst
+	}
+	if l.exactLost && l.dst.IsValid() && l.dst == l.signalled {
 		return l.dst
 	}
 	if l.rank < rankExact && l.learningDelayed() && l.clock().Sub(l.learnedAt) < LearnDelay {
