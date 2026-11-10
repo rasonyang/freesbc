@@ -59,6 +59,30 @@ func (p PortRange) Pairs() int {
 	return (hi - lo + 1) / 2
 }
 
+// PairsExcluding is Pairs less the pairs that contain any of ports (the pair
+// of an even port p is p, p+1; of an odd port p it is p-1, p), each pair
+// counted once. Ports outside the range, and 0, change nothing.
+func (p PortRange) PairsExcluding(ports ...int) int {
+	lo, hi := int(p.Min), int(p.Max)
+	if lo%2 != 0 {
+		lo++
+	}
+	seen := map[int]struct{}{}
+	n := p.Pairs()
+	for _, port := range ports {
+		even := port &^ 1
+		if port <= 0 || even < lo || even+1 > hi {
+			continue
+		}
+		if _, dup := seen[even]; dup {
+			continue
+		}
+		seen[even] = struct{}{}
+		n--
+	}
+	return n
+}
+
 func (p *PortRange) UnmarshalYAML(b []byte) error {
 	s, err := yamlScalarString(b)
 	if err != nil {

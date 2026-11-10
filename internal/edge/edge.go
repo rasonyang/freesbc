@@ -311,7 +311,7 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 		return nil, err
 	}
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
-	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
+	s.pubPool, s.privPool = newMediaPools(cfg, topo, priv, s.log, s.mediaTimeout)
 	s.dialogs = newDialogTable(s.metrics, s.log)
 	s.subs = newSubTable(s.metrics)
 	// A subscription belongs to a registration binding: when the binding

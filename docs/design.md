@@ -419,7 +419,7 @@ Every top-level section is restart-only except `shield`. The table is
 
 | Hot (re-read per use) | Restart-only (`config.RestartOnlyChanges` key) |
 |---|---|
-| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`Server.beginDialog`, `invite.go`); the effective session limit is `max_sessions` clamped to the boot `rtp` pairs, or half of them in the single-IP layout (`Server.sessionLimit`, `invite.go`) | |
+| `shield.max_sessions`, `shield.invite_rate_limit`: `beginDialog` reads `store.Current()` once per out-of-dialog INVITE (`Server.beginDialog`, `invite.go`); the effective session limit is `max_sessions` clamped to the boot `rtp` usable pairs (SIP-socket pairs left out), or half of them in the single-IP layout (`Server.sessionLimit`, `invite.go`) | |
 | `shield.rate_limit`, `shield.carrier_rate_limit`, `shield.ban`: the shield reads `store.Current()` on every check (`Shield.AllowRate`, `shield.go`), re-parsing a rate-limit string only when it changes (`Shield.rateLimit`, `shield.go`) | `public` (`ip`, `bind`) |
 | `shield.register_ban`, `shield.register_ban_aor`, `shield.admission_ban` and their long stages `shield.register_ban_long`, `shield.register_ban_aor_long`, `shield.admission_ban_long`: `Shield.Strike` and `Shield.StrikeAOR` read `store.Current()` per strike, re-parsing each string only when it changes (`strikeLimits`, `cachedStrikeLimit`, `offenders.go`) | |
 | | `private` (`ip`) |
@@ -2591,9 +2591,17 @@ A `PlanePool` owns one **bind** plane: a port range, a bind address, a
 silence timeout and the `AllowLoopback` destination policy (§8.4)
 (`PlaneParams`, `portpool.go`). The edge runs two (`newMediaPools`,
 `edge/mediapool.go`): **public**, bound to `public.bind`, and
-**private**, bound to `private.ip`. Both draw from the one `rtp` range; each
-bind IP is its own port namespace, so the pools never hand out the same
-socket and each holds `(max-min+1)/2` pairs. Public-side sockets (phones,
+**private**, bound to `private.ip`. Both draw from the one `rtp` range. In the
+two-address layout each bind IP is its own port namespace, so the pools never
+hand out the same socket and each holds `(max-min+1)/2` pairs. In the
+single-IP layout both bind one address over one range: a port one pool holds
+fails the other's bind with EADDRINUSE and is skipped, and a call takes two
+pairs. A pool is built with the UDP ports FreeSBC's own SIP sockets hold on
+its bind address (`NewPlanePool`, `portpool.go`; the public udp listener, and
+the server's private SIP socket); the pair containing each, even or odd, is
+never reserved, bound or retried, by `allocatePairWith` or `allocateSingle`,
+and `newMediaPools` logs it once at startup. Other processes' ports keep the
+skip-on-failed-bind behaviour. Public-side sockets (phones,
 browsers, carriers) come from the public pool, switch-side sockets from the
 private pool; neither leg can ever be told to send media to the other plane's
 address.
@@ -2632,13 +2640,17 @@ means a sweep past ports other processes hold never stalls `Stats`, `release`
 or another allocation on the plane.
 
 `PlanePool.Stats` (`portpool.go`) returns `(inUse, total)`, where `total` is
-`(hi - lo + 1) / 2` after the even-bump, clamped to 0.
+`(hi - lo + 1) / 2` after the even-bump, less the excluded SIP-socket pairs
+inside the range, clamped to 0.
 
 Deployment sizing: **one pair per call per plane**. A plain call (phone or
 carrier) consumes 1 pair from the public pool and 1 from the private pool; a
 browser call consumes 1 reserved pair (1 bound socket) from the public pool and
 1 pair from the private pool. The `rtp` range therefore bounds concurrent calls
-at `(max-min+1)/2` per plane.
+at `(max-min+1)/2` per plane, less the pair holding a SIP socket. `config.SessionPairs`
+(`Config.SessionPairs` for the boot config) is the one count the default
+`shield.max_sessions`, its validation, the `rtp` checks and `Server.sessionLimit`
+share: the smaller plane's usable pairs, or half the usable pairs in the single-IP layout.
 
 ### 8.3 `media.Session` — the four-socket relay
 
@@ -3578,7 +3590,7 @@ If the forward fails, FreeSBC makes one stateless re-send attempt and answers
 | **edge inviteAttempt** | the dialog's `inFlight` slot | `d.track(...)` per attempt, **before** the INVITE is sent | tracked → `markSent` → overwritten by the next attempt → taken by `cancelSeries` or cleared by `untrack` | holds the request **as forwarded**, the **series** cancel, and `sent`/`cancelled`; a CANCEL finds the record by Call-ID + From tag; `cancelSeries` guarantees exactly one canceller and never lets a CANCEL overtake its INVITE | handler goroutines through `track`/`markSent`/`untrack`; the OnCancel hook and the backstop through `cancelSeries` | `defer d.untrack()` on handler return; `cancelSeries` on CANCEL or backstop | `dialogTable.mu` |
 | **switch cooldown** | one `cooldownTable` (`cooldown.go`) on `Server`, which also holds the per-node REGISTER breaker `reg[name]` (closed ⇄ open ⇄ half-open probe) | `edge.New` | absent ⇄ `until[name]` | keyed by the node's `IP:port` name, never by anything a client supplies; all-cooling falls back to dialling everything; `switchCooldown` (`edge.go`) = 30 s | handler goroutines only | `Recover` on any final response; lazy expiry otherwise | `cooldownTable.mu` |
 | **media Session** | the dialog that allocated it | `media.AllocateAcross` (`media/session.go`) with `(pubPool, privPool, …)` | `sessAllocated` (`media/session.go`) → `sessRunning` → `sessClosed` | forward-only; `Start` starts the relay at most once; `Close` is idempotent and safe from any goroutine; an unstarted session has **no watchdog** | `SetRemote`, `SetExpectedRemote`, `SetSignallingSource`, `Relatch` from the signalling goroutine; `Close` from anywhere | `dialog.end()`, the watchdog, `recoverRelayPanic` | `state atomic.Int32` (CAS/Swap), `lastRx [2]atomic.Int64` (one per sending side), per-latch `mu` |
-| **port allocation** | `PlanePool.inUse` (`media/portpool.go`) | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A; the public and private pools share the `rtp` range but bind different IPs, so they never collide | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
+| **port allocation** | `PlanePool.inUse` (`media/portpool.go`) | `allocatePair` / `allocateSingle` | reserved → released | RTP even, RTCP = RTP+1; a muxed WebRTC socket still reserves the odd port; a partial `AllocateAcross` releases side A; the public and private pools share the `rtp` range; in the two-address layout they bind different IPs and never collide, in the single-IP layout they share one address and learn of each other's ports through EADDRINUSE; the pair holding a SIP socket is excluded from each pool at construction (`NewPlanePool`) | the pool only | `Session.Close`, `WebRTCSession.Close`, `WebRTCLeg.Close`, the `AllocateAcross` failure path | `PlanePool.mu`, held only to reserve a candidate; binds run outside it |
 | **SRTP context** | one direction of one browser leg | `newSRTPContextFromKeys` (`media/srtp.go`) after the DTLS handshake (`WebRTCLeg.deriveSRTP`, `webrtcleg.go`) | installed once → dropped with the leg | keys come only from DTLS-SRTP key export and are never copied across legs; replay windows 64 (SRTP) / 128 (SRTCP) per context | the leg's `deriveSRTP`, exactly once | dropped with the leg | `SRTPContext.mu` serialising pion's lockless context; the leg holds the pair under `WebRTCLeg.mu` |
 | **WebRTC leg** | `WebRTCSession` (which closes it) | `NewWebRTCLeg` in `allocateWebRTC` (`edge/media.go`) or (offerer leg) `allocateOfferedWebRTC` (`edge/media.go`) | `legAllocated → legEstablishing → legEstablished \| legFailed → legClosed` | forward-only, `legClosed` terminal; first error wins; keys set exactly once — no re-keying, no ICE restart | `setState`/`set` only, under `mu` | `Close` from `WebRTCSession.Close`, the failure path in `Start`, or a fingerprint mismatch | `WebRTCLeg.mu` for agent/mux/demux/contexts/state; `readyOnce`; handles snapshotted under the lock and closed outside it |
 | **shield ban entry** | `banList` (`shield/banlist.go`), three per `Shield`: `Shield.bans` (`shield/shield.go`) (bucketKey: IPv4 address or IPv6 /64, every transport), `Shield.socketBans` (`shield/shield.go`) (UDP IP:port) and `Shield.udpBans` (`shield/shield.go`) (bucketKey, UDP only) | `ban(key, dur, reason)` from `CheckScanner`'s scanner branch (`bans`, or `socketBans` for a UDP verdict), and from `Shield.Strike` and `Shield.StrikeOn` (`shield/offenders.go`), which ban into `bans` or, for a UDP strike, `udpBans` with reason `register`, `admission` or `malformed` | absent → banned (extendable) → expired (lazy) → removed | hard cap **65536** per table (`banCap`) with an overflow counter; a socket ban lasts at most 1 min (`socketBanMax`); carrier sources are never scanner-banned or struck | `ban`, `banned` (lazy delete), `prune` | lazy expiry on lookup, the 1-minute prune tick, or process exit | `banList.mu` |

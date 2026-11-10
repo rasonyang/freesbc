@@ -127,8 +127,8 @@ func (c *Config) validateSharedSocket(fail failFunc) {
 	if adv := c.Edge.Advertise.Port("udp"); adv != 0 && adv != c.Edge.Listen.UDP {
 		fail("edge.advertise.udp: %d translates the udp port %d, which is not supported when private.ip equals public.bind (the NAT must forward udp/%d unchanged)", adv, c.Edge.Listen.UDP, c.Edge.Listen.UDP)
 	}
-	if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs < 2 {
-		fail("rtp: %d-%d holds %d pair when private.ip equals public.bind; a call takes two pairs from the one range, so it needs at least 2", c.RTP.Min, c.RTP.Max, pairs)
+	if pairs := c.PublicPairs(); c.RTP.Min >= 1024 && pairs < 2 {
+		fail("rtp: %d-%d holds %d usable pair (the pair holding udp port %d is left out) when private.ip equals public.bind; a call takes two pairs from the one range, so it needs at least 2", c.RTP.Min, c.RTP.Max, pairs, c.Edge.Listen.UDP)
 	}
 	quiet := func(string, ...any) {}
 	for i, s := range c.Edge.Switch {
@@ -163,6 +163,8 @@ func (c *Config) validateRTP(fail failFunc) {
 	}
 	if r.Pairs() < 1 {
 		fail("rtp: %d-%d holds no RTP/RTCP pair (RTP on an even port, RTCP on RTP+1) — widen it", r.Min, r.Max)
+	} else if c.SessionPairs() < 1 && !c.SharedSocket() {
+		fail("rtp: %d-%d holds no usable RTP/RTCP pair: the only pair holds a SIP socket (udp port %d or %d), which is left out of the media range — widen it", r.Min, r.Max, c.Edge.Listen.UDP, c.PrivateAddr().Port())
 	}
 }
 
@@ -457,12 +459,12 @@ func (c *Config) validateShield(fail failFunc) {
 	}
 	if c.Shield.MaxSessions < 0 {
 		fail("shield.max_sessions: must be >= 0, got %d", c.Shield.MaxSessions)
-	} else if pairs := c.RTP.Pairs(); c.RTP.Min >= 1024 && pairs >= 1 && c.Shield.MaxSessions > pairs {
-		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor (one RTP/RTCP pair per call per plane)",
+	} else if pairs := c.SessionPairs(); c.RTP.Min >= 1024 && c.RTP.Pairs() >= 1 && !c.SharedSocket() && pairs >= 1 && c.Shield.MaxSessions > pairs {
+		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor (one RTP/RTCP pair per call per plane, less any pair holding a SIP socket)",
 			c.Shield.MaxSessions, pairs, c.RTP.Min, c.RTP.Max)
-	} else if c.SharedSocket() && c.RTP.Min >= 1024 && c.Shield.MaxSessions > pairs/2 {
-		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor when private.ip equals public.bind (both planes draw from the one range, two pairs per call)",
-			c.Shield.MaxSessions, pairs/2, c.RTP.Min, c.RTP.Max)
+	} else if c.SharedSocket() && c.RTP.Min >= 1024 && c.Shield.MaxSessions > pairs {
+		fail("shield.max_sessions: %d exceeds the %d calls rtp %d-%d can anchor when private.ip equals public.bind (both planes draw from the one range, two pairs per call, less the pair holding the SIP socket)",
+			c.Shield.MaxSessions, pairs, c.RTP.Min, c.RTP.Max)
 	}
 	if c.Shield.InviteRateLimit != "" {
 		if rl, err := ParseRateLimit(c.Shield.InviteRateLimit); err != nil {

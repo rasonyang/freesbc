@@ -221,3 +221,76 @@ func TestPoolStatsOddCapacity(t *testing.T) {
 		t.Errorf("after 1 alloc: inUse=%d total=%d, want 1/2", inUse, total)
 	}
 }
+
+// The pair holding a SIP socket is left out of the pool for good: never
+// reserved, bound or retried, and not counted in Stats.
+func TestPoolExcludesSIPPortPair(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sip  int
+	}{{"even", 23004}, {"odd", 23005}} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewPlanePool("test", func() PlaneParams {
+				return PlaneParams{MinPort: 23000, MaxPort: 23009, Timeout: time.Minute, AllowLoopback: true}
+			}, tc.sip)
+			if _, total := p.Stats(); total != 4 {
+				t.Fatalf("total = %d, want 4 (5 pairs less the SIP pair)", total)
+			}
+			var binds []int
+			orig := listenUDP
+			listenUDP = func(network string, a *net.UDPAddr) (*net.UDPConn, error) {
+				binds = append(binds, a.Port)
+				return orig(network, a)
+			}
+			defer func() { listenUDP = orig }()
+
+			var conns []*net.UDPConn
+			defer func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			}()
+			seen := map[int]bool{}
+			var pairs []*portPair
+			for i := 0; i < 2; i++ {
+				pair, err := p.allocatePair()
+				if err != nil {
+					t.Fatal(err)
+				}
+				pairs = append(pairs, pair)
+				seen[pair.RTPPort()] = true
+			}
+			for i := 0; i < 2; i++ {
+				c, err := p.allocateSingle()
+				if err != nil {
+					t.Fatal(err)
+				}
+				conns = append(conns, c)
+				seen[c.LocalAddr().(*net.UDPAddr).Port] = true
+			}
+			if len(seen) != 4 || seen[23004] {
+				t.Errorf("allocated %v, want the 4 pairs other than 23004", seen)
+			}
+			if _, err := p.allocatePair(); !errors.Is(err, ErrPortsExhausted) {
+				t.Errorf("fifth allocation: %v, want ErrPortsExhausted", err)
+			}
+			for _, port := range binds {
+				if port == 23004 || port == 23005 {
+					t.Errorf("a bind was attempted on the SIP pair port %d", port)
+				}
+			}
+			if in, total := p.Stats(); in != 4 || total != 4 {
+				t.Errorf("Stats = %d/%d, want 4/4", in, total)
+			}
+			for _, pr := range pairs {
+				pr.Close()
+			}
+			if got := p.ExcludedPairs(23000, 23009); len(got) != 1 || got[0] != 23004 {
+				t.Errorf("ExcludedPairs = %v", got)
+			}
+			if got := p.ExcludedPairs(23006, 23009); len(got) != 0 {
+				t.Errorf("ExcludedPairs outside the range = %v", got)
+			}
+		})
+	}
+}

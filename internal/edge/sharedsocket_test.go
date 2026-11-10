@@ -668,3 +668,38 @@ edge:
 		t.Errorf("Listeners = %v", got)
 	}
 }
+
+// A SIP port inside the media range: both pools leave its pair out and the
+// session cap is the usable count (half of it in the single-IP layout).
+func TestSharedSocketSIPPortInsideRTPRange(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+public: {ip: 203.0.113.7, bind: 10.77.0.2}
+private: {ip: 10.77.0.2}
+rtp: 10000-19999
+edge:
+  switch: [10.77.0.3:5080]
+  listen: {udp: 16060}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topo := &topology{publicMediaIP: netip.MustParseAddr("203.0.113.7"), privateMediaIP: netip.MustParseAddr("10.77.0.2")}
+	var logs strings.Builder
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	pub, priv := newMediaPools(cfg, topo, cfg.PrivateAddr(), log, func() time.Duration { return time.Minute })
+	for name, p := range map[string]*media.PlanePool{"public": pub, "private": priv} {
+		if got := p.ExcludedPairs(10000, 19999); len(got) != 1 || got[0] != 16060 {
+			t.Errorf("%s excluded %v, want [16060]", name, got)
+		}
+		if _, total := p.Stats(); total != 4999 {
+			t.Errorf("%s total = %d, want 4999", name, total)
+		}
+	}
+	if n := strings.Count(logs.String(), "left out of media allocation"); n != 2 {
+		t.Errorf("logged %d exclusions, want 2:\n%s", n, logs.String())
+	}
+	srv := &Server{boot: cfg, privAddr: cfg.PrivateAddr(), shared: true}
+	if got := srv.sessionLimit(cfg); got != 2499 {
+		t.Errorf("sessionLimit = %d, want 2499", got)
+	}
+}
