@@ -198,7 +198,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 			s.registerUnanswered(name, aor, "transport error", probe)
 			continue
 		}
-		final, responded := s.pumpRegister(ctx, req, tx, clTx, in)
+		final, responded := s.pumpRegister(ctx, req, out, tx, clTx, in)
 		clTx.Terminate()
 
 		if final != nil {
@@ -255,7 +255,7 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 // It is the response loop onRegister has always had, lifted out so the
 // retry loop above can run it once per node; the response handling itself
 // is unchanged.
-func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, clTx sip.ClientTransaction, in bindingInput) (*sip.Response, bool) {
+func (s *Server) pumpRegister(ctx context.Context, req, out *sip.Request, tx sip.ServerTransaction, clTx sip.ClientTransaction, in bindingInput) (*sip.Response, bool) {
 	responded := false
 	responses := clTx.Responses()
 	for {
@@ -285,7 +285,7 @@ func (s *Server) pumpRegister(ctx context.Context, req *sip.Request, tx sip.Serv
 			if final {
 				s.registerOutcome(in, res)
 			}
-			err := s.relayResponseHide(req, tx, res, respToClient, func(relayed *sip.Response) error {
+			err := s.relayResponseHide(req, out, tx, res, respToClient, func(relayed *sip.Response) error {
 				if final && res.StatusCode/100 == 2 {
 					granted := s.recordBinding(res, in)
 					// The client compares the Contact in the 200 OK

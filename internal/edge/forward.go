@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"sync"
+	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -138,7 +141,7 @@ func annotateVia(req *sip.Request, source string) {
 func (s *Server) stripOwnRoutes(req *sip.Request) {
 	for {
 		r := req.Route()
-		if r == nil || !s.topo.isSelf(r.Address) {
+		if r == nil || !s.topo.isSelfRoute(r.Address) {
 			return
 		}
 		req.RemoveHeader("Route")
@@ -165,22 +168,101 @@ func noBuild(*sipgo.Client, *sip.Request) error { return nil }
 // with no Via at all and the requester's transaction layer cannot match
 // it.
 //
+// "Ours" is the advertised sent-by (isSelfVia) or, when branch is not empty,
+// the branch FreeSBC put on the request this answers, whatever the sent-by.
+// The branch is what a NAT SIP ALG leaves alone while it rewrites the host
+// of FreeSBC's own address inside the message, and it is as good a proof as
+// the sent-by: it is random, per request, and sipgo already matched the
+// response to its client transaction on it. A top Via with another branch is
+// refused as before. An empty branch (not known) keeps the exact check.
+//
 // ok=false means the response must not be forwarded.
 //
 // allowEmpty is for a response about to get the requester's own Vias back
 // (respToSwitch, hide.go): nothing needs to be left to route by.
-func (s *Server) popOwnVia(res *sip.Response, allowEmpty bool) (ok bool) {
+func (s *Server) popOwnVia(res *sip.Response, allowEmpty bool, branch string) (ok bool) {
 	top := res.Via()
 	if top == nil {
 		return false
 	}
-	if !s.topo.isSelfVia(top) {
+	if !s.topo.isSelfVia(top) && !(branch != "" && viaBranch(top) == branch) {
 		// Not our Via: the response does not belong to a request we sent.
 		return false
 	}
 	res.RemoveHeader("Via")
 	// After popping ours there must be a Via left to route by.
 	return allowEmpty || res.Via() != nil
+}
+
+// viaBranch is the branch parameter of a Via, or "".
+func viaBranch(v *sip.ViaHeader) string {
+	if v == nil || v.Params == nil {
+		return ""
+	}
+	b, _ := v.Params.Get("branch")
+	return b
+}
+
+// topBranch is the branch of the request's top Via — the one FreeSBC added
+// to a request it forwards — or "".
+func topBranch(req *sip.Request) string {
+	if req == nil {
+		return ""
+	}
+	return viaBranch(req.Via())
+}
+
+// unroutableLog rate-limits the WARN for a response dropped because its top
+// Via is not FreeSBC's: the first drop logs at once, the ones inside the next
+// unroutableWarnEvery are counted and reported by the next line.
+type unroutableLog struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+const unroutableWarnEvery = time.Minute
+
+// take reports whether to log now, and how many drops were held back since
+// the last line.
+func (u *unroutableLog) take(now time.Time) (suppressed int, ok bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.last.IsZero() && now.Sub(u.last) < unroutableWarnEvery {
+		u.suppressed++
+		return 0, false
+	}
+	u.last, suppressed, u.suppressed = now, u.suppressed, 0
+	return suppressed, true
+}
+
+// logUnroutable records a response dropped by popOwnVia: a WARN, at most one
+// a minute. res is the response as received (its top Via not yet popped);
+// branch is the one FreeSBC put on the forwarded request. reason says why:
+// "not_ours" (the top Via is neither FreeSBC's advertised address nor carries
+// that branch, which is how a misrouted response or an ALG rewriting the
+// branch looks) or "no_via_below" (it was ours but nothing was left to route
+// by). branch_matches says whether the top Via's branch equals the forwarded
+// request's. At Debug this was invisible.
+func (s *Server) logUnroutable(res *sip.Response, branch string) {
+	sentBy, topB, reason := "", "", "not_ours"
+	matches := false
+	if v := res.Via(); v != nil {
+		sentBy = net.JoinHostPort(v.Host, strconv.Itoa(v.Port))
+		topB = viaBranch(v)
+		matches = branch != "" && topB == branch
+		if matches || s.topo.isSelfVia(v) {
+			reason = "no_via_below"
+		}
+	}
+	s.log.Debug("dropping response that cannot be routed back",
+		"code", res.StatusCode, "sip_call_id", fsip.CallID(res))
+	if n, ok := s.unroutable.take(time.Now()); ok {
+		s.log.Warn("dropped a response that cannot be routed back; a SIP ALG on the path may be rewriting FreeSBC's address (docs/troubleshooting.md)",
+			"code", res.StatusCode, "sip_call_id", fsip.CallID(res), "reason", reason,
+			"via_sent_by", sentBy, "via_branch", topB, "branch_matches", matches,
+			"suppressed_since_last", n)
+	}
 }
 
 // errResponseDropped reports a response that cannot be routed back: its
@@ -200,6 +282,10 @@ var errResponseDropped = errors.New("proxy: response cannot be routed back")
 // else in the response is the far end's and is left alone, except the Allow
 // and Supported values the proxy cannot carry (sanitizeExtensions).
 //
+// fwd is the request FreeSBC forwarded (orig is the one it received): its top
+// Via branch is what popOwnVia accepts whatever the sent-by of the response's
+// top Via says.
+//
 // adapt runs on the clone after the Via is popped, the rewrite applied and
 // the destination set, before anything is sent, and is the last to change
 // it. It is where each loop rewrites the Contact and the SDP body; the error
@@ -208,13 +294,13 @@ var errResponseDropped = errors.New("proxy: response cannot be routed back")
 //
 // A failure to send is logged, not returned: the transaction layer owns
 // retransmission, and there is nothing a relay loop can do about it.
-func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, res *sip.Response,
+func (s *Server) relayResponseHide(orig, fwd *sip.Request, tx sip.ServerTransaction, res *sip.Response,
 	mode respHide, adapt func(out *sip.Response) error) error {
 
 	out := res.Clone()
-	if !s.popOwnVia(out, mode == respToSwitch) {
-		s.log.Debug("dropping response that cannot be routed back",
-			"code", out.StatusCode, "sip_call_id", fsip.CallID(out))
+	branch := topBranch(fwd)
+	if !s.popOwnVia(out, mode == respToSwitch, branch) {
+		s.logUnroutable(res, branch)
 		return errResponseDropped
 	}
 	sanitizeExtensions(out)
@@ -271,7 +357,7 @@ func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.S
 			if !fsip.Forwardable(res) {
 				continue // a 100 Trying is hop-by-hop; ours already went out
 			}
-			_ = s.relayResponseHide(req, tx, res, mode, adapt)
+			_ = s.relayResponseHide(req, out, tx, res, mode, adapt)
 			if res.StatusCode >= 200 {
 				return res, nil
 			}

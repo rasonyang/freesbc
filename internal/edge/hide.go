@@ -383,11 +383,56 @@ func (s *Server) hideToPublic(out *sip.Request, to side, recordRoute, inDialog b
 	}
 }
 
+// restoreOwnRecordRoutes puts FreeSBC's advertised public address back into
+// every Record-Route of a public party's response that carries
+// recordRouteMarker, which a NAT SIP ALG may have rewritten, so the switch's
+// route set (and, through it, its in-dialog requests) and a client's never
+// name an internal NAT address. The side is the one whose transport the
+// entry names, as side.recordRoute wrote it; an entry naming a transport
+// FreeSBC has no public side for cannot be restored and is removed. The
+// marker is a public party's claim: believing it only replaces that party's
+// own entry with FreeSBC's, which the later Route handling strips again.
+func (s *Server) restoreOwnRecordRoutes(res *sip.Response) {
+	hs := headersNamed(res, "Record-Route")
+	if len(hs) == 0 {
+		return
+	}
+	changed := false
+	var all []*sip.RecordRouteHeader
+	for _, h := range hs {
+		rr, ok := h.(*sip.RecordRouteHeader)
+		if !ok {
+			continue
+		}
+		if hasRecordRouteMarker(rr.Address) {
+			tr := "udp"
+			if v, ok := rr.Address.UriParams.Get("transport"); ok && v != "" {
+				tr = strings.ToLower(v)
+			}
+			pub, ok := s.topo.publicSide(tr)
+			changed = true
+			if !ok {
+				continue
+			}
+			rr.Address.Host, rr.Address.Port = pub.host(), pub.advPort
+		}
+		all = append(all, rr)
+	}
+	if !changed {
+		return
+	}
+	fsip.RemoveHeaders(res, "Record-Route")
+	for _, rr := range all {
+		res.AppendHeader(rr)
+	}
+}
+
 // hideResponse applies mode's rewrite to a response clone whose own Via has
 // been popped (see the file comment).
 func (s *Server) hideResponse(res *sip.Response, orig *sip.Request, mode respHide) {
 	switch mode {
 	case respToSwitch:
+		s.restoreOwnRecordRoutes(res)
 		fsip.RemoveHeaders(res, "Via")
 		var vias []sip.Header
 		for _, h := range headersNamed(orig, "Via") {
@@ -491,6 +536,9 @@ func (s *Server) isPrivateURI(u sip.Uri) bool { return sideMatches(s.topo.privat
 
 // isPublicURI reports whether u names one of FreeSBC's public listeners.
 func (s *Server) isPublicURI(u sip.Uri) bool {
+	if hasRecordRouteMarker(u) {
+		return true
+	}
 	for _, p := range s.topo.public {
 		if sideMatches(p, u) {
 			return true

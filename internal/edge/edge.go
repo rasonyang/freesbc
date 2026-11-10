@@ -165,7 +165,10 @@ type Server struct {
 	// dropSummary accumulates admission drops and struck malformed reads
 	// between two summary WARNs (admissionSummaryEvery).
 	dropSummary *dropSummary
-	enumLimit   *enumLimiter
+	// unroutable rate-limits the WARN for a response dropped because its
+	// top Via is not FreeSBC's (logUnroutable).
+	unroutable unroutableLog
+	enumLimit  *enumLimiter
 	// regGuard remembers the challenges relayed to public REGISTER
 	// sources, so failed credential attempts can be struck (regguard.go).
 	regGuard *regGuard

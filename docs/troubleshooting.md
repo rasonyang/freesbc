@@ -98,6 +98,14 @@ Symptoms, all on flows to or from UDP 5060 only:
 - The `m=` port of an SDP answer arrives rewritten, so media goes to the wrong socket (`reason=rtp_silence`, or the `freesbc_rtp_packets_rejected_total{plane}` counter rising with the latch Warn lines).
 - Registrations and calls work from some networks and not others.
 
+The ALG's fingerprint is FreeSBC's own advertised address (`public.ip`) replaced, inside the SIP message, by an internal address of the NAT, on flows to port 5060 only: a flow FreeSBC opens to a carrier on 5060 is the same kind of flow to the ALG, whatever FreeSBC's own port is. FreeSBC tolerates the rewrite of the addresses it wrote itself, on carrier and client legs alike:
+
+- A response is matched by the branch FreeSBC put on the request it answers (`popOwnVia`, `internal/edge/forward.go`), so a top Via whose sent-by was rewritten is still FreeSBC's. A top Via with any other branch is still refused (RFC 3261 §16.7 step 3).
+- FreeSBC's public Record-Route entry carries the flag parameter `fsbc-rr` (`recordRouteMarker`, `internal/edge/topology.go`). An entry or a Route that carries it is FreeSBC's own whatever host and port it now names, and a response from a public party gets the advertised address back in it before it is relayed (`restoreOwnRecordRoutes`, `internal/edge/hide.go`), so no NAT address reaches the switch's route set. Route headers carrying the marker are stripped like any of FreeSBC's own.
+- A rewritten To or From in a response is replaced by the switch's own (`respToSwitch`), and a rewritten Request-URI on an in-dialog request is replaced by the stored contact.
+
+A response that still cannot be routed back is dropped, and FreeSBC logs `dropped a response that cannot be routed back` at WARN, at most once a minute (with `suppressed_since_last`). The line names the top Via as received (`via_sent_by`, `via_branch`), whether its branch equals the one FreeSBC put on the forwarded request (`branch_matches`) and why (`reason`: `not_ours` when the top Via is neither FreeSBC's advertised address nor carries that branch, `no_via_below` when it was FreeSBC's but nothing was left to route by). Calls that fail on every answer with `not_ours` lines are the cue to look for an ALG. The first fix is still to disable it, below.
+
 Confirm it by sending the same payload to 5060 and to another port and comparing what arrives. On the FreeSBC host, capture with `tcpdump -n -i any -A udp port 5060 or udp port 16060` or `sngrep`, then send one OPTIONS or INVITE from outside to `public.ip:5060` and the same bytes to `public.ip:16060` (a second listener, or a throwaway `nc -u` sender towards a test port). If the copy that arrives on 5060 differs and the other is intact, an ALG is rewriting it.
 
 Fix it, in this order of preference:
