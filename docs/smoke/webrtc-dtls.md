@@ -108,6 +108,7 @@ Check the file, then run it:
 | `freesbc_webrtc_ice_failure_total` | browser legs that never completed ICE, including legs closed before they were established (CANCEL, tab closed) |
 | `freesbc_webrtc_dtls_failure_total` | browser legs whose DTLS handshake failed, **including a fingerprint mismatch** |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | packets relayed, folded in when a session ends |
+| `freesbc_rtp_packets_rejected_total{plane}` | RTP packets the media latch refused (`private`: FreeSWITCH's side); stays 0 in a clean run |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Linux only: kernel UDP receive drops for the whole network namespace; rx/tx 1.0 does not exclude them |
 | `freesbc_media_ports_in_use` | RTP port pairs held across all pools: +2 per browser call |
 
@@ -127,6 +128,7 @@ the kernel's side.
 | `level=WARN msg="webrtc leg failed" err="media: dtls peer certificate does not match the signalled fingerprint: …"` | the fingerprint check failed inside the handshake (T5) |
 | `level=WARN msg="webrtc leg failed" err="media: webrtc session closed before establishment"` (or `…leg closed before it was established`) | the call ended while ICE/DTLS was still running (T6) |
 | `level=INFO msg="call ended" sip_call_id=… reason=… terminated_by=… duration=… webrtc=… carrier=… stats=…` | the dialog ended and its media counters were folded in; `reason` says why (`dtls_failure` for a failed browser leg) and `terminated_by` (`caller`, `callee` or `proxy`) who ended it and moves `freesbc_edge_calls_ended_total{reason}` |
+| `level=WARN msg="media packets rejected by latch" plane=private …` | the private latch refused packets from a source other than the one it holds (not expected in a clean run) |
 | `level=WARN msg="rejecting call: media setup failed" err=…` | the browser's offer was refused with 488 before any media was set up, for example an offer without `a=rtcp-mux` |
 
 Neither fingerprint and no ICE password is ever logged. Lines starting

@@ -2727,6 +2727,26 @@ receiving media after an authorised move even if it never sends first (a
 recvonly peer, an IVR waiting to hear audio). An address with no usable
 port only re-arms the source check (`Armed`).
 
+**What the latch reports.** `latch.decide` (`media/session.go`) is `acceptFrom`
+returning a `latchVerdict`: same source, first latch (`evSet`), move to a
+better-ranked source (`evMoved`) or refusal (`evRefused`). The latch logs
+nothing itself, because it holds `latch.mu`; `latchReporter.observe`
+(`media/latchlog.go`) acts on the verdict after the lock is released, and the
+accepted, already-latched path returns before touching anything. A first latch
+logs at Debug (`media latch set`), a move at Info (`media latch moved`, with
+`plane`, `kind`, `from`, `to` and both ranks; a move needs a strictly higher
+rank, so a latch moves at most three times between relatches). Every refusal
+is counted in `LegStats.RTPRejected` or `RTCPRejected` (by `Session.forward`,
+`relay.go`, and `WebRTCSession.privateToPublic`, `webrtcsession.go`), and one
+that finds a source already latched logs a Warn, `media packets rejected by
+latch`, at most once a second per session and ten a second per plane (`logLimiter`, `planeBudget` on `PlanePool`, `media/latchlog.go`; a line the plane cap holds back is counted into the next one as `lines_suppressed`):
+`plane`, `kind`, `reason` (`latched`: no better ranked than the held source;
+`source`: strict mode, or the IP is not the expected one), `latched` and
+`source` with their ranks, and `count` (refusals since the previous line).
+No payload or user part is logged. `plane` is the pool's name
+(`NewPlanePool`), `public` for side A on the edge. A refusal while nothing is
+latched is counted, not logged.
+
 Both session kinds apply these to their RTP/RTCP latch pair through one rule,
 `seedPair` and `relatchPair` (`media/session.go`): RTCP goes to the RTP port
 plus one, and with no such port the RTCP source check is re-armed with port 0.
@@ -3281,8 +3301,12 @@ only inside `dialog.end()`.
 `media.Stats` carries packets and bytes, rx and tx, per side: `Stats.A` and
 `Stats.B` (`Side`, `Total`). On every call A is the public leg (client,
 browser or carrier) and B the private one (the switch). **RTCP is relayed but
-never counted.** There is no drop counter, no auth-failure counter and no RTCP
-counter. Rx counts the length after inbound decryption; Tx counts the bytes
+not counted in rx and tx.** Packets dropped are counted by cause:
+`SRTPRxDrops` and `SRTPTxDrops` (SDES authentication, replay, a missing key),
+and `RTPRejected` and `RTCPRejected` (packets from that side's far end that
+the latch refused, §8.4); oversize datagrams are counted nowhere. The
+`call ended` line prints the whole struct with field names (`Stats.String`,
+`media/stats.go`). Rx counts the length after inbound decryption; Tx counts the bytes
 actually written after outbound encryption, and **only when the `WriteToUDPAddrPort`
 itself succeeded** (`Session.forward`, `relay.go`), so on a browser call the public-side tx
 exceeds the private-side rx by the SRTP overhead. On a `WebRTCSession` the
@@ -3858,6 +3882,7 @@ permanent series per call."
 | `freesbc_sip_requests_total` | Counter | `method` (one of the 14 methods sipgo names, else `OTHER`), `transport` (`UDP`/`TCP`/`TLS`/`WS`/`WSS`, else `OTHER`) | edge `Server.guard` (`edge.go`), for every request the shield admits |
 | `freesbc_sip_responses_total` | Counter | `class` (`1xx`…`6xx`) | every response the edge sends or relays |
 | `freesbc_rtp_packets_rx_total` / `_tx_total` | Counter | — | edge: finished sessions folded in at `dialog.end` (`dialog.go`; `Metrics.MediaEnded` in `edge/metrics.go`) plus every live session's own atomic counters sampled at scrape time (`Metrics.rtpTotals`). `Metrics.mediaMu` makes "leave the live set, fold the final counters into the finished total" one step against a scrape, so a session is never counted twice and the series never goes backwards; no per-packet cost |
+| `freesbc_rtp_packets_rejected_total` | Counter | `plane` (`public`: media side A, `private`: side B; both exported from zero) | RTP packets the media latch refused, finished plus live sessions exactly as the rx/tx totals (`Metrics.MediaEnded`, `Metrics.rtpTotals`, `edge/metrics.go`). RTCP refusals are in the per-call `RTCPRejected` only. A rate that tracks the packet rate while rx stands still is the latch lock-out in [troubleshooting](troubleshooting.md#rtp-silence-reasonrtp_silence) |
 | `freesbc_rtp_bytes_rx_total` / `_tx_total` | Counter | — | the same as the packets series |
 | `freesbc_udp_receive_buffer_errors_total` / `freesbc_udp_in_errors_total` | Counter | — | Linux only: the kernel's `RcvbufErrors` and `InErrors` from the `Udp:` lines of `/proc/net/snmp` plus `Udp6RcvbufErrors` and `Udp6InErrors` from `/proc/net/snmp6`, IPv4 + IPv6 summed, read at scrape time (`readUDPStats`, `udpstats.go`, called from `collector.Collect`, `admin/metrics.go`). The kernel keeps them per network namespace, so they cover every UDP socket in it, not only FreeSBC's, and `InErrors` already includes `RcvbufErrors`. A datagram dropped on a full receive buffer never reaches `freesbc_rtp_packets_rx_total`, so rx/tx 1.0 does not exclude kernel loss; these series do. An absent `snmp6` (IPv6 disabled) leaves IPv4 alone; an unreadable or unparsable `/proc/net/snmp`, or any other OS, exports neither series (no error metric, no log) |
 | `freesbc_udp_socket_drops_total` / `freesbc_udp_socket_rx_queue_bytes` | Counter / Gauge | `socket` (`public`, `private`, `shared`) | Linux only, per socket where the series above are per namespace: the `drops` (last) and `rx_queue` columns of `/proc/self/net/udp` and `udp6` for the edge's UDP SIP sockets, read at scrape time (`collector.collectUDPSockets`, `admin/metrics.go`; `readUDPSockets`, `udpstats.go`). The addresses come from `Deps.ListenerInfos` (transport `udp`: `public.bind` with the `edge.listen.udp` port, and the private socket, or the one `shared` socket in the single-IP layout), so `admin` never imports `edge`. `parseProcNetAddr` (`udpstats.go`) decodes the kernel's hex address words in host byte order and unmaps an IPv4-mapped `udp6` row; sockets on one address are summed. `drops` is the socket's `sk_drops`: mostly a full receive buffer, also checksum and socket-filter drops. A socket in neither table, an unreadable table, or any other OS exports nothing for it. `rx_queue` is the backlog at the instant of the scrape, not a peak |
@@ -3906,9 +3931,9 @@ There is no carrier DNS metric.
 | Level | Examples |
 |---|---|
 | `Error` | `"proxy handler panic"` (+ stack); `"registration binding rejected"`; `"rejecting call: media ports exhausted"`; media relay panic (`"media relay panic; killing session"`); `"admin handler panic"` (+ stack); `"config watcher error"`, `"config reload failed, keeping previous config"`; `"config watcher exited"`, `"edge proxy exited"`, `"admin server exited"` |
-| `Warn` | `"config reload changes restart-only settings; …"`; `shield banned scanner`; `shield banned source for repeated failures` (once per source key and stage window, attribute `stage` `short` or `long`, §14.1); `shield locked AoR for repeated failed REGISTER credentials; …` (once per lock, attribute `stage`, §7.4); `"public request dropped by admission; …"` (the first drop per source IP and reason, remembered in a FIFO set capped at 4096, `maxWarnedSources`, `admission.go`); `"REGISTER enumeration limit reached; …"`; `"rejecting call: too many unanswered calls from one source"`; `"upstream INVITE unanswered; entering cooldown"` / `"upstream REGISTER unanswered; entering cooldown"` / `"upstream REGISTER unanswered; breaker open, REGISTERs not dialed"` (at most one per node per 30 s, plus one at each breaker opening); `"forward INVITE upstream"` / `"forward INVITE to client"` / `"forward INVITE to carrier"` / `"forward carrier REGISTER"` failures; `"carrier has no resolved address"`; `"carrier DNS lookup failed; keeping the last good addresses"`; `"carrier request names an unknown or expired registration token; …"`; `"2xx ACK never arrived; …"` (the first miss per plane, then at most one per minute, with `suppressed`); `"webrtc leg failed"`; the fingerprint-mismatch teardown; `"rejecting call to WebSocket client: …"` (a WebSocket client with no ws/wss listener cannot be offered DTLS-SRTP) |
-| `Info` | `"edge proxy listening"`, `"media planes ready"`, `"freesbc started"`, `"shutting down"`, `"admin server listening"`, `"config reloaded"`; `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"proxying INVITE to carrier"`; `"carrier registration"` with the granted expiry; `"carrier resolved"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"rejecting call: media not negotiable"`; `"ending the call; sending BYE to both ends"` with the `reason`; `"call ended"` with `reason`, `terminated_by`, `duration`, `webrtc`, `carrier` and media stats |
-| `Debug` | dialog ACK/BYE bookkeeping; `"2xx ACK never arrived"` for every miss; shield rate-limit drops and scanner-datagram drops; edge `"public request dropped by admission"` after the first per source; `"in-dialog request without a dialog record; hashing upstream"` and its carrier variant; `"pruned expired registration bindings"` / `"pruned expired carrier registrations"`; `"carrier DNS lookup still failing"`; `"forward carrier OPTIONS"`; dropped unroutable responses |
+| `Warn` | `"config reload changes restart-only settings; …"`; `shield banned scanner`; `shield banned source for repeated failures` (once per source key and stage window, attribute `stage` `short` or `long`, §14.1); `shield locked AoR for repeated failed REGISTER credentials; …` (once per lock, attribute `stage`, §7.4); `"public request dropped by admission; …"` (the first drop per source IP and reason, remembered in a FIFO set capped at 4096, `maxWarnedSources`, `admission.go`); `"REGISTER enumeration limit reached; …"`; `"rejecting call: too many unanswered calls from one source"`; `"upstream INVITE unanswered; entering cooldown"` / `"upstream REGISTER unanswered; entering cooldown"` / `"upstream REGISTER unanswered; breaker open, REGISTERs not dialed"` (at most one per node per 30 s, plus one at each breaker opening); `"forward INVITE upstream"` / `"forward INVITE to client"` / `"forward INVITE to carrier"` / `"forward carrier REGISTER"` failures; `"carrier has no resolved address"`; `"carrier DNS lookup failed; keeping the last good addresses"`; `"carrier request names an unknown or expired registration token; …"`; `"2xx ACK never arrived; …"` (the first miss per plane, then at most one per minute, with `suppressed`); `"webrtc leg failed"`; `"media packets rejected by latch"` (a latch that holds a source refused packets; at most one per second per session and ten per second per plane, with `count`, §8.4); the fingerprint-mismatch teardown; `"rejecting call to WebSocket client: …"` (a WebSocket client with no ws/wss listener cannot be offered DTLS-SRTP) |
+| `Info` | `"edge proxy listening"`, `"media planes ready"`, `"freesbc started"`, `"shutting down"`, `"admin server listening"`, `"config reloaded"`; `"proxying INVITE upstream"` / `"proxying INVITE to client"` / `"proxying INVITE to carrier"`; `"carrier registration"` with the granted expiry; `"carrier resolved"`; `"registration accepted"` / `"removed"` / `"rejected"`; `"webrtc media established"`; `"media latch moved"` (a better-ranked source replaced the latched one); `"rejecting call: media not negotiable"`; `"ending the call; sending BYE to both ends"` with the `reason`; `"call ended"` with `reason`, `terminated_by`, `duration`, `webrtc`, `carrier` and media stats |
+| `Debug` | `"media latch set"` (a side's first latch); dialog ACK/BYE bookkeeping; `"2xx ACK never arrived"` for every miss; shield rate-limit drops and scanner-datagram drops; edge `"public request dropped by admission"` after the first per source; `"in-dialog request without a dialog record; hashing upstream"` and its carrier variant; `"pruned expired registration bindings"` / `"pruned expired carrier registrations"`; `"carrier DNS lookup still failing"`; `"forward carrier OPTIONS"`; dropped unroutable responses |
 
 sipgo's transport, transaction and server layers log through the same logger
 with `caller=sipgo`. Credentials, digest nonces, ICE passwords and DTLS

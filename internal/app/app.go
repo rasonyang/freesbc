@@ -323,6 +323,8 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 				RTPPacketsTx:           s.RTPPacketsTx,
 				RTPBytesRx:             s.RTPBytesRx,
 				RTPBytesTx:             s.RTPBytesTx,
+				RTPRejectedPublic:      s.RTPRejectedPublic,
+				RTPRejectedPrivate:     s.RTPRejectedPrivate,
 				PortAllocationFailures: s.MediaPortAllocationFailures,
 				ICEFailures:            s.WebRTCICEFailures,
 				DTLSFailures:           s.WebRTCDTLSFailures,

@@ -1,6 +1,9 @@
 package media
 
-import "sync/atomic"
+import (
+	"fmt"
+	"sync/atomic"
+)
 
 // Stats is one media session's packet counters, per side
 // of the relay. Counters are named from the SBC's point of view: "rx" is
@@ -19,7 +22,7 @@ type Stats struct {
 }
 
 // LegStats is one side's RTP counters. RTCP is relayed but not counted,
-// except in the two SDES drop counters, which cover RTP and RTCP.
+// except in the two SDES drop counters and RTCPRejected.
 type LegStats struct {
 	RTPPacketsRx uint64
 	RTPPacketsTx uint64
@@ -32,7 +35,24 @@ type LegStats struct {
 	// SRTPTxDrops counts packets that could not be sent to an SDES side
 	// because they could not be encrypted (no local key yet, or failure).
 	SRTPTxDrops uint64
+	// RTPRejected and RTCPRejected count packets that arrived from this
+	// side's far end and that the latch refused (a source signalling does
+	// not vouch for, or one no better than the source already latched), by
+	// kind. Oversize packets and SRTP authentication failures
+	// (SRTPRxDrops) are not counted here.
+	RTPRejected  uint64
+	RTCPRejected uint64
 }
+
+// String names every field, for the "call ended" log line, whose stats
+// attribute would otherwise print eight bare numbers per side.
+func (l LegStats) String() string {
+	type plain LegStats // no String method: avoids recursion
+	return fmt.Sprintf("%+v", plain(l))
+}
+
+// String is "A:{...} B:{...}" with named fields.
+func (s Stats) String() string { return fmt.Sprintf("A:%s B:%s", s.A, s.B) }
 
 // Side returns one side's counters.
 func (s Stats) Side(side Side) LegStats {
@@ -51,6 +71,8 @@ func (s Stats) Total() LegStats {
 		RTPBytesTx:   s.A.RTPBytesTx + s.B.RTPBytesTx,
 		SRTPRxDrops:  s.A.SRTPRxDrops + s.B.SRTPRxDrops,
 		SRTPTxDrops:  s.A.SRTPTxDrops + s.B.SRTPTxDrops,
+		RTPRejected:  s.A.RTPRejected + s.B.RTPRejected,
+		RTCPRejected: s.A.RTCPRejected + s.B.RTCPRejected,
 	}
 }
 
@@ -63,6 +85,17 @@ type counters struct {
 	rtpBytesTx   [2]atomic.Uint64
 	srtpRxDrops  [2]atomic.Uint64
 	srtpTxDrops  [2]atomic.Uint64
+	rtpRejected  [2]atomic.Uint64
+	rtcpRejected [2]atomic.Uint64
+}
+
+// recordRejected counts a packet from side's far end that the latch refused.
+func (c *counters) recordRejected(side Side, rtp bool) {
+	if rtp {
+		c.rtpRejected[side].Add(1)
+		return
+	}
+	c.rtcpRejected[side].Add(1)
 }
 
 // recordRx and recordTx count RTP only; RTCP is relayed but not counted,
@@ -93,6 +126,8 @@ func (c *counters) snapshot() Stats {
 			RTPBytesTx:   c.rtpBytesTx[side].Load(),
 			SRTPRxDrops:  c.srtpRxDrops[side].Load(),
 			SRTPTxDrops:  c.srtpTxDrops[side].Load(),
+			RTPRejected:  c.rtpRejected[side].Load(),
+			RTCPRejected: c.rtcpRejected[side].Load(),
 		}
 	}
 	return Stats{A: leg(SideA), B: leg(SideB)}

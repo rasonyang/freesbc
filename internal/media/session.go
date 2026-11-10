@@ -1,6 +1,7 @@
 package media
 
 import (
+	"log/slog"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -289,23 +290,66 @@ func (l *latch) rankOf(src netip.AddrPort) latchRank {
 	return rankAny
 }
 
+// latchEvent is what a latch decision did, for the caller to count and log
+// once the latch mutex is released.
+type latchEvent uint8
+
+const (
+	evSame    latchEvent = iota // accepted without a latch change (or, for permits, would be accepted)
+	evSet                       // first latch (from rankNone)
+	evMoved                     // replaced a latched source with a better-vouched one
+	evRefused                   // not accepted
+)
+
+// latchVerdict is the value-typed result of a latch decision. held and
+// heldRank describe the source latched BEFORE the decision (rankNone when
+// none); rank is how well src is vouched for.
+type latchVerdict struct {
+	ev       latchEvent
+	held     netip.AddrPort
+	heldRank latchRank
+	rank     latchRank
+}
+
+func (v latchVerdict) ok() bool { return v.ev != evRefused }
+
+// reason names why a refusal happened: "source" when the mode or the
+// armed expectation rejects src outright, "latched" when src is no better
+// vouched than the source already held.
+func (v latchVerdict) reason() string {
+	if v.rank == rankNone {
+		return "source"
+	}
+	return "latched"
+}
+
 // acceptFrom reports whether a packet from src may be processed, latching
 // the stream to src when it is the first acceptable source or a
 // better-vouched one than the source already latched.
-func (l *latch) acceptFrom(src netip.AddrPort) bool {
+func (l *latch) acceptFrom(src netip.AddrPort) bool { return l.decide(src).ok() }
+
+// decide is acceptFrom reporting what happened, so the caller can count
+// and log it outside the latch mutex. The already-latched path allocates
+// nothing and takes the mutex once.
+func (l *latch) decide(src netip.AddrPort) latchVerdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.sameSource(src) {
-		return true
+		return latchVerdict{ev: evSame}
 	}
 	r := l.rankOf(src)
 	if r <= l.rank {
-		return false // unacceptable, or no better than the latched source
+		// unacceptable, or no better than the latched source
+		return latchVerdict{ev: evRefused, held: l.remote, heldRank: l.rank, rank: r}
+	}
+	v := latchVerdict{ev: evSet, held: l.remote, heldRank: l.rank, rank: r}
+	if l.rank != rankNone {
+		v.ev = evMoved
 	}
 	l.remote = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 	l.rank = r
 	l.learnedAt = l.clock()
-	return true
+	return v
 }
 
 // permitsFrom reports whether acceptFrom would take a packet from src,
@@ -313,13 +357,20 @@ func (l *latch) acceptFrom(src netip.AddrPort) bool {
 // decrypt on a source the latch refuses anyway, and calls acceptFrom only
 // once the packet has authenticated, so a forged packet never moves the
 // latch.
-func (l *latch) permitsFrom(src netip.AddrPort) bool {
+func (l *latch) permitsFrom(src netip.AddrPort) bool { return l.permit(src).ok() }
+
+// permit is permitsFrom reporting the verdict (never evSet or evMoved).
+func (l *latch) permit(src netip.AddrPort) latchVerdict {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.sameSource(src) {
-		return true
+		return latchVerdict{ev: evSame}
 	}
-	return l.rankOf(src) > l.rank
+	r := l.rankOf(src)
+	if r <= l.rank {
+		return latchVerdict{ev: evRefused, held: l.remote, heldRank: l.rank, rank: r}
+	}
+	return latchVerdict{ev: evSame, rank: r} // would be accepted; nothing latched
 }
 
 // learningDelayed reports whether a below-exact latch waits LearnDelay
@@ -370,6 +421,10 @@ type SessionConfig struct {
 	// Timeout tears the session down after this much silence; zero means
 	// the Timeout of side A's pool PlaneParams (see AllocateAcross).
 	Timeout time.Duration
+	// Log receives the latch logs (a refused-packet WARN, a latch move);
+	// nil uses the default logger. Each side is named in them by its
+	// pool's name (NewPlanePool), "a" or "b" when that is empty.
+	Log *slog.Logger
 }
 
 // Session is the media half of one call: two port pairs relaying RTP and
@@ -392,7 +447,9 @@ type Session struct {
 
 	lastRx   [2]atomic.Int64 // per sending side: unix nanos of its last genuine packet
 	counters counters
-	done     chan struct{}
+	// rep counts and logs what the latches decide (latchlog.go).
+	rep  latchReporter
+	done chan struct{}
 	// cause is why the session closed, stored by the Close that won, before
 	// done is closed (see CloseCause).
 	cause atomic.Int32
@@ -455,6 +512,7 @@ func allocateAcross(poolA *PlanePool, parA PlaneParams, poolB *PlanePool, parB P
 		timeout: cfg.Timeout,
 		done:    make(chan struct{}),
 	}
+	s.rep = newLatchReporter(cfg.Log, &s.counters, [2]string{poolA.name, poolB.name}, [2]*planeBudget{&poolA.rejectBudget, &poolB.rejectBudget})
 	pars := [2]PlaneParams{parA, parB}
 	for side := range s.pairs {
 		s.rtp[side] = &latch{mode: cfg.Latch[side], allowLoopback: pars[side].AllowLoopback, policy: pars[side].Dest}

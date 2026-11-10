@@ -49,7 +49,7 @@ To confirm on the wire, capture on the FreeSBC host (`tcpdump -ni any udp port 5
 
 **Fingerprint.** `reason=rtp_silence terminated_by=proxy`, with a `duration` that runs 5 to 6 minutes past the moment the audio stopped (the watchdog polls every quarter of its timeout). FreeSBC BYEs both ends.
 
-**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP or SRTCP packet that fails authentication, never do. An accepted RTCP packet refreshes it exactly like RTP (a receive-only side that sends RTCP receiver reports stays alive, as on hold), though RTCP packets are not counted in the RTP packet/byte metrics. A held endpoint that sends neither RTP nor RTCP for the timeout is reclaimed.
+**What the watchdog counts.** The timeout is the constant `rtpSilenceTimeout` (5 minutes; it is not a config key, see [config.md](config.md)). Each direction has its own last-received time, and the call ends when the older of the two is past the timeout, so one side that stops sending is enough even while the other still talks. Only a packet the first-packet latch accepted refreshes it: a packet from a source that does not match the latch, and an SRTP or SRTCP packet that fails authentication, never do (the first is counted as `RTPRejected`/`RTCPRejected`, the second as `SRTPRxDrops`; see the latch lock-out below). An accepted RTCP packet refreshes it exactly like RTP (a receive-only side that sends RTCP receiver reports stays alive, as on hold), though RTCP packets are not counted in the RTP packet/byte metrics. A held endpoint that sends neither RTP nor RTCP for the timeout is reclaimed.
 
 The usual causes:
 
@@ -57,6 +57,13 @@ The usual causes:
 - **Hold with no RTP.** An endpoint that holds with `a=inactive` and sends nothing, or a switch that holds without music, leaves a silent direction. After 5 minutes the call is torn down. Keep packets flowing during hold (music on hold on the switch, or an endpoint that sends comfort noise).
 - **Silence suppression with no comfort noise.** Disable it, or send CN.
 - **A NAT mapping for the media pinhole that expired.** Raise the NAT's UDP timeout.
+- **The latch refuses a live stream.** Media stops mid-call in one direction, `rx` stops advancing on that side while the far end keeps sending, and `RTPRejected` in the `call ended` stats and `freesbc_rtp_packets_rejected_total{plane}` grow at the packet rate (50 per second for a 20 ms codec). While it happens the journal carries, at most once a second per call and ten a second per plane, a WARN:
+
+  ```
+  media packets rejected by latch plane=public kind=rtp reason=latched latched=198.51.100.20:20004 latched_rank=exact source=198.51.100.20:20002 source_rank=signalled count=50
+  ```
+
+  `latched` is the source the relay is listening to and `source` the one it refuses; `plane=public` is the client or carrier side, `private` the switch. A latch only moves to a better-ranked source (`any` < `signalled` < `exact`), so look just before it for the INFO `media latch moved ... from=... to=... from_rank=signalled to_rank=exact`: the stream the call started on was replaced by the exact address the SDP named (a few stray packets from that port were enough), and the live stream on another port of the same IP is now refused (the shape of issue #324). `reason=source` instead means the IP itself is not accepted (strict mode: not the SDP address). Nothing is relayed from the refused source, so the silence watchdog ends the call after 5 minutes; the endpoint sending from the refused port is the one to fix (send RTP from the port its SDP announces, or re-INVITE).
 - **SDES-SRTP keys that do not match.** Packets that fail authentication are dropped and do not count, so the call goes quiet and ends here. Look for the `SDES keys not applied` WARN and see [SDES-SRTP on public legs](edge.md#sdes-srtp-on-public-legs).
 
 ### A BYE you did not expect (`reason=bye_caller` or `bye_callee`)

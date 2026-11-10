@@ -46,6 +46,8 @@ type WebRTCSession struct {
 	counters counters
 
 	log *slog.Logger // nil = the default logger
+	// rep counts and logs what the private latches decide (latchlog.go).
+	rep latchReporter
 
 	done chan struct{}
 	// cause is why the session closed (see CloseCause).
@@ -68,6 +70,9 @@ type WebRTCSessionConfig struct {
 	Timeout time.Duration
 	// Log receives relay-level errors; nil uses the default logger.
 	Log *slog.Logger
+	// PublicPlane names the browser side in latch logs; empty means "a".
+	// The private side is named by its pool.
+	PublicPlane string
 }
 
 // NewWebRTCSession pairs an already-allocated WebRTC leg with a freshly
@@ -86,7 +91,7 @@ func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConf
 	if timeout <= 0 {
 		timeout = par.Timeout
 	}
-	return &WebRTCSession{
+	s := &WebRTCSession{
 		leg:      leg,
 		priv:     priv,
 		privPool: privPool,
@@ -95,7 +100,9 @@ func NewWebRTCSession(leg *WebRTCLeg, privPool *PlanePool, cfg WebRTCSessionConf
 		timeout:  timeout,
 		log:      cfg.Log,
 		done:     make(chan struct{}),
-	}, nil
+	}
+	s.rep = newLatchReporter(cfg.Log, &s.counters, [2]string{cfg.PublicPlane, privPool.name}, [2]*planeBudget{nil, &privPool.rejectBudget})
+	return s, nil
 }
 
 // PrivateRTPPort is the FreeSWITCH-facing RTP port (RTCP is +1). The
@@ -258,7 +265,7 @@ func (s *WebRTCSession) privateToPublic(conn net.Conn, out *SRTPContext, rtpKind
 		if n > maxPacketSize {
 			continue // oversize: forwarding it would forward a truncation
 		}
-		if !lat.acceptFrom(src) {
+		if !s.rep.observe(SideB, rtpKind, src, lat.decide(src)) {
 			continue // pre-latch source mismatch, or post-latch hijack
 		}
 		if !s.leg.mediaVerified() {

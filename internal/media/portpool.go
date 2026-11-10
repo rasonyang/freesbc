@@ -110,6 +110,8 @@ func (p DestPolicy) refuses(ip netip.Addr) bool {
 type PlanePool struct {
 	name   string
 	params func() PlaneParams
+	// rejectBudget caps the pool's "rejected by latch" WARNs (latchlog.go).
+	rejectBudget planeBudget
 
 	mu     sync.Mutex
 	inUse  map[int]struct{} // RTP (even) ports currently allocated

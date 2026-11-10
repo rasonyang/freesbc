@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"sync"
 
@@ -190,9 +191,9 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 		if err := requireRTCPMux(offer); err != nil {
 			return nil, err
 		}
-		sess, err = s.allocateWebRTC(ctx, offer)
+		sess, err = s.allocateWebRTC(ctx, offer, s.log.With("sip_call_id", d.callID))
 	} else {
-		sess, err = s.allocateRTP(offer, src, d.publicSRTP(), d.carrierName() == "")
+		sess, err = s.allocateRTP(offer, src, d.publicSRTP(), d.carrierName() == "", s.log.With("sip_call_id", d.callID))
 	}
 	if err != nil {
 		return nil, err
@@ -242,7 +243,7 @@ func (s *Server) buildUpstreamOffer(ctx context.Context, d *dialog, offerBody []
 // src is the IP the phone's SIP came from; pin (a registered client, not a
 // carrier) sends its early media to src rather than to the address its SDP
 // names.
-func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy, pin bool) (*mediaSession, error) {
+func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy, pin bool, log *slog.Logger) (*mediaSession, error) {
 	if pol == srtpImpossible {
 		return nil, errSDESInsecure
 	}
@@ -259,6 +260,7 @@ func (s *Server) allocateRTP(offer *sdp.Session, src netip.Addr, pol srtpPolicy,
 		// strict: FreeSWITCH's signalled address over wg0 is trustworthy,
 		// and strict mode already tolerates a NAT-rewritten port.
 		Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
+		Log:   log,
 	})
 	if err != nil {
 		return nil, err
@@ -300,7 +302,7 @@ func (s *Server) parseSDP(body []byte) (*sdp.Session, error) {
 // starts ICE/DTLS in the background so the SDP answer can go out
 // immediately — the browser cannot begin its connectivity checks until it
 // has our ICE credentials, so waiting here would deadlock.
-func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*mediaSession, error) {
+func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session, log *slog.Logger) (*mediaSession, error) {
 	a := offer.Audio
 	cfg := media.WebRTCLegConfig{
 		AdvertisedIP: s.topo.publicMediaIP,
@@ -321,7 +323,8 @@ func (s *Server) allocateWebRTC(ctx context.Context, offer *sdp.Session) (*media
 	}
 	sess, err := media.NewWebRTCSession(leg, s.privPool, media.WebRTCSessionConfig{
 		PrivateLatch: media.LatchStrict,
-		Log:          s.log,
+		Log:          log,
+		PublicPlane:  "public",
 	})
 	if err != nil {
 		_ = leg.Close()
@@ -386,7 +389,7 @@ func (s *Server) startWebRTC(ctx context.Context, sess *media.WebRTCSession, fin
 // fingerprint arrive only in its answer, and startOfferedWebRTC takes it
 // from there. Until then the leg has its socket and local credentials,
 // which is all the offer needs.
-func (s *Server) allocateOfferedWebRTC() (*media.WebRTCSession, error) {
+func (s *Server) allocateOfferedWebRTC(log *slog.Logger) (*media.WebRTCSession, error) {
 	leg, err := media.NewWebRTCLeg(s.pubPool, media.WebRTCLegConfig{
 		AdvertisedIP: s.topo.publicMediaIP,
 		Offerer:      true,
@@ -397,7 +400,8 @@ func (s *Server) allocateOfferedWebRTC() (*media.WebRTCSession, error) {
 	}
 	sess, err := media.NewWebRTCSession(leg, s.privPool, media.WebRTCSessionConfig{
 		PrivateLatch: media.LatchStrict,
-		Log:          s.log,
+		Log:          log,
+		PublicPlane:  "public",
 	})
 	if err != nil {
 		_ = leg.Close()
@@ -709,7 +713,7 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool, s
 		if !s.webrtcEnabled {
 			return nil, errWebRTCDisabled
 		}
-		sess, err := s.allocateOfferedWebRTC()
+		sess, err := s.allocateOfferedWebRTC(s.log.With("sip_call_id", d.callID))
 		if err != nil {
 			return nil, err
 		}
@@ -734,6 +738,7 @@ func (s *Server) buildPublicOffer(d *dialog, offerBody []byte, toBrowser bool, s
 			// for (negotiateFork records the phone's SIP address); the
 			// private FreeSWITCH leg stays strict.
 			Latch: [2]media.LatchMode{media.LatchLoose, media.LatchStrict},
+			Log:   s.log.With("sip_call_id", d.callID),
 		})
 		if err != nil {
 			return nil, err

@@ -61,7 +61,7 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 				// move, so a forged packet from a vouched address cannot
 				// latch the stream. permits only spares a decrypt for a
 				// source the latch would refuse anyway.
-				if !inLatch.permitsFrom(src) {
+				if !s.rep.observe(from, rtpKind, src, inLatch.permit(src)) {
 					continue
 				}
 				ctx := leg.in.ctx.Load()
@@ -75,10 +75,10 @@ func (s *Session) forward(from, to Side, rtpKind bool) {
 					s.counters.srtpRxDrops[from].Add(1)
 					continue
 				}
-				if !inLatch.acceptFrom(src) {
+				if !s.rep.observe(from, rtpKind, src, inLatch.decide(src)) {
 					continue
 				}
-			} else if !inLatch.acceptFrom(src) {
+			} else if !s.rep.observe(from, rtpKind, src, inLatch.decide(src)) {
 				continue // pre-latch source mismatch, or post-latch hijack
 			}
 			// Only NOW is the packet proven genuine: the latch accepted it

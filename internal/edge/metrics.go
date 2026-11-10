@@ -109,6 +109,10 @@ type Metrics struct {
 	rtpPacketsTx atomic.Uint64
 	rtpBytesRx   atomic.Uint64
 	rtpBytesTx   atomic.Uint64
+	// rtpRejected counts RTP packets the media latches refused, finished
+	// sessions only, per plane: public is media side A, private side B.
+	rtpRejectedPublic  atomic.Uint64
+	rtpRejectedPrivate atomic.Uint64
 }
 
 func NewMetrics() *Metrics { return &Metrics{} }
@@ -309,7 +313,10 @@ func (m *Metrics) MediaEnded(webrtc bool, key any, stats func() media.Stats) {
 		return
 	}
 	delete(m.liveMedia, key)
-	t := stats().Total()
+	st := stats()
+	m.rtpRejectedPublic.Add(st.A.RTPRejected)
+	m.rtpRejectedPrivate.Add(st.B.RTPRejected)
+	t := st.Total()
 	m.rtpPacketsRx.Add(t.RTPPacketsRx)
 	m.rtpPacketsTx.Add(t.RTPPacketsTx)
 	m.rtpBytesRx.Add(t.RTPBytesRx)
@@ -318,23 +325,27 @@ func (m *Metrics) MediaEnded(webrtc bool, key any, stats func() media.Stats) {
 
 // rtpTotals is the finished sessions' totals plus the live sessions'
 // current counters, sampled now.
-func (m *Metrics) rtpTotals() media.LegStats {
+func (m *Metrics) rtpTotals() (t media.LegStats, rejectedPublic, rejectedPrivate uint64) {
 	m.mediaMu.Lock()
 	defer m.mediaMu.Unlock()
-	t := media.LegStats{
+	rejectedPublic, rejectedPrivate = m.rtpRejectedPublic.Load(), m.rtpRejectedPrivate.Load()
+	t = media.LegStats{
 		RTPPacketsRx: m.rtpPacketsRx.Load(),
 		RTPPacketsTx: m.rtpPacketsTx.Load(),
 		RTPBytesRx:   m.rtpBytesRx.Load(),
 		RTPBytesTx:   m.rtpBytesTx.Load(),
 	}
 	for _, stats := range m.liveMedia {
-		l := stats().Total()
+		st := stats()
+		rejectedPublic += st.A.RTPRejected
+		rejectedPrivate += st.B.RTPRejected
+		l := st.Total()
 		t.RTPPacketsRx += l.RTPPacketsRx
 		t.RTPPacketsTx += l.RTPPacketsTx
 		t.RTPBytesRx += l.RTPBytesRx
 		t.RTPBytesTx += l.RTPBytesTx
 	}
-	return t
+	return t, rejectedPublic, rejectedPrivate
 }
 
 // WebRTCFailure classifies a browser-leg failure as ICE or DTLS, so an
@@ -384,6 +395,10 @@ type Snapshot struct {
 	RTPPacketsTx uint64
 	RTPBytesRx   uint64
 	RTPBytesTx   uint64
+	// RTPRejectedPublic and RTPRejectedPrivate count RTP packets the media
+	// latch refused on the public (side A) and private (side B) plane.
+	RTPRejectedPublic  uint64
+	RTPRejectedPrivate uint64
 
 	MediaPortAllocationFailures uint64
 	WebRTCICEFailures           uint64
@@ -431,7 +446,7 @@ type Snapshot struct {
 }
 
 func (m *Metrics) Snapshot() Snapshot {
-	rtp := m.rtpTotals()
+	rtp, rejPub, rejPriv := m.rtpTotals()
 	s := Snapshot{
 		ActiveRegistrations:    m.registrations.Load(),
 		ActiveSubscriptions:    m.subscriptions.Load(),
@@ -451,6 +466,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		RTPPacketsTx:           rtp.RTPPacketsTx,
 		RTPBytesRx:             rtp.RTPBytesRx,
 		RTPBytesTx:             rtp.RTPBytesTx,
+		RTPRejectedPublic:      rejPub,
+		RTPRejectedPrivate:     rejPriv,
 
 		MediaPortAllocationFailures: m.portFailures.Load(),
 		HandlerPanics:               m.handlerPanics.Load(),
