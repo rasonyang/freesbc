@@ -74,6 +74,10 @@ type Metrics struct {
 	// out-of-dialog INVITE, one counter per (fixed) reason (invite.go).
 	inviteRejects [numInviteRejects]atomic.Uint64
 
+	// inviteFailures counts out-of-dialog INVITEs that ended without a
+	// confirmed dialog, by leg, direction and class (invitefail.go).
+	inviteFailures [numFailLegs][numFailDirs][numFailClasses]atomic.Uint64
+
 	// registerBindingRejects counts 2xx REGISTER answers that did not
 	// record a binding because the request did not prove what it claims,
 	// one counter per (fixed) reason (registerproof.go).
@@ -210,6 +214,11 @@ func (m *Metrics) AckMissed(p plane) { m.ackMissed[p].Add(1) }
 
 // InviteRejected counts one out-of-dialog INVITE the edge refused itself.
 func (m *Metrics) InviteRejected(r inviteReject) { m.inviteRejects[r].Add(1) }
+
+// InviteFailed counts one out-of-dialog INVITE that never connected.
+func (m *Metrics) InviteFailed(leg failLeg, dir int, class failClass) {
+	m.inviteFailures[leg][dir][class].Add(1)
+}
 
 // RegisterBindingRejected counts one 2xx REGISTER that recorded no binding.
 func (m *Metrics) RegisterBindingRejected(r bindingReject) { m.registerBindingRejects[r].Add(1) }
@@ -422,6 +431,10 @@ type Snapshot struct {
 	// not.
 	CallsEnded    map[string]uint64
 	InviteRejects map[string]uint64
+	// InviteFailures is keyed "leg/direction/class" (failLegLabels,
+	// failDirLabels, failClassLabels); every combination is present.
+	InviteFailures map[string]uint64
+
 	// RegisterBindingRejects is keyed by reason (bindingRejectLabels); every
 	// reason is present, zero or not.
 	RegisterBindingRejects map[string]uint64
@@ -476,6 +489,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		AdmissionDrops:              map[string]uint64{},
 		CallsEnded:                  map[string]uint64{},
 		InviteRejects:               map[string]uint64{},
+		InviteFailures:              map[string]uint64{},
 		RegisterBindingRejects:      map[string]uint64{},
 		AckMissed:                   map[string]uint64{},
 		ParseFailures:               map[string]uint64{},
@@ -523,6 +537,13 @@ func (m *Metrics) Snapshot() Snapshot {
 	}
 	for r := range m.inviteRejects {
 		s.InviteRejects[inviteRejectLabels[r]] = m.inviteRejects[r].Load()
+	}
+	for l := range m.inviteFailures {
+		for d := range m.inviteFailures[l] {
+			for c := range m.inviteFailures[l][d] {
+				s.InviteFailures[failLegLabels[l]+"/"+failDirLabels[d]+"/"+failClassLabels[c]] = m.inviteFailures[l][d][c].Load()
+			}
+		}
 	}
 	for r := range m.registerBindingRejects {
 		s.RegisterBindingRejects[bindingRejectLabels[r]] = m.registerBindingRejects[r].Load()

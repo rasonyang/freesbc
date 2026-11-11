@@ -21,7 +21,7 @@ call ended sip_call_id=... reason=ack_timeout terminated_by=proxy duration=32.1s
 | `media_fault` | `proxy` | The media session closed for another reason (a relay goroutine panicked) | A bug: keep the log around the line and report it |
 | `shutdown` | `proxy` | The process was stopping | Expected |
 
-A call that never connected has no `call ended` line; `freesbc_edge_invite_rejects_total{reason}` counts the INVITEs FreeSBC refused itself.
+A call that never connected has no `call ended` line; it has an `invite failed` line instead ([A call never connects](#a-call-never-connects)), and `freesbc_edge_invite_rejects_total{reason}` counts the INVITEs FreeSBC refused itself.
 
 ### Lost ACK (`reason=ack_timeout`)
 
@@ -87,6 +87,23 @@ Asterisk (`pjsip set logger on`, or `sip set debug on` for chan_sip):
 - Session timers: on the PJSIP endpoint, `timers` (`yes`, `no`, `always`, `forced`), `timers_sess_expires` and `timers_min_se`; in chan_sip, `session-timers`, `session-expires`, `session-minse` and `session-refresher`. As a test set `timers=no`.
 - Media timeouts: `rtp_timeout` and `rtp_timeout_hold` on the PJSIP endpoint (chan_sip: `rtptimeout`, `rtpholdtimeout`); a channel with no media for that long gets a BYE.
 - `external_media_address` and `external_signaling_address` on the transport must not be set to an address that is not FreeSBC's: media and signaling are anchored on FreeSBC either way.
+
+## A call never connects
+
+Every out-of-dialog INVITE that ends without a confirmed dialog writes one `invite failed` line (Info, Warn for a timeout) and, unless the caller hung up first, counts in `freesbc_edge_invite_failures_total{leg,direction,class}`:
+
+```
+invite failed sip_call_id=... direction=private->public leg=carrier carrier=alpha code=480 reason_phrase="Temporarily Unavailable" sip_reason="Q.850;cause=19" duration=2.4s source=far_end class=4xx
+```
+
+- `leg` is the far end the INVITE was sent to: `carrier` or `client` for a call from the switch, `switch` for a call from a carrier or a client. `carrier` is the `edge.carriers` name (`unknown` for a carrier source with no entry), empty for a client call. `direction` is `private->public` or `public->private`, as in the `proxying INVITE` line, and the counter's `direction` is `outbound` or `inbound` as in `freesbc_edge_carrier_requests_total`.
+- `source=far_end`: the far end's own final, logged as it sent it (`code`, `reason_phrase`, and its `Reason` headers, joined by ", ", as `sip_reason`; both texts are cut at 256 bytes), even though the switch sees FreeSBC's relay of it. Class `4xx`, `5xx` or `6xx`. A 3xx is not a failure and a 2xx is a call.
+- `source=edge`: FreeSBC refused it itself (`freesbc_edge_invite_rejects_total{reason}` has the cause: media, caps, drain, no target). Admission drops send nothing and have no line.
+- `source=timeout`, Warn, class `timeout`: the far end sent no final response (the INVITE's budget ran out, or the transport failed). `code` is the 408 or 503 FreeSBC answered with. Look at the far end's reachability and at `freesbc_edge_invite_rejects_total{reason="timeout"|"upstream_failed"}`.
+- `duration` runs from the INVITE being sent to the final; for a refusal before the INVITE was sent, from its arrival.
+- `source=cancel` is Debug and uncounted: the caller's own CANCEL ended a ringing call. A 487 the far end sends without a CANCEL from the caller is an ordinary `far_end` failure.
+
+A digest challenge is a far-end 4xx too: a switch that challenges every client INVITE with 407, or a carrier that challenges the switch with 401/407, writes an Info line and a `4xx` count for the challenge, and another for the retried INVITE only if that fails. Filter on `code` when counting real failures.
 
 ## A SIP ALG rewrites SIP on UDP 5060
 

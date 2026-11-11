@@ -183,7 +183,9 @@ func (s *Server) invitePrivate(req *sip.Request, tx sip.ServerTransaction) {
 	case targetCarrier:
 		s.inviteToCarrier(req, tx, name)
 	default:
-		s.rejectInvite(req, tx, 404, "Not Found", rejectNoTarget)
+		// Nothing to route to: the far end it was heading for is unknown,
+		// so the failure is filed under the client leg (invitefail.go).
+		s.rejectInvite(newInviteFlow(req, legClient, false, ""), req, tx, 404, "Not Found", rejectNoTarget)
 	}
 }
 
@@ -195,15 +197,16 @@ func (s *Server) invitePrivate(req *sip.Request, tx sip.ServerTransaction) {
 // the carrier is offered a public anchor port, the switch is answered with
 // a private one.
 func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, carrier string) {
+	fc := newInviteFlow(req, legCarrier, false, carrier)
 	dest, ok := s.carrierDest(carrier)
 	if !ok {
 		s.log.Warn("carrier has no resolved address", "carrier", carrier, "sip_call_id", fsip.CallID(req))
-		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoTarget)
+		s.rejectInvite(fc, req, tx, 503, "Service Unavailable", rejectNoTarget)
 		return
 	}
 	to, ok := s.carrierSide(carrier)
 	if !ok {
-		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectNoPublicSide)
+		s.rejectInvite(fc, req, tx, 503, "Service Unavailable", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -212,7 +215,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
-	d, ok := s.beginDialog(req, tx, planePrivate, true)
+	d, ok := s.beginDialog(fc, req, tx, planePrivate, true)
 	if !ok {
 		return
 	}
@@ -228,7 +231,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildPublicOffer(d, body, false, netip.Addr{}); err != nil {
-			s.rejectInviteMedia(req, tx, err)
+			s.rejectInviteMedia(fc, req, tx, err)
 			return
 		}
 	} else {
@@ -241,7 +244,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 
 	out, err := s.prepareForwardHidden(req, s.topo.private, to, dest, true)
 	if err != nil {
-		s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
+		s.rejectInvite(fc, req, tx, 483, "Too Many Hops", rejectTooManyHops)
 		return
 	}
 	// The Request-URI is the switch's, unchanged. The Contact is ours: the
@@ -264,7 +267,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 
 	// A CANCEL from the switch ends this server transaction; the INVITE
 	// sent to the carrier must be cancelled too (bridgeCancel, invite.go).
-	if !s.bridgeCancel(tx, d, cancel) {
+	if !s.bridgeCancel(tx, d, fc, cancel) {
 		return
 	}
 	a := &inviteAttempt{req: out, cancel: cancel}
@@ -278,14 +281,15 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)
-		s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
+		s.giveUp(ctx, d, fc, req, tx, 503, "Service Unavailable")
 		return
 	}
+	fc.markSent()
 	if d.markSent(a) {
 		go s.sendCancel(a)
 	}
 
-	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
+	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, fc: fc, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeCarrier,
 		calleeRemote: dest, transport: to.transport, fromPrivate: true, resp: respToSwitch}
 	if r := s.pumpInvite(ctx, l); !r.finalised {
@@ -293,7 +297,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 		if errors.Is(clTx.Err(), sip.ErrTransactionTimeout) {
 			code, reason = 408, "Request Timeout"
 		}
-		s.giveUp(ctx, d, req, tx, code, reason)
+		s.giveUp(ctx, d, fc, req, tx, code, reason)
 	}
 }
 

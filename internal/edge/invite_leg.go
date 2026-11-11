@@ -50,6 +50,7 @@ type inviteLeg struct {
 	out  *sip.Request // the INVITE as forwarded
 	clTx sip.ClientTransaction
 	d    *dialog
+	fc   *inviteFlow // the INVITE's failure record (invitefail.go)
 	// offer is what the caller's SDP was turned into; nil for an offerless
 	// INVITE, where offerless builds the near-side offer from the callee's
 	// first SDP instead (offerless.go).
@@ -282,13 +283,19 @@ func (s *Server) pumpInvite(ctx context.Context, l *inviteLeg) pumpResult {
 			// ringing, so its INVITE is CANCELled (RFC 3261 §16.7 step
 			// 10: a proxy that finalises the caller cancels the pending
 			// branches).
-			s.rejectInvite(l.req, l.tx, 488, "Not Acceptable Here", rejectMediaFailed)
+			s.rejectInvite(l.fc, l.req, l.tx, 488, "Not Acceptable Here", rejectMediaFailed)
 			if res.StatusCode/100 != 2 {
 				s.abandonAttempt(l)
 			}
 			return pumpResult{responded: true, finalised: true}, true
 		}
 		if res.StatusCode >= 200 {
+			// res is the response as received: relayResponseHide worked on a
+			// clone, so the Reason header hiding strips is still readable.
+			// A 3xx is not a failure and a 2xx confirmed the dialog.
+			if res.StatusCode >= 400 {
+				s.inviteFailedRelayed(l.fc, res)
+			}
 			return pumpResult{final: res, responded: true, finalised: true}, true
 		}
 		return pumpResult{}, false
