@@ -84,6 +84,7 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		return ProxyStats{
 			CallsEnded:             map[string]uint64{"bye_caller": 2, "rtp_silence": 0},
 			InviteRejects:          map[string]uint64{"early_cap": 1, "port_exhausted": 0, "session_cap": 3, "invite_rate": 0},
+			InviteFailures:         map[string]uint64{"carrier/outbound/4xx": 2, "switch/inbound/timeout": 0},
 			RegisterBindingRejects: map[string]uint64{"no_contact": 2, "no_auth": 0, "auth_aor_mismatch": 1},
 			ActiveSessions:         4, ActiveSubscriptions: 7,
 		}
@@ -99,6 +100,8 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		`freesbc_edge_invite_rejects_total{reason="port_exhausted"} 0`,
 		`freesbc_edge_invite_rejects_total{reason="session_cap"} 3`,
 		`freesbc_edge_invite_rejects_total{reason="invite_rate"} 0`,
+		`freesbc_edge_invite_failures_total{class="4xx",direction="outbound",leg="carrier"} 2`,
+		`freesbc_edge_invite_failures_total{class="timeout",direction="inbound",leg="switch"} 0`,
 		"freesbc_edge_sessions 4",
 		"freesbc_edge_subscriptions 7",
 	} {

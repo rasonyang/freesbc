@@ -201,6 +201,10 @@ type ProxyStats struct {
 	// inviteRejectLabels).
 	InviteRejects map[string]uint64 `json:"invite_rejects_total"`
 
+	// InviteFailures counts out-of-dialog INVITEs that ended without a
+	// confirmed dialog, keyed "leg/direction/class".
+	InviteFailures map[string]uint64 `json:"invite_failures_total"`
+
 	// RegisterBindingRejects counts 2xx REGISTER answers that recorded no
 	// binding, by reason (a fixed set, edge bindingRejectLabels).
 	RegisterBindingRejects map[string]uint64 `json:"register_binding_rejected_total"`

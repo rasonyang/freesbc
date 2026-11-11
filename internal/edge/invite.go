@@ -3,6 +3,7 @@ package edge
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"net/netip"
 	"strconv"
@@ -144,8 +145,18 @@ func (r inviteReject) String() string { return inviteRejectLabels[r] }
 // counts it. Every handler returns after calling it, and sipgo hands a
 // retransmitted INVITE to the existing server transaction rather than to
 // the handler, so one INVITE is counted once.
-func (s *Server) rejectInvite(req *sip.Request, tx sip.ServerTransaction, code int, reason string, why inviteReject) {
+//
+// fc is the INVITE's failure record: the same call writes its one "invite
+// failed" line (invitefail.go).
+func (s *Server) rejectInvite(fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction, code int, reason string, why inviteReject) {
+	s.rejectInviteAs(fc, req, tx, code, reason, why, failEdge)
+}
+
+// rejectInviteAs is rejectInvite for a final that stands for a far end that
+// never answered (failTimeout): same counter, a Warn line.
+func (s *Server) rejectInviteAs(fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction, code int, reason string, why inviteReject, src failSource) {
 	s.metrics.InviteRejected(why)
+	s.inviteFailed(fc, code, reason, "", src)
 	s.reject(req, tx, code, reason)
 }
 
@@ -183,14 +194,17 @@ func (w *capWarner) allow(why inviteReject) bool {
 
 // rejectBusy refuses an out-of-dialog INVITE from an admitted peer with a
 // 503 and a Retry-After, through the same counting path as rejectInvite.
-func (s *Server) rejectBusy(req *sip.Request, tx sip.ServerTransaction, retryAfter int, why inviteReject, msg string, args ...any) {
+func (s *Server) rejectBusy(fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction, retryAfter int, why inviteReject, msg string, args ...any) {
 	args = append(args, "reason", why.String(), "retry_after", retryAfter, "sip_call_id", fsip.CallID(req))
+	failLevel := slog.LevelDebug // as the WARN: a flood against a full cap stays quiet
 	if s.capWarn.allow(why) {
 		s.log.Warn(msg, args...)
+		failLevel = slog.LevelInfo
 	} else {
 		s.log.Debug(msg, args...)
 	}
 	s.metrics.InviteRejected(why)
+	s.inviteFailedAt(fc, 503, "Service Unavailable", "", failEdge, failLevel)
 	res := sip.NewResponseFromRequest(req, 503, "Service Unavailable", nil)
 	res.AppendHeader(sip.NewHeader("Retry-After", strconv.Itoa(retryAfter)))
 	s.respond(req, tx, res)
@@ -243,25 +257,25 @@ func inviteRetryAfter(rl config.RateLimit) int {
 //
 // All four directions reach it after their cheap validation, and
 // re-INVITEs never do (they go through onReInvite).
-func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerPlane plane, carrierCall bool) (*dialog, bool) {
+func (s *Server) beginDialog(fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction, callerPlane plane, carrierCall bool) (*dialog, bool) {
 	cfg := s.store.Current()
 	if carrierCall && s.drain.on() {
 		// Before any slot, rate token or media port: drain refuses the
 		// carrier directions only.
-		s.rejectBusy(req, tx, drainRetryAfter, rejectDraining, "rejecting call: draining")
+		s.rejectBusy(fc, req, tx, drainRetryAfter, rejectDraining, "rejecting call: draining")
 		return nil, false
 	}
 	limit := s.sessionLimit(cfg)
 	d, res := s.dialogs.begin(req, callerPlane, limit)
 	switch res {
 	case beginClosed:
-		s.rejectInvite(req, tx, 503, "Service Unavailable", rejectShuttingDown)
+		s.rejectInvite(fc, req, tx, 503, "Service Unavailable", rejectShuttingDown)
 		return nil, false
 	case beginMerged:
-		s.rejectInvite(req, tx, 482, "Loop Detected", rejectLoopDetected)
+		s.rejectInvite(fc, req, tx, 482, "Loop Detected", rejectLoopDetected)
 		return nil, false
 	case beginFull:
-		s.rejectBusy(req, tx, sessionCapRetryAfter, rejectSessionCap,
+		s.rejectBusy(fc, req, tx, sessionCapRetryAfter, rejectSessionCap,
 			"rejecting call: session cap reached", "limit", limit)
 		return nil, false
 	}
@@ -270,7 +284,7 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 		// that skipped validation, and then no limit applies.
 		if rl, err := config.ParseRateLimit(cfg.Shield.InviteRateLimit); err == nil && !s.inviteLimiter.Allow(rl) {
 			d.end(endShutdown) // never confirmed: frees the slot, counts nothing
-			s.rejectBusy(req, tx, inviteRetryAfter(rl), rejectInviteRate,
+			s.rejectBusy(fc, req, tx, inviteRetryAfter(rl), rejectInviteRate,
 				"rejecting call: new-INVITE rate limit reached", "limit", cfg.Shield.InviteRateLimit)
 			return nil, false
 		}
@@ -300,13 +314,21 @@ func (s *Server) beginDialog(req *sip.Request, tx sip.ServerTransaction, callerP
 // registration, the hook will never fire, and nothing has been sent yet.
 // sipgo has already answered the caller, so the caller of bridgeCancel just
 // returns.
-func (s *Server) bridgeCancel(tx sip.ServerTransaction, d *dialog, cancel context.CancelFunc) bool {
+func (s *Server) bridgeCancel(tx sip.ServerTransaction, d *dialog, fc *inviteFlow, cancel context.CancelFunc) bool {
 	h := d.hook
-	return tx.OnCancel(func(*sip.Request) {
+	// The caller's own CANCEL is a normal hang-up of a ringing call: its
+	// "invite failed" line is Debug and uncounted. It is written first, so
+	// a far-end 487 that follows is not reported as a failure.
+	ok := tx.OnCancel(func(*sip.Request) {
+		s.inviteFailed(fc, 487, "Request Terminated", "", failCancel)
 		if dd := h.dialog(); dd == nil || !s.cancelCall(dd, cancelByCaller) {
 			cancel()
 		}
 	})
+	if !ok {
+		s.inviteFailed(fc, 487, "Request Terminated", "", failCancel)
+	}
+	return ok
 }
 
 // inviteToUpstream handles a call from the public side to the switch. It
@@ -323,9 +345,10 @@ func (s *Server) bridgeCancel(tx sip.ServerTransaction, d *dialog, cancel contex
 //     X-FreeSBC-Carrier. Carriers are exempt from the per-source early-call
 //     cap; shield.carrier_rate_limit bounds them.
 func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, src netip.AddrPort, carrier string) {
+	fc := newInviteFlow(req, legSwitch, true, carrier)
 	from, ok := s.publicSideFor(req)
 	if !ok {
-		s.rejectInvite(req, tx, 488, "Not Acceptable Here", rejectNoPublicSide)
+		s.rejectInvite(fc, req, tx, 488, "Not Acceptable Here", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -335,7 +358,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		if !ok {
 			s.log.Warn("rejecting call: too many unanswered calls from one source",
 				"public_remote", src.String(), "limit", maxEarlyPerSource, "sip_call_id", fsip.CallID(req))
-			s.rejectInvite(req, tx, 503, "Service Unavailable", rejectEarlyCap)
+			s.rejectInvite(fc, req, tx, 503, "Service Unavailable", rejectEarlyCap)
 			return
 		}
 		defer release()
@@ -352,7 +375,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// One record from here to teardown: the dialog owns the media session,
 	// the CANCEL bridge and the per-fork answers, and end() is the single
 	// exit whether the call connects or not.
-	d, ok := s.beginDialog(req, tx, planePublic, carrier != "")
+	d, ok := s.beginDialog(fc, req, tx, planePublic, carrier != "")
 	if !ok {
 		return
 	}
@@ -370,7 +393,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildUpstreamOffer(ctx, d, body, src.Addr()); err != nil {
-			s.rejectInviteMedia(req, tx, err)
+			s.rejectInviteMedia(fc, req, tx, err)
 			return
 		}
 	} else {
@@ -389,7 +412,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	//
 	// A false return means the CANCEL beat this registration and nothing has
 	// been sent upstream yet: ending the series is the whole of the work left.
-	if !s.bridgeCancel(tx, d, cancel) {
+	if !s.bridgeCancel(tx, d, fc, cancel) {
 		return
 	}
 	defer d.untrack()
@@ -435,7 +458,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		}
 		out, err := s.prepareForward(req, from, s.topo.private, dest, true)
 		if err != nil {
-			s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
+			s.rejectInvite(fc, req, tx, 483, "Too Many Hops", rejectTooManyHops)
 			return
 		}
 		if carrier != "" {
@@ -486,6 +509,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 			s.upstreamCooldown.Penalize(name, cooldown)
 			continue
 		}
+		fc.markSent()
 		if d.markSent(a) {
 			// A CANCEL took the attempt while the INVITE was being sent: it
 			// could not go out ahead of the INVITE, so it goes out now.
@@ -495,7 +519,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 		// In-dialog traffic rides the WINNING switch: directionFor sends the
 		// client's ACKs and BYEs to this address, and the winner's Contact is
 		// what their Request-URI names.
-		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
+		l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, fc: fc, offer: offer, offerless: offerless,
 			near: from, far: s.topo.private, callee: calleeUpstream,
 			calleeRemote: dest, transport: from.transport, resp: resp}
 		r := s.pumpInvite(ctx, l)
@@ -535,7 +559,7 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	// Every node failed and nothing was relayed: 503 tells the client's own
 	// failover (or the human) to try again rather than pretending the callee
 	// is unreachable.
-	s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
+	s.giveUp(ctx, d, fc, req, tx, 503, "Service Unavailable")
 }
 
 // giveUp sends the one final response a caller is owed when its INVITE
@@ -543,16 +567,20 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 // it a 487 from sipgo; 408 when the backstop expired (RFC 3261 §16.7 step
 // 6, §16.8); 487 when an orphan CANCEL ended it; the path's own status
 // otherwise.
-func (s *Server) giveUp(ctx context.Context, d *dialog, req *sip.Request, tx sip.ServerTransaction,
+func (s *Server) giveUp(ctx context.Context, d *dialog, fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction,
 	code int, reason string) {
 	switch {
 	case d.callerCancelled():
+		s.inviteFailed(fc, 487, "Request Terminated", "", failCancel)
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		s.rejectInvite(req, tx, 408, "Request Timeout", rejectTimeout)
+		s.rejectInviteAs(fc, req, tx, 408, "Request Timeout", rejectTimeout, failTimeout)
 	case ctx.Err() != nil || d.wasCancelled():
+		s.inviteFailed(fc, 487, "Request Terminated", "", failCancel)
 		s.reject(req, tx, 487, "Request Terminated")
 	default:
-		s.rejectInvite(req, tx, code, reason, rejectUpstreamFailed)
+		// No final response from the far end: a transaction timeout or a
+		// transport failure, whatever status stands in for it.
+		s.rejectInviteAs(fc, req, tx, code, reason, rejectUpstreamFailed, failTimeout)
 	}
 }
 
@@ -594,12 +622,13 @@ func hashUserFor(req *sip.Request) string {
 // inviteToClient handles a call FreeSWITCH is placing to a registered
 // client — acceptance criterion 3.
 func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
+	fc := newInviteFlow(req, legClient, false, "")
 	binding, ok := s.bindingForRequest(req)
 	if !ok {
 		// Nothing registered under that contact any more. 404 is the
 		// correct answer and lets FreeSWITCH fail over or play a
 		// treatment, rather than ringing into nothing.
-		s.rejectInvite(req, tx, 404, "Not Found", rejectNoTarget)
+		s.rejectInvite(fc, req, tx, 404, "Not Found", rejectNoTarget)
 		return
 	}
 	dest := binding.Source.String()
@@ -607,7 +636,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if !ok {
 		// A registered client FreeSBC cannot reach is 480: the endpoint is
 		// gone, not the service.
-		s.rejectInvite(req, tx, 480, "Temporarily Unavailable", rejectNoPublicSide)
+		s.rejectInvite(fc, req, tx, 480, "Temporarily Unavailable", rejectNoPublicSide)
 		return
 	}
 	body := req.Body()
@@ -619,7 +648,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if toBrowser && !s.webrtcEnabled {
 		s.log.Warn("rejecting call to WebSocket client: WebRTC is not enabled, so no DTLS-SRTP offer can be built",
 			"sip_call_id", fsip.CallID(req), "aor", binding.AOR, "transport", binding.Transport)
-		s.rejectInvite(req, tx, 488, "Not Acceptable Here", rejectWebRTCDisabled)
+		s.rejectInvite(fc, req, tx, 488, "Not Acceptable Here", rejectWebRTCDisabled)
 		return
 	}
 
@@ -627,7 +656,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	defer cancel()
 
 	// One record from here to teardown, as in inviteToUpstream.
-	d, ok := s.beginDialog(req, tx, planePrivate, false)
+	d, ok := s.beginDialog(fc, req, tx, planePrivate, false)
 	if !ok {
 		return
 	}
@@ -642,7 +671,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	if len(body) > 0 {
 		var err error
 		if offer, err = s.buildPublicOffer(d, body, toBrowser, netip.Addr{}); err != nil {
-			s.rejectInviteMedia(req, tx, err)
+			s.rejectInviteMedia(fc, req, tx, err)
 			return
 		}
 	} else {
@@ -654,7 +683,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	// client (hideToPublic), and its answers get them back (respToSwitch).
 	out, err := s.prepareForwardFor(req, s.topo.private, to, dest, true, hideClient)
 	if err != nil {
-		s.rejectInvite(req, tx, 483, "Too Many Hops", rejectTooManyHops)
+		s.rejectInvite(fc, req, tx, 483, "Too Many Hops", rejectTooManyHops)
 		return
 	}
 	// The Request-URI FreeSWITCH used names FreeSBC's own contact; the
@@ -678,7 +707,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	// keep ringing. A false return means the CANCEL beat this registration
 	// and nothing has been sent yet: ending here is the whole of the work
 	// left.
-	if !s.bridgeCancel(tx, d, cancel) {
+	if !s.bridgeCancel(tx, d, fc, cancel) {
 		return
 	}
 	a := &inviteAttempt{req: out, cancel: cancel}
@@ -692,14 +721,15 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
 		s.log.Warn("forward INVITE to client", "err", err, "aor", binding.AOR)
-		s.giveUp(ctx, d, req, tx, 480, "Temporarily Unavailable")
+		s.giveUp(ctx, d, fc, req, tx, 480, "Temporarily Unavailable")
 		return
 	}
+	fc.markSent()
 	if d.markSent(a) {
 		go s.sendCancel(a)
 	}
 
-	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, offer: offer, offerless: offerless,
+	l := &inviteLeg{req: req, tx: tx, out: out, clTx: clTx, d: d, fc: fc, offer: offer, offerless: offerless,
 		near: s.topo.private, far: to, callee: calleeClient,
 		calleeRemote: dest, transport: binding.Transport, fromPrivate: true, resp: respToSwitch}
 	if r := s.pumpInvite(ctx, l); !r.finalised {
@@ -711,7 +741,7 @@ func (s *Server) inviteToClient(req *sip.Request, tx sip.ServerTransaction) {
 		if errors.Is(clTx.Err(), sip.ErrTransactionTimeout) {
 			code, reason = 408, "Request Timeout"
 		}
-		s.giveUp(ctx, d, req, tx, code, reason)
+		s.giveUp(ctx, d, fc, req, tx, code, reason)
 	}
 }
 
@@ -768,26 +798,27 @@ func clientRequestURI(b Binding) sip.Uri {
 // rejectMedia maps a media-setup failure to the right SIP status: no
 // common codec is 488 (the offer is unacceptable), an exhausted port pool
 // is 503 (temporary capacity), anything else 500.
-func (s *Server) rejectMedia(req *sip.Request, tx sip.ServerTransaction, err error) {
+func (s *Server) rejectMedia(req *sip.Request, tx sip.ServerTransaction, err error) (code int, reason string) {
+	code, reason = 488, "Not Acceptable Here"
 	switch {
 	case errors.Is(err, errNoUsableCodec), errors.Is(err, errRenumbered), errors.Is(err, errSDES):
 		s.log.Info("rejecting call: media not negotiable", "err", err, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 488, "Not Acceptable Here")
 	case errors.Is(err, errShuttingDown):
-		s.reject(req, tx, 503, "Service Unavailable")
+		code, reason = 503, "Service Unavailable"
 	case errors.Is(err, media.ErrPortsExhausted):
 		s.metrics.PortAllocationFailed()
 		s.log.Error("rejecting call: media ports exhausted", "err", err, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 503, "Service Unavailable")
+		code, reason = 503, "Service Unavailable"
 	default:
 		s.log.Warn("rejecting call: media setup failed", "err", err, "sip_call_id", fsip.CallID(req))
-		s.reject(req, tx, 488, "Not Acceptable Here")
 	}
+	s.reject(req, tx, code, reason)
+	return code, reason
 }
 
 // rejectInviteMedia is rejectMedia for an out-of-dialog INVITE: it counts
 // the refusal by the same classification that picks the status.
-func (s *Server) rejectInviteMedia(req *sip.Request, tx sip.ServerTransaction, err error) {
+func (s *Server) rejectInviteMedia(fc *inviteFlow, req *sip.Request, tx sip.ServerTransaction, err error) {
 	switch {
 	case errors.Is(err, errShuttingDown):
 		s.metrics.InviteRejected(rejectShuttingDown)
@@ -796,7 +827,8 @@ func (s *Server) rejectInviteMedia(req *sip.Request, tx sip.ServerTransaction, e
 	default:
 		s.metrics.InviteRejected(rejectMediaFailed)
 	}
-	s.rejectMedia(req, tx, err)
+	code, reason := s.rejectMedia(req, tx, err)
+	s.inviteFailed(fc, code, reason, "", failEdge)
 }
 
 // isInDialog reports whether a request belongs to an established dialog,

@@ -1908,6 +1908,25 @@ and never reaches the handler again, so each INVITE is counted once. PRACK/100re
 and delayed offers pass end to end (§7.9a), so there is no 420 or offerless
 488 to count.
 
+**Why an INVITE never connected.** Every out-of-dialog INVITE that ends
+without a confirmed dialog writes one `invite failed` line and counts in
+`freesbc_edge_invite_failures_total{leg,direction,class}`, through
+`Server.inviteFailed` (`invitefail.go`) and the `inviteFlow` the handler
+makes on arrival; its `done` flag makes the first report the only one. The
+report is made where the outcome is known: `pumpInvite` for a far-end final
+of 4xx to 6xx, read from the response as received (`relayResponseHide`
+works on a clone, so the `Reason` header hiding strips is still there),
+`rejectInvite` for a final the edge generates (`source=edge`, the class from
+its code), `giveUp` when there was no final at all (`source=timeout`, Warn,
+class `timeout`, `code` the 408 or 503 sent), and `bridgeCancel` for the
+caller's own CANCEL (`source=cancel`, Debug, not counted). `leg` is the far
+end the INVITE was heading for, `direction` follows
+`freesbc_edge_carrier_requests_total`, and `duration` runs from the INVITE
+being sent (from its arrival when it never was). A 3xx and a 2xx are not
+failures. `reason_phrase` and `sip_reason` come from the far end and are cut
+at 256 bytes; no SDP or credential is logged. A session or rate cap refusal
+(`rejectBusy`) logs at Debug while its own WARN is rate-limited.
+
 ### 7.8 Forwarding mechanics
 
 `prepareForward(req, from, to, dest, recordRoute)` (`forward.go`)
@@ -3949,6 +3968,7 @@ permanent series per call."
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_ack_missed_total` | Counter | `plane` ∈ {`public`, `private`}: the side that failed to ACK a 2xx | edge `noteAckMiss` (`ack.go`), once per missed ACK (§7.7); both planes are always exported |
 | `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `Server.rejectInvite` (`invite.go`) / `Server.rejectBusy` (`invite.go`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
+| `freesbc_edge_invite_failures_total` | Counter | `leg` ∈ {`carrier`, `client`, `switch`}, `direction` ∈ {`inbound`, `outbound`}, `class` ∈ {`4xx`, `5xx`, `6xx`, `timeout`} | edge `Server.inviteFailed` (`invitefail.go`), one per out-of-dialog INVITE that ended without a confirmed dialog and not by the caller's own CANCEL (§7.7); all 24 combinations are always exported |
 | `freesbc_hep_packets_sent_total` | Counter | — | `hep.Stats.Sent` through `Deps.HEP` (`hepStats`, `app.go`): SIP messages written to the collector. Exported only when `hep:` is set |
 | `freesbc_hep_packets_dropped_total` | Counter | — | `hep.Stats.Dropped`: copies refused because the send queue was full or closed, and queued ones given up at shutdown |
 | `freesbc_hep_errors_total` | Counter | `kind` ∈ {`write`, `encode`} | `hep.Stats.WriteErrors` (dial or write failure) and `EncodeErrors` (oversize or unaddressable); both kinds always exported while the mirror is on |
