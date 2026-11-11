@@ -1,7 +1,7 @@
 # FreeSBC Design
 
 This document describes FreeSBC as it is implemented in this repository
-(module `github.com/freesbc/freesbc`, Go 1.27.3). It describes code that
+(module `github.com/freesbc/freesbc`, Go 1.27.4). It describes code that
 exists. It contains no roadmap, no tutorial, and no generic protocol
 background; where a behaviour is unusual or fragile it is stated as the
 current behaviour without a recommendation. Every configuration key, default
@@ -1406,13 +1406,15 @@ Per REGISTER:
    opening (`registerUnanswered`, `edge/register.go`).
 
 Per attempt: `prepareForward(..., recordRoute=false)`; replace the Contact
-with `registeredContact(user, token)` (a wildcard is forwarded as `*`, see
-below); forward with `TransactionRequest`; pump responses.
+with `registeredContact(user, token)` and carry the requested lifetime as the
+one `Expires` header (a wildcard is forwarded as `*`, see below); forward
+with `TransactionRequest`; pump responses.
 
 | Header | Treatment on REGISTER |
 |---|---|
 | Request-URI | **unchanged** — the phone computed the digest over it |
-| Contact (request) | replaced with `sip:<user>@private.ip:5060;transport=udp;fsbc=<token>` (`registeredContact`, `edge/register.go`); a wildcard `*` un-REGISTER is forwarded as `*`, because it names every binding of the AoR, other devices' included |
+| Contact (request) | replaced with `sip:<user>@private.ip:5060;transport=udp;fsbc=<token>` (`registeredContact`, `edge/register.go`), with none of the client's header parameters (its `expires` goes up as `Expires`, next row); a wildcard `*` un-REGISTER is forwarded as `*`, because it names every binding of the AoR, other devices' included |
+| Expires (request) | when the Contact is replaced and `requestedExpires` found a lifetime (the Contact `expires` parameter, else the `Expires` header), every `Expires` header, in any case, is replaced by one carrying it (`onRegister`, `edge/register.go`; `SetHeader`, `internal/sip/header.go`). A Contact-parameter un-REGISTER (`Contact: <...>;expires=0` and no `Expires` header) is therefore forwarded with `Expires: 0`, and the registrar removes the binding FreeSBC removes. A REGISTER with no lifetime anywhere is forwarded with none, so the registrar's default applies; a wildcard un-REGISTER and a Contact-less query keep their `Expires` as sent |
 | Contact (2xx) | when the request carried a Contact: **every** Contact removed and the client's own URI restored with `expires=<granted>` — sip.js treats a Contact mismatch as a failed registration. After a wildcard un-REGISTER every Contact is removed and none restored. A REGISTER with no Contact (a binding query) has the registrar's Contact list relayed verbatim (`pumpRegister`, `internal/edge/register.go`) |
 | Via | top Via annotated with `received`/`rport`; FreeSBC's own Via prepended |
 | Route | leading Route values naming FreeSBC stripped |

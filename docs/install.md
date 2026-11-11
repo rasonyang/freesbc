@@ -134,7 +134,7 @@ The hash check alone only proves an intact download; to check the signature of `
 
 ## Build from source
 
-Requires Go >= 1.27.3:
+Requires Go >= 1.27.4:
 
 ```sh
 go build -o freesbc ./cmd/freesbc
