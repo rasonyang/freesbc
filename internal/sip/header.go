@@ -39,6 +39,18 @@ func SetContact(msg Editable, u sip.Uri) {
 	msg.AppendHeader(&sip.ContactHeader{Address: u})
 }
 
+// SetHeader replaces every header of a name, in any case, with one header
+// carrying value. sipgo keeps a header it does not parse (Expires among
+// them) under the name as it arrived, and its RemoveHeader matches that
+// name exactly, so the names to remove are taken from GetHeaders, which
+// folds case.
+func SetHeader(msg Editable, name, value string) {
+	for _, h := range msg.GetHeaders(name) {
+		msg.RemoveHeader(h.Name())
+	}
+	msg.AppendHeader(sip.NewHeader(name, value))
+}
+
 // SetSDPBody replaces a message's body with an SDP one, keeping
 // Content-Type and Content-Length consistent.
 func SetSDPBody(msg Editable, body []byte) {

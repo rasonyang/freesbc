@@ -185,6 +185,26 @@ func TestRemoveHeadersAndSetContact(t *testing.T) {
 	}
 }
 
+// SetHeader leaves exactly one header of the name, whatever case each copy
+// arrived in, and adds one where there was none.
+func TestSetHeader(t *testing.T) {
+	req := parseRequest(t, strings.Replace(testInvite, "Content-Length: 0\r\n",
+		"Expires: 3600\r\nexpires: 60\r\nEXPIRES: 7\r\nContent-Length: 0\r\n", 1))
+	if n := len(req.GetHeaders("Expires")); n != 3 {
+		t.Fatalf("fixture has %d Expires headers, want 3", n)
+	}
+	SetHeader(req, "Expires", "0")
+	if hs := req.GetHeaders("Expires"); len(hs) != 1 || hs[0].Value() != "0" {
+		t.Errorf("Expires after SetHeader = %v, want exactly one 0", hs)
+	}
+
+	req = parseRequest(t, testInvite)
+	SetHeader(req, "Expires", "60")
+	if hs := req.GetHeaders("Expires"); len(hs) != 1 || hs[0].Value() != "60" {
+		t.Errorf("Expires after SetHeader on a request without one = %v, want exactly one 60", hs)
+	}
+}
+
 func TestSetSDPBody(t *testing.T) {
 	req := parseRequest(t, testInvite)
 	req.AppendHeader(sip.NewHeader("Content-Type", "text/plain"))

@@ -172,8 +172,19 @@ func (s *Server) onRegister(req *sip.Request, tx sip.ServerTransaction, arrived 
 		// exception: it names every binding of the AoR, including the ones
 		// other devices registered through FreeSBC under their own tokens,
 		// so it goes upstream as "*" and is not narrowed to one token.
+		//
+		// The rewritten Contact carries none of the client's parameters, so
+		// a lifetime the client asked for with an expires parameter on its
+		// own Contact would be lost, and an un-REGISTER that says expires=0
+		// only there would refresh the binding upstream while FreeSBC drops
+		// its own (issue #341). The lifetime requestedExpires settled on goes
+		// up as the one Expires header instead. A REGISTER that asked for
+		// none is left without one, so the registrar's default applies.
 		if hasContact && !wildcard {
 			fsip.SetContact(out, s.registeredContact(user, token))
+			if in.requested > 0 || in.unregister {
+				fsip.SetHeader(out, "Expires", strconv.FormatInt(int64(in.requested/time.Second), 10))
+			}
 		}
 		// The Request-URI is NOT rewritten. It is part of the digest
 		// calculation the phone already performed (RFC 3261 §22.4 uses the

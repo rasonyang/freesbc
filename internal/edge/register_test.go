@@ -403,6 +403,172 @@ func TestUnregisterRemovesBinding(t *testing.T) {
 	}
 }
 
+// withContactExpires puts a REGISTER's expiry on its Contact as an expires
+// parameter, the form Zoiper un-registers with. header names the Expires
+// header to leave beside it, in that exact case, with headerValue; "" drops
+// the one buildRegister added.
+func withContactExpires(req *sip.Request, expires int, header, headerValue string) *sip.Request {
+	fsip.RemoveHeaders(req, "Expires")
+	if header != "" {
+		req.AppendHeader(sip.NewHeader(header, headerValue))
+	}
+	c := req.Contact()
+	c.Params = sip.NewParams()
+	c.Params.Add("expires", fmt.Sprintf("%d", expires))
+	return req
+}
+
+// forwardedExpires returns the values of every Expires header (any case)
+// on a REGISTER the fake switch received.
+func forwardedExpires(req *sip.Request) []string {
+	var vals []string
+	for _, h := range req.GetHeaders("Expires") {
+		vals = append(vals, h.Value())
+	}
+	return vals
+}
+
+// The rewritten Contact carries none of the client's parameters, so an
+// un-REGISTER that says expires=0 only on its Contact must reach the
+// registrar as Expires: 0. Otherwise FreeSBC drops its binding while the
+// registrar refreshes its own (issue #341).
+func TestContactParamUnregisterReachesRegistrar(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+
+	if res := phone.do(t, phone.buildRegister("1001", "example.com", 600, ""), h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	bindings := h.srv.loc.ByAOR("1001@example.com")
+	if len(bindings) != 1 {
+		t.Fatalf("bindings = %d after register, want 1", len(bindings))
+	}
+	token := bindings[0].Token
+
+	req := withContactExpires(phone.buildRegister("1001", "example.com", 600, ""), 0, "", "")
+	res := phone.do(t, req, h.publicUDP)
+	if res.StatusCode != 200 {
+		t.Fatalf("un-REGISTER: %d", res.StatusCode)
+	}
+
+	regs := h.fs.waitFor(sip.REGISTER, 2, 3*time.Second)
+	if len(regs) < 2 {
+		t.Fatalf("FreeSWITCH saw %d REGISTERs, want 2", len(regs))
+	}
+	if got := forwardedExpires(regs[1]); len(got) != 1 || got[0] != "0" {
+		t.Errorf("un-REGISTER reached the registrar with Expires %q, want exactly [0]", got)
+	}
+	// It still names the registered binding, and only that.
+	contacts := regs[1].GetHeaders("Contact")
+	if len(contacts) != 1 {
+		t.Fatalf("FreeSWITCH saw %d Contacts, want exactly 1", len(contacts))
+	}
+	fwd, _ := contacts[0].(*sip.ContactHeader)
+	if tok, _ := fwd.Address.UriParams.Get(contactTokenParam); tok != token {
+		t.Errorf("forwarded Contact %s does not carry the binding token %s", contacts[0].Value(), token)
+	}
+	if _, port, _ := net.SplitHostPort(phone.local); strings.Contains(contacts[0].Value(), ":"+port) {
+		t.Errorf("the phone's own contact leaked upstream: %s", contacts[0].Value())
+	}
+
+	if h.srv.loc.Count() != 0 {
+		t.Errorf("bindings = %d after un-REGISTER, want 0", h.srv.loc.Count())
+	}
+	back := res.Contact()
+	if back == nil {
+		t.Fatal("200 OK to the un-REGISTER carried no Contact")
+	}
+	if v, _ := back.Params.Get("expires"); v != "0" {
+		t.Errorf("Contact relayed to the phone has expires=%q, want 0", v)
+	}
+}
+
+// A lifetime asked for only on the Contact reaches the registrar too.
+func TestContactParamExpiresReachesRegistrar(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+
+	req := withContactExpires(phone.buildRegister("1001", "example.com", 600, ""), 60, "", "")
+	if res := phone.do(t, req, h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	regs := h.fs.waitFor(sip.REGISTER, 1, 3*time.Second)
+	if len(regs) == 0 {
+		t.Fatal("FreeSWITCH saw no REGISTER")
+	}
+	if got := forwardedExpires(regs[0]); len(got) != 1 || got[0] != "60" {
+		t.Errorf("REGISTER reached the registrar with Expires %q, want exactly [60]", got)
+	}
+	if h.srv.loc.Count() != 1 {
+		t.Errorf("bindings = %d after REGISTER, want 1", h.srv.loc.Count())
+	}
+}
+
+// The Contact parameter wins over the Expires header (RFC 3261 §10.2.1),
+// and the registrar is shown exactly one Expires carrying it, whatever case
+// the client wrote the header in.
+func TestContactParamExpiresOverridesHeader(t *testing.T) {
+	for _, name := range []string{"Expires", "expires"} {
+		t.Run(name, func(t *testing.T) {
+			h := startHarness(t, false)
+			phone := newUDPClient(t)
+			h.fs.mu.Lock()
+			h.fs.challenge = false
+			h.fs.mu.Unlock()
+
+			if res := phone.do(t, phone.buildRegister("1001", "example.com", 600, ""), h.publicUDP); res.StatusCode != 200 {
+				t.Fatalf("REGISTER: %d", res.StatusCode)
+			}
+			req := withContactExpires(phone.buildRegister("1001", "example.com", 600, ""), 0, name, "3600")
+			if res := phone.do(t, req, h.publicUDP); res.StatusCode != 200 {
+				t.Fatalf("un-REGISTER: %d", res.StatusCode)
+			}
+			regs := h.fs.waitFor(sip.REGISTER, 2, 3*time.Second)
+			if len(regs) < 2 {
+				t.Fatalf("FreeSWITCH saw %d REGISTERs, want 2", len(regs))
+			}
+			if got := forwardedExpires(regs[1]); len(got) != 1 || got[0] != "0" {
+				t.Errorf("un-REGISTER reached the registrar with Expires %q, want exactly [0]", got)
+			}
+			if h.srv.loc.Count() != 0 {
+				t.Errorf("bindings = %d after un-REGISTER, want 0", h.srv.loc.Count())
+			}
+		})
+	}
+}
+
+// A REGISTER with no expiry anywhere leaves the lifetime to the registrar:
+// FreeSBC must not invent an Expires header for it.
+func TestRegisterWithoutExpiryForwardsNone(t *testing.T) {
+	h := startHarness(t, false)
+	phone := newUDPClient(t)
+	h.fs.mu.Lock()
+	h.fs.challenge = false
+	h.fs.mu.Unlock()
+
+	req := phone.buildRegister("1001", "example.com", 600, "")
+	fsip.RemoveHeaders(req, "Expires")
+	if res := phone.do(t, req, h.publicUDP); res.StatusCode != 200 {
+		t.Fatalf("REGISTER: %d", res.StatusCode)
+	}
+	regs := h.fs.waitFor(sip.REGISTER, 1, 3*time.Second)
+	if len(regs) == 0 {
+		t.Fatal("FreeSWITCH saw no REGISTER")
+	}
+	if got := forwardedExpires(regs[0]); len(got) != 0 {
+		t.Errorf("REGISTER with no expiry reached the registrar with Expires %q, want none", got)
+	}
+	if h.srv.loc.Count() != 1 {
+		t.Errorf("bindings = %d after REGISTER, want 1", h.srv.loc.Count())
+	}
+}
+
 // A REGISTER carrying several Contacts must reach the registrar with ONLY
 // the SBC's rewritten one. Leaving the client's own contacts alongside it
 // would hand FreeSWITCH addresses that bypass the SBC entirely — sipgo's
