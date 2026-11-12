@@ -67,9 +67,12 @@ func TestCaseE_NoLeaksAfterCalls(t *testing.T) {
 	if n := h.srv.ActiveCalls(); n != 0 {
 		t.Errorf("dialogs left: %d", n)
 	}
-	if snap := h.srv.metrics.Snapshot(); snap.ActiveMediaSessions != 0 || snap.ActiveDialogs != 0 {
-		t.Errorf("gauges did not return to zero: %+v", snap)
-	}
+	// dialog.end drops these gauges after the media session has returned its
+	// ports, which is all waitForRelease can see.
+	waitFor(t, 3*time.Second, "the media and dialog gauges to return to zero", func() bool {
+		snap := h.srv.metrics.Snapshot()
+		return snap.ActiveMediaSessions == 0 && snap.ActiveDialogs == 0
+	})
 
 	// Goroutines. Counting them all would measure the wrong thing: the
 	// fake switch (a plain sipgo server) parks a goroutine per server
