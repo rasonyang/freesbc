@@ -3,6 +3,7 @@ package edge
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emiago/sipgo/sip"
 )
@@ -65,6 +66,11 @@ func TestRejectedRegistrationCountsFailure(t *testing.T) {
 	if res.StatusCode != 403 {
 		t.Fatalf("REGISTER got %d, want FreeSWITCH's 403 relayed", res.StatusCode)
 	}
+	// pumpRegister counts the refusal only after it has relayed the 403, so
+	// the phone can hold the answer before the counter moves.
+	waitFor(t, 3*time.Second, "the refusal to be counted", func() bool {
+		return h.srv.Metrics().Snapshot().RegistrationFailure >= 1
+	})
 	snap := h.srv.Metrics().Snapshot()
 	if snap.RegistrationFailure != 1 {
 		t.Errorf("RegistrationFailure = %d, want 1", snap.RegistrationFailure)

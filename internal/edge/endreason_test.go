@@ -239,6 +239,11 @@ func TestEndReasonDTLSFailure(t *testing.T) {
 	}
 	h.fs.sendAckTo2xx(t, res)
 	assertEnded(t, h, rec, fsip.CallID(res), endDTLSFailure, true, false)
+	// The failed leg closes the session, which ends the call, before
+	// startWebRTC has finished closing the leg and counted the failure.
+	waitFor(t, 3*time.Second, "the DTLS failure to be counted", func() bool {
+		return h.srv.metrics.Snapshot().WebRTCDTLSFailures >= 1
+	})
 	if snap := h.srv.metrics.Snapshot(); snap.WebRTCDTLSFailures != 1 {
 		t.Errorf("dtls failure counter = %d, want 1", snap.WebRTCDTLSFailures)
 	}
