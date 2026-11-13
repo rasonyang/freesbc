@@ -28,9 +28,14 @@ import (
 // by the carrier's transport) ordered by priority and weight (RFC 2782) and
 // then A/AAAA per target; with an explicit port through A/AAAA only (RFC
 // 3263 §4.2). With no SRV record the port is the transport's default (5060,
-// 5061 for tls). There is no NAPTR and no failover across SRV targets. Go exposes no record TTL, so a good
-// answer is cached for the carrierDNSTTL constant and a failed one for the
-// much shorter carrierDNSNegTTL. A failed refresh keeps the last good set:
+// 5061 for tls). There is no NAPTR and no failover across SRV targets.
+// Every address of an answer, A/AAAA or SRV target alike, passes the
+// carrier address clamp (carrierAddrPolicy, carrierclamp.go) before it is
+// used: a refused address is dropped from the set, so it is neither a
+// destination nor a carrier source, and an answer with nothing left is a
+// failed lookup. Go exposes no record TTL, so a good answer is cached for
+// the carrierDNSTTL constant and a failed one for the much shorter
+// carrierDNSNegTTL. A failed refresh keeps the last good set:
 // a resolver outage must never turn a carrier's source address into
 // "unknown". A DNS failure at startup is not fatal either; the carrier is
 // simply unresolved (and its calls dropped by admission) until a lookup
@@ -155,6 +160,10 @@ type carrierEntry struct {
 	// lastErr is the text of the most recent failed lookup, cleared on
 	// success.
 	lastErr string
+	// refused is the set of addresses the clamp refused in the latest
+	// answer, kept so that an address refused again on the next refresh is
+	// logged at Debug rather than warned about every time.
+	refused map[netip.Addr]bool
 }
 
 // Carrier resolution modes.
@@ -170,6 +179,8 @@ type carrierDirectory struct {
 	carriers []config.Carrier // sorted by name
 	static   []netip.Prefix   // carrier_sources plus literal-IP carriers
 	extra    []netip.Prefix   // carrier_sources alone
+	// policy is the clamp every resolved address passes (carrierclamp.go).
+	policy carrierAddrPolicy
 
 	// lookupSRV and lookupIP are the DNS seams; tests replace them.
 	lookupSRV func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
@@ -183,12 +194,16 @@ type carrierDirectory struct {
 	snap atomic.Pointer[carrierSnapshot]
 }
 
-func newCarrierDirectory(cfg *config.Config, log *slog.Logger) *carrierDirectory {
+// newCarrierDirectory builds the directory from the startup snapshot. priv
+// is the effective private SIP socket's address, one of FreeSBC's own
+// addresses the clamp refuses.
+func newCarrierDirectory(cfg *config.Config, priv netip.Addr, log *slog.Logger) *carrierDirectory {
 	d := &carrierDirectory{
 		log:      log,
 		carriers: cfg.CarrierList(),
 		static:   cfg.CarrierNets(),
 		extra:    cfg.CarrierSourceNets(),
+		policy:   newCarrierAddrPolicy(cfg, priv),
 		lookupSRV: func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error) {
 			return net.DefaultResolver.LookupSRV(ctx, service, proto, name)
 		},
@@ -269,8 +284,8 @@ func (d *carrierDirectory) refresh(ctx context.Context) {
 		if fresh {
 			continue
 		}
-		addrs, mode, err := d.resolve(ctx, c)
-		if d.apply(c, now, addrs, mode, err) {
+		addrs, refused, mode, err := d.resolve(ctx, c)
+		if d.apply(c, now, addrs, refused, mode, err) {
 			changed = true
 		}
 	}
@@ -282,8 +297,9 @@ func (d *carrierDirectory) refresh(ctx context.Context) {
 }
 
 // apply records one lookup outcome and reports whether the resolved set
-// changed state (a success). It takes mu.
-func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.AddrPort, mode string, err error) bool {
+// changed state (a success). refused is what the clamp took out of the
+// answer; addrs is what is left. It takes mu.
+func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.AddrPort, refused []refusedAddr, mode string, err error) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	e := d.entries[c.Name]
@@ -291,6 +307,7 @@ func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.
 		e = &carrierEntry{}
 		d.entries[c.Name] = e
 	}
+	d.logRefused(c, e, addrs, refused)
 	if err != nil || len(addrs) == 0 {
 		if err == nil {
 			err = errors.New("no addresses")
@@ -315,6 +332,33 @@ func (d *carrierDirectory) apply(c config.Carrier, now time.Time, addrs []netip.
 	return true
 }
 
+// logRefused reports the addresses the clamp took out of one answer: a Warn
+// naming the carrier, the address and its reason class for an address not
+// refused in the previous answer, Debug for one that was. Each address is
+// reported once per refresh however many SRV targets or ports carried it. A
+// lookup that produced no answer at all (a resolver error) keeps the
+// previous set, so an outage does not re-arm the Warn. The caller holds mu.
+func (d *carrierDirectory) logRefused(c config.Carrier, e *carrierEntry, addrs []netip.AddrPort, refused []refusedAddr) {
+	if len(addrs) == 0 && len(refused) == 0 {
+		return
+	}
+	now := make(map[netip.Addr]bool, len(refused))
+	for _, r := range refused {
+		if now[r.addr] {
+			continue
+		}
+		now[r.addr] = true
+		if e.refused[r.addr] {
+			d.log.Debug("carrier DNS answer still holds a refused address",
+				"carrier", c.Name, "host", r.host, "addr", r.addr.String(), "reason", r.reason)
+			continue
+		}
+		d.log.Warn("carrier DNS answer refused: address not allowed for a DNS-name carrier",
+			"carrier", c.Name, "host", r.host, "addr", r.addr.String(), "reason", r.reason)
+	}
+	e.refused = now
+}
+
 // Run refreshes the directory until ctx ends: once at once, then whenever
 // an entry's cache window has passed (checked at half the negative TTL).
 func (d *carrierDirectory) Run(ctx context.Context) {
@@ -331,12 +375,15 @@ func (d *carrierDirectory) Run(ctx context.Context) {
 	}
 }
 
-// resolve returns the destinations of one DNS-name carrier, in preference
-// order, and how they resolved (carrierModeSRV or carrierModeA).
-func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]netip.AddrPort, string, error) {
+// resolve returns the destinations of one DNS-name carrier that passed the
+// clamp, in preference order, the addresses the clamp refused, and how they
+// resolved (carrierModeSRV or carrierModeA). The clamp runs per target before
+// the targets are joined, so a refused address never takes the first place
+// (carrierDest) whatever its position in the answer.
+func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]netip.AddrPort, []refusedAddr, string, error) {
 	if c.ExplicitPort {
-		addrs, err := d.hostAddrs(ctx, c.Host, uint16(c.Port))
-		return addrs, carrierModeA, err
+		addrs, refused, err := d.hostAddrs(ctx, c.Host, uint16(c.Port))
+		return addrs, refused, carrierModeA, err
 	}
 	service, proto := srvName(c.Transport)
 	sctx, cancel := context.WithTimeout(ctx, carrierLookupTimeout)
@@ -345,14 +392,16 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 	if err != nil {
 		var dnsErr *net.DNSError
 		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
-			return nil, "", fmt.Errorf("srv lookup: %w", err)
+			return nil, nil, "", fmt.Errorf("srv lookup: %w", err)
 		}
 		recs = nil // no SRV record: fall back to the host itself
 	}
 	var out []netip.AddrPort
+	var refused []refusedAddr
 	var lastErr error
 	for _, t := range orderSRV(recs, d.rnd) {
-		addrs, err := d.hostAddrs(ctx, t.host, t.port)
+		addrs, ref, err := d.hostAddrs(ctx, t.host, t.port)
+		refused = append(refused, ref...)
 		if err != nil {
 			lastErr = err
 			continue
@@ -360,13 +409,17 @@ func (d *carrierDirectory) resolve(ctx context.Context, c config.Carrier) ([]net
 		out = append(out, addrs...)
 	}
 	if len(out) > 0 {
-		return dedupeAddrPorts(out), carrierModeSRV, nil
+		return dedupeAddrPorts(out), refused, carrierModeSRV, nil
+	}
+	if len(recs) > 0 && len(refused) > 0 {
+		// SRV exists and the clamp left none of its targets' addresses.
+		return nil, refused, "", refusedError(c.Host, refused)
 	}
 	if len(recs) > 0 && lastErr != nil {
-		return nil, "", lastErr // SRV exists but none of its targets resolved
+		return nil, nil, "", lastErr // SRV exists but none of its targets resolved
 	}
-	addrs, err := d.hostAddrs(ctx, c.Host, uint16(c.DialPort()))
-	return addrs, carrierModeA, err
+	addrs, refused, err := d.hostAddrs(ctx, c.Host, uint16(c.DialPort()))
+	return addrs, refused, carrierModeA, err
 }
 
 // srvName is the SRV service and protocol of a carrier transport (RFC 3263
@@ -381,26 +434,33 @@ func srvName(transport string) (service, proto string) {
 	return "sip", "udp"
 }
 
-// hostAddrs resolves host to A/AAAA addresses on port.
-func (d *carrierDirectory) hostAddrs(ctx context.Context, host string, port uint16) ([]netip.AddrPort, error) {
+// hostAddrs resolves host to A/AAAA addresses on port, keeping the answer's
+// order, and passes each through the clamp: what it refuses is returned
+// apart, and an answer it leaves empty is an error that says so.
+func (d *carrierDirectory) hostAddrs(ctx context.Context, host string, port uint16) ([]netip.AddrPort, []refusedAddr, error) {
 	lctx, cancel := context.WithTimeout(ctx, carrierLookupTimeout)
 	defer cancel()
 	ips, err := d.lookupIP(lctx, host)
 	if err != nil {
-		return nil, fmt.Errorf("lookup %s: %w", host, err)
+		return nil, nil, fmt.Errorf("lookup %s: %w", host, err)
 	}
 	out := make([]netip.AddrPort, 0, len(ips))
+	var refused []refusedAddr
 	for _, ip := range ips {
 		ip = ip.Unmap().WithZone("")
-		if ip.IsUnspecified() {
+		if reason := d.policy.refuses(ip); reason != "" {
+			refused = append(refused, refusedAddr{host: host, addr: ip, reason: reason})
 			continue
 		}
 		out = append(out, netip.AddrPortFrom(ip, port))
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("lookup %s: no addresses", host)
+		if len(refused) > 0 {
+			return nil, refused, refusedError(host, refused)
+		}
+		return nil, nil, fmt.Errorf("lookup %s: no addresses", host)
 	}
-	return out, nil
+	return out, refused, nil
 }
 
 func dedupeAddrPorts(in []netip.AddrPort) []netip.AddrPort {

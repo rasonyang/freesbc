@@ -60,9 +60,11 @@ edge:
   #   tcp: 16060             # signaling only, forward the rtp range 1:1
 
   carriers:                  # where the switch may send requests (allowlist);
-    carrier-a: sip.carrier-a.com      # must equal the switch gateway's host[:port]
-    mobile:    198.51.100.10:16060    # name is stamped as X-FreeSBC-Carrier
-    fixed:     198.51.100.11:16060    #   on inbound calls from that carrier
+    mobile:    198.51.100.10:16060    # must equal the switch gateway's host[:port]
+    fixed:     198.51.100.11:16060    # name is stamped as X-FreeSBC-Carrier on inbound calls
+    carrier-a: sip.carrier-a.com      # DNS name: SRV, then A/AAAA. An answer naming a private,
+                                      #   loopback, link-local or FreeSBC/switch address is refused;
+                                      #   write a carrier on a private network as a literal IP
     secure:                           # mapping form: transport udp (default) | tcp | tls
       host: sip.secure-carrier.com    # tls: SRV _sips._tcp, port 5061; the certificate must name this host
       transport: tls
