@@ -91,9 +91,11 @@ func (c *Config) validateTopology(fail failFunc) {
 // cgnatPrefix is the shared address space (RFC 6598).
 var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
-// privateOrCGNAT reports whether ip is in a private class (RFC 1918, IPv6
-// ULA) or in CGNAT space.
-func privateOrCGNAT(ip netip.Addr) bool {
+// PrivateOrCGNAT reports whether ip is in a private class (RFC 1918, IPv6
+// ULA) or in CGNAT space. The edge uses it too: for the public media plane's
+// destination policy and the carrier address clamp, both lifted when
+// public.ip is itself in one of these classes.
+func PrivateOrCGNAT(ip netip.Addr) bool {
 	ip = ip.Unmap()
 	return ip.IsPrivate() || cgnatPrefix.Contains(ip)
 }
@@ -108,7 +110,8 @@ func privateOrCGNAT(ip netip.Addr) bool {
 // reach, so everything that keeps that source IP unforgeable or unambiguous
 // is checked: the shared address and the switch are private, no carrier
 // source can be the switch, and the udp port is not translated. A carrier
-// named by DNS cannot be checked here; docs/edge.md tells the operator.
+// named by DNS cannot be checked here; the edge refuses any DNS answer that
+// names a switch address (carrierAddrPolicy, internal/edge/carrierclamp.go).
 func (c *Config) validateSharedSocket(fail failFunc) {
 	if !c.SharedSocket() {
 		return
@@ -118,7 +121,7 @@ func (c *Config) validateSharedSocket(fail failFunc) {
 		return
 	}
 	shared := c.PublicBind()
-	if !privateOrCGNAT(shared) {
+	if !PrivateOrCGNAT(shared) {
 		fail("private.ip: %q is shared with public.bind but is not a private or CGNAT address; one socket for both sides is allowed only behind 1:1 NAT on a private address", c.Private.IP)
 	}
 	if c.Edge.Listen.UDP == 0 {
@@ -137,7 +140,7 @@ func (c *Config) validateSharedSocket(fail failFunc) {
 			continue // already reported by validateEdge
 		}
 		label := fmt.Sprintf("edge.switch[%d]", i)
-		if !privateOrCGNAT(ap.Addr()) {
+		if !PrivateOrCGNAT(ap.Addr()) {
 			fail("%s: %q is not a private or CGNAT address; the switch is trusted by its source IP when private.ip equals public.bind", label, s)
 		}
 		for _, pfx := range c.Edge.carrierNets {

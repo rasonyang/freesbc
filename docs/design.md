@@ -542,7 +542,7 @@ The carrier path is the edge plane's third kind of far end, next to registered c
 
 Carrier traffic uses the fixed private socket `private.ip:5060` toward the switch and, toward the carrier, the transport of its `edge.carriers` entry: UDP (the public UDP listener, `edge.listen.udp`, required by a `udp` carrier), TCP or TLS. For a `tcp` or `tls` carrier FreeSBC dials the connection itself (§6.10); the matching `edge.listen.tcp|tls` is needed only for the carrier's own inbound connections (`validateCarriers`, `internal/config/validate.go`).
 
-Code lives in `internal/edge`: `carrier.go` (classification, `inviteToCarrier`, `optionsToCarrier`), `carrierdns.go` (directory), `carrierreg.go` (registration table and `registerToCarrier`), `carrierconn.go` (outbound tcp/tls connections), `hide.go` (topology hiding), plus the carrier branches in `invite.go`, `indialog.go`, `admission.go`, `arrival.go` and `forward.go`.
+Code lives in `internal/edge`: `carrier.go` (classification, `inviteToCarrier`, `optionsToCarrier`), `carrierdns.go` (directory), `carrierclamp.go` (which DNS-answer addresses the directory refuses), `carrierreg.go` (registration table and `registerToCarrier`), `carrierconn.go` (outbound tcp/tls connections), `hide.go` (topology hiding), plus the carrier branches in `invite.go`, `indialog.go`, `admission.go`, `arrival.go` and `forward.go`.
 
 ### 6.1 Classification of switch-originated requests
 
@@ -618,6 +618,7 @@ Every header whose name starts with `x-freesbc-` (any case) is internal. Only Fr
 - A literal-IP entry is static: one address, the entry's port.
 - A DNS-name entry without a port resolves through SRV ordered by priority and RFC 2782 weight (`orderSRV`, `carrierdns.go`), then A/AAAA per target (the SRV name is `_sip._udp`, `_sip._tcp` or `_sips._tcp` for a udp, tcp or tls carrier, `srvName`); with no SRV record it falls back to A/AAAA on the carrier's default port, 5060 (5061 for tls; `Carrier.DialPort`). An entry with an explicit port skips SRV and resolves A/AAAA only (RFC 3263 §4.2; `carrierDirectory.resolve`, `carrierdns.go`).
 - Resolution runs on the public side only; the switch is never asked and the private leg does no DNS.
+- Every address of an answer, A/AAAA or SRV target, passes the carrier address clamp (`carrierAddrPolicy.refuses`, `internal/edge/carrierclamp.go`) in `carrierDirectory.hostAddrs` (`carrierdns.go`), before the targets are joined and the first address is taken: unspecified (and `0.0.0.0/8`), multicast and the IPv4 broadcast, loopback, link-local, FreeSBC's own addresses (`public.ip`, `public.bind`, the private SIP socket's address) and every `edge.switch` IP are refused always; RFC 1918, ULA and CGNAT unless `public.ip` is itself private or CGNAT (`config.PrivateOrCGNAT`, `internal/config/validate.go`, the same condition as `publicDestPolicy`, `edge/mediapool.go`). Loopback is lifted only when `public.ip` or `public.bind` is loopback, the rule `newMediaPools` (`edge/mediapool.go`) applies to `AllowLoopback`; there a loopback answer also skips the own and switch checks, since a single-host lab shares 127.0.0.1 between FreeSBC, the switch and the carrier. There is no config key. A refused address is neither a destination nor a carrier source; it is logged at WARN with the carrier, the address and its class once, then at Debug while later answers still carry it (`carrierDirectory.logRefused`, `carrierdns.go`). An answer the clamp empties is a failed lookup whose error names each refused address and class (`refusedError`, `carrierclamp.go`), so the last good set is kept and `carrier_dns:<name>` (§13.6) is raised. Literal-IP entries are never clamped.
 - A good answer is cached `carrierDNSTTL` (`carrierdns.go`) = 300 s; a failed or empty one `carrierDNSNegTTL` = 10 s; one query is bounded by `carrierLookupTimeout` = 3 s. A failed refresh keeps the last good set (`carrierDirectory.refresh`, `carrierdns.go`), logged at WARN once per failure run. A failure at startup is not fatal: the carrier is unresolved, its INVITEs are dropped by admission and requests for it get 503, until a lookup succeeds.
 - `carrierDirectory.Run` (`carrierdns.go`), started from `Server.Run` (`edge.go`), refreshes once at start and then every 5 s checks which entries have expired. Each refresh publishes an immutable `carrierSnapshot` through an atomic pointer, so admission and the shield read it without locking.
 - A request to a carrier goes to the first resolved address only (`carrierDest`, `carrierreg.go`). There is no failover across SRV targets or addresses inside FreeSBC; line selection and failover belong to the switch. The order of a resolved set is re-drawn at each refresh (weighted-random within a priority), so the first address can change every 300 s for a name with several equal-priority targets.
@@ -3888,7 +3889,7 @@ self-signed certificate.
 | Only the switch speaks on the private socket | **Enforced by the read filter**; in the single-IP layout the shared socket instead treats an `edge.switch` source IP as the switch and every other source as public: the private UDP socket admits only `edge.switch` node IPs and stamps the arrival marker; a datagram from any other source is dropped before parsing (`Server.readFilter`, `edge.go`). A LAN host that is itself a node address is trusted |
 | The private LAN between FreeSBC and the switch is trusted | **Assumed.** SIP to the switch is plain UDP and carries per-call Via/Contact data |
 | Every inbound carrier's signalling IPs are an `edge.carriers` address (literal IP or resolved DNS name) or listed in `edge.carrier_sources` | **Assumed.** An INVITE from any other unregistered public source is dropped silently (§7.5); `edge.carrier_sources` has a width cap (no wider than IPv4 /8 or IPv6 /32) |
-| A carrier name's DNS answer is honest | **Assumed.** The resolved addresses become carrier sources and send targets; there is no DNSSEC |
+| A carrier name's DNS answer is honest | **Assumed**, within a clamp. The resolved addresses become carrier sources and send targets; there is no DNSSEC. **Enforced:** an answer cannot name loopback, link-local, multicast, unspecified, FreeSBC's own addresses or an `edge.switch` IP, nor a private or CGNAT address unless `public.ip` is itself private (`carrierAddrPolicy`, `edge/carrierclamp.go`, §6.4). Any other public address in the answer is trusted |
 | A public phone or browser calls from the transport address it registered from | **Assumed** (true for a phone that keeps its NAT pinhole with its own REGISTER refreshes, and for sip.js, which keeps one WebSocket). A client whose source changed since its last REGISTER is refused silently until it re-registers |
 | The switch never identifies or trusts a request by FreeSBC's IP on its client port | **Not enforceable by FreeSBC.** Client calls also arrive from `private.ip`; trusting that address on the client port lets them skip digest authentication. Identify carriers by `X-FreeSBC-Carrier`, the registration line or the DID |
 | Only the carrier port may skip authentication, and only for `private.ip` | **Assumed.** FreeSBC delivers only requests admitted from a carrier source to `edge.switch_carrier_port`, never client traffic; the switch or a host firewall must stop any other LAN host from reaching that port |
@@ -4724,9 +4725,14 @@ be used to read an environment variable.
   or use `hep.transport: tls` with mutual TLS. Without `hep.redact_auth`, REGISTER
   digests and nonces are shipped (`docs/homer.md`).
 - **Carrier sources follow DNS.** The addresses of a DNS-name `edge.carriers`
-  entry are carrier sources for as long as they stay in the directory. There is
-  no DNSSEC and no pinning, so whoever controls that answer can add a carrier
-  source.
+  entry are carrier sources and send targets for as long as they stay in the
+  directory. There is no DNSSEC and no pinning, so whoever controls that answer
+  can add a carrier source and redirect the carrier's calls to any public
+  address. The clamp (`carrierAddrPolicy`, `carrierclamp.go`, §6.4) bounds
+  where: never loopback, link-local, multicast, unspecified, FreeSBC's own
+  addresses or an `edge.switch` IP, and no private or CGNAT address unless
+  `public.ip` is itself private. A carrier on a private network is written as
+  a literal IP, which is never clamped.
 - **The carrier registration token is deterministic and not secret**
   (`carrierToken` (`carrierreg.go`): SHA-256 over the switch node name and
   the switch's Contact). A party who can guess both can compute it. What it

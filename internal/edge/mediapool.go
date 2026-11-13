@@ -61,7 +61,7 @@ func publicDestPolicy(bind netip.Addr, topo *topology) media.DestPolicy {
 	adv := topo.publicMediaIP.Unmap()
 	return media.DestPolicy{
 		Restrict:     true,
-		AllowPrivate: adv.IsPrivate() || netip.MustParsePrefix("100.64.0.0/10").Contains(adv),
+		AllowPrivate: config.PrivateOrCGNAT(adv),
 		Own:          []netip.Addr{adv, bind, topo.privateMediaIP},
 	}
 }
