@@ -74,9 +74,13 @@ func ringAndAnswerALG(f *fakeSwitch, contact sip.Uri) chan string {
 }
 
 // callCodes is fakeSwitch.call that also reports every provisional status.
+// The statuses come from the fake switch's transport-layer handler (wire
+// order), not tx.Responses(): sipgo v1.6.0 can drop a 180 that arrives after
+// the 200 (prov.go, sipgo#306).
 func callCodes(t *testing.T, f *fakeSwitch, ruri sip.Uri, dest, body string) (*sip.Response, []int) {
 	t.Helper()
 	req := f.callRequest(ruri, dest, body)
+	callID := req.CallID().Value()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tx, err := f.cli.TransactionRequest(ctx, req)
@@ -84,15 +88,17 @@ func callCodes(t *testing.T, f *fakeSwitch, ruri sip.Uri, dest, body string) (*s
 		t.Fatalf("fake switch INVITE: %v", err)
 	}
 	defer tx.Terminate()
-	var codes []int
 	for {
 		select {
 		case res, ok := <-tx.Responses():
 			if !ok {
 				t.Fatal("fake switch INVITE: no final response")
 			}
-			codes = append(codes, res.StatusCode)
 			if res.StatusCode >= 200 {
+				codes := f.responseCodes(callID)
+				if !hasCode(codes, res.StatusCode) {
+					codes = append(codes, res.StatusCode) // the handler may not have run yet
+				}
 				return res, codes
 			}
 		case <-tx.Done():
