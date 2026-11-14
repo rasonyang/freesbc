@@ -20,7 +20,7 @@ curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install
 4. Installs `freesbc` to `$FREESBC_PREFIX/bin` (default `/usr/local/bin`), using `sudo` only when that directory is not writable, and prints `freesbc version`. The new binary replaces the old one by a rename, so a running process is not disturbed; restart it to switch.
 5. On Linux with systemd, run as root, unless `--no-service`: creates the `freesbc` system user and `/etc/freesbc` (mode 0750, `root:freesbc`), installs `/etc/systemd/system/freesbc.service` (with `ExecStart` pointing at `$FREESBC_PREFIX/bin`) and runs `systemctl daemon-reload`. It does **not** enable or start the service: the config needs addresses first. The layout is the one described in [Run as a systemd service](#run-as-a-systemd-service). Not root or no systemd, it skips this step and says why.
 6. In that service step it never overwrites an existing `/etc/freesbc/freesbc.yaml`. When there is none and `FREESBC_SWITCH`, `FREESBC_PRIVATE_IP` and `FREESBC_PUBLIC_IP` are all set, it writes one with `freesbc init -c /etc/freesbc/freesbc.yaml`, sets it to `root:freesbc` mode 0640 and runs `freesbc check` on it. Piped from `curl`, stdin is not a terminal, so `init` cannot prompt; these variables are the only way to answer it.
-7. Prints the next steps: with no config yet, `init`, `chown`/`chmod`, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; with a config, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; without the service step, `init`, `check` and `run` on a local `freesbc.yaml`.
+7. Prints the next steps: with no config yet, `init`, `chown`/`chmod`, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; with a config, `check --deploy --local-addresses` and `systemctl enable --now freesbc`; on a host whose `net.core.rmem_max` is below 8 MiB or `wmem_max` below 1 MiB (or unreadable), a sysctl drop-in line for each such cap and `sysctl -p` (see [UDP socket buffers](#udp-socket-buffers)) go before `systemctl enable --now freesbc`; without the service step, `init`, `check` and `run` on a local `freesbc.yaml`.
 
 The whole body is in a `main()` function called on the last line, so a truncated download runs nothing. Running the script again is safe: it replaces the binary and the unit file and keeps the user, `/etc/freesbc` and the config. Put local unit changes in a drop-in (`systemctl edit freesbc`), which a re-run leaves alone.
 
@@ -219,11 +219,14 @@ install -d -m 0750 -o root -g freesbc /etc/freesbc
 /usr/local/bin/freesbc init -c /etc/freesbc/freesbc.yaml   # prompts on a terminal; in a script pass --switch etc.
 chown root:freesbc /etc/freesbc/freesbc.yaml && chmod 0640 /etc/freesbc/freesbc.yaml
 /usr/local/bin/freesbc check --deploy --local-addresses -c /etc/freesbc/freesbc.yaml   # TLS files and addresses
+# raise only a cap below the request (UDP socket buffers); never lower a larger one
+printf 'net.core.rmem_max = 8388608\nnet.core.wmem_max = 8388608\n' > /etc/sysctl.d/90-freesbc.conf
+sysctl -p /etc/sysctl.d/90-freesbc.conf
 systemctl enable --now freesbc
 journalctl -u freesbc -f
 ```
 
-`check --deploy --local-addresses` opens the TLS certificates and keys, carrier CA files and HEP TLS files the way `run` will, prints each certificate's subject, SANs, issuer and expiry (an expired one is an error, one under 30 days a warning), and checks `public.bind` and `private.ip` are assigned to this host. It binds no configured port and contacts no peer (an unaliased 127/8 address is probed with a bind on an ephemeral port, as `run` does), so it is safe next to a running instance; run it on the target host, as the `freesbc` user to prove the service can read the files (`sudo -u freesbc`). Plain `check` opens none of this, and a bad path would otherwise turn into a restart loop under `Restart=on-failure`. The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service can read but not change its own config. `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead of `init`, install it in place with `install -m 0640 -o root -g freesbc freesbc.example.yaml /etc/freesbc/freesbc.yaml` and edit the addresses.
+`check --deploy --local-addresses` opens the TLS certificates and keys, carrier CA files and HEP TLS files the way `run` will, prints each certificate's subject, SANs, issuer and expiry (an expired one is an error, one under 30 days a warning), and checks `public.bind` and `private.ip` are assigned to this host. It binds no configured port and contacts no peer (an unaliased 127/8 address is probed with a bind on an ephemeral port, as `run` does), so it is safe next to a running instance; run it on the target host, as the `freesbc` user to prove the service can read the files (`sudo -u freesbc`). On Linux it also notes, without failing, a `net.core.rmem_max` or `wmem_max` below what the UDP SIP sockets request (see [UDP socket buffers](#udp-socket-buffers)). Plain `check` opens none of this, and a bad path would otherwise turn into a restart loop under `Restart=on-failure`. The config and any TLS cert and key it names must be readable by the `freesbc` group (`root:freesbc`, mode 0640), so the service can read but not change its own config. `init` writes mode 0600 owned by root, hence the `chown` and `chmod`. To start from the annotated `freesbc.example.yaml` instead of `init`, install it in place with `install -m 0640 -o root -g freesbc freesbc.example.yaml /etc/freesbc/freesbc.yaml` and edit the addresses.
 
 ### Environment file
 
@@ -235,9 +238,13 @@ env $(grep -v '^#' /etc/freesbc/freesbc.env) /usr/local/bin/freesbc check -c /et
 
 Do not `. freesbc.env` instead: the shell would expand the `$` in a bcrypt hash.
 
+### UDP socket buffers
+
+Many stock Linux hosts cap socket buffers at 212992 bytes (`net.core.rmem_max`, `wmem_max`), far below the 8 MiB receive and 1 MiB send buffer every UDP SIP socket requests, and the kernel then drops datagrams silently under bursts. The sysctl drop-in in the steps above (`/etc/sysctl.d/90-freesbc.conf`) raises them. Leave out a key that is already larger: never lower a cap. The install script prints a line only for each cap below the request, and `check --deploy` notes the shortfall on Linux without failing (exit code 0). A running socket keeps the size it got, so the drop-in takes effect only after the service is started or restarted. Details: [UDP socket buffers](edge.md#udp-socket-buffers).
+
 ### Tuning and reload
 
-For bursty traffic raise `net.core.rmem_max` and `net.core.wmem_max` to at least 8 MiB and 1 MiB, so the UDP SIP sockets get their requested buffers ([UDP socket buffers](edge.md#udp-socket-buffers)).
+Buffer caps: see [UDP socket buffers](#udp-socket-buffers) above.
 
 There is no `ExecReload` (FreeSBC has no SIGHUP handler): a `shield.*` edit reloads by itself when the file is saved, and any other key needs `systemctl restart freesbc`. A bad config or a bind error exits 1 and systemd retries every 5 s, so run `freesbc check` before a restart. The unit's comments cover `LimitNOFILE`, an optional `MemoryMax` with `GOMEMLIMIT`, and dropping the capability when no port is below 1024.
 
