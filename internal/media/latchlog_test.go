@@ -111,10 +111,9 @@ func TestLatchRefusalCountedPlain(t *testing.T) {
 	if st := s.Stats(); st.B.RTPRejected != 0 || st.B.RTCPRejected != 0 || st.A.RTPPacketsRx != 2 {
 		t.Errorf("side B or rx moved: %+v", st)
 	}
+	// The counter moves before the reporter logs, so wait for the line.
+	eventually(t, "rejected-by-latch WARN", func() bool { return len(log.find(msgRejected)) > 0 })
 	recs := log.find(msgRejected)
-	if len(recs) == 0 {
-		t.Fatal("no rejected-by-latch WARN")
-	}
 	// The limiter is shared by the RTP and RTCP loops, so either kind may
 	// have won the first line.
 	r := recs[0]
@@ -176,6 +175,8 @@ func TestLatchRefusalCountedWebRTCPrivate(t *testing.T) {
 	if st := s.Stats(); st.A.RTPRejected != 0 || st.B.RTCPRejected != 0 {
 		t.Errorf("wrong side or kind: %+v", st)
 	}
+	// The counter moves before the reporter logs, so wait for the line.
+	eventually(t, "rejected-by-latch WARN", func() bool { return len(log.find(msgRejected)) > 0 })
 	if recs := log.find(msgRejected); len(recs) != 1 || recs[0].attrs["plane"] != "test" || recs[0].attrs["kind"] != "rtp" {
 		t.Errorf("WARN: %+v", recs)
 	}
