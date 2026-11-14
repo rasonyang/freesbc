@@ -578,9 +578,22 @@ type fakeSwitch struct {
 	// would have written FreeSBC's own.
 	requestHook func(*sip.Request)
 
+	// codesMu guards codes: the status of every response the switch's
+	// client read, per Call-ID, in wire order (leaf lock, never held
+	// across a call).
+	codesMu sync.Mutex
+	codes   map[string][]int
+
 	conn   *net.UDPConn
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// responseCodes returns a copy of the statuses recorded for callID.
+func (f *fakeSwitch) responseCodes(callID string) []int {
+	f.codesMu.Lock()
+	defer f.codesMu.Unlock()
+	return append([]int(nil), f.codes[callID]...)
 }
 
 func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
@@ -592,6 +605,19 @@ func startFakeSwitch(t *testing.T, addr string) *fakeSwitch {
 		t.Fatal(err)
 	}
 	f.ua = ua
+	// OnMessage appends to an unsynchronised slice, so it is registered
+	// once here, before anything serves (as the edge does in Run).
+	f.codes = make(map[string][]int)
+	ua.TransportLayer().OnMessage(func(m sip.Message) {
+		res, ok := m.(*sip.Response)
+		if !ok || res.CallID() == nil {
+			return
+		}
+		id := res.CallID().Value()
+		f.codesMu.Lock()
+		f.codes[id] = append(f.codes[id], res.StatusCode)
+		f.codesMu.Unlock()
+	})
 	srv, err := sipgo.NewServer(ua)
 	if err != nil {
 		t.Fatal(err)
