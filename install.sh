@@ -303,6 +303,37 @@ setup_config() {
 	return 0
 }
 
+# cap_low succeeds when the kernel's net.core.$1 is below $2 or cannot be
+# read. A larger cap is never touched. The wanted numbers (below) are the ones
+# every UDP SIP socket requests (edge.UDPSIPBuffers); a test in internal/app
+# keeps them in step.
+cap_low() {
+	cur=$(cat "/proc/sys/net/core/$1" 2>/dev/null || true)
+	case $cur in '' | *[!0-9]*) return 0 ;; esac
+	[ "$cur" -lt "$2" ]
+}
+
+# sysctl_steps prints the drop-in step for each cap below the request, and
+# nothing when none is.
+sysctl_steps() {
+	RMEM_WANT=8388608
+	WMEM_WANT=1048576
+	redir='>'
+	q="'"
+	nl='\n'
+	if cap_low rmem_max "$RMEM_WANT"; then
+		printf '  printf %snet.core.rmem_max = %s%s%s %s /etc/sysctl.d/90-freesbc.conf\n' "$q" "$RMEM_WANT" "$nl" "$q" "$redir" >&2
+		redir='>>'
+	fi
+	if cap_low wmem_max "$WMEM_WANT"; then
+		printf '  printf %snet.core.wmem_max = 8388608%s%s %s /etc/sysctl.d/90-freesbc.conf\n' "$q" "$nl" "$q" "$redir" >&2
+		redir='>>'
+	fi
+	if [ "$redir" = '>>' ]; then
+		printf '  sysctl -p /etc/sysctl.d/90-freesbc.conf\n' >&2
+	fi
+}
+
 next_steps() {
 	cmd=freesbc
 	if [ "$(command -v freesbc 2>/dev/null || true)" != "$BIN_DIR/freesbc" ]; then
@@ -312,6 +343,7 @@ next_steps() {
 	service-config)
 		printf '\nNext steps (as root):\n' >&2
 		printf '  %s check --deploy --local-addresses -c %s\n' "$cmd" "$CONF_PATH" >&2
+		sysctl_steps
 		printf '  systemctl enable --now freesbc\n' >&2
 		;;
 	service)
@@ -322,6 +354,9 @@ Next steps (as root):
   chown root:freesbc $CONF_PATH
   chmod 0640 $CONF_PATH
   $cmd check --deploy --local-addresses -c $CONF_PATH
+EOF
+		sysctl_steps
+		cat >&2 <<EOF
   systemctl enable --now freesbc
 
 Or set FREESBC_SWITCH, FREESBC_PRIVATE_IP and FREESBC_PUBLIC_IP and re-run

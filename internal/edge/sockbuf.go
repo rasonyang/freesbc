@@ -20,6 +20,12 @@ const (
 	udpSIPWriteBuffer = 1 << 20
 )
 
+// UDPSIPBuffers returns the receive and send buffer sizes requested for every
+// UDP SIP socket, for `check --deploy` to compare with the kernel's caps.
+func UDPSIPBuffers() (rcv, snd int) {
+	return udpSIPReadBuffer, udpSIPWriteBuffer
+}
+
 // sizeUDPSocket asks for udpSIPReadBuffer and udpSIPWriteBuffer on pc and
 // logs what the kernel granted. It never fails: a socket with a small
 // buffer still works, so a refusal or a cap is a WARN only.

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,17 +26,20 @@ const certWarnWindow = 30 * 24 * time.Hour
 // bind on an ephemeral port, as run does). Every failure is collected, not
 // just the first. report is the "config OK" line and the findings, one block
 // per file. err (nil when all checks passed) joins the failures and is
-// returned even when report is not empty. A config that does not load
-// returns that error with an empty report. Private keys are never printed.
+// returned even when report is not empty. note is advice that never fails the
+// check: the NAT checklist and, on Linux, a line per UDP socket buffer cap
+// (net.core.rmem_max, wmem_max) below what every UDP SIP socket requests
+// (udpBufferNote). A config that does not load returns that error with an
+// empty report. Private keys are never printed.
 func CheckDeploy(path string, localAddresses bool) (report, note string, err error) {
 	cfg, err := config.Load(path)
 	if err != nil {
 		return "", "", err
 	}
-	return checkDeploy(path, cfg, localAddresses, time.Now())
+	return checkDeploy(path, cfg, localAddresses, time.Now(), runtime.GOOS, os.ReadFile)
 }
 
-func checkDeploy(path string, cfg *config.Config, localAddresses bool, now time.Time) (report, note string, err error) {
+func checkDeploy(path string, cfg *config.Config, localAddresses bool, now time.Time, goos string, read func(string) ([]byte, error)) (report, note string, err error) {
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s: config OK\n", path)
 	var errs []error
@@ -104,7 +110,7 @@ func checkDeploy(path string, cfg *config.Config, localAddresses bool, now time.
 			}
 		}
 	}
-	return out.String(), cfg.NATChecklist(), errors.Join(errs...)
+	return out.String(), cfg.NATChecklist() + udpBufferNote(goos, read), errors.Join(errs...)
 }
 
 // describeLeaf is the report block for one certificate: subject, SANs,
@@ -134,4 +140,36 @@ func describeLeaf(key string, c *x509.Certificate, now time.Time) string {
 	}
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// udpBufferNote is one line per Linux socket buffer cap below what every UDP
+// SIP socket requests (edge.UDPSIPBuffers): a capped receive buffer drops
+// datagrams silently under bursts, and the only other signal is a start-up
+// warning per socket. A cap that cannot be read or parsed, equal to or above
+// the request, or any other OS (macOS has kern.ipc.maxsockbuf), gives no
+// line; read is not called off Linux.
+func udpBufferNote(goos string, read func(path string) ([]byte, error)) string {
+	if goos != "linux" {
+		return ""
+	}
+	rcv, snd := edge.UDPSIPBuffers()
+	var out strings.Builder
+	for _, k := range []struct {
+		key, effect string
+		want        int
+	}{
+		{"rmem_max", "datagrams may drop silently under bursts", rcv},
+		{"wmem_max", "sends may stall under bursts", snd},
+	} {
+		b, err := read("/proc/sys/net/core/" + k.key)
+		if err != nil {
+			continue
+		}
+		got, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || got >= k.want {
+			continue
+		}
+		fmt.Fprintf(&out, "net.core.%s %d < %d requested by every UDP SIP socket: %s; add /etc/sysctl.d/90-freesbc.conf (docs/edge.md#udp-socket-buffers)\n", k.key, got, k.want, k.effect)
+	}
+	return out.String()
 }
