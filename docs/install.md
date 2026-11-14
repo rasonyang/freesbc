@@ -245,4 +245,71 @@ There is no `ExecReload` (FreeSBC has no SIGHUP handler): a `shield.*` edit relo
 
 The config file is watched. A `shield` edit is validated and applied atomically; a bad edit never takes down the process, because the previous config stays active and the error is logged. Everything else (addresses, `rtp`, `tls`, `edge`, `admin`) is read once at startup: a reload that edits it is logged as a warning listing the keys, and the running process keeps its startup values until restarted. The reload classes are in [config.md](config.md#reload-classes).
 
-On SIGINT or SIGTERM FreeSBC drops its calls with their media released; no BYE is sent. A second SIGINT or SIGTERM exits at once. To let calls finish before a restart, drain the node first (`POST /api/drain`, see [two-node.md](two-node.md)).
+On SIGINT or SIGTERM FreeSBC drops its calls with their media released; no BYE is sent. A second SIGINT or SIGTERM exits at once. To let calls finish before a restart, drain the node first (`POST /api/drain`, see [Restart and upgrade on one node](#restart-and-upgrade-on-one-node)).
+
+## Restart and upgrade on one node
+
+Use this for an upgrade, a rollback, a restart-only config change (everything except `shield.*`) or a renewed TLS certificate when there is one FreeSBC. With two nodes the other one takes the new calls during the drain: see "Rolling restart" in [two-node.md](two-node.md#rolling-restart).
+
+What the drain does on one node ([edge.md](edge.md#admission-and-abuse-controls), Drain mode):
+
+- **New carrier calls are refused** until the restart ends: carrier to switch and switch to carrier both get `503` + `Retry-After: 30`. The switch's gateway goes down or its dialplan falls through, and the carrier sees `503` too. An `OPTIONS` from a carrier source, from the switch to FreeSBC and from the switch to a carrier host also gets `503`, so a carrier that disables a trunk on failed pings may do so; check its policy first. This is a short outage by design. The drain's point is not to cut the calls that are already up. Pick a quiet time, and pause an outbound campaign (such as AI calling) before you start.
+- **Client calls are not refused.** Registered-client calls, in both directions, are admitted while draining, and `active_calls` counts every confirmed call, clients included. A client on a long call keeps `active_calls` above 0, so decide the deadline with that in mind.
+- **A stop drops what is still up.** SIGTERM drops every call and releases its media; no BYE is sent (see [Reload and signals](#reload-and-signals)). The far ends find out from their session timers or from RTP silence.
+
+What a restart loses (all of it is in memory): client bindings (a client that holds a stream connection reconnects and registers again on its own, if its software does; a UDP client's calls are not admitted until it registers, up to its registration interval), the carrier registrations (the switch sends REGISTER again on its own timer; the `fsbc=` token is deterministic, so the same Contact is accepted again, but until then a carrier INVITE naming it is logged at WARN and falls back to the hash pool with the Request-URI unchanged), bans, subscriptions and the drain state (a restart starts not draining). A carrier `OPTIONS` is answered `200` again at once.
+
+1. Note the running version (`curl` the admin API's `/api/status`, field `version`: `freesbc version` prints the binary on disk, not the process) and keep the current binary: `cp -p /usr/local/bin/freesbc /usr/local/bin/freesbc.prev`.
+2. Install the new binary: `curl -fsSL https://github.com/rasonyang/freesbc/releases/latest/download/install.sh | sh`, or `... | FREESBC_VERSION=vX.Y.Z sh` for a tag. The running process is not disturbed. As root on systemd the script also rewrites the unit file and runs `systemctl daemon-reload`; it does not restart anything.
+3. Check the config with the new binary, as the service user, so a problem fails now and not during the outage: `sudo -u freesbc /usr/local/bin/freesbc check --deploy --local-addresses -c /etc/freesbc/freesbc.yaml` (with an environment file, run it as in [Environment file](#environment-file)). `--deploy` opens the TLS, CA and HEP files the way `run` does, which plain `check` does not; it binds no configured port, so it is safe next to the running process. Stop here on a failure: nothing has been refused yet.
+4. Run the script below. It drains, waits for `active_calls` to reach 0 until its deadline, restarts, and prints the running version and the drain state. At the deadline it stops without restarting and leaves the drain on, and you choose: restart anyway (every call still up is dropped, as above), or `DELETE /api/drain` to go back to normal.
+5. Make one test call, through each path you use (carrier and client).
+6. To roll back, install the previous release (`... | FREESBC_VERSION=<previous tag> sh`; a release up to v0.6.1 has no signature bundle; the default `FREESBC_VERIFY=auto` says so and goes on) or copy `freesbc.prev` back over `/usr/local/bin/freesbc`, then repeat steps 3 to 5. A downgrade needs no config change unless a key was added in between: strict YAML makes the old binary's `check` reject it (an unknown key), and the check says which.
+
+```sh
+#!/bin/sh
+# Drain, wait for the calls to end, restart, verify. Run as root.
+set -eu
+
+ADMIN=http://127.0.0.1:8080          # admin.listen; scheme and host:port as in the Host header
+PASSWORD=${FREESBC_ADMIN_PASSWORD:?set FREESBC_ADMIN_PASSWORD}
+DEADLINE=300                         # seconds to wait for active_calls to reach 0
+HEALTH_WAIT=60                       # seconds to wait for the admin API after the restart
+
+# The password goes to curl on stdin, not on its command line.
+api() {
+  printf 'user = "admin:%s"\n' "$PASSWORD" | curl -fsS -K - -H "Origin: $ADMIN" "$@"
+}
+field() { sed -n "s/.*\"$1\": *\"\{0,1\}\([^\",}]*\).*/\1/p" | head -n 1; }
+
+echo "running version: $(api "$ADMIN/api/status" | field version)"
+api -X POST "$ADMIN/api/drain" >/dev/null
+echo "draining: new carrier calls get 503 until the restart ends"
+
+waited=0
+while :; do
+  calls=$(api "$ADMIN/api/drain" | field active_calls)
+  [ "$calls" = 0 ] && break
+  if [ "$waited" -ge "$DEADLINE" ]; then
+    echo "deadline: $calls call(s) still up; not restarting, still draining" >&2
+    echo "restart anyway: systemctl restart freesbc  (drops those calls, no BYE)" >&2
+    echo "back out:       curl -X DELETE -H 'Origin: $ADMIN' -u admin $ADMIN/api/drain" >&2
+    exit 1
+  fi
+  sleep 5
+  waited=$((waited + 5))
+done
+
+systemctl restart freesbc
+
+waited=0
+until api "$ADMIN/api/health" >/dev/null 2>&1; do
+  [ "$waited" -ge "$HEALTH_WAIT" ] && { echo "admin API not back after ${HEALTH_WAIT}s" >&2; exit 1; }
+  sleep 2
+  waited=$((waited + 2))
+done
+echo "running version: $(api "$ADMIN/api/status" | field version)"
+echo "draining: $(api "$ADMIN/api/drain" | field draining)   (must be false)"
+```
+
+The unit has `Restart=on-failure`, so a restart that fails to start is retried every 5 s and the health wait times out: read `journalctl -u freesbc`.
