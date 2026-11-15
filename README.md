@@ -92,6 +92,7 @@ Endpoints, drain mode, health conditions, the audit log and pprof: [`docs/config
 - [`docs/install.md`](docs/install.md): install script, manual download, source build, systemd service, `freesbc init`
 - [`docs/config.md`](docs/config.md): every key, default, validation rule and reload class
 - [`docs/edge.md`](docs/edge.md): topology, behaviour, switch-side requirements, scope rule, non-goals, known limitations
+- [`docs/single-ip-carrier.md`](docs/single-ip-carrier.md): ordered go-live checklist for one host behind a 1:1 NAT with a carrier (security group, ALG check, first calls, caps)
 - [`docs/two-node.md`](docs/two-node.md): two independent FreeSBC nodes for failover and rolling restarts (carriers, switch, clients; FreeSWITCH and Asterisk examples)
 - [`docs/homer.md`](docs/homer.md): mirror SIP signaling to a HOMER collector over HEP (setup, what is mirrored, security notes)
 - [`docs/performance.md`](docs/performance.md): method, all results, sizing (memory, CPS and `GOMEMLIMIT`), lower bounds
