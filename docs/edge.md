@@ -228,6 +228,8 @@ Further consequences of one address:
 
 and firewalls its own SIP port (`10.77.0.3:5080` above) to accept traffic from `10.77.0.2` only. The rest of [Switch-side requirements](#switch-side-requirements) applies with `private.ip` read as the shared address.
 
+For an outbound carrier deployment on this layout, [the go-live checklist](single-ip-carrier.md) lists the steps in order: security group, check, telling the carrier, the ALG test, the first calls and the caps.
+
 ## UDP socket buffers
 
 FreeSBC asks the kernel for an 8 MiB receive buffer and a 1 MiB send buffer on every UDP SIP socket (the public `edge.listen.udp` socket and the private `private.ip:5060` socket; one socket in the single-IP layout, which is both). The sizes are fixed, not configurable, and `rmem_default` need not be raised because the size is set explicitly. RTP sockets are not resized. The kernel caps the request at `net.core.rmem_max` and `net.core.wmem_max` (Linux) or `kern.ipc.maxsockbuf` (macOS), so raise them to at least 8 MiB and 1 MiB; only then is the receive request granted in full. Linux then allocates double the request (16 MiB of receive buffer per socket, the extra half for its own bookkeeping) and `getsockopt` reports that doubled figure. The receive request was 4 MiB until #235 raised it; a host still at `rmem_max` 4 MiB runs, warns once per socket and keeps the smaller buffer:
