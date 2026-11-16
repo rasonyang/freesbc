@@ -530,13 +530,23 @@ func TestWebRTCSessionEndToEnd(t *testing.T) {
 		t.Error("a wrong fingerprint was accepted")
 	}
 
+	// Poll: Tx is recorded after the socket write returns, so a receiver can
+	// see the packet before the relay goroutine has counted it.
 	st := sess.Stats()
+	for end := time.Now().Add(2 * time.Second); time.Now().Before(end) && !webrtcCountersMoving(st); {
+		time.Sleep(10 * time.Millisecond)
+		st = sess.Stats()
+	}
 	if st.A.RTPPacketsRx == 0 || st.B.RTPPacketsTx == 0 {
 		t.Errorf("public→private counters not moving: %+v", st)
 	}
 	if st.B.RTPPacketsRx == 0 || st.A.RTPPacketsTx == 0 {
 		t.Errorf("private→public counters not moving: %+v", st)
 	}
+}
+
+func webrtcCountersMoving(st Stats) bool {
+	return st.A.RTPPacketsRx != 0 && st.B.RTPPacketsTx != 0 && st.B.RTPPacketsRx != 0 && st.A.RTPPacketsTx != 0
 }
 
 // TestWebRTCSessionCleanup proves Close releases every resource: both
