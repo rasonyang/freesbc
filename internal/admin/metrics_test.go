@@ -86,6 +86,7 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 			InviteRejects:          map[string]uint64{"early_cap": 1, "port_exhausted": 0, "session_cap": 3, "invite_rate": 0},
 			InviteFailures:         map[string]uint64{"carrier/outbound/4xx": 2, "switch/inbound/timeout": 0},
 			RegisterBindingRejects: map[string]uint64{"no_contact": 2, "no_auth": 0, "auth_aor_mismatch": 1},
+			CredentialMismatches:   map[string]uint64{"INVITE": 4, "MESSAGE": 0},
 			ActiveSessions:         4, ActiveSubscriptions: 7,
 		}
 	}
@@ -96,6 +97,8 @@ func TestMetricsCallEndAndRejectCounters(t *testing.T) {
 		`freesbc_edge_register_binding_rejected_total{reason="no_contact"} 2`,
 		`freesbc_edge_register_binding_rejected_total{reason="no_auth"} 0`,
 		`freesbc_edge_register_binding_rejected_total{reason="auth_aor_mismatch"} 1`,
+		`freesbc_edge_credential_mismatch_total{method="INVITE"} 4`,
+		`freesbc_edge_credential_mismatch_total{method="MESSAGE"} 0`,
 		`freesbc_edge_invite_rejects_total{reason="early_cap"} 1`,
 		`freesbc_edge_invite_rejects_total{reason="port_exhausted"} 0`,
 		`freesbc_edge_invite_rejects_total{reason="session_cap"} 3`,

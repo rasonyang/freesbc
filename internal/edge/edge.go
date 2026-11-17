@@ -165,6 +165,9 @@ type Server struct {
 	// dropSummary accumulates admission drops and struck malformed reads
 	// between two summary WARNs (admissionSummaryEvery).
 	dropSummary *dropSummary
+	// credWarn limits the WARN for refused call-path credentials
+	// (credentialcheck.go).
+	credWarn credWarner
 	// unroutable rate-limits the WARN for a response dropped because its
 	// top Via is not FreeSBC's (logUnroutable).
 	unroutable unroutableLog

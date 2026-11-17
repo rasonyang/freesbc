@@ -65,6 +65,10 @@ func (s *Server) onInvite(req *sip.Request, tx sip.ServerTransaction, in inbound
 			s.dropSilently(dropInviteNotAdmitted, req, src,
 				"to", req.Recipient.User)
 			return
+		} else if kind == srcClient && s.credentialMismatch(req, src) {
+			// Before admitEarly and beginDialog: no slot, token or port.
+			s.rejectInvite(newInviteFlow(req, legSwitch, true, ""), req, tx, 403, "Forbidden", rejectCredentialMismatch)
+			return
 		}
 	}
 	if inDialog {
@@ -118,6 +122,9 @@ const (
 	rejectInviteRate
 	// rejectDraining: the edge is in drain mode (503 + Retry-After).
 	rejectDraining
+	// rejectCredentialMismatch: a registered source presented a credential
+	// no binding at its source has proved (403; credentialcheck.go).
+	rejectCredentialMismatch
 	numInviteRejects
 )
 
@@ -137,6 +144,8 @@ var inviteRejectLabels = [numInviteRejects]string{
 	rejectSessionCap:     "session_cap",
 	rejectInviteRate:     "invite_rate",
 	rejectDraining:       "draining",
+
+	rejectCredentialMismatch: "credential_mismatch",
 }
 
 func (r inviteReject) String() string { return inviteRejectLabels[r] }

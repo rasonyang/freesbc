@@ -406,6 +406,10 @@ func (s *Server) onSubscribe(req *sip.Request, tx sip.ServerTransaction, in inbo
 		s.respond(req, tx, methodNotAllowed(req))
 		return
 	}
+	if s.credentialMismatch(req, in.src) {
+		s.reject(req, tx, 403, "Forbidden")
+		return
+	}
 	event := eventOf(req)
 	if event == "" {
 		s.reject(req, tx, 489, "Bad Event")

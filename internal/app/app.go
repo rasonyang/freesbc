@@ -334,6 +334,7 @@ func adminDeps(edgeSrv *edge.Server, version string, running *config.Config, sto
 				InviteRejects:          s.InviteRejects,
 				InviteFailures:         s.InviteFailures,
 				RegisterBindingRejects: s.RegisterBindingRejects,
+				CredentialMismatches:   s.CredentialMismatches,
 				AckMissed:              s.AckMissed,
 				ParseFailures:          s.ParseFailures,
 				UpgradeFailures:        s.UpgradeFailures,
