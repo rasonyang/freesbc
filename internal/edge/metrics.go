@@ -83,6 +83,11 @@ type Metrics struct {
 	// one counter per (fixed) reason (registerproof.go).
 	registerBindingRejects [numBindingRejects]atomic.Uint64
 
+	// credentialMismatches counts public INVITE, MESSAGE and SUBSCRIBE
+	// refused 403 for a credential no binding at the source proved, by
+	// method (credentialcheck.go).
+	credentialMismatches [numCredMethods]atomic.Uint64
+
 	// streamConns is the gauge of open stream connections per transport
 	// (streamTransports); streamRefused counts connections refused at
 	// accept, streamClosed connections closed by policy, both by (fixed)
@@ -219,6 +224,9 @@ func (m *Metrics) InviteRejected(r inviteReject) { m.inviteRejects[r].Add(1) }
 func (m *Metrics) InviteFailed(leg failLeg, dir int, class failClass) {
 	m.inviteFailures[leg][dir][class].Add(1)
 }
+
+// CredentialMismatch counts one request refused for an unproved credential.
+func (m *Metrics) CredentialMismatch(c credMethod) { m.credentialMismatches[c].Add(1) }
 
 // RegisterBindingRejected counts one 2xx REGISTER that recorded no binding.
 func (m *Metrics) RegisterBindingRejected(r bindingReject) { m.registerBindingRejects[r].Add(1) }
@@ -439,6 +447,10 @@ type Snapshot struct {
 	// reason is present, zero or not.
 	RegisterBindingRejects map[string]uint64
 
+	// CredentialMismatches is keyed by method (credMethodLabels); every
+	// method is present, zero or not.
+	CredentialMismatches map[string]uint64
+
 	// AckMissed is the 2xx ACKs that never came, keyed by the plane that
 	// owed them ("public", "private"); both are always present.
 	AckMissed map[string]uint64
@@ -491,6 +503,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		InviteRejects:               map[string]uint64{},
 		InviteFailures:              map[string]uint64{},
 		RegisterBindingRejects:      map[string]uint64{},
+		CredentialMismatches:        map[string]uint64{},
 		AckMissed:                   map[string]uint64{},
 		ParseFailures:               map[string]uint64{},
 		UpgradeFailures:             map[string]uint64{},
@@ -547,6 +560,9 @@ func (m *Metrics) Snapshot() Snapshot {
 	}
 	for r := range m.registerBindingRejects {
 		s.RegisterBindingRejects[bindingRejectLabels[r]] = m.registerBindingRejects[r].Load()
+	}
+	for c := range m.credentialMismatches {
+		s.CredentialMismatches[credMethodLabels[c]] = m.credentialMismatches[c].Load()
 	}
 	for i := range m.requestsIn {
 		method := metricOther

@@ -424,6 +424,11 @@ func (s *Server) recordBinding(res *sip.Response, in bindingInput) int {
 		Source:    in.source,
 		ExpiresAt: time.Now().Add(granted),
 	}
+	// Only a credential that passed credentialMatches proves a digest
+	// username; a refresh without one leaves the stored value (Put).
+	if s.credentialMatches(in) {
+		b.DigestUser = in.head.User
+	}
 	if _, err := s.loc.Put(b); err != nil {
 		// The table is full. The registration itself succeeded upstream,
 		// so the client is registered — FreeSBC just cannot deliver

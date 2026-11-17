@@ -46,6 +46,10 @@ func (s *Server) onMessage(req *sip.Request, tx sip.ServerTransaction, in inboun
 		s.respond(req, tx, methodNotAllowed(req))
 		return
 	}
+	if s.credentialMismatch(req, in.src) {
+		s.reject(req, tx, 403, "Forbidden")
+		return
+	}
 	if tooLargeMessage(req) {
 		s.reject(req, tx, 413, "Request Entity Too Large")
 		return

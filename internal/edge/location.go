@@ -43,6 +43,12 @@ type Binding struct {
 	// CallID and CSeq identify the registration flow, so a refresh
 	// replaces the right binding rather than creating a second one.
 	CallID string
+	// DigestUser is the digest username of the REGISTER credential that
+	// proved this binding (Server.credentialMatches), as sent. Under
+	// edge.allow_register_auth_mismatch it can differ from User. A refresh
+	// that carries no matching credential leaves it as it was (Put). The
+	// call-path credential check compares against it (HasDigestUser).
+	DigestUser string
 }
 
 // Expired reports whether the binding has lapsed as of now.
@@ -134,6 +140,11 @@ func (l *Location) Put(b Binding) (*Binding, error) {
 			// Refresh in place: the token must not change, or FreeSWITCH
 			// would be left holding a contact that no longer resolves.
 			b.Token = e.Token
+			// A refresh with no proving credential keeps the username a
+			// credential already proved.
+			if b.DigestUser == "" {
+				b.DigestUser = e.DigestUser
+			}
 			// The refresh may come from a new source (the phone's NAT
 			// mapping changed), so re-index under the new address.
 			l.unindexSourceLocked(e)
@@ -222,6 +233,27 @@ func (l *Location) HasSource(transport string, src netip.AddrPort) bool {
 	now := time.Now()
 	for _, b := range l.bySource[src] {
 		if strings.EqualFold(b.Transport, transport) && !b.Expired(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasDigestUser reports whether a live (unexpired) binding registered over
+// transport from exactly src was proved by the digest username user. The
+// comparison is credentialMatches's: case-insensitive, and an empty user
+// never matches. Unlike SourceBinding it has no fallback to another binding
+// of the source.
+func (l *Location) HasDigestUser(transport string, src netip.AddrPort, user string) bool {
+	if user == "" {
+		return false
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	now := time.Now()
+	for _, b := range l.bySource[src] {
+		if strings.EqualFold(b.Transport, transport) && !b.Expired(now) &&
+			b.DigestUser != "" && strings.EqualFold(b.DigestUser, user) {
 			return true
 		}
 	}

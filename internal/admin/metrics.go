@@ -65,6 +65,7 @@ type collector struct {
 	proxyRejects     *prometheus.Desc
 	proxyInviteFail  *prometheus.Desc
 	proxyBindRej     *prometheus.Desc
+	proxyCredMism    *prometheus.Desc
 	proxyParseFail   *prometheus.Desc
 	proxyUpgradeFail *prometheus.Desc
 	proxyStreams     *prometheus.Desc
@@ -146,6 +147,7 @@ func newCollector(deps Deps, audit *auditLog, health *healthTracker, tlsRec func
 		proxyStreamCls:   prometheus.NewDesc("freesbc_edge_stream_closed_total", "Stream connections closed by policy, by reason (idle, slow, oversize, malformed, handshake, rate).", []string{"reason"}, nil),
 		proxyRejects:     prometheus.NewDesc("freesbc_edge_invite_rejects_total", "Out-of-dialog INVITEs the edge answered with a final response itself, by reason.", []string{"reason"}, nil),
 		proxyInviteFail:  prometheus.NewDesc("freesbc_edge_invite_failures_total", "Out-of-dialog INVITEs that ended without a confirmed dialog, by far-end leg, direction and failure class (a caller's own CANCEL is not counted).", []string{"leg", "direction", "class"}, nil),
+		proxyCredMism:    prometheus.NewDesc("freesbc_edge_credential_mismatch_total", "Public INVITE, MESSAGE and SUBSCRIBE refused 403 because a credential named a username no binding at the source had proved, by method.", []string{"method"}, nil),
 		proxyBindRej:     prometheus.NewDesc("freesbc_edge_register_binding_rejected_total", "2xx REGISTER answers that recorded no binding because the request did not prove its Contact, credential or AoR, by reason.", []string{"reason"}, nil),
 		// carrier is a configured name or "unknown"; direction and method
 		// are bounded sets.
@@ -180,7 +182,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.proxyRegTotal, c.proxyRegFailure, c.proxyRegAuth, c.proxyRegUnans, c.proxyRegBrk, c.proxyReqIn, c.proxyResOut,
 		c.proxyRTPPktRx, c.proxyRTPPktTx, c.proxyRTPRejected, c.proxyRTPByteRx, c.proxyRTPByteTx,
 		c.proxyPortFail, c.proxyICEFail, c.proxyDTLSFail, c.proxyPanics,
-		c.proxyAdmission, c.proxyCallsEnded, c.proxyAckMissed, c.proxyRejects, c.proxyInviteFail, c.proxyBindRej, c.proxyParseFail, c.proxyUpgradeFail, c.proxyStreams, c.proxyStreamRef, c.proxyStreamCls, c.proxyCarrierReq, c.proxyCarrierReg,
+		c.proxyAdmission, c.proxyCallsEnded, c.proxyAckMissed, c.proxyRejects, c.proxyInviteFail, c.proxyBindRej, c.proxyCredMism, c.proxyParseFail, c.proxyUpgradeFail, c.proxyStreams, c.proxyStreamRef, c.proxyStreamCls, c.proxyCarrierReq, c.proxyCarrierReg,
 	} {
 		ch <- d
 	}
@@ -319,6 +321,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	for reason, v := range p.RegisterBindingRejects {
 		counter(c.proxyBindRej, float64(v), reason)
+	}
+	for method, v := range p.CredentialMismatches {
+		counter(c.proxyCredMism, float64(v), method)
 	}
 	for name, n := range p.CarrierRegistrations {
 		g(c.proxyCarrierReg, float64(n), name)

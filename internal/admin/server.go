@@ -209,6 +209,11 @@ type ProxyStats struct {
 	// binding, by reason (a fixed set, edge bindingRejectLabels).
 	RegisterBindingRejects map[string]uint64 `json:"register_binding_rejected_total"`
 
+	// CredentialMismatches counts public INVITE, MESSAGE and SUBSCRIBE
+	// refused for a credential no binding at the source proved, by method
+	// (a fixed set, edge credMethodLabels).
+	CredentialMismatches map[string]uint64 `json:"credential_mismatch_total"`
+
 	// AckMissed counts 2xx ACKs that never arrived, by the plane that owed
 	// them (public or private).
 	AckMissed map[string]uint64 `json:"ack_missed_total"`

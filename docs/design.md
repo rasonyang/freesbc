@@ -1901,6 +1901,7 @@ fixed and every label is exported from the start:
 | `timeout` | 408 | `giveUp`: the INVITE's own budget ran out |
 | `session_cap` | 503 + `Retry-After: 5` | `beginDialog`: `shield.max_sessions` calls already hold a slot (§7.1); sent by `rejectBusy`, which counts like `rejectInvite` |
 | `invite_rate` | 503 + `Retry-After` | `beginDialog`: `shield.invite_rate_limit` exhausted (§7.1) |
+| `credential_mismatch` | 403 | `onInvite`: a registration source's credential names a username no live binding at its transport and source has proved (§14.1); before any slot, token or port |
 
 Only the handler's own refusal counts. A silent admission drop stays in
 `freesbc_edge_admission_drops_total`; a response relayed from the far side is
@@ -3966,11 +3967,12 @@ permanent series per call."
 | `freesbc_edge_register_unanswered_total` | Counter | — | edge `Server.registerUnanswered` (`edge/register.go`): one per REGISTER attempt a switch node answered with nothing (a silent node or a transport error); no node label |
 | `freesbc_edge_register_breaker_rejects_total` | Counter | — | edge `RegisterBreakerRejected`: one per client REGISTER answered 503 + `Retry-After: 30` without dialing because every node's REGISTER breaker was open (§7.4) |
 | `freesbc_edge_register_binding_rejected_total` | Counter | `reason` ∈ {`no_contact`, `no_auth`, `auth_aor_mismatch`} | edge `Server.rejectBinding` (`registerproof.go`): one per 2xx REGISTER that recorded no binding because the request did not prove its Contact, credential or AoR (§7.4); every reason is always exported |
+| `freesbc_edge_credential_mismatch_total` | Counter | `method` ∈ {`INVITE`, `MESSAGE`, `SUBSCRIBE`} | edge `Server.credentialMismatch` (`credentialcheck.go`): one per public out-of-dialog request from a registration source refused 403 for a credential no binding at its source proved (§14.1); every method is always exported |
 | `freesbc_edge_register_auth_failures_total` | Counter | — | edge `registerStrike` (`regguard.go`): one per failed REGISTER credential attempt struck against its source (§7.4), replays counted in the read filter included. No `source` label: the sources are in `GET /api/shield/offenders` |
 | `freesbc_edge_admission_drops_total` | Counter | `reason` ∈ {`invite_not_admitted`, `register_enumeration`, `subscribe_not_admitted`, `message_not_admitted`, `dialogless_not_admitted`, `options_not_admitted`, `register_aor_locked`} | edge `Server.dropSilently` (`admission.go`): a public out-of-dialog INVITE refused by admission (§7.5), a REGISTER from a source over the enumeration limit (§7.4), an out-of-dialog SUBSCRIBE or MESSAGE from a source without a live registration (§7.8a), a BYE or INFO naming no dialog from a source that is neither a live registration nor a carrier (answered 481, §7.8a); every reason is always exported |
 | `freesbc_edge_calls_ended_total` | Counter | `reason` ∈ {`bye_caller`, `bye_callee`, `bye_unanswered`, `rtp_silence`, `dtls_failure`, `reinvite_refused`, `answer_timeout`, `answer_unusable`, `media_fault`, `shutdown`, `ack_timeout`} | edge `dialog.end` (`dialog.go`), one per confirmed call that ended, by the reason of the `end` that won (§7.7); every reason is always exported |
 | `freesbc_edge_ack_missed_total` | Counter | `plane` ∈ {`public`, `private`}: the side that failed to ACK a 2xx | edge `noteAckMiss` (`ack.go`), once per missed ACK (§7.7); both planes are always exported |
-| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`} | edge `Server.rejectInvite` (`invite.go`) / `Server.rejectBusy` (`invite.go`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
+| `freesbc_edge_invite_rejects_total` | Counter | `reason` ∈ {`early_cap`, `shutting_down`, `loop_detected`, `no_public_side`, `webrtc_disabled`, `no_target`, `too_many_hops`, `media_failed`, `port_exhausted`, `upstream_failed`, `timeout`, `session_cap`, `invite_rate`, `draining`, `credential_mismatch`} | edge `Server.rejectInvite` (`invite.go`) / `Server.rejectBusy` (`invite.go`), one per final response the edge itself sends to an out-of-dialog INVITE (§7.7); every reason is always exported |
 | `freesbc_edge_invite_failures_total` | Counter | `leg` ∈ {`carrier`, `client`, `switch`}, `direction` ∈ {`inbound`, `outbound`}, `class` ∈ {`4xx`, `5xx`, `6xx`, `timeout`} | edge `Server.inviteFailed` (`invitefail.go`), one per out-of-dialog INVITE that ended without a confirmed dialog and not by the caller's own CANCEL (§7.7); all 24 combinations are always exported |
 | `freesbc_hep_packets_sent_total` | Counter | — | `hep.Stats.Sent` through `Deps.HEP` (`hepStats`, `app.go`): SIP messages written to the collector. Exported only when `hep:` is set |
 | `freesbc_hep_packets_dropped_total` | Counter | — | `hep.Stats.Dropped`: copies refused because the send queue was full or closed, and queued ones given up at shutdown |
@@ -4413,6 +4415,36 @@ subscription is answered 481 and never reaches the switch, so a made-up
 To-tag cannot carry it past admission (in `Server.onInDialog`, `indialog.go`). Subscription
 records are bounded per registration and in all (§15.1) and a SUBSCRIBE over
 either bound gets 503, which is not a drop.
+
+**Call-path credential check** (`credentialMismatch`, `credentialcheck.go`).
+A binding exists only after a 2xx to a REGISTER proved by a digest username
+(`bindingProof`, §7.4), so a source admitted as a registration is an account
+holder; without a check it could guess other accounts' passwords through the
+switch's challenge of INVITE, MESSAGE or SUBSCRIBE, which nothing counts. For
+an out-of-dialog INVITE (`onInvite`, after `admitPublicInvite` returns
+`srcClient`), MESSAGE or SUBSCRIBE (after `admitPublicOutOfDialog` admits the
+source as a registration; a source that is also a carrier counts as the
+registration), every `Authorization` and `Proxy-Authorization` username
+(`fsip.DigestIdentity`) must be the digest username of a live binding at that
+exact transport and IP:port (`Location.HasDigestUser`, which compares
+`Binding.DigestUser` as `credentialMatches` does and, unlike `SourceBinding`,
+never falls back to another binding). An unparsable or empty username fails
+too. Otherwise the edge answers 403 itself and forwards nothing. The INVITE
+refusal runs before `admitEarly` and `beginDialog`, so it takes no session
+slot, `invite_rate_limit` token or media port, and goes through `rejectInvite`
+(`credential_mismatch`). `Binding.DigestUser` is set from the REGISTER's
+digest username when `credentialMatches` held (under
+`edge.allow_register_auth_mismatch` it is the digest username, not the To
+user) and kept by `Location.Put` across a refresh that proved nothing by
+credential. A request with no credential, a carrier-only source and any
+in-dialog request are not checked. It is a refusal and not a strike on
+purpose: a binding for another account needs a 2xx to a REGISTER with that
+account's credential, which `register_ban_aor` already bounds; nobody is
+banned, so a shared NAT pays nothing; and a forged UDP datagram naming a
+victim's socket can only be refused, never strike or ban the victim. Each
+refusal counts in `freesbc_edge_credential_mismatch_total{method}` and logs at
+Debug (method, transport, source, the offending username; never a nonce or
+response), with one WARN a minute (`credWarner`).
 
 **Carrier transports** (`carrierconn.go`, `carrierFor`). A carrier's resolved
 address is a carrier source only on that carrier's own transport, so a tls
