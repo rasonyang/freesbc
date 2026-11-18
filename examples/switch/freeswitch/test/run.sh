@@ -18,13 +18,13 @@
 # has gateways through both nodes, the phone moves from A to B, A is restarted and stopped,
 # then drained.
 #
-# Env: IMG (default safarov/freeswitch:latest), WORK (default ~/.cache/freesbc-freeswitch-test,
+# Env: IMG (default safarov/freeswitch:1.10.12, the version the README verifies), WORK (default ~/.cache/freesbc-freeswitch-test,
 # must be under a path docker can bind-mount), KEEP=1 to leave the containers running.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 EX=$(dirname "$HERE")
 REPO=$(cd "$EX/../../.." && pwd)
-IMG=${IMG:-safarov/freeswitch:latest}
+IMG=${IMG:-safarov/freeswitch:1.10.12}
 STOCK=/usr/share/freeswitch/conf/vanilla   # stock config inside the image
 WORK=${WORK:-$HOME/.cache/freesbc-freeswitch-test}
 P=fs108   # name prefix for networks and containers
@@ -93,6 +93,11 @@ done
   cp "$EX"/sip_profiles/external/*.xml sip_profiles/external/
   cp "$EX/dialplan/carrier-in.xml" dialplan/
   cp "$EX/dialplan/default/00_freesbc_outbound.xml" dialplan/default/
+  mkdir -p dialplan/default-early
+  cp "$EX/dialplan/default-early/"*.xml dialplan/default-early/
+  # one line in the stock default context, before everything else (README, Install)
+  awk '{print} /^  <context name="default">/ {print "    <X-PRE-PROCESS cmd=\"include\" data=\"default-early/*.xml\"/>"}' dialplan/default.xml > dialplan/default.xml.new &&
+    mv dialplan/default.xml.new dialplan/default.xml
   rm -f sip_profiles/*-ipv6.xml dialplan/default/01_example.com.xml
   include_last vars.xml freesbc-vars.xml
   # test only (sorts before 00_freesbc_outbound): a number whose first carrier (b) refuses
@@ -157,6 +162,7 @@ phone_profile() { # extra gateway XML (part 5 adds one through node B)
 <param name="realm" value="203.0.113.7"/><param name="proxy" value="203.0.113.7:5060"/><param name="register" value="true"/>
 <param name="expire-seconds" value="3600"/><param name="extension" value="1000"/></gateway>
 $1
+<X-PRE-PROCESS cmd="include" data="phone/*.xml"/>
 </gateways><domains><domain name="all" alias="false" parse="true"/></domains>
 <settings>
 <param name="sip-ip" value="203.0.113.50"/><param name="rtp-ip" value="203.0.113.50"/>
@@ -166,6 +172,7 @@ $1
 </settings></profile>
 Y
 }
+mkdir -p cli/sip_profiles/phone; echo '<include/>' > cli/sip_profiles/phone/empty.xml
 phone_profile ""
 cat > cli/dialplan/public.xml <<'Y'
 <include>
@@ -331,6 +338,63 @@ r=$(sip $P-sbc REGISTER 10.77.0.2 10.77.0.10:5060)
 check "5060 REGISTER without credentials from private.ip is challenged [$r]" bash -c "echo '$r' | grep -q ' 401 '"
 r=$(fsx phone 'originate {ignore_early_media=true}sofia/gateway/fsbc/999999999999 &echo' 2>&1)
 check "a destination outside the outbound allowlist is refused [$r]" bash -c "! echo '$r' | grep -q '^+OK'"
+
+# --- 3b. per-user concurrent-call limit (dialplan/default-early/00_freesbc_user_limit.xml, N=3)
+echo; echo "== per-user limit (limit hash user <sip_auth_username> 3 !USER_BUSY) =="
+# Two more phone identities, added for this part only (part 5 counts the Contacts of 1000):
+# user 1001 (registers through FreeSBC) and "spoof": the digest of 1000 with another From user.
+cat > cli/sip_profiles/phone/zz-limit.xml <<'Y'
+<include>
+<gateway name="fsbc2"><param name="username" value="1001"/><param name="password" value="CHANGE-ME-NOW"/>
+<param name="realm" value="203.0.113.7"/><param name="proxy" value="203.0.113.7:5060"/><param name="register" value="true"/>
+<param name="expire-seconds" value="3600"/><param name="extension" value="1001"/></gateway>
+<gateway name="spoof"><param name="username" value="1000"/><param name="password" value="CHANGE-ME-NOW"/>
+<param name="realm" value="203.0.113.7"/><param name="proxy" value="203.0.113.7:5060"/><param name="register" value="false"/>
+<param name="caller-id-in-from" value="true"/></gateway>
+</include>
+Y
+fsx phone 'sofia profile phone rescan' >/dev/null
+WAIT=60 wait_for gw_up phone fsbc2
+echo_has() { echo "$1" | grep -q "$2"; }
+usage() { fsx switch "limit_usage hash user $1" | tr -d '\r\n '; }
+usage_is() { [ "$(usage "$1")" = "$2" ]; }
+lcall() { # uuid, gateway, destination: a call that stays up (answered by the switch or the phone)
+  fsx phone "bgapi originate {origination_uuid=$1,ignore_early_media=true}sofia/gateway/$2/$3 &playback(tone_stream://%(120000,0,440))" >/dev/null
+}
+refused() { # gateway, destination, extra originate variables -> the originate result
+  fsx phone "originate {ignore_early_media=true${3:-}}sofia/gateway/$1/$2 &echo" 2>&1
+}
+for i in 1 2 3; do lcall l$i fsbc 9196; done
+WAIT=90 wait_for usage_is 1000 3
+check "user 1000: three concurrent calls to 9196 are up; limit_usage hash user 1000 = 3 (key is the digest username) [$(usage 1000)]" usage_is 1000 3
+r=$(refused fsbc 9196)
+check "  ... the fourth is refused USER_BUSY [$r]" echo_has "$r" USER_BUSY
+check "  ... as a 486 from the switch" has phone '^SIP/2.0 486'
+check "  ... and no fourth slot was taken (usage still 3)" usage_is 1000 3
+r=$(refused fsbc2 9196)
+check "another user (1001) is still admitted while 1000 is at the limit [$r]" echo_has "$r" '+OK'
+check "  ... and counted under its own key (limit_usage hash user 1001 = 1)" usage_is 1001 1
+r=$(refused spoof 9196 ',origination_caller_id_number=1005')
+check "digest 1000 with From user 1005: still refused USER_BUSY, From is not the key [$r]" echo_has "$r" USER_BUSY
+check "  ... the INVITE carried From user 1005" has phone 'From: .*<sip:1005@'
+check "  ... and nothing was counted under 1005" usage_is 1005 0
+fsx phone 'hupall' >/dev/null
+WAIT=60 wait_for usage_is 1000 0
+check "slots are released when the calls hang up (usage 1000 = 0, 1001 = 0)" bash -c "[ '$(usage 1000)' = 0 ] && [ '$(usage 1001)' = 0 ]"
+# user-to-user: 1001 calls 1000 (Local_Extension of the stock default context); the count is the caller's
+for i in 1 2 3; do lcall u$i fsbc2 1000; done
+WAIT=90 wait_for usage_is 1001 3
+check "user-to-user: three calls 1001 -> 1000 are up; they count against the caller (limit_usage hash user 1001 = 3) [$(usage 1001)]" usage_is 1001 3
+check "  ... they were routed by Local_Extension" has switch 'Regex \(PASS\) \[Local_Extension\]'
+r=$(refused fsbc2 1000)
+check "  ... the fourth user-to-user call is refused USER_BUSY before any bridge [$r]" echo_has "$r" USER_BUSY
+check "  ... the callee 1000 is not counted (usage 0)" usage_is 1000 0
+fsx phone 'hupall' >/dev/null; fsx switch 'hupall' >/dev/null
+WAIT=60 wait_for usage_is 1001 0
+fsx phone 'sofia profile phone killgw fsbc2' >/dev/null; fsx phone 'sofia profile phone killgw spoof' >/dev/null
+rm -f cli/sip_profiles/phone/zz-limit.xml
+fsx switch 'sofia profile internal flush_inbound_reg 1001@203.0.113.7' >/dev/null
+WAIT=30 wait_for bash -c "[ \"\$(docker exec $P-switch fs_cli -x 'sofia status profile internal reg' | grep -c '^Contact:')\" = 1 ]"
 
 # --- 5. two nodes: restart, stop and drain node A -------------------------
 # Everything above ran through node A. Now the switch has gateways through both nodes

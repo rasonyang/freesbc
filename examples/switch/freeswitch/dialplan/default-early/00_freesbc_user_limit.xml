@@ -1,0 +1,21 @@
+<include>
+  <!-- Per-user concurrent-call limit for every call an authenticated user originates:
+       to another user, to a carrier, to a feature code, and while it still rings.
+       Included at the top of the stock "default" context (README, Install), before
+       Local_Extension and every other extension, so no route skips it.
+
+       The key is ${sip_auth_username}: the digest username the switch verified on this
+       INVITE (auth-calls=true). Do not use ${sip_from_user} or ${caller_id_number}
+       (the caller chooses them) or ${username} / ${accountcode}, which this setup does
+       not reliably set. A call over the limit is refused 486 (USER_BUSY) before any
+       bridge, so no leg and no FreeSBC media port is taken. The channel releases its
+       slot when it hangs up.
+
+       Only the "default" context (user_context of authenticated users) includes this
+       file. Carrier calls (carrier-in) and the carrier gateways are not counted. -->
+  <extension name="freesbc-user-limit" continue="true">
+    <condition field="${sip_auth_username}" expression="^(.+)$">
+      <action application="limit" data="hash user $1 3 !USER_BUSY"/>
+    </condition>
+  </extension>
+</include>
