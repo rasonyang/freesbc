@@ -35,6 +35,7 @@ Paths are relative to the FreeSWITCH conf directory (`/etc/freeswitch`, `/usr/lo
 | `sip_profiles/external/carrier-b-n1.xml`, `carrier-b-n2.xml` | IP-authenticated carrier line `carrier-b` (failover), one gateway per node. |
 | `dialplan/carrier-in.xml` | Context for inbound carrier calls. |
 | `dialplan/default/00_freesbc_outbound.xml` | Outbound routing with failover across carriers and nodes, for authenticated users. |
+| `dialplan/default-early/00_freesbc_user_limit.xml` | Per-user concurrent-call limit (3), applied to every call an authenticated user originates. Included at the top of the stock `default` context. |
 
 ### Install
 
@@ -48,6 +49,15 @@ cp sip_profiles/internal.xml sip_profiles/external.xml  $FS_CONF/sip_profiles/
 cp sip_profiles/external/*.xml               $FS_CONF/sip_profiles/external/
 cp dialplan/carrier-in.xml                   $FS_CONF/dialplan/
 cp dialplan/default/00_freesbc_outbound.xml  $FS_CONF/dialplan/default/
+mkdir -p $FS_CONF/dialplan/default-early
+cp dialplan/default-early/*.xml              $FS_CONF/dialplan/default-early/
+
+# The per-user limit must run before Local_Extension and every other extension, and the
+# stock default.xml includes default/*.xml only after them: add one include as the first
+# line of the "default" context.
+grep -q 'default-early' $FS_CONF/dialplan/default.xml ||
+  sed -i 's#^  <context name="default">#&\n    <X-PRE-PROCESS cmd="include" data="default-early/*.xml"/>#' $FS_CONF/dialplan/default.xml
+grep -c 'default-early' $FS_CONF/dialplan/default.xml   # must print 1, else add the line by hand
 
 # Stock files to remove: IPv6 profiles listen on the same ports with the stock ACLs;
 # 01_example.com.xml routes 7/10/11-digit numbers to a stock "default_gateway".
@@ -198,16 +208,24 @@ Not exercised: `leg_timeout`/`originate_timeout` variants, a gateway ping answer
 
 ## Policy FreeSBC deliberately does not do
 
-FreeSBC only does what the edge alone can do ([scope rule](../../../docs/edge.md#scope-rule)). These stay on the switch. The `limit` on a gateway key, `sched_hangup` and the CDR below were run against the same setup; the per-user `limit` uses the same syntax and was not run.
+FreeSBC only does what the edge alone can do ([scope rule](../../../docs/edge.md#scope-rule)). These stay on the switch. The per-user `limit` below ships in `dialplan/default-early/` and `test/run.sh` checks it; the `limit` on a gateway key, `sched_hangup` and the CDR were run by hand against the same setup.
 
-**Per-carrier and per-user concurrent-call limits**, in the dialplan before the bridge (`mod_hash` is loaded in the stock config):
+**Per-user concurrent-call limit** (`dialplan/default-early/00_freesbc_user_limit.xml`, `mod_hash` is loaded in the stock config). One credential can be registered from several addresses, and every call it places anchors media on the edge, so bound it here:
 
 ```xml
-<action application="limit" data="hash outbound carrier-a 30 !NORMAL_CIRCUIT_CONGESTION"/>
-<action application="limit" data="hash user ${accountcode} 3 !USER_BUSY"/>
+<extension name="freesbc-user-limit" continue="true">
+  <condition field="${sip_auth_username}" expression="^(.+)$">
+    <action application="limit" data="hash user $1 3 !USER_BUSY"/>
+  </condition>
+</extension>
 ```
 
-With a limit of 1, a second concurrent call is refused (`limit_usage hash outbound carrier-a` shows 1; the second gets `NORMAL_CIRCUIT_CONGESTION`, recorded in the CDR).
+- **It sits at the top of the `default` context**, ahead of `Local_Extension`, so a call to another user, to a carrier, to a feature code and a call that is still ringing all pass it before any bridge. A file in `dialplan/default/` would be too late: the stock `default.xml` includes that directory after `Local_Extension`, and a user-to-user call would skip it. Carrier calls (`carrier-in`) and the carrier trunks do not pass it and are not counted.
+- **The key is `${sip_auth_username}`**, the digest username the switch verified on the INVITE. `${sip_from_user}` and `${caller_id_number}` are chosen by the caller; `${username}` was `0000000000` and `${accountcode}` is set only by the stock directory users, nothing in this example sets it.
+- **Over the limit** the call is refused `486 Busy Here` (`USER_BUSY`), which does not invite retries, before a leg or an edge media port exists. The slot is released when the channel hangs up.
+- **Per-carrier limit**, in the outbound extension before the bridge: `<action application="limit" data="hash outbound carrier-a 30 !NORMAL_CIRCUIT_CONGESTION"/>`. With a limit of 1, a second concurrent call is refused (`limit_usage hash outbound carrier-a` shows 1; the second gets `NORMAL_CIRCUIT_CONGESTION`, recorded in the CDR). Run by hand, not by `run.sh`.
+
+`test/run.sh` checks, with the limit at 3: user 1000's three concurrent calls to `9196` are up and `limit_usage hash user 1000` is 3; the fourth is refused `USER_BUSY` (a `486`) and takes no slot; user 1001 is still admitted and counted under its own key; the digest of 1000 with `From` user 1005 is still refused and nothing is counted under 1005; the slots are released on hangup; three calls 1001 to 1000 (routed by `Local_Extension`) count against the caller 1001, the fourth is refused and the callee is not counted.
 
 **Whole-switch limits** in `autoload_configs/switch.conf.xml` (stock: 1000 and 30): `<param name="max-sessions" value="1000"/>` and `<param name="sessions-per-second" value="30"/>`. Keep FreeSBC's `shield.max_sessions` below the real media capacity, as `docs/edge.md` advises.
 
@@ -230,7 +248,7 @@ With a limit of 1, a second concurrent call is refused (`limit_usage hash outbou
 
 ## Verified with
 
-2026-10-15 (single node: 2026-10-09), end to end in Docker by [`test/run.sh`](test/run.sh) (builds FreeSBC, derives the switch, phone and carrier configs from the image's stock config plus the files in this directory, prints `PASS`/`FAIL`, removes everything; `KEEP=1` keeps the containers) on two networks (private `10.77.0.0/24`, public `203.0.113.0/24`): two FreeSBC nodes (linux/arm64 build, one shared `freesbc.yaml` with `${PUBLIC_IP}` and `${PRIVATE_IP}`): node A `10.77.0.2` / `203.0.113.7` and node B `10.77.0.3` / `203.0.113.8`; FreeSWITCH `1.10.12-release-10222002881-a88d069d6f` (image `safarov/freeswitch:latest`, linux/amd64 under emulation, stock `vanilla` config plus the files in this directory) at `10.77.0.10`; a second FreeSWITCH as the phone (registering user `1000` through FreeSBC with a gateway) and a third as the carrier (a registrar for `acct-a` and `acct-a2` on `203.0.113.60:5060`, a profile that answers `503` on `:5061`).
+2026-11-18 (single node: 2026-10-09; two-node checks first run 2026-10-15), end to end in Docker by [`test/run.sh`](test/run.sh) (builds FreeSBC, derives the switch, phone and carrier configs from the image's stock config plus the files in this directory, prints `PASS`/`FAIL`, removes everything; `KEEP=1` keeps the containers) on two networks (private `10.77.0.0/24`, public `203.0.113.0/24`): two FreeSBC nodes (linux/arm64 build, one shared `freesbc.yaml` with `${PUBLIC_IP}` and `${PRIVATE_IP}`): node A `10.77.0.2` / `203.0.113.7` and node B `10.77.0.3` / `203.0.113.8`; FreeSWITCH `1.10.12-release-10222002881-a88d069d6f` (image `safarov/freeswitch:1.10.12`, the `run.sh` default; `latest` is now 1.11.3 and not verified; linux/amd64 under emulation, stock `vanilla` config plus the files in this directory) at `10.77.0.10`; a second FreeSWITCH as the phone (registering user `1000` through FreeSBC with a gateway) and a third as the carrier (a registrar for `acct-a` and `acct-a2` on `203.0.113.60:5060`, a profile that answers `503` on `:5061`).
 
 - A client registered through FreeSBC with digest (`registration accepted aor=1000@203.0.113.7`) and called `9196` (echo): `407`, authenticated retry, answered, and the RTP counters on FreeSBC moved symmetrically; a call placed from the switch with `originate user/1000@203.0.113.7` reached the phone, and the stored Contact kept its `fsbc=` parameter.
 - The carrier gateway REGISTERed through FreeSBC to the carrier (`carrier registration carrier=carrier-a expires=300`, gateway `carrier-a-n1` `REGED`); an outbound call (`15551230001`) reached the carrier with `Via` and `Contact` showing `203.0.113.7`; failover `carrier-b` (503) then `carrier-a` worked.
@@ -242,4 +260,4 @@ Not verified: a pool of several switches; TLS/WebSocket/WebRTC clients and SDES 
 
 The two-node checks, all run by `test/run.sh`: node A restarted (stale Contact, `404`), node A stopped (the next inbound carrier call, the next agent-to-switch call and the next switch-to-agent call complete through B; the phone re-registers through B by a second gateway), media timeout of a call that lost its node, node A drained (carrier calls to A refused with `503` and bridged on through B, an agent on A still receives and places calls), gateway ping with `503` and recovery. See [Two FreeSBC nodes](#two-freesbc-nodes) for the observations.
 
-`test/run.sh` repeats the checks above except the non-INVITE answers on 5080, the `limit`, `sched_hangup` and CDR runs, which were manual.
+`test/run.sh` repeats the checks above except the non-INVITE answers on 5080, and adds the per-user `limit` check (see Policy FreeSBC deliberately does not do). The per-carrier `limit`, `sched_hangup` and CDR runs were manual.
