@@ -1,0 +1,165 @@
+# Prometheus alert rules for a FreeSBC /metrics scrape whose job is named
+# "freesbc" (the FreeSBCDown and FreeSBCScrapeAbsent rules select on that job
+# name; rename it in your scrape config and in these two exprs together).
+# Load with rule_files in prometheus.yml. Thresholds are starting points:
+# tune them to the deployment. docs/config.md, section "Alerting", explains
+# the choices and the series that are still missing.
+groups:
+  - name: freesbc
+    rules:
+      - alert: FreeSBCDown
+        expr: 'up{job="freesbc"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: FreeSBC is down or cannot be scraped
+          description: >-
+            The freesbc job has not been scraped for 2 minutes; check the
+            process and admin.listen (docs/config.md#admin).
+
+      - alert: FreeSBCScrapeAbsent
+        expr: 'absent(up{job="freesbc"})'
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No FreeSBC target is scraped at all
+          description: >-
+            The freesbc job has no target in the scrape config (a target
+            removed from the config produces no up series, so FreeSBCDown
+            cannot see it); check the Prometheus configuration.
+
+      - alert: FreeSBCHealthDegraded
+        expr: freesbc_admin_health_status >= 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: FreeSBC reports a degraded health condition
+          description: >-
+            The health gauge is 1 (degraded); GET /api/health names the
+            active conditions (docs/design.md#136-health-conditions). Some
+            of them overlap rules in this file and fire twice —
+            shield_ban_cap, config_reload_failed, tls_cert_expiry and
+            tls_cert_renewed — and config_restart_required has no dedicated
+            rule. The catch-all exists for the rest: a single cooling
+            switch node, a carrier DNS failure.
+
+      - alert: FreeSBCHealthCritical
+        expr: freesbc_admin_health_status >= 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: FreeSBC reports a critical health condition
+          description: >-
+            The health gauge is 2 (critical): every switch node cooling,
+            a carrier DNS failure with no address left, the RTP port pool
+            exhausted, an expired TLS certificate, or remote plain-HTTP
+            admin. GET /api/health names the active conditions
+            (docs/design.md#136-health-conditions).
+
+      - alert: FreeSBCAckTimeout
+        expr: 'increase(freesbc_edge_calls_ended_total{reason="ack_timeout"}[15m]) > 0'
+        labels:
+          severity: warning
+        annotations:
+          summary: A call ended because its ACK never arrived
+          description: >-
+            Usually a missing NAT forward or a SIP ALG eating in-dialog
+            requests (docs/troubleshooting.md#lost-ack-reasonack_timeout).
+
+      - alert: FreeSBCRTPSilence
+        expr: 'increase(freesbc_edge_calls_ended_total{reason="rtp_silence"}[15m]) > 0'
+        labels:
+          severity: warning
+        annotations:
+          summary: A call ended for RTP silence
+          description: >-
+            One side sent no genuine RTP or RTCP for 5 minutes: one-way or
+            dead media (docs/troubleshooting.md#rtp-silence-reasonrtp_silence).
+
+      - alert: FreeSBCCarrierInviteFailure
+        expr: 'increase(freesbc_edge_invite_failures_total{leg="carrier",class=~"5xx|timeout"}[15m]) > 0'
+        labels:
+          severity: warning
+        annotations:
+          summary: An outbound call to a carrier failed
+          description: >-
+            The carrier answered 5xx or nothing at all; the alert cannot
+            name the carrier (the counter has no carrier label) — the
+            `invite failed` log line carries it
+            (docs/troubleshooting.md#a-call-never-connects).
+
+      - alert: FreeSBCMediaRejected
+        expr: sum by (instance, plane) (rate(freesbc_rtp_packets_rejected_total[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The media latch is refusing packets
+          description: >-
+            Packets arrive from a source the latch refuses; a SIP ALG, a wrong
+            SDP port or a stray sender. Grouped by instance so the alert
+            names the node (docs/troubleshooting.md#rtp-silence-reasonrtp_silence,
+            docs/two-node.md).
+
+      - alert: FreeSBCUDPDrops
+        expr: rate(freesbc_udp_socket_drops_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: The kernel is dropping SIP datagrams
+          description: >-
+            Linux only, per socket (public, private, shared); usually a full
+            receive buffer, so check net.core.rmem_max
+            (docs/troubleshooting.md#sip-datagrams-lost-under-bursts,
+            docs/edge.md#udp-socket-buffers).
+
+      - alert: FreeSBCBanTableFull
+        expr: freesbc_shield_bans > 0.8 * 65536 or increase(freesbc_shield_ban_adds_rejected_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: A shield ban table is near or at its cap
+          description: >-
+            Each ban table holds at most 65536 entries and refuses new bans
+            when full; check the attack and the shield keys
+            (docs/config.md#shield).
+
+      - alert: FreeSBCConfigReloadFailed
+        expr: freesbc_config_reload_failed == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: The last config reload failed
+          description: >-
+            The file on disk was rejected and the previous config is still
+            active (docs/config.md#reload-classes).
+
+      - alert: FreeSBCCertExpiry
+        expr: freesbc_tls_cert_expiry_timestamp_seconds - time() < 14 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: The TLS certificate expires within 14 days
+          description: >-
+            The loaded tls leaf is near not-after; renew it and restart to
+            serve the renewal. The series is absent when no tls pair is
+            loaded (docs/config.md#tls).
+
+      - alert: FreeSBCCertRenewalPending
+        expr: freesbc_tls_cert_disk_differs == 1
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: A renewed TLS certificate waits for a restart
+          description: >-
+            The tls cert file on disk holds a different leaf than the one
+            being served; restart (drain first) to apply it
+            (docs/config.md#tls).

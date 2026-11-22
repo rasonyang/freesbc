@@ -1,4 +1,6 @@
-// Package doccheck keeps the code citations in the Markdown docs valid.
+// Package doccheck keeps the code citations in the Markdown docs valid,
+// and the Prometheus example rules in step with the exported metrics
+// (TestAlertRulesMetricNames).
 //
 // The docs cite code by symbol and file, never by line number, because line
 // numbers rot with every edit. This package has no non-test code; it is a

@@ -99,6 +99,7 @@ Endpoints, drain mode, health conditions, the audit log and pprof: [`docs/config
 - [`docs/troubleshooting.md`](docs/troubleshooting.md): calls that connect and then drop (`call ended` reasons, lost ACK, RTP silence, session timers)
 - [`docs/design.md`](docs/design.md): the design document, what the code does as implemented
 - [`examples/switch/`](examples/switch/README.md): verified FreeSWITCH and Asterisk configurations for the reference topology
+- [`examples/prometheus/alerts.yml`](examples/prometheus/alerts.yml): Prometheus alert rules for the `/metrics` scrape (see [`docs/config.md`](docs/config.md#alerting))
 - [`freesbc.example.yaml`](freesbc.example.yaml): annotated example
 
 ## Not in scope

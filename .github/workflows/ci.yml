@@ -64,6 +64,17 @@ jobs:
       - name: check example config
         run: ./freesbc check -c freesbc.example.yaml
 
+  # promtool covers the PromQL syntax internal/doccheck cannot parse (it
+  # checks only metric names, labels and reason values).
+  promtool:
+    name: promtool check rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: promtool check rules
+        run: docker run --rm -v "$PWD:/src" -w /src --entrypoint promtool prom/prometheus:v3.5.0 check rules examples/prometheus/alerts.yml
+
   test:
     name: go test -race
     runs-on: ubuntu-latest
