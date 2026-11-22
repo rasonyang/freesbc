@@ -2,13 +2,13 @@
 
 Minimal, copy-pasteable Asterisk configuration for the FreeSBC reference topology. [`docs/edge.md`](../../../docs/edge.md) ("Switch-side requirements") stays the normative list; these files illustrate it.
 
-**Verified with** (2026-10-15): Asterisk 22.10.1 (`andrius/asterisk:latest`, aarch64, stock modules) behind two FreeSBC nodes at commit `694bff1` (linux/arm64 build), in Docker, by [`test/run.sh`](test/run.sh). Passed end to end:
+**Verified with** (2026-11-23): Asterisk 22.10.1 (`andrius/asterisk:latest`, aarch64, stock modules) behind two FreeSBC nodes at commit `5451871` (linux/arm64 build), in Docker, by [`test/run.sh`](test/run.sh). Passed end to end:
 
 - a client registers with digest through FreeSBC; its stored Contact keeps `;fsbc=<token>`; it calls `600` (Echo) and RTP flows both ways through the anchor; the switch calls the registered client;
 - a carrier `REGISTER` (digest, `outbound_proxy`) succeeds; an outbound call to a carrier that digest-challenges the INVITE; `Dial` failover from `carrier-a` to `mobile` after a 503;
 - inbound carrier calls identified by `X-FreeSBC-Carrier`, with the header visible in the dialplan (`PJSIP_HEADER(read,...)`), also by registration line (`line=yes`, a manual one-off run, not part of `test/run.sh`);
 - a request to port 5080 from a LAN address other than `private.ip` is rejected by the endpoint `acl` (the switch answers a generic 401); an INVITE without credentials on 5060 is challenged; a client that sends `X-FreeSBC-Carrier` on the public side never reaches the switch with it (FreeSBC strips it);
-- the per-user `GROUP_COUNT()` limit (third concurrent call gets `Busy()`);
+- the per-user `GROUP_COUNT()` limit, keyed on the authenticated endpoint (a fourth concurrent call gets `Busy()`, also when its From user differs from the authenticated user; a user-to-user call counts; another user is unaffected);
 - two FreeSBC nodes (see "Two FreeSBC nodes"): carrier calls and registrations through both nodes, both `private.ip` accepted by the `acl` and the `identify`; a drained node (`POST /api/drain`) answers carrier INVITEs 503 and `Dial` moves to the other node, while an agent attached to it still gets and makes calls; after a crash (`SIGKILL`) of a node the next carrier call in each direction and the next agent call (re-registered through the other node) complete through the survivor; `max_contacts=1` + `remove_existing=yes` replaces a stale Contact; `rtp_timeout` tears down the channels whose node died; qualify on carrier contacts, and the effect of OPTIONS `503` and `404` on it (below).
 
 **Not verified:** TCP/TLS/WS/WSS clients and carriers, WebRTC clients, SDES-SRTP, a switch pool, SUBSCRIBE/MWI/BLF, REFER, MESSAGE, PRACK/UPDATE against a peer that needs them, `qualify_frequency` on client contacts other than the stale-Contact case, the `Dial` `L()` / `TIMEOUT(absolute)` timers actually firing (the options are accepted; the 1 h limit was not waited out), DNS-named carriers (the test substitutes IP addresses for the two `edge.carriers` entries), `opus` (accepted in `allow=`, not exercised on a call), other Asterisk versions (the option names below are for Asterisk 20+).
@@ -20,7 +20,7 @@ The test uses other subnets (10.78.0.0/24 and 198.18.0.0/24) so it does not coll
 | File | Install as | Content |
 |---|---|---|
 | [`pjsip.conf`](pjsip.conf) | `/etc/asterisk/pjsip.conf` | two UDP transports, client endpoints, two carriers (one registered, one by DID), each with an endpoint per FreeSBC node |
-| [`extensions.conf`](extensions.conf) | `/etc/asterisk/extensions.conf` | client, outbound (failover between carriers and between FreeSBC nodes, limits) and carrier contexts |
+| [`extensions.conf`](extensions.conf) | `/etc/asterisk/extensions.conf` | client, per-user limit, outbound (failover between carriers and between FreeSBC nodes, limits) and carrier contexts |
 | [`acl.conf`](acl.conf) | `/etc/asterisk/acl.conf` | `freesbc-only`: the carrier endpoints accept only the `private.ip` of each FreeSBC node |
 
 ## Reference topology
@@ -126,9 +126,12 @@ What `test/run.sh` showed (Asterisk 22.10.1):
 All of these are the switch's job (they pass neither of the two questions of the [scope rule](../../../docs/edge.md#scope-rule)). `extensions.conf` carries working examples.
 
 ```asterisk
-; per-user and per-carrier concurrency
-exten => s,1,Set(GROUP(user)=${CALLERID(num)})
- same => n,GotoIf($[${GROUP_COUNT(${CALLERID(num)}@user)} > 2]?busy)
+; per-user concurrency, keyed on the endpoint Asterisk authenticated
+; (CHANNEL(endpoint), not the caller-chosen From user), run at the head of
+; every [from-clients] extension so user-to-user calls count too; and
+; per-carrier concurrency
+exten => s,1,Set(GROUP(user)=${CHANNEL(endpoint)})
+ same => n,GotoIf($[${GROUP_COUNT(${CHANNEL(endpoint)}@user)} > 3]?busy)
  same => n,Set(GROUP(carrier)=carrier-a)
  same => n,GotoIf($[${GROUP_COUNT(carrier-a@carrier)} > 30]?trynext)
 

@@ -172,6 +172,43 @@ Y
 }
 mkcli cli 198.18.0.20 198.18.0.7 1001 1002
 mkcli cliB 198.18.0.21 198.18.0.8 1001
+# Two more client endpoints, only for the per-user-limit checks below: sw-1002
+# authenticates as 1002 (outbound calls as another user), and sw-spoof
+# authenticates as 1001 but sends a forged From user 1005 (no endpoint 1005
+# exists on the switch, so auth_username still identifies the call as endpoint
+# 1001). Outbound-only, so no identify: inbound calls stay on endpoint sw.
+cat >> cli/pjsip.conf <<'Y'
+[sw-1002]
+type=endpoint
+context=incoming
+disallow=all
+allow=ulaw,alaw
+direct_media=no
+outbound_auth=1002
+aors=sw-1002
+from_user=1002
+[sw-1002]
+type=aor
+contact=sip:198.18.0.7:5060
+[sw-spoof]
+type=endpoint
+context=incoming
+disallow=all
+allow=ulaw,alaw
+direct_media=no
+outbound_auth=1001
+aors=sw-spoof
+from_user=1005
+[sw-spoof]
+type=aor
+contact=sip:198.18.0.7:5060
+Y
+cat >> cli/extensions.conf <<'Y'
+[out-1002]
+exten => _X.,1,Dial(PJSIP/${EXTEN}@sw-1002,30)
+[out-spoof]
+exten => _X.,1,Dial(PJSIP/${EXTEN}@sw-spoof,30)
+Y
 
 # carrier-a simulator: digest-protected registrar with two accounts (acct through node A,
 # acct-b through node B), challenges INVITEs, refuses 0155555559. [trunk] is the carrier's
@@ -342,7 +379,7 @@ rx sw 'pjsip set logger on' >/dev/null
 check "client 1001 registered with digest; stored Contact keeps fsbc=" \
   bash -c "docker exec $P-sw asterisk -rx 'pjsip show contacts' | grep -q 'transport=udp;fsb'"
 rx cli 'channel originate Local/600@out extension s@tone' >/dev/null; sleep 7
-check "client -> 600 Echo reached the dialplan after a digest challenge" has sw 'Executing \[600@from-clients:2\] Echo'
+check "client -> 600 Echo reached the dialplan after a digest challenge" has sw 'Executing \[600@from-clients:3\] Echo'
 check "client call carried RTP both ways through FreeSBC" has fsa 'carrier=false stats=.*RTPPacketsRx:[1-9]'
 rx sw 'channel originate PJSIP/1001 application Milliwatt' >/dev/null; sleep 4; rx sw 'channel request hangup all' >/dev/null; sleep 1
 check "switch -> registered client call rang the client" has cli 'CLIENT SIM got call to 1001'
@@ -381,8 +418,38 @@ check "client forged X-FreeSBC-Carrier (sent on the wire)" has cli 'X-FreeSBC-Ca
 check "  ... FreeSBC stripped it: the switch never ran from-carrier for it" bash -c "! docker logs $P-sw 2>&1 | grep -q 'Executing \[600@from-carrier'"
 
 # --- limits ---------------------------------------------------------------
-for i in 1 2 3; do rx cli 'channel originate Local/0112345678@out extension s@tone' >/dev/null; sleep 0.3; done; sleep 7
-check "third concurrent outbound call of one user got Busy (GROUP_COUNT)" has sw 'Executing \[s@outbound:[0-9]+\] Busy\('
+# Per-user concurrency: at most 3 calls, keyed on the endpoint Asterisk
+# authenticated (CHANNEL(endpoint), not the caller-chosen From user), and taken
+# at the head of every [from-clients] extension, so user-to-user calls count
+# too. The calls are originated with Milliwatt so each stays up while the next
+# one arrives.
+busy() { cnt sw 'Executing \[s@user-limit:[0-9]+\] Busy\('; }
+for i in 1 2 3; do rx cli 'channel originate Local/0112345670@out application Milliwatt' >/dev/null; sleep 0.5; done
+check "per-user limit: user 1001's 3 concurrent calls to a carrier are up" wait_cnt carA 'CARRIER-A SIM got call to 0112345670' 2 20
+n=$(busy)
+rx cli 'channel originate Local/0112345671@out application Milliwatt' >/dev/null
+check "  ... the 4th concurrent call of the same user got Busy (GROUP_COUNT)" wait_cnt sw 'Executing \[s@user-limit:[0-9]+\] Busy\(' "$n" 20
+check "  ... and never reached the carrier" bash -c "! docker logs $P-carA 2>&1 | grep -q 'CARRIER-A SIM got call to 0112345671'"
+# A forged From user does not move the call into another group: there is no
+# endpoint 1005, so auth_username identifies it as endpoint 1001, already full.
+n=$(busy)
+rx cli 'channel originate Local/0112345672@out-spoof application Milliwatt' >/dev/null
+check "  ... the 4th is still refused when its From user (1005) differs from the authenticated user (1001)" wait_cnt sw 'Executing \[s@user-limit:[0-9]+\] Busy\(' "$n" 20
+check "  ... that INVITE really carried From user 1005" has cli 'From: .*<sip:1005@'
+check "  ... nothing was counted under the forged user" bash -c "! docker exec $P-sw asterisk -rx 'group show channels' | grep -q '1005'"
+rx cli 'channel originate Local/0112345673@out-1002 application Milliwatt' >/dev/null; sleep 4
+check "  ... another user (1002) is still admitted while 1001 is at the limit" has carA 'CARRIER-A SIM got call to 0112345673'
+rx cli 'channel request hangup all' >/dev/null; rx sw 'channel request hangup all' >/dev/null; rx carA 'channel request hangup all' >/dev/null; sleep 2
+# A user-to-user call ([from-clients] _10XX) counts against the caller too.
+n1002=$(cnt cli 'CLIENT SIM got call to 1002')
+for i in 1 2 3; do rx cli 'channel originate Local/1002@out application Milliwatt' >/dev/null; sleep 0.5; done
+check "a user-to-user call counts: 1001's 3 concurrent calls to 1002 are up" wait_cnt cli 'CLIENT SIM got call to 1002' "$((n1002+2))" 20
+n=$(busy)
+rx cli 'channel originate Local/1002@out application Milliwatt' >/dev/null
+check "  ... the 4th user-to-user call of the same caller got Busy" wait_cnt sw 'Executing \[s@user-limit:[0-9]+\] Busy\(' "$n" 20
+rx cli 'channel originate Local/0112345674@out-1002 application Milliwatt' >/dev/null; sleep 4
+check "  ... the callee is not counted: 1002 is still admitted while caller 1001 is at the limit" has carA 'CARRIER-A SIM got call to 0112345674'
+rx cli 'channel request hangup all' >/dev/null; rx sw 'channel request hangup all' >/dev/null; rx carA 'channel request hangup all' >/dev/null; sleep 2
 
 # --- 5. two nodes: qualify and drain --------------------------------------
 contact_status() { rx sw 'pjsip show contacts' | grep -E "^ *Contact: +$1/" | awk '{print $NF" "$(NF-1)}'; }
@@ -421,9 +488,9 @@ n=$(cnt cli 'CLIENT SIM got call to 1001'); a_ended=$(cnt fsa 'call ended.*carri
 rx sw 'channel originate PJSIP/1001 application Milliwatt' >/dev/null; sleep 4; rx sw 'channel request hangup all' >/dev/null; sleep 2
 check "drain A: switch -> agent attached to A still rings (client calls are admitted)" bash -c "[ \$(docker logs $P-cli 2>&1 | grep -c 'CLIENT SIM got call to 1001') -gt $n ]"
 check "  ... through node A" bash -c "[ \$(docker logs $P-fsa 2>&1 | grep -c 'call ended.*carrier=false') -gt $a_ended ]"
-c=$(cnt sw 'Executing \[600@from-clients:2\] Echo')
+c=$(cnt sw 'Executing \[600@from-clients:3\] Echo')
 rx cli 'channel originate Local/600@out extension s@tone' >/dev/null; sleep 7
-check "drain A: agent -> 600 still admitted through A" bash -c "[ \$(docker logs $P-sw 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'Executing \[600@from-clients:2\] Echo') -gt $c ]"
+check "drain A: agent -> 600 still admitted through A" bash -c "[ \$(docker logs $P-sw 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c 'Executing \[600@from-clients:3\] Echo') -gt $c ]"
 echo "INFO  undrain A: $(adm fsa DELETE /api/drain | tail -1)"
 sleep 12
 echo "INFO  contact status after undrain: carrier-a=$(cstat carrier-a) mobile=$(cstat mobile)"
@@ -507,9 +574,9 @@ check "max_contacts=1 + remove_existing: registering through B replaced the stal
 n=$(cnt cliB 'CLIENT SIM got call to 1001')
 rx sw 'channel originate PJSIP/1001 application Milliwatt' >/dev/null; sleep 4; rx sw 'channel request hangup all' >/dev/null; sleep 1
 check "A down: next switch -> agent call rang the agent through B" bash -c "[ $(cnt cliB 'CLIENT SIM got call to 1001') -gt $n ]"
-c=$(cnt sw 'Executing \[600@from-clients:2\] Echo')
+c=$(cnt sw 'Executing \[600@from-clients:3\] Echo')
 rx cliB 'channel originate Local/600@out extension s@tone' >/dev/null; sleep 7
-check "A down: next agent -> 600 call completed through B" bash -c "[ $(cnt sw 'Executing \[600@from-clients:2\] Echo') -gt $c ]"
+check "A down: next agent -> 600 call completed through B" bash -c "[ $(cnt sw 'Executing \[600@from-clients:3\] Echo') -gt $c ]"
 check "  ... with RTP both ways through node B" has fsb 'carrier=false stats=.*RTPPacketsRx:[1-9]'
 
 echo; [ $fail = 0 ] && echo "ALL PASS" || echo "SOME CHECKS FAILED"
