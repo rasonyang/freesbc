@@ -347,6 +347,17 @@ The public leg is SRTP/SRTCP on its usual media port pair; the switch leg is alw
 
 Known limitation: there is no automatic retry after a 488 to our `RTP/SAVP` offer under `optional`. An `RTP/SAVP` offer to a plain-only endpoint fails (RFC 3264), and the 488 is relayed as it is; set `srtp: off` for such a peer.
 
+## What the media plane can and cannot protect
+
+Read this before choosing FreeSBC for media confidentiality.
+
+- **The public leg can be encrypted; the switch leg never is.** A client leg is DTLS-SRTP (ws/wss) or SDES-SRTP (a sips/TLS-registered client with `edge.srtp`), and a carrier leg can be SDES-SRTP (`transport: tls` plus the carrier's `srtp`). The leg toward the switch is always plain `RTP/AVP`. There is no ZRTP and no SRTP pass-through mode, so no call's media is ever protected end to end.
+- **FreeSBC is a mandatory decryption point on every call with an encrypted leg.** It decrypts what a protected leg sends and encrypts what it sends back to that leg, and it holds the keys in memory while the call is up. A compromise of the FreeSBC host, or a tap on the private LAN between FreeSBC and the switch, yields every call in the clear.
+- **The private leg has no in-band authentication.** A datagram is "the switch" when it reaches the private socket from an `edge.switch` address — an address test plus, on Linux, the interface test of [The private socket's ingress rule](#the-private-sockets-ingress-rule). A host that can put a datagram on that socket with a switch source IP is the switch, as far as FreeSBC is concerned.
+- **`edge.allow_insecure_sdes` moves the keys onto plaintext signaling.** SDES keys travel in the SDP, so on a transport that is not TLS or WSS an on-path attacker reads them — and under `optional` can delete the `a=crypto` line to force plain RTP. Set it only where the signaling path is already protected another way (a VPN, a private link); it belongs in no public deployment.
+
+If the private LAN is not trusted — a shared hosting VLAN, a colo cross-connect, a switch pool spanning sites — run the leg between FreeSBC and the switch over WireGuard or IPsec. The tunnel must then carry the whole private side: `private.ip` must be the tunnel interface's own address, because the Linux private-socket filter admits a datagram only when it arrives on the interface that owns `private.ip`, or on loopback (see [The private socket's ingress rule](#the-private-sockets-ingress-rule)), and every `edge.switch` entry must be a tunnel address of the switch, since `Server.readFilter` (`internal/edge/edge.go`) admits only those IPs. A tunnel terminating on another interface shows up only as upstream timeouts. The interface is resolved once at startup, so taking the tunnel down and back up (`wg-quick down`/`up`) drops switch traffic until FreeSBC is restarted. In the single-IP layout no filter is attached at all, and the switch is trusted by its source IP alone.
+
 ## Reliable provisionals, UPDATE and delayed offers
 
 PRACK, UPDATE and an INVITE or re-INVITE without SDP work on client, switch and carrier legs, with the same guarantees as an ordinary INVITE: media anchored on SBC ports, every SDP built by FreeSBC, nothing of either side's SDP crossing.

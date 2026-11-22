@@ -3881,6 +3881,12 @@ unreadable `tls` file is a startup error of `run`, not a fallback to a
 self-signed certificate.
 
 **No certificate is hot-rotated.** Every TLS config is built once at startup.
+No revocation is consulted anywhere: Go checks no CRL or OCSP responder and
+there is no key for one (`carrierTLSConfig`, `edge/carrierconn.go`;
+`hep.TLSConfig`, `hep/sender.go`). A revoked carrier certificate stays
+trusted until it expires or its issuer is removed from trust (`ca_file` or
+the system roots), and `edge.carriers` is restart-only, so a roots change
+takes effect at the next `run`.
 
 ### 12.6 What the code enforces vs what deployment must guarantee
 

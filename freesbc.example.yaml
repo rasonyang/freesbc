@@ -42,8 +42,12 @@ rtp: 20000-29999             # one range, allocated independently per bind IP (h
 edge:
   switch: [10.77.0.10:5060]  # literal IP:port; more than one = hash-user pool
   srtp: optional            # SDES-SRTP for registered clients: off (default) | optional | required;
-  #                         #   used only over TLS/WSS signaling, unless allow_insecure_sdes: true
-  # allow_insecure_sdes: false
+  #                         #   applied per call by the transport the client registered over:
+  #                         #   tls/wss only, unless allow_insecure_sdes: true. With the shipped
+  #                         #   listeners every client registers over udp/tcp, so `optional`
+  #                         #   changes nothing — and `required` would refuse every such call
+  #                         #   with 488. Making it real: the steps after `listen`.
+  # allow_insecure_sdes: false  # true puts the SDES keys on plaintext signaling; never in public
   # allow_register_auth_mismatch: false  # true only if the switch maps an auth user to another AoR
   switch_carrier_port: 5080  # carriers (FreeSWITCH: external profile port);
                              #   default = the switch port above;
@@ -54,6 +58,22 @@ edge:
     # tls: 5061              # SIP/TLS (sips); needs tls
     # wss: 443               # enables WebRTC (ICE-Lite, DTLS-SRTP, rtcp-mux); needs tls
     # ws: 8080               # plaintext WebSocket, development only
+
+  # --- Making srtp real -----------------------------------------------------
+  # SDES keys travel in the SDP, so `srtp` does nothing for a client whose
+  # signaling is not TLS or WSS — what matters is the transport each client
+  # registered over, not which listeners exist. To make it real:
+  #   1. uncomment the top-level `tls:` block above;
+  #   2. under `listen`, uncomment `tls: 5061` (sips clients get SDES-SRTP;
+  #      browsers on `wss` get DTLS-SRTP regardless of this key);
+  #   3. keep `srtp: optional` (a plain RTP/AVP answer is accepted as plain —
+  #      a downgrade by design) or set `required` (RTP/SAVP only; a plain
+  #      offer is refused 488 — and every call from a client still registered
+  #      over udp/tcp is refused 488, so it locks out the clients that stay
+  #      on the shipped udp/tcp listeners).
+  # Either way the switch leg stays plain RTP — FreeSBC decrypts and
+  # re-encrypts whenever a leg is encrypted; see docs/edge.md, "What the media
+  # plane can and cannot protect".
 
   # advertise:               # only when the NAT translates a port: Via/Contact/
   #   udp: 16060             # Record-Route name 16060, the socket binds 5060;
