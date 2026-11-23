@@ -2923,7 +2923,7 @@ Plane defaults:
 |---|---|---|
 | Public leg (side A): phone, or a carrier in either direction | **loose**, with the far end's SIP source IP as a signalled source | `allocateRTP` (`edge/media.go`; a caller's leg, source = the INVITE's source address, which for an inbound carrier call is the carrier's) and `buildPublicOffer` (`edge/media.go`; a callee's leg), whose answer is ranked by the address the INVITE was sent to in `negotiateFork` (`edge/media.go`; for an outbound carrier call, the carrier's resolved address). A phone behind a hard NAT cannot be trusted to signal the source its RTP comes from |
 | Private leg (side B): the switch | **strict** | the switch's signalled address is trustworthy, and strict already tolerates a NAT-rewritten port |
-| WebRTC public leg | none: ICE fixed the peer and SRTP authenticates every packet | |
+| WebRTC public leg | none: the DTLS fingerprint fixes the peer's identity and SRTP authenticates every packet; the ICE-nominated pair is only the current destination (§8.7) | |
 | WebRTC private leg | strict | `WebRTCSessionConfig.PrivateLatch` (`media/webrtcsession.go`), set in `allocateWebRTC` (`edge/media.go`) and `allocateOfferedWebRTC` (`edge/media.go`) |
 
 The edge seeds both sides from the signalled address: side A from a client's
@@ -3143,8 +3143,27 @@ on either failure, logging neither fingerprint.
 
 **ICE credentials** are 3 random bytes → 4 base64url characters (ufrag) and
 18 bytes → 24 characters (pwd). They are secrets: anyone who learns the pwd
-can answer connectivity checks and take over the media path, so they are
-never logged at normal levels.
+can have its binding requests answered and take over the media path, so
+they are never logged at normal levels. "The media path" is an address as
+much as a key: the relay's destination is whatever pair the ICE agent
+nominated, and that remote address need not be, and often is not, the one
+the SIP came from. A browser behind a symmetric NAT, through a TURN relay
+or over a VPN egress sends its connectivity checks from, and takes its
+media at, a source its signalling never used, and the public side has no
+latch to rank that source (the §8.4 plane table): media to or from an
+address that never sent SIP is a healthy call's shape, not a hijack's.
+
+A source that learns the pwd cannot read or inject media — it is relayed
+ciphertext it cannot decrypt, and its own packets fail SRTP authentication
+in `publicToPrivate` (`internal/media/webrtcsession.go`) — but it can take
+the media away from the browser. `WebRTCLeg.verified`
+(`internal/media/webrtcleg.go`) is one flag per leg, set once in
+`establish`, and nothing re-checks it when the selected pair changes, so a
+single nominating binding request with valid integrity moves the pair and
+everything `privateToPublic` sends follows it. On an established call the browser
+stops receiving media while its own audio still reaches the switch — the
+call stays up, one-way; before the fingerprint is verified the same
+request makes DTLS fail and the call ends.
 
 `WebRTCSession` joins the leg to a private port pair from the private pool
 (`NewWebRTCSession`, `webrtcsession.go`). Its `WebRTCSession.Start` (`webrtcsession.go`) waits for
@@ -3838,7 +3857,11 @@ The topology is two addresses, each written once (`docs/config.md`). They may be
   the public UDP port, which must be reachable from the carrier.
 - **No TURN and no full ICE.** The WebRTC leg is ICE-lite with a single host
   candidate, so FreeSBC must have a publicly reachable media address
-  (`public.ip`).
+  (`public.ip`). That one candidate pins only FreeSBC's own side: pion
+  still answers connectivity checks from any source holding the pwd and
+  accepts peer-reflexive remote candidates, so the browser-side media
+  address is whichever pair gets nominated — the address the SIP came from
+  fixes nothing there (§8.7).
 
 ### 12.3 Firewall and port-range assumptions
 
