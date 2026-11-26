@@ -78,7 +78,7 @@ groups:
             dead media (docs/troubleshooting.md#rtp-silence-reasonrtp_silence).
 
       - alert: FreeSBCCarrierInviteFailure
-        expr: 'increase(freesbc_edge_invite_failures_total{leg="carrier",class=~"5xx|timeout"}[15m]) > 5'
+        expr: 'sum by (job, instance) (increase(freesbc_edge_invite_failures_total{leg="carrier",class=~"5xx|timeout"}[15m])) > 5'
         labels:
           severity: warning
         annotations:

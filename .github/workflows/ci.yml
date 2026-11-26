@@ -65,7 +65,8 @@ jobs:
         run: ./freesbc check -c freesbc.example.yaml
 
   # promtool covers the PromQL syntax internal/doccheck cannot parse (it
-  # checks only metric names, labels and reason values).
+  # checks only metric names, labels and reason values); the unit fixture
+  # covers the FreeSBCCarrierInviteFailure aggregation behavior.
   promtool:
     name: promtool check rules
     runs-on: ubuntu-latest
@@ -74,6 +75,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: promtool check rules
         run: docker run --rm -v "$PWD:/src" -w /src --entrypoint promtool prom/prometheus:v3.5.0 check rules examples/prometheus/alerts.yml
+      - name: promtool test rules
+        run: docker run --rm -v "$PWD:/src" -w /src --entrypoint promtool prom/prometheus:v3.5.0 test rules examples/prometheus/alerts.test.yml
 
   test:
     name: go test -race
