@@ -28,23 +28,20 @@ groups:
           description: >-
             The freesbc job has no target in the scrape config (a target
             removed from the config produces no up series, so FreeSBCDown
-            cannot see it); check the Prometheus configuration.
+            cannot see it); check the Prometheus configuration
+            (docs/config.md#alerting).
 
       - alert: FreeSBCHealthDegraded
-        expr: freesbc_admin_health_status >= 1
+        expr: freesbc_admin_health_status == 1
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: FreeSBC reports a degraded health condition
           description: >-
-            The health gauge is 1 (degraded); GET /api/health names the
-            active conditions (docs/design.md#136-health-conditions). Some
-            of them overlap rules in this file and fire twice —
-            shield_ban_cap, config_reload_failed, tls_cert_expiry and
-            tls_cert_renewed — and config_restart_required has no dedicated
-            rule. The catch-all exists for the rest: a single cooling
-            switch node, a carrier DNS failure.
+            The health gauge is exactly 1 (degraded, with no critical
+            condition); GET /api/health names the active conditions
+            (docs/design.md#136-health-conditions).
 
       - alert: FreeSBCHealthCritical
         expr: freesbc_admin_health_status >= 2
@@ -81,15 +78,17 @@ groups:
             dead media (docs/troubleshooting.md#rtp-silence-reasonrtp_silence).
 
       - alert: FreeSBCCarrierInviteFailure
-        expr: 'increase(freesbc_edge_invite_failures_total{leg="carrier",class=~"5xx|timeout"}[15m]) > 0'
+        expr: 'increase(freesbc_edge_invite_failures_total{leg="carrier",class=~"5xx|timeout"}[15m]) > 5'
         labels:
           severity: warning
         annotations:
-          summary: An outbound call to a carrier failed
+          summary: Outbound carrier calls are failing repeatedly
           description: >-
-            The carrier answered 5xx or nothing at all; the alert cannot
-            name the carrier (the counter has no carrier label) — the
-            `invite failed` log line carries it
+            More than five outbound carrier-call attempts in 15 minutes
+            ended in a 5xx or with no final response. The count includes
+            rejections FreeSBC itself generated (drain, session or
+            invite-rate caps, no target or public side, media-capacity
+            failure); the `invite failed` log line names the source and carrier
             (docs/troubleshooting.md#a-call-never-connects).
 
       - alert: FreeSBCMediaRejected
