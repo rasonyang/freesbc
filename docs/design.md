@@ -3888,8 +3888,8 @@ there is no key for one (`carrierTLSConfig`, `edge/carrierconn.go`;
 `hep.TLSConfig`, `hep/sender.go`). A revoked carrier certificate stays
 trusted until it expires or its issuer is removed from trust (`ca_file` or
 the system roots). Editing a `ca_file` PEM does not itself trigger a
-configuration reload, and Go loads the system roots once per process, so a
-roots change takes effect only at the next `run`.
+configuration reload, and on Linux Go loads the system roots once per
+process, so a roots change takes effect only at the next `run`.
 
 ### 12.6 What the code enforces vs what deployment must guarantee
 
