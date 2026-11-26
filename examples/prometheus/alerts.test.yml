@@ -1,0 +1,88 @@
+# Focused promtool unit tests for FreeSBCCarrierInviteFailure in alerts.yml.
+# Run from the repository root:
+# docker run --rm -v "$PWD:/src" -w /src --entrypoint promtool prom/prometheus:v3.5.0 test rules examples/prometheus/alerts.test.yml
+rule_files:
+  - alerts.yml
+
+tests:
+  # Four 5xx plus four timeout failures on one instance are one combined
+  # alert, not one alert per class series.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="freesbc",instance="edge1"}'
+        values: '1+0x15'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge1",leg="carrier",direction="outbound",class="5xx"}'
+        values: '0 0 4+0x13'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge1",leg="carrier",direction="outbound",class="timeout"}'
+        values: '0 0 4+0x13'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FreeSBCCarrierInviteFailure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: freesbc
+              instance: edge1
+            exp_annotations:
+              summary: Outbound carrier calls are failing repeatedly
+              description: >-
+                More than five outbound carrier-call attempts in 15 minutes
+                ended in a 5xx or with no final response. The count includes
+                rejections FreeSBC itself generated (drain, session or
+                invite-rate caps, no target or public side, media-capacity
+                failure); the `invite failed` log line names the source and carrier
+                (docs/troubleshooting.md#a-call-never-connects).
+
+  # Six failures from one class are over the threshold.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="freesbc",instance="edge1"}'
+        values: '1+0x15'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge1",leg="carrier",direction="outbound",class="5xx"}'
+        values: '0 0 6+0x13'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FreeSBCCarrierInviteFailure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: freesbc
+              instance: edge1
+            exp_annotations:
+              summary: Outbound carrier calls are failing repeatedly
+              description: >-
+                More than five outbound carrier-call attempts in 15 minutes
+                ended in a 5xx or with no final response. The count includes
+                rejections FreeSBC itself generated (drain, session or
+                invite-rate caps, no target or public side, media-capacity
+                failure); the `invite failed` log line names the source and carrier
+                (docs/troubleshooting.md#a-call-never-connects).
+
+  # Exactly five is not over the threshold.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="freesbc",instance="edge1"}'
+        values: '1+0x15'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge1",leg="carrier",direction="outbound",class="5xx"}'
+        values: '0 0 5+0x13'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FreeSBCCarrierInviteFailure
+        exp_alerts: []
+
+  # Four failures on each of two instances must not combine into one
+  # over-threshold count: the rule groups by job and instance.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="freesbc",instance="edge1"}'
+        values: '1+0x15'
+      - series: 'up{job="freesbc",instance="edge2"}'
+        values: '1+0x15'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge1",leg="carrier",direction="outbound",class="5xx"}'
+        values: '0 0 4+0x13'
+      - series: 'freesbc_edge_invite_failures_total{job="freesbc",instance="edge2",leg="carrier",direction="outbound",class="timeout"}'
+        values: '0 0 4+0x13'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: FreeSBCCarrierInviteFailure
+        exp_alerts: []

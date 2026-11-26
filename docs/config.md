@@ -337,6 +337,23 @@ The config API is read-only. There is no write endpoint: edit the file, run `fre
 
 The WebUI's Config tab shows the running file read-only, a candidate editor whose **Validate** button calls `POST /api/config/validate` (the errors, or the restart-only keys the candidate changes), and a line diff of the running file against the candidate. It also has a **Download config** button that fetches `/api/config/raw` fresh (never the candidate text) and saves the exact bytes as `freesbc-<host>-<UTC timestamp>.yaml`, for example `freesbc-127.0.0.1-8080-20261006T120000Z.yaml`. The file is not redacted: it contains `admin.password_hash` and any secret written as a literal, so store it like a credential. `${VAR}` references are saved as references, not values. Keep secrets as `${VAR}` references so a downloaded copy does not leak them.
 
+#### Alerting
+
+[`examples/prometheus/alerts.yml`](../examples/prometheus/alerts.yml) is a Prometheus rule group covering the common cases, loadable with `rule_files`: a failed scrape, no scrape target at all, the aggregate `freesbc_admin_health_status` gauge at degraded and at critical, calls ended for a lost ACK or RTP silence, repeated outbound carrier-call failures, media the latch refuses, kernel socket drops (Linux only), a ban table at its cap, a failed reload, and certificate expiry and renewal-pending. The thresholds are starting points, and each rule's `description` names the doc section that explains the cause. A rule whose series is absent stays silent: the TLS rules fire only when a `tls` pair is loaded, and `freesbc_udp_socket_drops_total` exists on Linux alone.
+
+Two rules select on the scrape job name: `FreeSBCDown` and `FreeSBCScrapeAbsent` assume it is `freesbc` (`up{job="freesbc"}`); rename it in the scrape config and in those exprs together. `FreeSBCScrapeAbsent` is the `absent()` counterpart: a target removed from the scrape config produces no `up` series at all, so `FreeSBCDown` alone cannot see it.
+
+`freesbc_admin_health_status` is the worst active health severity: 0 when no condition is active, 1 when only degraded conditions are active, 2 when any critical condition is active (`docs/design.md` §13.6). `FreeSBCHealthDegraded` therefore uses `== 1` and stays warning-only; `FreeSBCHealthCritical` uses `>= 2`. Only `shield_ban_cap`, `config_reload_failed`, `tls_cert_expiry` and `tls_cert_renewed` overlap rules shipped in the same file. `config_restart_required`, `rtp_ports` and `ack_missed:<plane>` have series of their own but no shipped rule; `switch_cooldown:<ip:port>`, `carrier_dns:<name>`, `tls_cert_disk_error` and `admin_plain_remote` have no dedicated series. The health catch-alls exist so those conditions still alert.
+
+`FreeSBCCarrierInviteFailure` uses a count threshold (`> 5` in 15 minutes) because a single 5xx or timeout is routine on a busy trunk. The underlying counter also includes edge-generated rejections on the carrier leg — drain, session and invite-rate caps through `rejectBusy`, no target or public side through `rejectInvite` (both `internal/edge/invite.go`), and media-capacity failures — so the alert means repeated outbound carrier-call setup failures, not necessarily carrier-side 5xx answers.
+
+Gaps no rule can cover yet, for want of a series:
+
+- A carrier keepalive's outcome is unknown: `freesbc_edge_carrier_requests_total{carrier,direction,method}` counts requests only, and a carrier keepalive is the switch's own OPTIONS, so there is no per-carrier answer class. The health view has `carrier_dns:<name>` as a condition, but there is no gauge for it.
+- `freesbc_edge_invite_failures_total{leg,direction,class}` splits invite failures by leg and class, and the shipped `FreeSBCCarrierInviteFailure` rule uses `leg="carrier"` with `class=~"5xx|timeout"` and a count threshold, but the counter has no carrier label: the alert cannot name the carrier — the name is only a field of the `invite failed` log line.
+- A switch node down is `switch_cooldown:<ip:port>`, a health condition only, not a series (`/api/switch-nodes`, `docs/design.md` §13.6).
+- `shield.max_sessions` is not exported as a gauge, so a sessions-near-cap rule has to guess the limit from `freesbc_media_ports_total` and the layout.
+
 ### `hep`
 
 Optional, off when absent. Mirrors every SIP message the edge receives or sends, on every socket, to a HOMER collector over HEPv3. What is mirrored, the HOMER ports and the security notes are in [`homer.md`](homer.md).
